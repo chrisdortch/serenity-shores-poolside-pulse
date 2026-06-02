@@ -1,314 +1,41 @@
-const STORAGE_KEY = 'poolside-pulse-state-v1';
-const ADMIN_CODE = '2468';
-
-const defaultState = {
-  admin: false,
-  tab: 'dashboard',
-  poolOpen: true,
-  musicPaused: false,
-  activeAlert: null,
-  countdown: 0,
-  lastWeatherCheck: null,
-  playlistName: 'Poolside Suno Mix',
-  playlistUrl: 'https://suno.com/playlist/serenity-shores-poolside-suno-mix',
-  currentTrack: 0,
-  volume: 80,
-  voiceRate: 1,
-  voicePitch: 1,
-  repeatCount: 1,
-  repeatDelay: 10,
-  instantMessage: 'Please close umbrellas due to wind.',
-  emergencyMessage: 'Attention guests: lightning has been detected nearby. Please exit the pool area immediately.',
-  lifeguardMessage: 'Ensure all guests exit the pool area. Close umbrellas, secure loose items, and take shelter indoors.',
-  clearMessage: 'The pool is now clear to reopen. Thank you.',
-  tracks: [
-    { title: 'Good Life', artist: 'OneRepublic', duration: '3:42', audioUrl: '' },
-    { title: 'Island In The Sun', artist: 'Weezer', duration: '3:20', audioUrl: '' },
-    { title: 'Riptide', artist: 'Vance Joy', duration: '3:24', audioUrl: '' },
-    { title: 'Here Comes The Sun', artist: 'The Beatles', duration: '3:05', audioUrl: '' },
-    { title: 'Watermelon Sugar', artist: 'Harry Styles', duration: '2:54', audioUrl: '' }
-  ],
-  events: [
-    { type: 'music', text: 'System started', time: new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) }
-  ]
-};
-
-let state = loadState();
-let timer = null;
-let audio = new Audio();
-audio.volume = state.volume / 100;
-
-function loadState() {
-  try {
-    return { ...defaultState, ...JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}') };
-  } catch {
-    return { ...defaultState };
-  }
-}
-
-function saveState() {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
-}
-
-function event(text, type = 'info') {
-  state.events = [{ type, text, time: new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) }, ...state.events].slice(0, 25);
-  saveState();
-}
-
-function speak(text, repeats = 1, delay = 0) {
-  if (!('speechSynthesis' in window)) {
-    alert('This browser does not support free built-in speech synthesis. Safari, Chrome, and Edge usually do.');
-    return;
-  }
-  const clean = String(text || '').trim();
-  if (!clean) return;
-  window.speechSynthesis.cancel();
-  let i = 0;
-  const play = () => {
-    const utterance = new SpeechSynthesisUtterance(clean);
-    utterance.rate = state.voiceRate;
-    utterance.pitch = state.voicePitch;
-    utterance.volume = state.volume / 100;
-    utterance.onend = () => {
-      i += 1;
-      if (i < repeats) setTimeout(play, delay * 1000);
-    };
-    window.speechSynthesis.speak(utterance);
-  };
-  play();
-  event(`Spoken announcement: ${clean.slice(0, 70)}${clean.length > 70 ? '…' : ''}`, 'announcement');
-}
-
-function startSafetyAlert(kind = 'Lightning') {
-  state.poolOpen = false;
-  state.musicPaused = true;
-  state.activeAlert = kind;
-  state.countdown = 30 * 60;
-  pauseMusic();
-  speak(state.emergencyMessage, 1, 0);
-  event(`${kind} safety alert triggered`, 'alert');
-  startTimer();
-  saveState();
-  render();
-}
-
-function clearSafetyAlert() {
-  state.poolOpen = true;
-  state.musicPaused = false;
-  state.activeAlert = null;
-  state.countdown = 0;
-  speak(state.clearMessage, 1, 0);
-  event('Safety alert cleared; music may resume', 'success');
-  saveState();
-  render();
-}
-
-function startTimer() {
-  if (timer) clearInterval(timer);
-  timer = setInterval(() => {
-    if (state.countdown > 0) {
-      state.countdown -= 1;
-      saveState();
-      render();
-    } else if (state.activeAlert) {
-      clearInterval(timer);
-      timer = null;
-      clearSafetyAlert();
-    }
-  }, 1000);
-}
-
-function formatTime(seconds) {
-  const m = Math.floor(seconds / 60).toString().padStart(2, '0');
-  const s = Math.floor(seconds % 60).toString().padStart(2, '0');
-  return `${m}:${s}`;
-}
-
-function currentTrack() {
-  return state.tracks[state.currentTrack] || state.tracks[0];
-}
-
-function playMusic() {
-  const track = currentTrack();
-  if (track?.audioUrl) {
-    audio.src = track.audioUrl;
-    audio.play().catch(() => alert('Browser blocked autoplay. Tap play again, or use a direct playable audio URL.'));
-  }
-  state.musicPaused = false;
-  event(`Music playing: ${track?.title || 'Unknown track'}`, 'music');
-  saveState();
-  render();
-}
-
-function pauseMusic() {
-  audio.pause();
-  state.musicPaused = true;
-  saveState();
-}
-
-function nextTrack() {
-  state.currentTrack = (state.currentTrack + 1) % Math.max(state.tracks.length, 1);
-  event(`Next track selected: ${currentTrack()?.title || 'Unknown track'}`, 'music');
-  if (!state.musicPaused) playMusic();
-  saveState();
-  render();
-}
-
-async function checkWeather() {
-  state.lastWeatherCheck = new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
-  event('Weather check completed using free prototype mode', 'weather');
-  saveState();
-  render();
-}
-
-function importTracks(text) {
-  const rows = text.split('\n').map(x => x.trim()).filter(Boolean);
-  const tracks = rows.map(row => {
-    const parts = row.split('|').map(x => x.trim());
-    return { title: parts[0] || 'Untitled', artist: parts[1] || 'Unknown', duration: parts[2] || '3:00', audioUrl: parts[3] || '' };
-  });
-  if (tracks.length) {
-    state.tracks = tracks;
-    state.currentTrack = 0;
-    event(`Imported ${tracks.length} playlist tracks`, 'music');
-    saveState();
-    render();
-  }
-}
-
-function appShell(content) {
-  const track = currentTrack();
-  const alertClass = state.activeAlert ? 'danger' : 'safe';
-  return `
-    <div class="hero">
-      <div class="heroOverlay">
-        <div class="brandMark">≋◠≋</div>
-        <h1>Serenity Shores</h1>
-        <h2>Poolside Pulse</h2>
-        <p>Music, updates, and pool safety.</p>
-        <div class="chips">
-          <span class="chip ${state.poolOpen ? 'good' : 'bad'}">${state.poolOpen ? '● Pool Open' : '● Pool Closed'}</span>
-          <span class="chip ${alertClass}">${state.activeAlert ? '⚠ Music Paused' : '🛡 Weather Safe'}</span>
-          <span class="chip">↻ Auto-check every 5 min</span>
-        </div>
-      </div>
-    </div>
-    <main class="app">
-      ${content}
-    </main>
-    <nav class="bottomNav">
-      ${navButton('dashboard', '⌂', 'Home')}
-      ${navButton('music', '♫', 'Music')}
-      ${navButton('safety', '🛡', 'Safety')}
-      ${navButton('announcements', '🔔', 'Announcements')}
-      ${navButton('admin', '☰', 'Admin')}
-    </nav>
-  `;
-}
-
-function navButton(tab, icon, label) {
-  return `<button class="nav ${state.tab === tab ? 'active' : ''}" data-tab="${tab}"><b>${icon}</b><span>${label}</span></button>`;
-}
-
-function dashboard() {
-  const track = currentTrack();
-  if (state.activeAlert) return safetyScreen();
-  return appShell(`
-    <section class="player card">
-      <div class="album">Poolside<br><span>Suno</span><small>Mix</small></div>
-      <div class="playerInfo">
-        <p class="eyebrow">NOW PLAYING</p>
-        <h3>${track.title}</h3>
-        <p>${track.artist}</p>
-        <p class="playlist">▥ ${state.playlistName}</p>
-      </div>
-      <div class="progress"><span></span></div>
-      <div class="controls">
-        <button>⤨</button><button>◀</button><button class="big" id="playPause">${state.musicPaused ? '▶' : 'Ⅱ'}</button><button id="nextTrack">▶</button><button>↻</button>
-      </div>
-    </section>
-    <section class="grid two">
-      <div class="card"><h3>Recently Played</h3>${state.tracks.slice(1,4).map(t => row(t)).join('')}</div>
-      <div class="card"><h3>Up Next</h3>${state.tracks.slice(1,4).map((t,i) => row(t, i+1)).join('')}</div>
-    </section>
-    <section class="notice card"><div class="icon">📣</div><div><h3>No active announcements</h3><p>You’ll see important updates here.</p></div></section>
-    <section class="notice card blue"><div class="icon">🛡</div><div><p class="eyebrow">SAFETY AUTOMATION</p><h3>You’re protected.</h3><p>Lightning and tornado alerts within 10 miles are monitored in prototype mode.</p></div></section>
-  `);
-}
-
-function safetyScreen() {
-  return appShell(`
-    <section class="alertBanner"><div>⚡</div><h3>${state.activeAlert} Alert — Exit the Pool</h3><p>${state.activeAlert} detected nearby. Your safety is our top priority.</p></section>
-    <section class="card notice"><div class="icon">📣</div><div><p class="eyebrow">ANNOUNCEMENT</p><h3>${state.emergencyMessage}</h3></div></section>
-    <section class="card timer"><div><p class="eyebrow">SAFETY TIMER</p><h2>${formatTime(state.countdown)}</h2><p>Exit the pool and seek shelter.</p></div><div class="timerCircle">${formatTime(state.countdown)}<small>remaining</small></div></section>
-    <section class="card peach"><p class="eyebrow">LIFEGUARD INSTRUCTIONS</p><h3>${state.lifeguardMessage}</h3></section>
-    <section class="card"><p class="eyebrow">ACTIVITY LOG</p><h3>${state.events[0]?.text || 'Weather check triggered'}</h3><p>${state.events[0]?.time || ''}</p></section>
-    <section class="card miniPlayer"><div class="album small">Poolside<br><span>Suno</span></div><div><p class="eyebrow">NOW PLAYING</p><h3>${currentTrack().title}</h3><p>Ⅱ Music Paused</p></div><button>🔇</button></section>
-    <button class="primary full" id="clearAlert">Clear Alert / Resume</button>
-  `);
-}
-
-function musicScreen() {
-  return appShell(`<section class="card"><h3>${state.playlistName}</h3><p>${state.playlistUrl}</p>${state.tracks.map((t,i) => row(t, i+1)).join('')}</section>`);
-}
-
-function announcementsScreen() {
-  return appShell(`
-    <section class="card"><h3>Speak Now</h3><textarea id="instantMessage">${state.instantMessage}</textarea><div class="grid two"><label>Repeat Count<input id="repeatCount" type="number" value="${state.repeatCount}" min="1"></label><label>Delay Seconds<input id="repeatDelay" type="number" value="${state.repeatDelay}" min="0"></label></div><button class="primary" id="speakNow">Speak Now</button></section>
-    <section class="card"><h3>Event History</h3>${state.events.map(e => `<div class="event"><b>${e.text}</b><span>${e.time}</span></div>`).join('')}</section>
-  `);
-}
-
-function safetyAdmin() {
-  return appShell(`
-    <section class="card"><h3>Weather Safety</h3><p>Prototype checks run every 5 minutes. Use a paid lightning provider before relying on this for real safety operations.</p><button class="dangerBtn" id="testLightning">Trigger Lightning Test</button><button class="primary" id="checkWeather">Check Weather Now</button><button class="ghost" id="clearAlert">Clear Alert</button></section>
-    <section class="card"><h3>Emergency Message</h3><textarea id="emergencyMessage">${state.emergencyMessage}</textarea><h3>Lifeguard Instructions</h3><textarea id="lifeguardMessage">${state.lifeguardMessage}</textarea><h3>Clear-to-Reopen Message</h3><textarea id="clearMessage">${state.clearMessage}</textarea><button class="primary" id="saveSafety">Save Safety Text</button></section>
-  `);
-}
-
-function adminScreen() {
-  if (!state.admin) {
-    return appShell(`<section class="card login"><h3>Admin Access</h3><p>Enter the prototype admin passcode.</p><input id="adminCode" placeholder="Passcode" type="password"><button class="primary" id="adminLogin">Enter Admin</button><p class="muted">Default prototype passcode: 2468. Replace with real authentication before public use.</p></section>`);
-  }
-  return appShell(`
-    <section class="adminTabs card"><button data-admin="playlist" class="active">Playlist</button><button data-admin="announcements">Announcements</button><button data-admin="safety">Safety</button><button data-admin="voice">Voice</button></section>
-    <section class="card"><p class="eyebrow">PLAYLIST</p><h3>Add / Update Playlist</h3><label>Playlist Name<input id="playlistName" value="${state.playlistName}"></label><label>Suno Playlist URL<input id="playlistUrl" value="${state.playlistUrl}"></label><div class="grid four"><input id="newTitle" placeholder="Song title"><input id="newArtist" placeholder="Artist"><input id="newDuration" placeholder="3:00"><input id="newAudio" placeholder="Direct audio URL optional"></div><button class="primary" id="addTrack">Add Track</button><h3>Bulk Import</h3><p class="muted">One song per line: Title | Artist | Duration | optional audio URL</p><textarea id="bulkImport">${state.tracks.map(t => `${t.title} | ${t.artist} | ${t.duration} | ${t.audioUrl || ''}`).join('\n')}</textarea><button class="primary" id="savePlaylist">Save Playlist</button></section>
-    <section class="card"><h3>Current Queue</h3>${state.tracks.map((t,i) => `<div class="trackEdit"><div><b>${i+1}. ${t.title}</b><p>${t.artist} · ${t.duration}</p></div><button data-up="${i}">↑</button><button data-down="${i}">↓</button><button data-del="${i}">Delete</button></div>`).join('')}</section>
-    <section class="card"><h3>Quick Admin Actions</h3><button class="dangerBtn" id="testLightning">Trigger Lightning Test</button><button class="primary" id="speakAdmin">Speak Instant Message</button><button class="ghost" id="adminLogout">Log Out</button></section>
-  `);
-}
-
-function row(t, number = '') {
-  return `<div class="songRow"><span>${number}</span><div class="thumb"></div><div><b>${t.title}</b><p>${t.artist}</p></div><em>${t.duration}</em></div>`;
-}
-
-function render() {
-  const root = document.getElementById('app');
-  const map = { dashboard, music: musicScreen, safety: safetyAdmin, announcements: announcementsScreen, admin: adminScreen };
-  root.innerHTML = (map[state.tab] || dashboard)();
-  bind();
-}
-
-function bind() {
-  document.querySelectorAll('[data-tab]').forEach(btn => btn.onclick = () => { state.tab = btn.dataset.tab; saveState(); render(); });
-  const byId = id => document.getElementById(id);
-  if (byId('playPause')) byId('playPause').onclick = () => state.musicPaused ? playMusic() : (pauseMusic(), render());
-  if (byId('nextTrack')) byId('nextTrack').onclick = nextTrack;
-  if (byId('clearAlert')) byId('clearAlert').onclick = clearSafetyAlert;
-  if (byId('testLightning')) byId('testLightning').onclick = () => startSafetyAlert('Lightning');
-  if (byId('checkWeather')) byId('checkWeather').onclick = checkWeather;
-  if (byId('adminLogin')) byId('adminLogin').onclick = () => { if (byId('adminCode').value === ADMIN_CODE) { state.admin = true; event('Admin logged in', 'admin'); saveState(); render(); } else alert('Wrong passcode'); };
-  if (byId('adminLogout')) byId('adminLogout').onclick = () => { state.admin = false; saveState(); render(); };
-  if (byId('speakNow')) byId('speakNow').onclick = () => { state.instantMessage = byId('instantMessage').value; state.repeatCount = +byId('repeatCount').value || 1; state.repeatDelay = +byId('repeatDelay').value || 0; saveState(); speak(state.instantMessage, state.repeatCount, state.repeatDelay); };
-  if (byId('speakAdmin')) byId('speakAdmin').onclick = () => speak(state.instantMessage, state.repeatCount, state.repeatDelay);
-  if (byId('saveSafety')) byId('saveSafety').onclick = () => { state.emergencyMessage = byId('emergencyMessage').value; state.lifeguardMessage = byId('lifeguardMessage').value; state.clearMessage = byId('clearMessage').value; event('Safety text updated', 'admin'); saveState(); render(); };
-  if (byId('addTrack')) byId('addTrack').onclick = () => { const title = byId('newTitle').value.trim(); if (!title) return; state.tracks.push({ title, artist: byId('newArtist').value || 'Unknown', duration: byId('newDuration').value || '3:00', audioUrl: byId('newAudio').value || '' }); event(`Added track: ${title}`, 'music'); saveState(); render(); };
-  if (byId('savePlaylist')) byId('savePlaylist').onclick = () => { state.playlistName = byId('playlistName').value; state.playlistUrl = byId('playlistUrl').value; importTracks(byId('bulkImport').value); event('Playlist updated', 'music'); saveState(); render(); };
-  document.querySelectorAll('[data-del]').forEach(b => b.onclick = () => { state.tracks.splice(+b.dataset.del, 1); state.currentTrack = 0; saveState(); render(); });
-  document.querySelectorAll('[data-up]').forEach(b => b.onclick = () => { const i = +b.dataset.up; if (i > 0) { [state.tracks[i-1], state.tracks[i]] = [state.tracks[i], state.tracks[i-1]]; saveState(); render(); } });
-  document.querySelectorAll('[data-down]').forEach(b => b.onclick = () => { const i = +b.dataset.down; if (i < state.tracks.length - 1) { [state.tracks[i+1], state.tracks[i]] = [state.tracks[i], state.tracks[i+1]]; saveState(); render(); } });
-}
-
-setInterval(() => checkWeather(), 5 * 60 * 1000);
-if (state.countdown > 0) startTimer();
-render();
+const KEY='poolside-pulse-state-v3';
+const PASS='2468';
+const time=()=>new Date().toLocaleTimeString([], {hour:'numeric',minute:'2-digit'});
+const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const uid=()=>Math.random().toString(36).slice(2,9);
+const base={admin:false,tab:'dashboard',poolOpen:true,musicPaused:true,alert:null,alertSummary:'',countdown:0,playlistName:'Poolside Suno Mix',playlistUrl:'https://suno.com/playlist/cf4b536e-9005-4c98-9ea5-a7f01eca116f',currentTrack:0,volume:80,voiceRate:1,voicePitch:1,instantMessage:'Please close umbrellas due to wind.',repeatCount:1,repeatDelay:10,scheduleMessage:'The pool will close in 15 minutes. Please begin gathering your belongings.',scheduleStart:'',scheduleRepeatCount:3,scheduleIntervalMinutes:5,resortAddress:'',latitude:'',longitude:'',radiusMiles:10,weatherEnabled:true,lastWeatherCheck:'',lastWeatherStatus:'Add resort address or GPS coordinates to enable weather monitoring.',emergencyMessage:'Attention guests: lightning or tornado activity has been detected nearby. Please exit the pool area immediately and seek shelter indoors.',lifeguardMessage:'Lifeguards: ensure all guests exit the pool area, close umbrellas, secure loose items, and confirm the pool deck is clear.',clearMessage:'The weather hold has cleared. The pool may reopen. Thank you for your patience.',tracks:[{title:'Good Life',artist:'OneRepublic',duration:'3:42',audioUrl:''},{title:'Island In The Sun',artist:'Weezer',duration:'3:20',audioUrl:''},{title:'Riptide',artist:'Vance Joy',duration:'3:24',audioUrl:''},{title:'Here Comes The Sun',artist:'The Beatles',duration:'3:05',audioUrl:''},{title:'Watermelon Sugar',artist:'Harry Styles',duration:'2:54',audioUrl:''}],scheduledAlerts:[],events:[{type:'info',text:'System ready',time:time()}]};
+let state=load();let timer=null;let audio=new Audio();audio.volume=state.volume/100;audio.onended=()=>nextTrack(true);
+function load(){try{return norm({...base,...JSON.parse(localStorage.getItem(KEY)||localStorage.getItem('poolside-pulse-state-v2')||localStorage.getItem('poolside-pulse-state-v1')||'{}')});}catch{return {...base};}}
+function norm(s){s.tracks=Array.isArray(s.tracks)&&s.tracks.length?s.tracks:base.tracks;s.scheduledAlerts=Array.isArray(s.scheduledAlerts)?s.scheduledAlerts:[];s.events=Array.isArray(s.events)?s.events:base.events;s.currentTrack=Math.min(Math.max(+s.currentTrack||0,0),Math.max(s.tracks.length-1,0));s.radiusMiles=+s.radiusMiles||10;return s;}
+function save(){localStorage.setItem(KEY,JSON.stringify(state));}
+function log(text,type='info'){state.events=[{type,text,time:time()},...state.events].slice(0,60);save();}
+function track(){return state.tracks[state.currentTrack]||{title:'No song selected',artist:'Admin',duration:'0:00',audioUrl:''};}
+function speak(text,repeats=1,delay=0){const msg=String(text||'').trim();if(!msg)return;if(!speechSynthesis in window){alert('This browser does not support speech synthesis.');return;}speechSynthesis.cancel();let i=0,total=Math.max(1,+repeats||1),wait=Math.max(0,+delay||0)*1000;const go=()=>{let u=new SpeechSynthesisUtterance(msg);u.rate=+state.voiceRate||1;u.pitch=+state.voicePitch||1;u.volume=(+state.volume||80)/100;u.onend=()=>{i++;if(i<total)setTimeout(go,wait)};speechSynthesis.speak(u)};go();log('Spoken announcement: '+msg.slice(0,90),'announcement');render();}
+function play(){state.musicPaused=false;let t=track();audio.volume=(+state.volume||80)/100;if(t.audioUrl){audio.src=t.audioUrl;audio.play().catch(()=>alert('Playback blocked or direct audio URL is not playable. Add a direct playable audio URL or tap play again.'));}else log('Now tracking current song: '+t.title+'. Add direct audio URL for browser playback.','music');save();render();}
+function pause(){audio.pause();state.musicPaused=true;save();render();}
+function nextTrack(auto=false){if(!state.tracks.length)return;state.currentTrack=(state.currentTrack+1)%state.tracks.length;log((auto?'Auto advanced':'Skipped')+' to: '+track().title,'music');if(!state.musicPaused)play();save();render();}
+function prevTrack(){if(!state.tracks.length)return;state.currentTrack=(state.currentTrack-1+state.tracks.length)%state.tracks.length;log('Returned to: '+track().title,'music');if(!state.musicPaused)play();save();render();}
+function setTrack(i,shouldPlay=false){state.currentTrack=Math.min(Math.max(+i||0,0),state.tracks.length-1);log('Current song set to: '+track().title,'music');save();shouldPlay?play():render();}
+async function fetchSuno(){state.playlistName=val('playlistName');state.playlistUrl=val('playlistUrl');save();log('Fetching Suno playlist...','music');render();try{let r=await fetch('/api/suno-playlist?url='+encodeURIComponent(state.playlistUrl));let d=await r.json();if(!r.ok||!d.ok)throw Error(d.error||'Suno fetch failed');if(!d.tracks?.length)throw Error('No tracks found. Suno may block playlist data.');state.tracks=d.tracks.map(t=>({title:t.title||'Untitled',artist:t.artist||'Suno',duration:t.duration||'3:00',audioUrl:t.audioUrl||'',sourceUrl:t.sourceUrl||state.playlistUrl}));state.currentTrack=0;log(`Imported ${state.tracks.length} songs from Suno${d.audioWarning?' - '+d.audioWarning:''}`,'music');save();render();}catch(e){log('Suno import failed: '+e.message,'alert');alert('Suno auto-import failed. Suno may hide or block public playlist data. Bulk import still works. Details: '+e.message);render();}}
+function importTracks(text){let rows=text.split('\n').map(x=>x.trim()).filter(Boolean);if(!rows.length)return;state.tracks=rows.map(row=>{let p=row.split('|').map(x=>x.trim());return{title:p[0]||'Untitled',artist:p[1]||'Unknown',duration:p[2]||'3:00',audioUrl:p[3]||'',sourceUrl:p[4]||''}});state.currentTrack=0;log('Imported '+state.tracks.length+' tracks','music');save();render();}
+async function geocode(){state.resortAddress=val('resortAddress');if(!state.resortAddress)return alert('Enter resort address first.');log('Geocoding resort address...','weather');render();try{let r=await fetch('/api/geocode?address='+encodeURIComponent(state.resortAddress));let d=await r.json();if(!r.ok||!d.ok)throw Error(d.error||'Geocode failed');state.latitude=String(d.latitude);state.longitude=String(d.longitude);log('Address geocoded: '+(d.matchedAddress||state.resortAddress),'weather');save();render();}catch(e){log('Geocode failed: '+e.message,'alert');alert('Could not convert that address. You can manually type latitude/longitude. '+e.message);render();}}
+async function checkWeather(silent=false){if(!state.weatherEnabled)return;let lat=+state.latitude,lon=+state.longitude;if(!lat||!lon){state.lastWeatherStatus='Waiting for resort GPS coordinates.';save();if(!silent)render();return;}state.lastWeatherCheck=time();if(!silent){log('Checking weather radius...','weather');render();}try{let r=await fetch(`/api/weather?lat=${lat}&lon=${lon}&radiusMiles=${state.radiusMiles}`);let d=await r.json();if(!r.ok||!d.ok)throw Error(d.error||'Weather check failed');state.lastWeatherStatus=d.summary;if(d.threat&&!state.alert){startAlert(d.threatType||'Weather',d.summary);return;}log((d.threat?'Weather threat remains: ':'Weather clear: ')+d.summary,d.threat?'alert':'weather');save();render();}catch(e){state.lastWeatherStatus='Weather check failed: '+e.message;log(state.lastWeatherStatus,'alert');save();render();}}
+function startAlert(kind='Lightning',summary='Manual admin test'){state.poolOpen=false;state.musicPaused=true;state.alert=kind;state.alertSummary=summary;state.countdown=30*60;audio.pause();speak(state.emergencyMessage,1,0);setTimeout(()=>speak(state.lifeguardMessage,1,0),2500);log(kind+' alert triggered: '+summary,'alert');startTimer();save();render();}
+function clearAlert(){state.poolOpen=true;state.musicPaused=true;state.alert=null;state.alertSummary='';state.countdown=0;speak(state.clearMessage,1,0);log('Safety alert cleared','success');save();render();}
+function startTimer(){if(timer)clearInterval(timer);timer=setInterval(()=>{if(state.countdown>0){state.countdown--;save();render();}else if(state.alert){clearInterval(timer);timer=null;clearAlert();}},1000)}
+function fmt(s){let m=String(Math.floor(s/60)).padStart(2,'0'),x=String(s%60).padStart(2,'0');return `${m}:${x}`}
+function schedule(){let msg=val('scheduleMessage');if(!msg)return alert('Enter a scheduled message.');let start=val('scheduleStart');state.scheduleMessage=msg;state.scheduleStart=start;state.scheduleRepeatCount=+val('scheduleRepeatCount')||1;state.scheduleIntervalMinutes=+val('scheduleIntervalMinutes')||5;state.scheduledAlerts.unshift({id:uid(),message:msg,startAt:start?new Date(start).getTime():Date.now()+60000,nextAt:start?new Date(start).getTime():Date.now()+60000,repeatCount:state.scheduleRepeatCount,intervalMinutes:state.scheduleIntervalMinutes,spokenCount:0,active:true,completed:false});log('Scheduled alert added','announcement');save();render();}
+function tickSchedules(){let changed=false,now=Date.now();for(let a of state.scheduledAlerts){if(!a.active||a.completed)continue;if(now>=a.nextAt&&a.spokenCount<a.repeatCount){speak(a.message,1,0);a.spokenCount++;if(a.spokenCount>=a.repeatCount){a.completed=true;a.active=false;log('Scheduled alert completed','announcement');}else{a.nextAt=now+a.intervalMinutes*60000;log('Scheduled alert spoken; repeats left: '+(a.repeatCount-a.spokenCount),'announcement');}changed=true;}}if(changed){save();render();}}
+function val(id){return document.getElementById(id)?.value||''}
+function shell(content){return `<div class="hero"><div class="heroOverlay"><div class="brandMark">≋◠≋</div><h1>Serenity Shores</h1><h2>Poolside Pulse</h2><p>Music, updates, and pool safety.</p><div class="chips"><span class="chip ${state.poolOpen?'good':'bad'}">${state.poolOpen?'● Pool Open':'● Pool Closed'}</span><span class="chip ${state.alert?'danger':'safe'}">${state.alert?'⚠ Music Paused':'🛡 Weather Monitor'}</span><span class="chip">↻ ${state.weatherEnabled?'Auto-check every 5 min':'Weather off'}</span></div></div></div><main class="app">${content}</main><nav class="bottomNav">${nav('dashboard','⌂','Home')}${nav('music','♫','Music')}${nav('safety','🛡','Weather')}${nav('announcements','🔔','Alerts')}${nav('admin','☰','Admin')}</nav>`}
+function nav(tab,icon,label){return `<button class="nav ${state.tab===tab?'active':''}" data-tab="${tab}"><b>${icon}</b><span>${label}</span></button>`}
+function dashboard(){if(state.alert)return safetyScreen();let t=track();return shell(`<section class="player card"><div class="album">Poolside<br><span>Suno</span><small>Mix</small></div><div class="playerInfo"><p class="eyebrow">NOW PLAYING</p><h3>${esc(t.title)}</h3><p>${esc(t.artist)} · ${esc(t.duration)}</p><p class="playlist">▥ ${esc(state.playlistName)}</p><p class="muted smallText">${t.audioUrl?'Playable audio URL attached':'Tracking title only; add direct audio URL for in-browser playback.'}</p></div><div class="progress"><span></span></div><div class="controls"><button id="prevTrack">◀</button><button class="big" id="playPause">${state.musicPaused?'▶':'Ⅱ'}</button><button id="nextTrack">Skip ▶</button></div></section><section class="grid two"><div class="card"><h3>Recently Played</h3>${state.tracks.slice(Math.max(0,state.currentTrack-3),state.currentTrack).reverse().map(row).join('')||'<p class="muted">No previous songs yet.</p>'}</div><div class="card"><h3>Up Next</h3>${state.tracks.slice(state.currentTrack+1,state.currentTrack+5).map(row).join('')||'<p class="muted">End of queue.</p>'}</div></section><section class="notice card blue"><div class="icon">🛡</div><div><p class="eyebrow">WEATHER AUTOMATION</p><h3>${esc(state.lastWeatherStatus)}</h3><p>${state.latitude&&state.longitude?`Monitoring ${state.radiusMiles} miles around ${state.latitude}, ${state.longitude}.`:'Admin should add resort address.'}</p></div></section>`)}
+function safetyScreen(){return shell(`<section class="alertBanner"><div>⚡</div><h3>${esc(state.alert)} Alert — Exit the Pool</h3><p>${esc(state.alertSummary||'Weather activity detected nearby.')}</p></section><section class="card timer"><div><p class="eyebrow">SAFETY TIMER</p><h2>${fmt(state.countdown)}</h2><p>Exit pool and seek shelter.</p></div><div class="timerCircle">${fmt(state.countdown)}<small>remaining</small></div></section><section class="card notice"><div class="icon">📣</div><div><p class="eyebrow">GUEST ANNOUNCEMENT</p><h3>${esc(state.emergencyMessage)}</h3></div></section><section class="card peach"><p class="eyebrow">LIFEGUARD INSTRUCTIONS</p><h3>${esc(state.lifeguardMessage)}</h3></section><button class="primary full" id="clearAlert">Clear Alert / Resume</button>`)}
+function musicScreen(){return shell(`<section class="card"><h3>${esc(state.playlistName)}</h3><p class="breakText">${esc(state.playlistUrl)}</p><button class="ghost" id="prevTrack">Previous</button><button class="primary" id="nextTrack">Skip Song</button></section><section class="card"><h3>Queue</h3>${state.tracks.map((t,i)=>row(t,i)).join('')}</section>`)}
+function announcementsScreen(){return shell(`<section class="card"><h3>Speak Now</h3><textarea id="instantMessage">${esc(state.instantMessage)}</textarea><div class="grid two"><label>Repeat Count<input id="repeatCount" type="number" value="${state.repeatCount}" min="1"></label><label>Delay Seconds<input id="repeatDelay" type="number" value="${state.repeatDelay}" min="0"></label></div><button class="primary" id="speakNow">Speak Immediately</button></section><section class="card"><h3>Schedule Spoken Alert</h3><textarea id="scheduleMessage">${esc(state.scheduleMessage)}</textarea><div class="grid three"><label>First Play Time<input id="scheduleStart" type="datetime-local" value="${esc(state.scheduleStart)}"></label><label>Repeat Count<input id="scheduleRepeatCount" type="number" value="${state.scheduleRepeatCount}" min="1"></label><label>Interval Minutes<input id="scheduleIntervalMinutes" type="number" value="${state.scheduleIntervalMinutes}" min="1"></label></div><button class="primary" id="scheduleAlert">Schedule Alert</button></section><section class="card"><h3>Scheduled Alerts</h3>${state.scheduledAlerts.map(a=>`<div class="scheduleRow"><div><b>${esc(a.message)}</b><p>${a.spokenCount}/${a.repeatCount} spoken · ${a.completed?'completed':'next '+new Date(a.nextAt).toLocaleString()}</p></div><button data-delSchedule="${a.id}">Delete</button></div>`).join('')||'<p class="muted">No scheduled alerts.</p>'}</section>`)}
+function safetyAdmin(){return shell(`<section class="card"><h3>Weather Safety Monitor</h3><label>Exact Resort Address<input id="resortAddress" value="${esc(state.resortAddress)}" placeholder="Street, City, State ZIP"></label><div class="grid three"><label>Latitude<input id="latitude" value="${esc(state.latitude)}"></label><label>Longitude<input id="longitude" value="${esc(state.longitude)}"></label><label>Radius Miles<input id="radiusMiles" type="number" value="${state.radiusMiles}"></label></div><label class="check"><input id="weatherEnabled" type="checkbox" ${state.weatherEnabled?'checked':''}> Enable automatic checks every 5 minutes</label><button class="primary" id="geocodeAddress">Extract GPS From Address</button><button class="primary" id="saveWeatherSettings">Save Weather Settings</button><button class="ghost" id="checkWeather">Check Weather Now</button><button class="dangerBtn" id="testLightning">Trigger Lightning Test</button></section><section class="card"><h3>Weather Status</h3><p><b>Last Check:</b> ${esc(state.lastWeatherCheck||'Not checked yet')}</p><p><b>Status:</b> ${esc(state.lastWeatherStatus)}</p><p class="muted">Free mode uses NWS active alerts and Open-Meteo thunderstorm codes. Strike-level lightning precision needs a paid lightning API.</p></section><section class="card"><h3>Safety Text</h3><textarea id="emergencyMessage">${esc(state.emergencyMessage)}</textarea><textarea id="lifeguardMessage">${esc(state.lifeguardMessage)}</textarea><textarea id="clearMessage">${esc(state.clearMessage)}</textarea><button class="primary" id="saveSafety">Save Safety Text</button></section>`)}
+function adminScreen(){if(!state.admin)return shell(`<section class="card login"><h3>Admin Access</h3><input id="adminCode" placeholder="Passcode" type="password"><button class="primary" id="adminLogin">Enter Admin</button><p class="muted">Prototype passcode: 2468.</p></section>`);return shell(`<section class="adminTabs card"><button data-tab="admin">Playlist</button><button data-tab="announcements">Alerts</button><button data-tab="safety">Weather</button><button id="adminLogout">Log Out</button></section><section class="card"><p class="eyebrow">PLAYLIST</p><h3>Add / Update Playlist</h3><label>Playlist Name<input id="playlistName" value="${esc(state.playlistName)}"></label><label>Suno Playlist URL<input id="playlistUrl" value="${esc(state.playlistUrl)}"></label><button class="primary" id="fetchSuno">Auto-Populate Songs From Suno Playlist</button><button class="ghost" id="savePlaylistFields">Save Playlist Name/URL</button><div class="grid four"><input id="newTitle" placeholder="Song title"><input id="newArtist" placeholder="Artist"><input id="newDuration" placeholder="3:00"><input id="newAudio" placeholder="Direct audio URL optional"></div><button class="primary" id="addTrack">Add Track</button><h3>Bulk Import</h3><p class="muted">One song per line: Title | Artist | Duration | optional audio URL</p><textarea id="bulkImport">${state.tracks.map(t=>`${t.title} | ${t.artist} | ${t.duration} | ${t.audioUrl||''}`).join('\n')}</textarea><button class="primary" id="savePlaylist">Save Playlist</button></section><section class="card"><h3>Current Queue</h3>${state.tracks.map((t,i)=>`<div class="trackEdit ${i===state.currentTrack?'selectedTrack':''}"><div><b>${i+1}. ${esc(t.title)}</b><p>${esc(t.artist)} · ${esc(t.duration)} ${i===state.currentTrack?'· NOW PLAYING':''}</p></div><button data-setcurrent="${i}">Play</button><button data-up="${i}">↑</button><button data-down="${i}">↓</button><button data-del="${i}">Delete</button></div>`).join('')}</section>`)}
+function row(t,i=null){let idx=i===null?state.tracks.indexOf(t):i;return `<div class="songRow ${idx===state.currentTrack?'selectedTrack':''}" data-rowtrack="${idx}"><span>${idx+1}</span><div class="thumb"></div><div><b>${esc(t.title)}</b><p>${esc(t.artist)} ${idx===state.currentTrack?'· NOW PLAYING':''}</p></div><em>${esc(t.duration)}</em></div>`}
+function render(){document.getElementById('app').innerHTML=({dashboard,music:musicScreen,safety:safetyAdmin,announcements:announcementsScreen,admin:adminScreen}[state.tab]||dashboard)();bind();}
+function bind(){document.querySelectorAll('[data-tab]').forEach(b=>b.onclick=()=>{state.tab=b.dataset.tab;save();render()});document.querySelectorAll('[data-rowtrack]').forEach(r=>r.onclick=()=>setTrack(r.dataset.rowtrack,false));let id=x=>document.getElementById(x);if(id('playPause'))id('playPause').onclick=()=>state.musicPaused?play():pause();document.querySelectorAll('#nextTrack').forEach(b=>b.onclick=()=>nextTrack(false));document.querySelectorAll('#prevTrack').forEach(b=>b.onclick=prevTrack);document.querySelectorAll('#clearAlert').forEach(b=>b.onclick=clearAlert);document.querySelectorAll('#testLightning').forEach(b=>b.onclick=()=>startAlert('Lightning','Manual lightning test triggered by admin.'));if(id('adminLogin'))id('adminLogin').onclick=()=>{if(val('adminCode')===PASS){state.admin=true;log('Admin logged in','admin');save();render()}else alert('Wrong passcode')};if(id('adminLogout'))id('adminLogout').onclick=()=>{state.admin=false;save();render()};if(id('fetchSuno'))id('fetchSuno').onclick=fetchSuno;if(id('savePlaylistFields'))id('savePlaylistFields').onclick=()=>{state.playlistName=val('playlistName');state.playlistUrl=val('playlistUrl');log('Playlist name and URL saved','music');save();render()};if(id('addTrack'))id('addTrack').onclick=()=>{let title=val('newTitle').trim();if(!title)return;state.tracks.push({title,artist:val('newArtist')||'Unknown',duration:val('newDuration')||'3:00',audioUrl:val('newAudio')||''});log('Added track: '+title,'music');save();render()};if(id('savePlaylist'))id('savePlaylist').onclick=()=>{state.playlistName=val('playlistName');state.playlistUrl=val('playlistUrl');importTracks(val('bulkImport'))};document.querySelectorAll('[data-setcurrent]').forEach(b=>b.onclick=()=>setTrack(b.dataset.setcurrent,true));document.querySelectorAll('[data-del]').forEach(b=>b.onclick=()=>{state.tracks.splice(+b.dataset.del,1);state.currentTrack=Math.min(state.currentTrack,Math.max(0,state.tracks.length-1));save();render()});document.querySelectorAll('[data-up]').forEach(b=>b.onclick=()=>{let i=+b.dataset.up;if(i>0){[state.tracks[i-1],state.tracks[i]]=[state.tracks[i],state.tracks[i-1]];save();render()}});document.querySelectorAll('[data-down]').forEach(b=>b.onclick=()=>{let i=+b.dataset.down;if(i<state.tracks.length-1){[state.tracks[i+1],state.tracks[i]]=[state.tracks[i],state.tracks[i+1]];save();render()}});if(id('speakNow'))id('speakNow').onclick=()=>{state.instantMessage=val('instantMessage');state.repeatCount=+val('repeatCount')||1;state.repeatDelay=+val('repeatDelay')||0;save();speak(state.instantMessage,state.repeatCount,state.repeatDelay)};if(id('scheduleAlert'))id('scheduleAlert').onclick=schedule;document.querySelectorAll('[data-delSchedule]').forEach(b=>b.onclick=()=>{state.scheduledAlerts=state.scheduledAlerts.filter(a=>a.id!==b.dataset.delSchedule);save();render()});if(id('geocodeAddress'))id('geocodeAddress').onclick=geocode;if(id('saveWeatherSettings'))id('saveWeatherSettings').onclick=()=>{state.resortAddress=val('resortAddress');state.latitude=val('latitude');state.longitude=val('longitude');state.radiusMiles=+val('radiusMiles')||10;state.weatherEnabled=id('weatherEnabled').checked;log('Weather settings saved','weather');save();render()};if(id('checkWeather'))id('checkWeather').onclick=()=>checkWeather(false);if(id('saveSafety'))id('saveSafety').onclick=()=>{state.emergencyMessage=val('emergencyMessage');state.lifeguardMessage=val('lifeguardMessage');state.clearMessage=val('clearMessage');log('Safety text saved','admin');save();render()};}
+setInterval(()=>checkWeather(true),300000);setInterval(tickSchedules,10000);if(state.countdown>0)startTimer();render();
