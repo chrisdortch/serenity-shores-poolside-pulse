@@ -1,0 +1,9 @@
+{
+  "name": "Serenity Shores Poolside Pulse",
+  "short_name": "Poolside Pulse",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f5fbfd",
+  "theme_color": "#0789a5",
+  "icons": []
+}
