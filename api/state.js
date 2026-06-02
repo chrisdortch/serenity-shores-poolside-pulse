@@ -5,7 +5,11 @@ function json(res, status, body) {
   res.end(JSON.stringify(body));
 }
 
-const STATE_KEY = 'serenity-shores-poolside-radio-v32';
+const STATE_KEY = 'serenity-shores-poolside-radio-v33';
+
+// Safe fallback: lets preview/admin/Home sync work even before Vercel KV/Upstash is configured.
+// For production/life-safety reliability, add KV_REST_API_URL and KV_REST_API_TOKEN in Vercel.
+globalThis.__POOL_SIDE_MEMORY_STATE__ ||= null;
 
 async function readBody(req) {
   if (req.body && typeof req.body === 'object') return req.body;
@@ -38,35 +42,53 @@ async function kv(command) {
   return data.result;
 }
 
+function finalizeState(state) {
+  return {
+    ...state,
+    savedAt: Date.now(),
+    revision: Number(state.revision || 0) + 1
+  };
+}
+
 export default async function handler(req, res) {
   try {
-    if (!kvReady()) {
-      return json(res, 200, {
-        ok: true,
-        cloudSync: false,
-        state: null,
-        note: 'Cloud sync is not configured yet. Add Vercel KV / Upstash Redis environment variables KV_REST_API_URL and KV_REST_API_TOKEN to this project.'
-      });
-    }
+    const hasKv = kvReady();
 
     if (req.method === 'GET') {
-      const raw = await kv(['GET', STATE_KEY]);
-      return json(res, 200, { ok: true, cloudSync: true, state: raw ? JSON.parse(raw) : null });
+      if (hasKv) {
+        const raw = await kv(['GET', STATE_KEY]);
+        return json(res, 200, { ok: true, cloudSync: true, syncMode: 'kv', state: raw ? JSON.parse(raw) : null, note: 'KV cloud sync active.' });
+      }
+      return json(res, 200, {
+        ok: true,
+        cloudSync: true,
+        syncMode: 'memory',
+        state: globalThis.__POOL_SIDE_MEMORY_STATE__,
+        note: 'Preview sync active using temporary server memory. Add Vercel KV/Upstash for production-grade persistence.'
+      });
     }
 
     if (req.method === 'POST') {
       const body = await readBody(req);
       const state = body.state || {};
       if (!state || typeof state !== 'object') return json(res, 400, { ok: false, error: 'state object required.' });
-      const safe = {
-        ...state,
-        savedAt: Date.now(),
-        revision: Number(state.revision || 0) + 1
-      };
+      const safe = finalizeState(state);
       const raw = JSON.stringify(safe);
       if (raw.length > 200000) return json(res, 400, { ok: false, error: 'State too large.' });
-      await kv(['SET', STATE_KEY, raw]);
-      return json(res, 200, { ok: true, cloudSync: true, state: safe });
+
+      if (hasKv) {
+        await kv(['SET', STATE_KEY, raw]);
+        return json(res, 200, { ok: true, cloudSync: true, syncMode: 'kv', state: safe, note: 'KV cloud sync active.' });
+      }
+
+      globalThis.__POOL_SIDE_MEMORY_STATE__ = safe;
+      return json(res, 200, {
+        ok: true,
+        cloudSync: true,
+        syncMode: 'memory',
+        state: safe,
+        note: 'Preview sync active using temporary server memory. Add Vercel KV/Upstash for production-grade persistence.'
+      });
     }
 
     return json(res, 405, { ok: false, error: 'GET or POST required.' });
