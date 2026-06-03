@@ -1,0 +1,1 @@
+If this file exists, the assistant has started diagnosing the v3.6 blank-page issue without touching other projects.
