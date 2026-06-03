@@ -1,6 +1,7 @@
 (() => {
-  const PATCH_VERSION = '4.5';
+  const PATCH_VERSION = '4.6';
   const tracked = new Set();
+  const ducked = new Map();
   let annAudio = null;
   let unlockAudio = null;
   let unlocked = false;
@@ -14,11 +15,12 @@
   }
   function getSrc(media) { try { return String(media.currentSrc || media.src || ''); } catch { return ''; } }
   function isPlaying(media) { try { return media && !media.paused && !media.ended && media.readyState > 0 && getSrc(media); } catch { return false; } }
+  function sameUrl(a, b) { try { return new URL(a, location.href).href === new URL(b, location.href).href; } catch { return String(a || '') === String(b || ''); } }
   function note(text) {
     try {
-      window.__pulseV45Status = text;
+      window.__pulseV46Status = text;
       const box = document.getElementById('feedbackBox');
-      if (box && !box.textContent.includes(text)) box.innerHTML += '<br><b>V4.5:</b> ' + text;
+      if (box && !box.textContent.includes(text)) box.innerHTML += '<br><b>V4.6:</b> ' + text;
     } catch {}
   }
   function makeHiddenAudio() {
@@ -49,22 +51,62 @@
     } catch {}
   }
   function musicPlayers(except) { return [...tracked].filter(media => media !== except && media !== getUnlockAudio() && !isAnnouncementSrc(getSrc(media))); }
+  function snapshot(media) {
+    try {
+      const src = getSrc(media);
+      if (!src) return;
+      ducked.set(media, {
+        src,
+        time: Number.isFinite(media.currentTime) ? media.currentTime : 0,
+        volume: Number.isFinite(media.__pulseOriginalVolume) ? media.__pulseOriginalVolume : (Number.isFinite(media.volume) ? Math.max(media.volume, 0.95) : 0.95),
+        wasPlaying: isPlaying(media) || !media.paused
+      });
+    } catch {}
+  }
   function duck(except) {
     duckDepth += 1;
-    musicPlayers(except).forEach(media => { if (isPlaying(media)) fade(media, 0, 850); });
+    musicPlayers(except).forEach(media => {
+      if (isPlaying(media)) {
+        snapshot(media);
+        fade(media, 0, 850);
+      }
+    });
     note('music fading to zero before announcement');
+  }
+  function restoreMedia(media, snap) {
+    return new Promise(resolve => {
+      (async () => {
+        try {
+          const currentSrc = getSrc(media);
+          if (snap.src && currentSrc && !sameUrl(currentSrc, snap.src)) return resolve();
+          if (!currentSrc && snap.src) media.src = snap.src;
+          const currentTime = Number.isFinite(media.currentTime) ? media.currentTime : 0;
+          if (snap.time > 1 && currentTime < Math.max(0, snap.time - 1.25)) {
+            try { media.currentTime = snap.time; } catch {}
+          }
+          if ((media.paused || media.ended) && snap.wasPlaying) {
+            note('music had been paused/interrupted by announcement; resuming same track');
+            try { await media.play(); } catch (e) { note('music resume was blocked: ' + (e && e.message ? e.message : e)); }
+          }
+          if (!media.paused || isPlaying(media)) {
+            fade(media, snap.volume || 0.95, 1000);
+          }
+          media.__pulseOriginalVolume = undefined;
+        } catch (e) {
+          note('music restore error: ' + (e && e.message ? e.message : e));
+        }
+        resolve();
+      })();
+    });
   }
   function unduck() {
     duckDepth = Math.max(0, duckDepth - 1);
     if (duckDepth > 0) return;
-    setTimeout(() => {
-      musicPlayers(null).forEach(media => {
-        if (!isPlaying(media)) return;
-        const target = Number.isFinite(media.__pulseOriginalVolume) ? media.__pulseOriginalVolume : 0.95;
-        fade(media, target, 1000);
-        media.__pulseOriginalVolume = undefined;
-      });
-      note('music fading back up after announcement');
+    const saved = [...ducked.entries()];
+    ducked.clear();
+    setTimeout(async () => {
+      for (const [media, snap] of saved) await restoreMedia(media, snap);
+      note('announcement finished; receiver music restored');
     }, 150);
   }
   async function unlockReceiverAudio(reason = 'receiver activation tap') {
@@ -114,7 +156,7 @@
   window.Audio = PatchedAudio;
 
   const nativePlay = HTMLMediaElement.prototype.play;
-  if (!HTMLMediaElement.prototype.__pulseV45Play) {
+  if (!HTMLMediaElement.prototype.__pulseV46Play) {
     HTMLMediaElement.prototype.play = function(...args) {
       tracked.add(this);
       const announcement = isAnnouncementSrc(getSrc(this));
@@ -144,19 +186,20 @@
         }, 850);
       });
     };
-    HTMLMediaElement.prototype.__pulseV45Play = true;
+    HTMLMediaElement.prototype.__pulseV46Play = true;
   }
   function rewriteVersion() {
     try {
-      document.title = 'Serenity Shores Poolside Pulse V4.5';
+      document.title = 'Serenity Shores Poolside Pulse V4.6';
       const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
       const nodes = [];
       while (walker.nextNode()) nodes.push(walker.currentNode);
       nodes.forEach(n => {
         if (n.nodeValue) n.nodeValue = n.nodeValue
-          .replaceAll('V4.4','V4.5').replaceAll('Version 4.4','Version 4.5')
-          .replaceAll('V4.2','V4.5').replaceAll('Version 4.2','Version 4.5')
-          .replaceAll('V4.0','V4.5').replaceAll('Version 4.0','Version 4.5');
+          .replaceAll('V4.5','V4.6').replaceAll('Version 4.5','Version 4.6')
+          .replaceAll('V4.4','V4.6').replaceAll('Version 4.4','Version 4.6')
+          .replaceAll('V4.2','V4.6').replaceAll('Version 4.2','Version 4.6')
+          .replaceAll('V4.0','V4.6').replaceAll('Version 4.0','Version 4.6');
       });
     } catch {}
   }
