@@ -70,8 +70,9 @@ async function getNwsAlerts(points) {
   };
 }
 
-async function getOpenMeteoThunder(points) {
-  const hits = [];
+async function getOpenMeteoSignals(points, windGustMph) {
+  const thunderHits = [];
+  const windHits = [];
   const errors = [];
   for (const point of points) {
     try {
@@ -79,6 +80,7 @@ async function getOpenMeteoThunder(points) {
       url.searchParams.set('latitude', point.lat.toFixed(5));
       url.searchParams.set('longitude', point.lon.toFixed(5));
       url.searchParams.set('current', 'weather_code,wind_gusts_10m');
+      url.searchParams.set('wind_speed_unit', 'mph');
       url.searchParams.set('forecast_days', '1');
       const response = await fetch(url.toString());
       if (!response.ok) {
@@ -87,37 +89,44 @@ async function getOpenMeteoThunder(points) {
       }
       const data = await response.json();
       const code = Number(data?.current?.weather_code);
-      if (THUNDERSTORM_CODES.has(code)) hits.push({ point: point.label, code });
+      const gust = Number(data?.current?.wind_gusts_10m);
+      if (THUNDERSTORM_CODES.has(code)) thunderHits.push({ point: point.label, code });
+      if (Number.isFinite(gust) && gust >= windGustMph) windHits.push({ point: point.label, gustMph: Math.round(gust), thresholdMph: windGustMph });
     } catch (error) {
       errors.push(`Open-Meteo ${point.label}: ${error.message}`);
     }
   }
-  return { thunderHits: hits, errors };
+  return { thunderHits, windHits, errors };
 }
 
-function classify(alerts, thunderHits, providerErrors) {
+function classify(alerts, thunderHits, windHits, providerErrors) {
   const tornado = alerts.find(a => TORNADO_EVENTS.some(name => a.event.includes(name)));
   if (tornado) return { threat: true, threatType: 'Tornado', summary: `${tornado.event}: ${tornado.headline || tornado.description || 'NWS tornado alert near resort.'}` };
   const severe = alerts.find(a => STORM_EVENTS.some(name => a.event.includes(name)) && /lightning|thunderstorm|storm/i.test(`${a.headline} ${a.description} ${a.instruction}`));
   if (severe) return { threat: true, threatType: 'Lightning/Thunderstorm', summary: `${severe.event}: ${severe.headline || 'Thunderstorm/lightning-risk alert near resort.'}` };
   if (thunderHits.length) return { threat: true, threatType: 'Lightning/Thunderstorm', summary: `Thunderstorm weather code detected within radius at ${thunderHits.map(h => h.point).join(', ')}.` };
+  if (windHits.length) {
+    const max = windHits.reduce((best, hit) => hit.gustMph > best.gustMph ? hit : best, windHits[0]);
+    return { threat: true, threatType: 'Strong Wind', summary: `Strong wind gust detected within radius: ${max.gustMph} mph at ${max.point}.` };
+  }
   if (alerts.length) return { threat: false, threatType: '', summary: `${alerts.length} NWS alert(s), none requiring pool closure by current rules.` };
   if (providerErrors.length) return { threat: false, threatType: '', summary: `No closure trigger detected. Some weather provider checks reported issues: ${providerErrors.slice(0, 2).join(' | ')}` };
-  return { threat: false, threatType: '', summary: 'No tornado or thunderstorm/lightning trigger detected in the monitored radius.' };
+  return { threat: false, threatType: '', summary: 'No tornado, thunderstorm/lightning, or strong-wind trigger detected in the monitored radius.' };
 }
 
 export default async function handler(req, res) {
   const lat = coord(req.query?.lat);
   const lon = coord(req.query?.lon);
   const radiusMiles = Math.max(1, Math.min(25, Number(req.query?.radiusMiles) || 10));
+  const windGustMph = Math.max(15, Math.min(80, Number(req.query?.windGustMph) || 35));
   if (lat === null || lon === null) return json(res, 400, { ok: false, error: 'Valid latitude and longitude are required. Use decimal coordinates like 36.6337 and -93.4166.' });
   try {
     const points = ringPoints(lat, lon, radiusMiles);
-    const [nws, meteo] = await Promise.all([getNwsAlerts(points), getOpenMeteoThunder(points)]);
+    const [nws, meteo] = await Promise.all([getNwsAlerts(points), getOpenMeteoSignals(points, windGustMph)]);
     const providerErrors = [...nws.errors, ...meteo.errors];
-    const result = classify(nws.alerts, meteo.thunderHits, providerErrors);
-    return json(res, 200, { ok: true, radiusMiles, checkedPoints: points.length, alerts: nws.alerts, thunderHits: meteo.thunderHits, providerErrors, ...result });
+    const result = classify(nws.alerts, meteo.thunderHits, meteo.windHits, providerErrors);
+    return json(res, 200, { ok: true, radiusMiles, windGustMph, checkedPoints: points.length, alerts: nws.alerts, thunderHits: meteo.thunderHits, windHits: meteo.windHits, providerErrors, ...result });
   } catch (error) {
-    return json(res, 200, { ok: true, threat: false, threatType: '', radiusMiles, checkedPoints: 0, alerts: [], thunderHits: [], providerErrors: [error.message], summary: `Weather check did not complete, but the app stayed online. Error: ${error.message || 'Unknown weather error.'}` });
+    return json(res, 200, { ok: true, threat: false, threatType: '', radiusMiles, windGustMph, checkedPoints: 0, alerts: [], thunderHits: [], windHits: [], providerErrors: [error.message], summary: `Weather check did not complete, but the app stayed online. Error: ${error.message || 'Unknown weather error.'}` });
   }
 }
