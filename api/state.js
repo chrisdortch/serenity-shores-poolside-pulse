@@ -42,11 +42,17 @@ async function kv(command) {
   return data.result;
 }
 
-function finalizeState(state) {
+function parseState(raw) {
+  if (!raw) return null;
+  if (typeof raw === 'object') return raw;
+  try { return JSON.parse(raw); } catch { return null; }
+}
+
+function finalizeState(state, previous = null) {
   return {
     ...state,
     savedAt: Date.now(),
-    revision: Number(state.revision || 0) + 1
+    revision: Math.max(Number(previous?.revision || 0), Number(state.revision || 0)) + 1
   };
 }
 
@@ -72,7 +78,12 @@ export default async function handler(req, res) {
       const body = await readBody(req);
       const state = body.state || {};
       if (!state || typeof state !== 'object') return json(res, 400, { ok: false, error: 'state object required.' });
-      const safe = finalizeState(state);
+
+      let previous = null;
+      if (hasKv) previous = parseState(await kv(['GET', STATE_KEY]));
+      else previous = globalThis.__POOL_SIDE_MEMORY_STATE__;
+
+      const safe = finalizeState(state, previous);
       const raw = JSON.stringify(safe);
       if (raw.length > 200000) return json(res, 400, { ok: false, error: 'State too large.' });
 
