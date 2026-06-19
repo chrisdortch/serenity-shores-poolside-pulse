@@ -1,7 +1,16 @@
+import * as hdf5 from 'jsfive';
+
 const THUNDERSTORM_CODES = new Set([95, 96, 99]);
 const TORNADO_EVENTS = ['Tornado Warning', 'Tornado Emergency'];
 const STORM_EVENTS = ['Severe Thunderstorm Warning', 'Special Weather Statement'];
 const XWEATHER_HOST = 'https://data.api.xweather.com';
+const NOAA_GLM_BUCKET = 'noaa-goes19';
+const NOAA_GLM_PRODUCT = 'GLM-L2-LCFA';
+const NOAA_GLM_HOST = `https://${NOAA_GLM_BUCKET}.s3.amazonaws.com`;
+const NOAA_GLM_DEFAULT_LOOKBACK_MINUTES = 6;
+const NOAA_GLM_MAX_FILES = 24;
+
+globalThis.__POOL_SIDE_GLM_CACHE__ ||= new Map();
 
 function json(res, status, body) {
   res.statusCode = status;
@@ -30,6 +39,164 @@ function ringPoints(lat, lon, radiusMiles) {
     points.push({ lat: p2 * 180 / Math.PI, lon: l2 * 180 / Math.PI, label: `${bearing}°` });
   }
   return points;
+}
+
+function dayOfYear(date) {
+  const start = Date.UTC(date.getUTCFullYear(), 0, 0);
+  return Math.floor((date.getTime() - start) / 86400000);
+}
+
+function pad(value, size = 2) {
+  return String(value).padStart(size, '0');
+}
+
+function glmPrefix(date) {
+  return `${NOAA_GLM_PRODUCT}/${date.getUTCFullYear()}/${pad(dayOfYear(date), 3)}/${pad(date.getUTCHours())}/`;
+}
+
+function glmStartMs(key) {
+  const match = key.match(/_s(\d{4})(\d{3})(\d{2})(\d{2})(\d{2})/);
+  if (!match) return 0;
+  const [, year, doy, hour, minute, second] = match;
+  return Date.UTC(Number(year), 0, Number(doy), Number(hour), Number(minute), Number(second));
+}
+
+function xmlText(value) {
+  return String(value || '')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'");
+}
+
+async function listGlmKeysForPrefix(prefix) {
+  const url = new URL(NOAA_GLM_HOST);
+  url.searchParams.set('list-type', '2');
+  url.searchParams.set('prefix', prefix);
+  url.searchParams.set('max-keys', '250');
+  const response = await fetch(url.toString());
+  if (!response.ok) throw new Error(`NOAA GLM list ${prefix}: HTTP ${response.status}`);
+  const xml = await response.text();
+  return [...xml.matchAll(/<Key>([^<]+)<\/Key>/g)].map(match => xmlText(match[1]));
+}
+
+async function recentGlmKeys(lookbackMinutes) {
+  const now = new Date();
+  const startMs = now.getTime() - (lookbackMinutes * 60000) - 30000;
+  const prefixDates = [now, new Date(startMs), new Date(now.getTime() - 3600000)];
+  const prefixes = [...new Set(prefixDates.map(glmPrefix))];
+  const keys = [];
+  const errors = [];
+  for (const prefix of prefixes) {
+    try {
+      keys.push(...await listGlmKeysForPrefix(prefix));
+    } catch (error) {
+      errors.push(error.message);
+    }
+  }
+  const recent = [...new Set(keys)]
+    .map(key => ({ key, startMs: glmStartMs(key) }))
+    .filter(item => item.startMs >= startMs && item.startMs <= now.getTime() + 120000)
+    .sort((a, b) => b.startMs - a.startMs)
+    .slice(0, NOAA_GLM_MAX_FILES)
+    .map(item => item.key);
+  return { keys: recent, errors };
+}
+
+function haversineMiles(aLat, aLon, bLat, bLon) {
+  const R = 3958.7613;
+  const toRad = n => n * Math.PI / 180;
+  const dLat = toRad(bLat - aLat);
+  const dLon = toRad(bLon - aLon);
+  const s1 = Math.sin(dLat / 2);
+  const s2 = Math.sin(dLon / 2);
+  const h = s1 * s1 + Math.cos(toRad(aLat)) * Math.cos(toRad(bLat)) * s2 * s2;
+  return 2 * R * Math.asin(Math.min(1, Math.sqrt(h)));
+}
+
+function cacheRead(key) {
+  const item = globalThis.__POOL_SIDE_GLM_CACHE__.get(key);
+  if (!item || item.expiresAt < Date.now()) {
+    globalThis.__POOL_SIDE_GLM_CACHE__.delete(key);
+    return null;
+  }
+  return item.value;
+}
+
+function cacheWrite(key, value) {
+  const cache = globalThis.__POOL_SIDE_GLM_CACHE__;
+  cache.set(key, { value, expiresAt: Date.now() + 10 * 60000 });
+  if (cache.size > 80) {
+    for (const oldKey of cache.keys()) {
+      cache.delete(oldKey);
+      if (cache.size <= 60) break;
+    }
+  }
+}
+
+function readDataset(file, name) {
+  const dataset = file.get(name);
+  return Array.isArray(dataset?.value) ? dataset.value : [];
+}
+
+async function readGlmFlashes(key) {
+  const cached = cacheRead(key);
+  if (cached) return cached;
+  const response = await fetch(`${NOAA_GLM_HOST}/${key}`);
+  if (!response.ok) throw new Error(`NOAA GLM file ${key.split('/').pop()}: HTTP ${response.status}`);
+  const buffer = await response.arrayBuffer();
+  const file = new hdf5.File(buffer, key);
+  const lats = readDataset(file, 'flash_lat');
+  const lons = readDataset(file, 'flash_lon');
+  const startMs = glmStartMs(key);
+  const flashes = [];
+  for (let i = 0; i < Math.min(lats.length, lons.length); i += 1) {
+    const lat = Number(lats[i]);
+    const lon = Number(lons[i]);
+    if (Number.isFinite(lat) && Number.isFinite(lon)) flashes.push({ lat, lon, index: i, startMs });
+  }
+  cacheWrite(key, flashes);
+  return flashes;
+}
+
+async function getNoaaGlmLightning(lat, lon, radiusMiles, query = {}) {
+  const lightningHits = [];
+  const errors = [];
+  const lookbackMinutes = Math.max(2, Math.min(15, Number(query.lightningLookbackMinutes) || NOAA_GLM_DEFAULT_LOOKBACK_MINUTES));
+  if (lat < -52 || lat > 52) return { lightningHits, errors: ['NOAA GLM coverage is limited outside roughly 52°S to 52°N.'], provider: 'noaa-goes-glm', filesChecked: 0 };
+  try {
+    const { keys, errors: listErrors } = await recentGlmKeys(lookbackMinutes);
+    errors.push(...listErrors);
+    const latPad = (radiusMiles / 69) + 0.08;
+    const lonPad = (radiusMiles / Math.max(10, 69 * Math.cos(lat * Math.PI / 180))) + 0.08;
+    for (const key of keys) {
+      try {
+        const flashes = await readGlmFlashes(key);
+        for (const flash of flashes) {
+          if (flash.lat < lat - latPad || flash.lat > lat + latPad || flash.lon < lon - lonPad || flash.lon > lon + lonPad) continue;
+          const distanceMI = haversineMiles(lat, lon, flash.lat, flash.lon);
+          if (distanceMI <= radiusMiles) {
+            lightningHits.push({
+              id: `glm-${key.split('/').pop()?.replace(/\.nc$/, '')}-${flash.index}`,
+              distanceMI,
+              lat: flash.lat,
+              lon: flash.lon,
+              dateTimeISO: new Date(flash.startMs || Date.now()).toISOString(),
+              source: 'noaa-goes-glm'
+            });
+          }
+        }
+      } catch (error) {
+        errors.push(error.message);
+      }
+      if (lightningHits.length) break;
+    }
+    return { lightningHits, errors, provider: 'noaa-goes-glm', filesChecked: keys.length, lookbackMinutes };
+  } catch (error) {
+    errors.push(`NOAA GLM lightning: ${error.message}`);
+    return { lightningHits, errors, provider: 'noaa-goes-glm', filesChecked: 0, lookbackMinutes };
+  }
 }
 
 async function getNwsAlerts(points) {
@@ -205,13 +372,13 @@ export default async function handler(req, res) {
   if (lat === null || lon === null) return json(res, 400, { ok: false, error: 'Valid latitude and longitude are required. Use decimal coordinates like 36.6337 and -93.4166.' });
   try {
     const points = ringPoints(lat, lon, radiusMiles);
-    const [nws, meteo, xweather] = await Promise.all([getNwsAlerts(points), getOpenMeteoSignals(points, windGustMph), getXweatherLightning(lat, lon, lightningRadiusMiles)]);
+    const [nws, meteo, noaaGlm, xweather] = await Promise.all([getNwsAlerts(points), getOpenMeteoSignals(points, windGustMph), getNoaaGlmLightning(lat, lon, lightningRadiusMiles, req.query || {}), getXweatherLightning(lat, lon, lightningRadiusMiles)]);
     const mock = mockSignals(req.query || {}, lightningRadiusMiles, windGustMph);
-    const lightningHits = [...mock.lightningHits, ...xweather.lightningHits];
+    const lightningHits = [...mock.lightningHits, ...noaaGlm.lightningHits, ...xweather.lightningHits];
     const windHits = [...mock.windHits, ...meteo.windHits];
-    const providerErrors = [...nws.errors, ...meteo.errors, ...xweather.errors];
+    const providerErrors = [...nws.errors, ...meteo.errors, ...noaaGlm.errors, ...xweather.errors];
     const result = classify(nws.alerts, lightningHits, meteo.thunderHits, windHits, providerErrors);
-    return json(res, 200, { ok: true, radiusMiles, lightningRadiusMiles, windGustMph, lightningProvider: xweather.provider, checkedPoints: points.length, alerts: nws.alerts, lightningHits, thunderHits: meteo.thunderHits, windHits, providerErrors, ...result });
+    return json(res, 200, { ok: true, radiusMiles, lightningRadiusMiles, windGustMph, lightningProvider: noaaGlm.provider, lightningLookbackMinutes: noaaGlm.lookbackMinutes, lightningFilesChecked: noaaGlm.filesChecked, paidLightningProvider: xweather.provider, checkedPoints: points.length, alerts: nws.alerts, lightningHits, thunderHits: meteo.thunderHits, windHits, providerErrors, ...result });
   } catch (error) {
     return json(res, 200, { ok: true, threat: false, threatType: '', radiusMiles, lightningRadiusMiles, windGustMph, checkedPoints: 0, alerts: [], lightningHits: [], thunderHits: [], windHits: [], providerErrors: [error.message], summary: `Weather check did not complete, but the app stayed online. Error: ${error.message || 'Unknown weather error.'}` });
   }
