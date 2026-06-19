@@ -8,7 +8,12 @@ const NOAA_GLM_BUCKET = 'noaa-goes19';
 const NOAA_GLM_PRODUCT = 'GLM-L2-LCFA';
 const NOAA_GLM_HOST = `https://${NOAA_GLM_BUCKET}.s3.amazonaws.com`;
 const NOAA_GLM_DEFAULT_LOOKBACK_MINUTES = 6;
-const NOAA_GLM_MAX_FILES = 24;
+const NOAA_GLM_MAX_FILES = 12;
+const NWS_FETCH_TIMEOUT_MS = 2200;
+const OPEN_METEO_FETCH_TIMEOUT_MS = 2200;
+const NOAA_GLM_LIST_TIMEOUT_MS = 1800;
+const NOAA_GLM_FILE_TIMEOUT_MS = 1800;
+const NOAA_GLM_BUDGET_MS = 6200;
 
 globalThis.__POOL_SIDE_GLM_CACHE__ ||= new Map();
 
@@ -17,6 +22,19 @@ function json(res, status, body) {
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
   res.setHeader('Cache-Control', 'no-store');
   res.end(JSON.stringify(body));
+}
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = 2500) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(new Error(`Timed out after ${timeoutMs}ms`)), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } catch (error) {
+    if (error?.name === 'AbortError') throw new Error(`Timed out after ${timeoutMs}ms`);
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function coord(value) {
@@ -75,7 +93,7 @@ async function listGlmKeysForPrefix(prefix) {
   url.searchParams.set('list-type', '2');
   url.searchParams.set('prefix', prefix);
   url.searchParams.set('max-keys', '250');
-  const response = await fetch(url.toString());
+  const response = await fetchWithTimeout(url.toString(), {}, NOAA_GLM_LIST_TIMEOUT_MS);
   if (!response.ok) throw new Error(`NOAA GLM list ${prefix}: HTTP ${response.status}`);
   const xml = await response.text();
   return [...xml.matchAll(/<Key>([^<]+)<\/Key>/g)].map(match => xmlText(match[1]));
@@ -143,7 +161,7 @@ function readDataset(file, name) {
 async function readGlmFlashes(key) {
   const cached = cacheRead(key);
   if (cached) return cached;
-  const response = await fetch(`${NOAA_GLM_HOST}/${key}`);
+  const response = await fetchWithTimeout(`${NOAA_GLM_HOST}/${key}`, {}, NOAA_GLM_FILE_TIMEOUT_MS);
   if (!response.ok) throw new Error(`NOAA GLM file ${key.split('/').pop()}: HTTP ${response.status}`);
   const buffer = await response.arrayBuffer();
   const file = new hdf5.File(buffer, key);
@@ -164,14 +182,22 @@ async function getNoaaGlmLightning(lat, lon, radiusMiles, query = {}) {
   const lightningHits = [];
   const errors = [];
   const lookbackMinutes = Math.max(2, Math.min(15, Number(query.lightningLookbackMinutes) || NOAA_GLM_DEFAULT_LOOKBACK_MINUTES));
+  const budgetMs = Math.max(1200, Math.min(9000, Number(query.lightningBudgetMs) || NOAA_GLM_BUDGET_MS));
+  const deadline = Date.now() + budgetMs;
   if (lat < -52 || lat > 52) return { lightningHits, errors: ['NOAA GLM coverage is limited outside roughly 52°S to 52°N.'], provider: 'noaa-goes-glm', filesChecked: 0 };
   try {
     const { keys, errors: listErrors } = await recentGlmKeys(lookbackMinutes);
     errors.push(...listErrors);
     const latPad = (radiusMiles / 69) + 0.08;
     const lonPad = (radiusMiles / Math.max(10, 69 * Math.cos(lat * Math.PI / 180))) + 0.08;
+    let filesChecked = 0;
     for (const key of keys) {
+      if (Date.now() > deadline) {
+        errors.push(`NOAA GLM check reached its ${Math.round(budgetMs / 1000)}s response budget.`);
+        break;
+      }
       try {
+        filesChecked += 1;
         const flashes = await readGlmFlashes(key);
         for (const flash of flashes) {
           if (flash.lat < lat - latPad || flash.lat > lat + latPad || flash.lon < lon - lonPad || flash.lon > lon + lonPad) continue;
@@ -192,7 +218,7 @@ async function getNoaaGlmLightning(lat, lon, radiusMiles, query = {}) {
       }
       if (lightningHits.length) break;
     }
-    return { lightningHits, errors, provider: 'noaa-goes-glm', filesChecked: keys.length, lookbackMinutes };
+    return { lightningHits, errors, provider: 'noaa-goes-glm', filesChecked, lookbackMinutes };
   } catch (error) {
     errors.push(`NOAA GLM lightning: ${error.message}`);
     return { lightningHits, errors, provider: 'noaa-goes-glm', filesChecked: 0, lookbackMinutes };
@@ -200,32 +226,33 @@ async function getNoaaGlmLightning(lat, lon, radiusMiles, query = {}) {
 }
 
 async function getNwsAlerts(points) {
-  const alerts = [];
-  const errors = [];
-  for (const point of points) {
+  const results = await Promise.all(points.map(async point => {
     try {
       const url = new URL('https://api.weather.gov/alerts/active');
       url.searchParams.set('point', `${point.lat.toFixed(4)},${point.lon.toFixed(4)}`);
-      const response = await fetch(url.toString(), {
+      const response = await fetchWithTimeout(url.toString(), {
         headers: {
           'User-Agent': 'Serenity Shores Poolside Pulse (contact: chrisdortch@gmail.com)',
           'Accept': 'application/geo+json,application/json'
         }
-      });
+      }, NWS_FETCH_TIMEOUT_MS);
       if (!response.ok) {
         const text = await response.text().catch(() => '');
-        errors.push(`NWS ${point.label}: HTTP ${response.status} ${text.slice(0, 120)}`);
-        continue;
+        return { alerts: [], errors: [`NWS ${point.label}: HTTP ${response.status} ${text.slice(0, 120)}`] };
       }
       const data = await response.json();
+      const alerts = [];
       for (const feature of data.features || []) {
         const props = feature.properties || {};
         alerts.push({ event: props.event || '', headline: props.headline || '', description: props.description || '', instruction: props.instruction || '', point: point.label });
       }
+      return { alerts, errors: [] };
     } catch (error) {
-      errors.push(`NWS ${point.label}: ${error.message}`);
+      return { alerts: [], errors: [`NWS ${point.label}: ${error.message}`] };
     }
-  }
+  }));
+  const alerts = results.flatMap(result => result.alerts);
+  const errors = results.flatMap(result => result.errors);
   const seen = new Set();
   return {
     alerts: alerts.filter(a => {
@@ -239,10 +266,7 @@ async function getNwsAlerts(points) {
 }
 
 async function getOpenMeteoSignals(points, windGustMph) {
-  const thunderHits = [];
-  const windHits = [];
-  const errors = [];
-  for (const point of points) {
+  const results = await Promise.all(points.map(async point => {
     try {
       const url = new URL('https://api.open-meteo.com/v1/forecast');
       url.searchParams.set('latitude', point.lat.toFixed(5));
@@ -250,20 +274,25 @@ async function getOpenMeteoSignals(points, windGustMph) {
       url.searchParams.set('current', 'weather_code,wind_gusts_10m');
       url.searchParams.set('wind_speed_unit', 'mph');
       url.searchParams.set('forecast_days', '1');
-      const response = await fetch(url.toString());
+      const response = await fetchWithTimeout(url.toString(), {}, OPEN_METEO_FETCH_TIMEOUT_MS);
       if (!response.ok) {
-        errors.push(`Open-Meteo ${point.label}: HTTP ${response.status}`);
-        continue;
+        return { thunderHits: [], windHits: [], errors: [`Open-Meteo ${point.label}: HTTP ${response.status}`] };
       }
       const data = await response.json();
       const code = Number(data?.current?.weather_code);
       const gust = Number(data?.current?.wind_gusts_10m);
-      if (THUNDERSTORM_CODES.has(code)) thunderHits.push({ point: point.label, code });
-      if (Number.isFinite(gust) && gust >= windGustMph) windHits.push({ point: point.label, gustMph: Math.round(gust), thresholdMph: windGustMph });
+      return {
+        thunderHits: THUNDERSTORM_CODES.has(code) ? [{ point: point.label, code }] : [],
+        windHits: Number.isFinite(gust) && gust >= windGustMph ? [{ point: point.label, gustMph: Math.round(gust), thresholdMph: windGustMph }] : [],
+        errors: []
+      };
     } catch (error) {
-      errors.push(`Open-Meteo ${point.label}: ${error.message}`);
+      return { thunderHits: [], windHits: [], errors: [`Open-Meteo ${point.label}: ${error.message}`] };
     }
-  }
+  }));
+  const thunderHits = results.flatMap(result => result.thunderHits);
+  const windHits = results.flatMap(result => result.windHits);
+  const errors = results.flatMap(result => result.errors);
   return { thunderHits, windHits, errors };
 }
 
@@ -377,7 +406,11 @@ export default async function handler(req, res) {
     const lightningHits = [...mock.lightningHits, ...noaaGlm.lightningHits, ...xweather.lightningHits];
     const windHits = [...mock.windHits, ...meteo.windHits];
     const providerErrors = [...nws.errors, ...meteo.errors, ...noaaGlm.errors, ...xweather.errors];
-    const result = classify(nws.alerts, lightningHits, meteo.thunderHits, windHits, providerErrors);
+    const summaryErrors = providerErrors.filter(error => !/NOAA GLM check reached/i.test(error));
+    const result = classify(nws.alerts, lightningHits, meteo.thunderHits, windHits, summaryErrors);
+    if (!result.threat && !summaryErrors.length && noaaGlm.filesChecked) {
+      result.summary = `No closure trigger detected. Free NWS, Open-Meteo, and NOAA GLM checks completed; NOAA scanned ${noaaGlm.filesChecked} recent lightning file(s).`;
+    }
     return json(res, 200, { ok: true, radiusMiles, lightningRadiusMiles, windGustMph, lightningProvider: noaaGlm.provider, lightningLookbackMinutes: noaaGlm.lookbackMinutes, lightningFilesChecked: noaaGlm.filesChecked, paidLightningProvider: xweather.provider, checkedPoints: points.length, alerts: nws.alerts, lightningHits, thunderHits: meteo.thunderHits, windHits, providerErrors, ...result });
   } catch (error) {
     return json(res, 200, { ok: true, threat: false, threatType: '', radiusMiles, lightningRadiusMiles, windGustMph, checkedPoints: 0, alerts: [], lightningHits: [], thunderHits: [], windHits: [], providerErrors: [error.message], summary: `Weather check did not complete, but the app stayed online. Error: ${error.message || 'Unknown weather error.'}` });
