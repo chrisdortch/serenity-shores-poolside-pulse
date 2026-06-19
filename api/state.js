@@ -48,9 +48,35 @@ function parseState(raw) {
   try { return JSON.parse(raw); } catch { return null; }
 }
 
+function mergeById(limit, sortNewestFirst, ...lists) {
+  const map = new Map();
+  for (const list of lists) {
+    if (!Array.isArray(list)) continue;
+    for (const item of list) {
+      if (!item || !item.id) continue;
+      map.set(item.id, { ...map.get(item.id), ...item });
+    }
+  }
+  const sorted = [...map.values()].sort((a, b) => {
+    const at = Number(a.ts || a.createdAt || 0);
+    const bt = Number(b.ts || b.createdAt || 0);
+    return sortNewestFirst ? bt - at : at - bt;
+  });
+  return sortNewestFirst ? sorted.slice(0, limit) : sorted.slice(-limit);
+}
+
+function recentEvents(events) {
+  const cutoff = Date.now() - 45 * 60 * 1000;
+  return (Array.isArray(events) ? events : [])
+    .filter(event => event && event.id && Number(event.createdAt || 0) >= cutoff);
+}
+
 function finalizeState(state, previous = null) {
+  const merged = { ...(previous || {}), ...state };
+  merged.events = mergeById(80, false, recentEvents(previous?.events), recentEvents(state.events));
+  merged.activityLog = mergeById(160, true, previous?.activityLog, state.activityLog);
   return {
-    ...state,
+    ...merged,
     savedAt: Date.now(),
     revision: Math.max(Number(previous?.revision || 0), Number(state.revision || 0)) + 1
   };
