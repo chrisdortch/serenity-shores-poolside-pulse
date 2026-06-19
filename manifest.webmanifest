@@ -1,7 +1,7 @@
 {
-  "name": "Serenity Shores Poolside Pulse V4.9",
-  "short_name": "Poolside Pulse V4.9",
-  "start_url": "/?v=4.9",
+  "name": "Serenity Shores Poolside Pulse V5",
+  "short_name": "Poolside Pulse V5",
+  "start_url": "/?v=5.0",
   "display": "standalone",
   "background_color": "#f6fbfd",
   "theme_color": "#0789a5",

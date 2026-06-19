@@ -1,6 +1,7 @@
 const THUNDERSTORM_CODES = new Set([95, 96, 99]);
 const TORNADO_EVENTS = ['Tornado Warning', 'Tornado Emergency'];
 const STORM_EVENTS = ['Severe Thunderstorm Warning', 'Special Weather Statement'];
+const XWEATHER_HOST = 'https://data.api.xweather.com';
 
 function json(res, status, body) {
   res.statusCode = status;
@@ -99,9 +100,90 @@ async function getOpenMeteoSignals(points, windGustMph) {
   return { thunderHits, windHits, errors };
 }
 
-function classify(alerts, thunderHits, windHits, providerErrors) {
+function xweatherReady() {
+  return Boolean(process.env.XWEATHER_CLIENT_ID && process.env.XWEATHER_CLIENT_SECRET);
+}
+
+function distanceFromHit(hit) {
+  const rel = hit?.relativeTo || hit?.loc?.relativeTo || {};
+  const candidates = [rel.distanceMI, rel.distanceMiles, hit?.distanceMI, hit?.distanceMiles];
+  for (const value of candidates) {
+    const n = Number(value);
+    if (Number.isFinite(n)) return n;
+  }
+  return null;
+}
+
+function normalizeLightningHit(raw, radiusMiles) {
+  const hit = raw?.ob || raw?.profile || raw || {};
+  const dist = distanceFromHit(raw) ?? distanceFromHit(hit);
+  const ts = hit.timestamp || hit.dateTimeISO || hit.recTimestamp || raw?.timestamp || raw?.dateTimeISO || Date.now();
+  const date = Number.isFinite(Number(ts))
+    ? new Date(Number(ts) * (Number(ts) < 20000000000 ? 1000 : 1))
+    : new Date(ts);
+  return {
+    id: hit.id || raw?.id || `${ts}:${Math.round((dist ?? radiusMiles) * 100)}`,
+    distanceMI: Number.isFinite(dist) ? dist : null,
+    dateTimeISO: hit.dateTimeISO || raw?.dateTimeISO || (Number.isFinite(date.getTime()) ? date.toISOString() : new Date().toISOString()),
+    bearing: hit.bearing || raw?.bearing || '',
+    source: 'xweather'
+  };
+}
+
+async function getXweatherLightning(lat, lon, radiusMiles) {
+  const lightningHits = [];
+  const errors = [];
+  if (!xweatherReady()) return { lightningHits, errors, provider: 'not-configured' };
+  try {
+    const url = new URL(`${XWEATHER_HOST}/lightning/closest`);
+    url.searchParams.set('p', `${lat.toFixed(5)},${lon.toFixed(5)}`);
+    url.searchParams.set('radius', `${radiusMiles}mi`);
+    url.searchParams.set('limit', '1');
+    url.searchParams.set('from', '-6minutes');
+    url.searchParams.set('client_id', process.env.XWEATHER_CLIENT_ID);
+    url.searchParams.set('client_secret', process.env.XWEATHER_CLIENT_SECRET);
+    const response = await fetch(url.toString(), { headers: { Accept: 'application/json' } });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || data.success === false) {
+      errors.push(`Xweather lightning: ${data.error?.description || data.error?.message || `HTTP ${response.status}`}`);
+      return { lightningHits, errors, provider: 'xweather' };
+    }
+    for (const item of data.response || []) {
+      const hit = normalizeLightningHit(item, radiusMiles);
+      if (hit.distanceMI === null || hit.distanceMI <= radiusMiles) lightningHits.push(hit);
+    }
+  } catch (error) {
+    errors.push(`Xweather lightning: ${error.message}`);
+  }
+  return { lightningHits, errors, provider: 'xweather' };
+}
+
+function mockSignals(query, lightningRadiusMiles, windGustMph) {
+  const lightningMiles = Number(query?.mockLightningMiles);
+  const windMph = Number(query?.mockWindMph);
+  return {
+    lightningHits: Number.isFinite(lightningMiles) ? [{
+      id: `mock-lightning-${Math.round(lightningMiles * 10)}-${Math.floor(Date.now() / 60000)}`,
+      distanceMI: lightningMiles,
+      dateTimeISO: new Date().toISOString(),
+      source: 'mock'
+    }].filter(hit => hit.distanceMI <= lightningRadiusMiles) : [],
+    windHits: Number.isFinite(windMph) && windMph >= windGustMph ? [{
+      point: 'mock',
+      gustMph: Math.round(windMph),
+      thresholdMph: windGustMph
+    }] : []
+  };
+}
+
+function classify(alerts, lightningHits, thunderHits, windHits, providerErrors) {
   const tornado = alerts.find(a => TORNADO_EVENTS.some(name => a.event.includes(name)));
   if (tornado) return { threat: true, threatType: 'Tornado', summary: `${tornado.event}: ${tornado.headline || tornado.description || 'NWS tornado alert near resort.'}` };
+  if (lightningHits.length) {
+    const closest = lightningHits.reduce((best, hit) => (hit.distanceMI ?? 999) < (best.distanceMI ?? 999) ? hit : best, lightningHits[0]);
+    const dist = Number.isFinite(closest.distanceMI) ? `${Math.round(closest.distanceMI * 10) / 10} miles` : 'the monitored radius';
+    return { threat: true, threatType: 'Lightning', summary: `Lightning strike detected within ${dist} of the resort.`, lightning: closest };
+  }
   const severe = alerts.find(a => STORM_EVENTS.some(name => a.event.includes(name)) && /lightning|thunderstorm|storm/i.test(`${a.headline} ${a.description} ${a.instruction}`));
   if (severe) return { threat: true, threatType: 'Lightning/Thunderstorm', summary: `${severe.event}: ${severe.headline || 'Thunderstorm/lightning-risk alert near resort.'}` };
   if (thunderHits.length) return { threat: true, threatType: 'Lightning/Thunderstorm', summary: `Thunderstorm weather code detected within radius at ${thunderHits.map(h => h.point).join(', ')}.` };
@@ -118,15 +200,19 @@ export default async function handler(req, res) {
   const lat = coord(req.query?.lat);
   const lon = coord(req.query?.lon);
   const radiusMiles = Math.max(1, Math.min(25, Number(req.query?.radiusMiles) || 10));
+  const lightningRadiusMiles = Math.max(1, Math.min(25, Number(req.query?.lightningRadiusMiles) || radiusMiles || 10));
   const windGustMph = Math.max(15, Math.min(80, Number(req.query?.windGustMph) || 35));
   if (lat === null || lon === null) return json(res, 400, { ok: false, error: 'Valid latitude and longitude are required. Use decimal coordinates like 36.6337 and -93.4166.' });
   try {
     const points = ringPoints(lat, lon, radiusMiles);
-    const [nws, meteo] = await Promise.all([getNwsAlerts(points), getOpenMeteoSignals(points, windGustMph)]);
-    const providerErrors = [...nws.errors, ...meteo.errors];
-    const result = classify(nws.alerts, meteo.thunderHits, meteo.windHits, providerErrors);
-    return json(res, 200, { ok: true, radiusMiles, windGustMph, checkedPoints: points.length, alerts: nws.alerts, thunderHits: meteo.thunderHits, windHits: meteo.windHits, providerErrors, ...result });
+    const [nws, meteo, xweather] = await Promise.all([getNwsAlerts(points), getOpenMeteoSignals(points, windGustMph), getXweatherLightning(lat, lon, lightningRadiusMiles)]);
+    const mock = mockSignals(req.query || {}, lightningRadiusMiles, windGustMph);
+    const lightningHits = [...mock.lightningHits, ...xweather.lightningHits];
+    const windHits = [...mock.windHits, ...meteo.windHits];
+    const providerErrors = [...nws.errors, ...meteo.errors, ...xweather.errors];
+    const result = classify(nws.alerts, lightningHits, meteo.thunderHits, windHits, providerErrors);
+    return json(res, 200, { ok: true, radiusMiles, lightningRadiusMiles, windGustMph, lightningProvider: xweather.provider, checkedPoints: points.length, alerts: nws.alerts, lightningHits, thunderHits: meteo.thunderHits, windHits, providerErrors, ...result });
   } catch (error) {
-    return json(res, 200, { ok: true, threat: false, threatType: '', radiusMiles, windGustMph, checkedPoints: 0, alerts: [], thunderHits: [], windHits: [], providerErrors: [error.message], summary: `Weather check did not complete, but the app stayed online. Error: ${error.message || 'Unknown weather error.'}` });
+    return json(res, 200, { ok: true, threat: false, threatType: '', radiusMiles, lightningRadiusMiles, windGustMph, checkedPoints: 0, alerts: [], lightningHits: [], thunderHits: [], windHits: [], providerErrors: [error.message], summary: `Weather check did not complete, but the app stayed online. Error: ${error.message || 'Unknown weather error.'}` });
   }
 }
