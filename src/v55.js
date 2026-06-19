@@ -8,6 +8,7 @@ const API={state:'/api/state',suno:'/api/suno-playlist?url=',tts:'/api/tts',voic
 const PROVIDERS={suno:'Suno',spotify:'Spotify'};
 const DEFAULT_PLAYLIST='https://suno.com/playlist/cf4b536e-9005-4c98-9ea5-a7f01eca116f';
 const DEFAULT_ADDRESS='615 Serenity Shores Ln, Kimberling City, MO 65686';
+const DEFAULT_SPOTIFY_CLIENT_ID='7e086716aaea4ce98051287b552a676c';
 const DEFAULT_ANNS=[
  ['welcome','Welcome','Good morning and welcome to Serenity Shores. We are glad your family is here. Please supervise children, keep glass out of the pool area, and follow lifeguard instructions so everyone can enjoy a safe day by the water.'],
  ['owner','Owner Message','From all of us at Serenity Shores, thank you for spending part of your vacation with us. We hope this place feels peaceful, fun, and memorable for your family.'],
@@ -32,7 +33,7 @@ const DEFAULT_SCHEDULE=[
  {id:'close15',label:'Closing 15',type:'announcement',offsetToClose:15,announcementId:'close15',enabled:true},
  {id:'close5',label:'Closing 5',type:'announcement',offsetToClose:5,announcementId:'close5',enabled:true}
 ];
-const BASE={screen:'home',admin:false,tab:'command',revision:0,sync:false,syncMode:'starting',musicProvider:'suno',playlistUrl:DEFAULT_PLAYLIST,spotifyUrl:'',playlistName:'Serenity Shores Poolside Pulse',tracks:[{title:'Import the Serenity Shores playlist',artist:'Poolside Pulse',duration:'3:00',audioUrl:''}],current:0,intent:'stopped',command:null,announcement:null,lastError:'',feedback:'Ready.',anns:DEFAULT_ANNS,schedule:DEFAULT_SCHEDULE,selected:'welcome',editId:'new',quickText:'Attention guests, this is a Serenity Shores pool announcement.',guestName:'',poolOpen:'09:00',poolClose:'22:00',playbackMode:'always',autoStart:true,autoStop:false,weather:'Weather monitor is standing by.',weatherCheckedAt:'',weatherAuto:true,weatherLastThreatKey:'',address:DEFAULT_ADDRESS,lat:'36.6337',lon:'-93.4166',radius:10,windGustMph:35,voiceMode:'ai',aiVoice:'marin',deviceVoice:'',voiceHealth:'Not checked yet.',rate:.94,pitch:1,lastRun:{},activityLog:[]};
+const BASE={screen:'home',admin:false,tab:'command',revision:0,sync:false,syncMode:'starting',musicProvider:'suno',playlistUrl:DEFAULT_PLAYLIST,spotifyUrl:'',spotifyClientId:DEFAULT_SPOTIFY_CLIENT_ID,playlistName:'Serenity Shores Poolside Pulse',tracks:[{title:'Import the Serenity Shores playlist',artist:'Poolside Pulse',duration:'3:00',audioUrl:''}],current:0,intent:'stopped',command:null,announcement:null,lastError:'',feedback:'Ready.',anns:DEFAULT_ANNS,schedule:DEFAULT_SCHEDULE,selected:'welcome',editId:'new',quickText:'Attention guests, this is a Serenity Shores pool announcement.',guestName:'',poolOpen:'09:00',poolClose:'22:00',playbackMode:'always',autoStart:true,autoStop:false,weather:'Weather monitor is standing by.',weatherCheckedAt:'',weatherAuto:true,weatherLastThreatKey:'',address:DEFAULT_ADDRESS,lat:'36.6337',lon:'-93.4166',radius:10,windGustMph:35,voiceMode:'ai',aiVoice:'marin',deviceVoice:'',voiceHealth:'Not checked yet.',rate:.94,pitch:1,lastRun:{},activityLog:[]};
 let S=loadState();
 S=v5State(S);
 let music=new Audio();
@@ -133,7 +134,7 @@ function v5State(s){
   s={...(s||{})};
   s.activityLog=Array.isArray(s.activityLog)?s.activityLog.slice(0,120):[];
   s.voiceHealth=s.voiceHealth||'Not checked yet.';
-  s.spotifyClientId=s.spotifyClientId||'';
+  s.spotifyClientId=s.spotifyClientId||DEFAULT_SPOTIFY_CLIENT_ID;
   s.spotifyDeviceId=s.spotifyDeviceId||'';
   s.spotifyDeviceName=s.spotifyDeviceName||'';
   s.spotifyVolume=Number.isFinite(Number(s.spotifyVolume))?Math.max(20,Math.min(100,Number(s.spotifyVolume))):92;
