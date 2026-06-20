@@ -1,4 +1,4 @@
-const VERSION='6.2';
+const VERSION='6.3';
 const PIN='7900';
 const KEY='poolside-pulse-v6';
 const SPOTIFY_TOKEN_KEY='poolside-pulse-v6-spotify-token';
@@ -1649,6 +1649,100 @@ bind=function(){
   if($('playHome'))$('playHome').addEventListener('click',()=>v62MaybeUnlockReceiverAudio('receiver play button'),{once:false});
   if($('spotifyReceiver'))$('spotifyReceiver').addEventListener('click',()=>v62MaybeUnlockReceiverAudio('receiver Spotify button'),{once:false});
 }
+
+// V6.3: keep Command browsers from becoming or publishing receiver identity,
+// and never mark a receiver event handled while another poll is still trying it.
+const V63_COMMAND_ONLY_SPOTIFY_FIELDS=[
+  'spotifyDeviceId',
+  'spotifyDeviceName',
+  'spotifyReceiverLastReady',
+  'spotifyStatus',
+  'spotifyNowPlaying',
+  'spotifyNeedsTap',
+  'spotifyDevicesSummary',
+  'spotifyAccountProduct',
+  'spotifyLastError'
+];
+const v63CloudStateBase=cloudState;
+cloudState=function(){
+  const c=v63CloudStateBase();
+  if(S.screen!=='home'){
+    V63_COMMAND_ONLY_SPOTIFY_FIELDS.forEach(k=>delete c[k]);
+    delete c.receiverActive;
+  }
+  return c;
+}
+
+function v63UnmarkHandled(id){
+  if(!id)return;
+  const map=v6HandledMap();
+  if(map[id]){
+    delete map[id];
+    v6SaveHandled(map);
+  }
+}
+
+const v63EventInFlight=new Set();
+const v63ShouldProcessEventBase=v6ShouldProcessEvent;
+v6ShouldProcessEvent=function(event){
+  return v63ShouldProcessEventBase(event)&&!v63EventInFlight.has(event.id);
+}
+
+v6ProcessEvent=async function(event){
+  if(!v6ShouldProcessEvent(event))return;
+  v63EventInFlight.add(event.id);
+  try{
+    if(event.kind==='command'){
+      lastCommandId=event.id;
+      await v6RunCommand(event);
+    }else if(event.kind==='announcement'){
+      await v6RunAnnouncement(event);
+      lastAnnouncementId=event.id;
+    }
+    v6MarkHandled(event.id);
+  }catch(e){
+    v63UnmarkHandled(event.id);
+    v62DelayEvent(event,e.message);
+    setFeedback(`Receiver will retry ${event.kind||'event'} after audio is ready: ${e.message}`,false);
+  }finally{
+    v63EventInFlight.delete(event.id);
+  }
+}
+
+function v63ReleaseCommandReceiver(reason='command mode'){
+  if(S.screen==='home')return;
+  receiverActive=false;
+  if(spotifyPlayer&&typeof spotifyPlayer.disconnect==='function'){
+    try{spotifyPlayer.disconnect();}catch{}
+  }
+  spotifyPlayer=null;
+  spotifyPlayerReady=false;
+  spotifyWebDeviceId='';
+  S.spotifyDeviceId='';
+  S.spotifyDeviceName='';
+  if(/receiver|playing|paused|ready/i.test(String(S.spotifyStatus||''))){
+    S.spotifyStatus=`Command mode: this browser is not a receiver (${reason}).`;
+  }
+  localSave();
+}
+
+const v63ReceiverReadinessBase=receiverReadiness;
+receiverReadiness=function(){
+  if(S.screen!=='home')return'Command only; Home receivers play sound';
+  return v63ReceiverReadinessBase();
+}
+
+const v63BindBase=bind;
+bind=function(){
+  v63BindBase();
+  if($('cmd'))$('cmd').addEventListener('click',()=>setTimeout(()=>v63ReleaseCommandReceiver('Command button'),0),{once:false});
+}
+
+window.addEventListener('poolside-audio-unlocked',()=>{
+  Object.keys(v62RetryAfter).forEach(id=>{v62RetryAfter[id]=0;});
+  setTimeout(()=>pullState(),120);
+});
+setTimeout(()=>v63ReleaseCommandReceiver('startup'),1200);
 
 completeSpotifyLogin();
 function loadVoices(){voices='speechSynthesis'in window?speechSynthesis.getVoices():[];}
