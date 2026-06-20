@@ -1,5 +1,5 @@
 (() => {
-  const PATCH_VERSION = '6.1';
+  const PATCH_VERSION = '6.2';
   const tracked = new Set();
   const ducked = new Map();
   let duckDepth = 0;
@@ -41,6 +41,17 @@
         && !/Command Center|Receiver Controls|Live Control/i.test(bodyText);
       if (box && receiverScreen && !box.innerHTML.includes(text)) box.innerHTML += '<br><b>V6 iPhone:</b> ' + text;
     } catch {}
+  }
+  function audioStatus() {
+    return {
+      version: PATCH_VERSION,
+      unlocked,
+      unlocking,
+      useMuteDuck: USE_MUTE_DUCK,
+      isiPhoneLike: isiPhoneLike(),
+      isSafariLike: isSafariLike(),
+      status: window.__pulseV6Status || ''
+    };
   }
   function makeHiddenAudio() {
     const a = document.createElement('audio');
@@ -155,12 +166,74 @@
       } catch {}
       unlocked = true;
       note('audio unlocked by ' + reason + '.');
+      try { window.dispatchEvent(new CustomEvent('poolside-audio-unlocked', { detail: audioStatus() })); } catch {}
     } catch (e) {
       note('audio still blocked: tap Activate Sound / Play Station on this iPhone, then send announcement again.');
     } finally {
       unlocking = false;
     }
     return unlocked;
+  }
+
+  async function playAnnouncementBlob(blob, onEnded) {
+    const a = getAnnAudio();
+    const url = URL.createObjectURL(blob);
+    try { a.pause(); } catch {}
+    a.src = url;
+    a.preload = 'auto';
+    a.playsInline = true;
+    a.setAttribute('playsinline', '');
+    a.setAttribute('webkit-playsinline', '');
+    a.muted = false;
+    try { a.volume = 1; } catch {}
+    try { a.load(); } catch {}
+    return await new Promise((resolve, reject) => {
+      let started = false;
+      let cleaned = false;
+      const cleanup = () => {
+        if (cleaned) return;
+        cleaned = true;
+        clearTimeout(startTimer);
+        a.removeEventListener('playing', onPlaying);
+        a.removeEventListener('ended', onEnd);
+        a.removeEventListener('error', onError);
+        try { URL.revokeObjectURL(url); } catch {}
+      };
+      const onPlaying = () => {
+        if (started) return;
+        started = true;
+        clearTimeout(startTimer);
+        unlocked = true;
+        note('announcement audio started on receiver.');
+        resolve(true);
+      };
+      const onEnd = () => {
+        cleanup();
+        try { onEnded && onEnded(); } catch {}
+      };
+      const onError = () => {
+        cleanup();
+        if (started) {
+          try { onEnded && onEnded(); } catch {}
+        } else {
+          reject(Error('receiver announcement audio element failed'));
+        }
+      };
+      const startTimer = setTimeout(() => {
+        if (!started) {
+          cleanup();
+          reject(Error('receiver announcement audio did not start; tap Play / Resume Spotify on this receiver once'));
+        }
+      }, 6000);
+      a.addEventListener('playing', onPlaying);
+      a.addEventListener('ended', onEnd);
+      a.addEventListener('error', onError);
+      Promise.resolve(a.play()).then(() => onPlaying()).catch(err => {
+        cleanup();
+        note('announcement play blocked; tap Play / Resume Spotify on this receiver.');
+        reject(err instanceof Error ? err : Error(String(err || 'announcement play blocked')));
+      });
+    });
   }
 
   const NativeAudio = window.Audio;
@@ -242,18 +315,19 @@
 
   function rewriteVersion() {
     try {
-      document.title = 'Serenity Shores Poolside Pulse V6.1';
+      document.title = 'Serenity Shores Poolside Pulse V6.2';
       const root = document.getElementById('app');
-      if (root) root.dataset.version = '6.1';
+      if (root) root.dataset.version = '6.2';
       const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
       const nodes = [];
       while (walker.nextNode()) nodes.push(walker.currentNode);
       nodes.forEach(n => {
         if (n.nodeValue) n.nodeValue = n.nodeValue
-          .replaceAll('V6.0','V6.1').replaceAll('Version 6.0','Version 6.1')
-          .replaceAll('V5.10','V6.1').replaceAll('Version 5.10','Version 6.1')
-          .replaceAll('V5.9','V6.1').replaceAll('Version 5.9','Version 6.1')
-          .replaceAll('V5.0','V6.1').replaceAll('Version 5.0','Version 6.1')
+          .replaceAll('V6.1','V6.2').replaceAll('Version 6.1','Version 6.2')
+          .replaceAll('V6.0','V6.2').replaceAll('Version 6.0','Version 6.2')
+          .replaceAll('V5.10','V6.2').replaceAll('Version 5.10','Version 6.2')
+          .replaceAll('V5.9','V6.2').replaceAll('Version 5.9','Version 6.2')
+          .replaceAll('V5.0','V6.2').replaceAll('Version 5.0','Version 6.2')
           .replaceAll('V4.9','V6').replaceAll('Version 4.9','Version 6')
           .replaceAll('V4.8','V6').replaceAll('Version 4.8','Version 6')
           .replaceAll('V4.7','V6').replaceAll('Version 4.7','Version 6')
@@ -267,6 +341,9 @@
   }
 
   window.__poolsidePulseUnlockAudio = unlockReceiverAudio;
+  window.__poolsidePulseAudioStatus = audioStatus;
+  window.__poolsidePulseReceiverAudioUnlocked = () => unlocked;
+  window.__poolsidePulsePlayAnnouncementBlob = playAnnouncementBlob;
   window.__poolsidePulseV59Audio = { version: PATCH_VERSION, useMuteDuck: USE_MUTE_DUCK, isiPhoneLike: isiPhoneLike(), isSafariLike: isSafariLike() };
   document.addEventListener('pointerdown', () => unlockReceiverAudio('pointer tap'), { capture: true, passive: true });
   document.addEventListener('click', () => unlockReceiverAudio('click'), { capture: true });

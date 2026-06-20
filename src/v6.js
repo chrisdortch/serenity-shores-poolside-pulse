@@ -1,4 +1,4 @@
-const VERSION='6.1';
+const VERSION='6.2';
 const PIN='7900';
 const KEY='poolside-pulse-v6';
 const SPOTIFY_TOKEN_KEY='poolside-pulse-v6-spotify-token';
@@ -1382,6 +1382,274 @@ bind=function(){
 function weatherMonitor(){
   if(S.weatherAuto&&S.screen==='home'&&!speaking&&(receiverActive||S.intent==='playing'||S.musicProvider==='spotify'))weather({announce:true});
 }
+
+// V6.2: receiver-first announcement playback. Remote announcement events are
+// acknowledged only after the receiver browser actually starts voice audio.
+const V62_EVENT_RETRY_MS=9000;
+const v62RetryAfter={};
+const v62QueuedEvents=new Set();
+
+function v62AudioState(){
+  try{
+    if(typeof window.__poolsidePulseAudioStatus==='function')return window.__poolsidePulseAudioStatus();
+  }catch{}
+  return {unlocked:false,status:'receiver audio state unknown'};
+}
+function v62AudioReadyText(){
+  const state=v62AudioState();
+  return state.unlocked?'audio unlocked':'tap receiver once for voice';
+}
+function v62CanTryEvent(event){
+  return !!(event&&event.id&&Date.now()>=Number(v62RetryAfter[event.id]||0));
+}
+function v62DelayEvent(event,message){
+  if(!event?.id)return;
+  v62RetryAfter[event.id]=Date.now()+V62_EVENT_RETRY_MS;
+  logEvent('receiver','Event waiting for receiver audio',message||event.kind||'event',{eventId:event.id});
+}
+async function v62MaybeUnlockReceiverAudio(reason='receiver action'){
+  try{
+    if(typeof window.__poolsidePulseUnlockAudio==='function')await window.__poolsidePulseUnlockAudio(reason);
+  }catch{}
+}
+async function v62RestoreAfterFailedStart(hadMusic,hadSpotify){
+  speaking=false;
+  if(hadSpotify)await restoreSpotifyAfterAnnouncement();
+  if(hadMusic){
+    try{
+      music.muted=false;
+      music.volume=Math.max(music.volume||.02,.02);
+      await music.play();
+      await fade(music,.95,500);
+      S.intent='playing';
+    }catch{}
+  }
+}
+async function v62PlayAnnouncementBlob(blob,finish){
+  if(typeof window.__poolsidePulsePlayAnnouncementBlob==='function'){
+    return await window.__poolsidePulsePlayAnnouncementBlob(blob,finish);
+  }
+  const boosted=await playBoostedAnnouncement(blob,finish);
+  if(boosted)return true;
+  const url=URL.createObjectURL(blob);
+  const a=new Audio(url);
+  a.preload='auto';
+  a.playsInline=true;
+  a.muted=false;
+  a.volume=1;
+  return await new Promise((resolve,reject)=>{
+    let settled=false;
+    let started=false;
+    const done=()=>{
+      if(settled)return;
+      settled=true;
+      URL.revokeObjectURL(url);
+      finish();
+    };
+    const fail=err=>{
+      if(settled)return;
+      if(started){done();return;}
+      settled=true;
+      URL.revokeObjectURL(url);
+      reject(err instanceof Error?err:Error(String(err||'announcement audio failed')));
+    };
+    a.onended=done;
+    a.onerror=()=>fail(Error('announcement audio element failed'));
+    Promise.resolve(a.play()).then(()=>{started=true;resolve(true);}).catch(fail);
+  });
+}
+function v62DeviceVoicePromise(msg,finish){
+  return new Promise((resolve,reject)=>{
+    if(!('speechSynthesis'in window)){reject(Error('No device speech engine available.'));return;}
+    let started=false;
+    let settled=false;
+    const timeout=setTimeout(()=>{
+      if(!started&&!settled){
+        settled=true;
+        reject(Error('Device speech did not start. Tap Play / Resume Spotify on this receiver once.'));
+      }
+    },3500);
+    const u=new SpeechSynthesisUtterance(msg);
+    const v=voices.find(v=>v.name===S.deviceVoice)||bestVoices()[0];
+    if(v)u.voice=v;
+    u.rate=Number(S.rate)||.94;
+    u.pitch=Number(S.pitch)||1;
+    u.volume=1;
+    u.onstart=()=>{
+      started=true;
+      if(!settled){
+        settled=true;
+        clearTimeout(timeout);
+        resolve(true);
+      }
+    };
+    u.onend=()=>{
+      clearTimeout(timeout);
+      if(!started&&!settled){
+        settled=true;
+        reject(Error('Device speech ended before starting.'));
+      }else finish();
+    };
+    u.onerror=event=>{
+      clearTimeout(timeout);
+      if(!started&&!settled){
+        settled=true;
+        reject(Error(event?.error||'Device speech failed before starting.'));
+      }else finish();
+    };
+    speechSynthesis.cancel();
+    speechSynthesis.speak(u);
+  });
+}
+
+speak=async function(text,hold=false,opts={}){
+  const msg=tokens(text).trim();
+  if(!msg){setFeedback('Announcement text is empty.',false);return false;}
+  if(speaking){
+    const key=opts.eventId||uid();
+    if(!v62QueuedEvents.has(key)){
+      v62QueuedEvents.add(key);
+      queue.push({text:msg,hold,eventId:key});
+    }
+    setFeedback('Announcement queued behind the current announcement.',true);
+    return true;
+  }
+  speaking=true;
+  const hadMusic=musicAudible();
+  const hadSpotify=await duckSpotifyForAnnouncement();
+  if(hadMusic){
+    setFeedback('Announcement starting; music faded down without restarting track.',true);
+    await fade(music,0,550);
+    try{music.pause();}catch{}
+  }
+  let finished=false;
+  const finish=async()=>{
+    if(finished)return;
+    finished=true;
+    speaking=false;
+    if(opts.eventId)v62QueuedEvents.delete(opts.eventId);
+    if(hadSpotify&&shouldResumeMusic())await restoreSpotifyAfterAnnouncement();
+    else if(hadMusic&&shouldResumeMusic()){
+      try{
+        music.muted=false;
+        music.volume=Math.max(music.volume||.02,.02);
+        await music.play();
+        await fade(music,.95,850);
+        S.intent='playing';
+        setFeedback('Announcement finished; same track faded back up without restart.',true);
+      }catch(e){setFeedback(`Could not restore music: ${e.message}`,false);}
+    }
+    logEvent('announcement',hold?'Safety announcement played':'Announcement played',msg.slice(0,150),{gain:S.announcementGain,eventId:opts.eventId||''});
+    if(S.screen==='home')await pushState('Receiver announcement logged.');
+    localSave();
+    renderWhenIdle();
+    const next=queue.shift();
+    if(next)setTimeout(()=>speak(next.text,next.hold,{eventId:next.eventId}),200);
+  };
+  try{
+    let spoken=false;
+    if(S.voiceMode==='ai'){
+      const r=await fetch(API.tts,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:msg,voice:S.aiVoice||'marin',instructions:'Speak like a calm, polished, natural resort public-address announcer at Serenity Shores. Be clear, warm, firm, projected, and loud enough to cut through pool music.'})});
+      if(r.ok){
+        const blob=await r.blob();
+        spoken=await v62PlayAnnouncementBlob(blob,finish);
+        if(spoken)setFeedback(`AI voice started on receiver at max volume. ${v62AudioReadyText()}.`,true);
+      }else{
+        const d=await r.json().catch(()=>({}));
+        setFeedback(`AI voice failed ${r.status}: ${d.error||d.detail||'check OpenAI key/billing/limits'}. Trying device voice.`,false);
+      }
+    }
+    if(!spoken){
+      spoken=await v62DeviceVoicePromise(msg,finish);
+      setFeedback('Device voice started on receiver at max browser volume.',true);
+    }
+    if(!spoken)throw Error('Announcement audio did not start.');
+    return true;
+  }catch(e){
+    await v62RestoreAfterFailedStart(hadMusic,hadSpotify);
+    const message=`Receiver could not start voice audio: ${e.message}. On the speaker-connected receiver, tap Play / Resume Spotify once, then send Speak Now again.`;
+    setFeedback(message,false);
+    logEvent('receiver','Announcement audio blocked',message,{eventId:opts.eventId||''});
+    if(S.screen==='home')await pushState('Receiver announcement blocked; waiting for receiver tap.');
+    renderWhenIdle();
+    throw Error(message);
+  }
+}
+
+sendAnnouncement=async function(text,hold=false){
+  const msg=tokens(text).trim();
+  if(!msg){setFeedback('Nothing to announce. Type text first.',false);return;}
+  const event=v6AppendEvent('announcement',{text:msg,hold:!!hold,label:hold?'Safety announcement':'Announcement'});
+  S.announcement={id:event.id,text:msg,hold:!!hold,createdAt:event.createdAt,source:event.source};
+  logEvent('announcement',hold?'Safety announcement sent':'Announcement sent',msg.slice(0,150),{eventId:event.id});
+  await pushState('Announcement command sent to all active Home receivers.');
+  if(S.screen==='home'){
+    try{
+      await speak(msg,hold,{eventId:event.id});
+      lastAnnouncementId=event.id;
+      v6MarkHandled(event.id);
+    }catch(e){
+      v62DelayEvent(event,e.message);
+    }
+  }
+  renderWhenIdle();
+}
+
+const v62ShouldProcessEventBase=v6ShouldProcessEvent;
+v6ShouldProcessEvent=function(event){
+  return v62ShouldProcessEventBase(event)&&v62CanTryEvent(event);
+}
+
+v6ProcessEvent=async function(event){
+  if(!v6ShouldProcessEvent(event))return;
+  try{
+    if(event.kind==='command'){
+      lastCommandId=event.id;
+      await v6RunCommand(event);
+    }else if(event.kind==='announcement'){
+      await v6RunAnnouncement(event);
+      lastAnnouncementId=event.id;
+    }
+    v6MarkHandled(event.id);
+  }catch(e){
+    v62DelayEvent(event,e.message);
+    setFeedback(`Receiver will retry ${event.kind||'event'} after audio is ready: ${e.message}`,false);
+  }
+}
+
+v6RunAnnouncement=async function(a){
+  if(!a?.text)return;
+  logEvent('receiver','Announcement received',String(a.text).slice(0,150),{eventId:a.id});
+  await speak(a.text,!!a.hold,{eventId:a.id});
+}
+
+const v62ReceiverReadinessBase=receiverReadiness;
+receiverReadiness=function(){
+  const base=v62ReceiverReadinessBase();
+  return S.screen==='home'?`${base}; ${v62AudioReadyText()}`:base;
+}
+
+const v62CommandPageBase=commandPage;
+commandPage=function(){
+  const selected=ann();
+  const knownTexts=new Set((S.anns||[]).map(a=>String(a.text||'')));
+  if((!S.quickText||knownTexts.has(String(S.quickText)))&&selected?.text)S.quickText=selected.text;
+  return v62CommandPageBase();
+}
+
+const v62BindBase=bind;
+bind=function(){
+  v62BindBase();
+  if($('quickTemplate')){
+    const apply=()=>v61ApplyQuickTemplate();
+    $('quickTemplate').oninput=apply;
+    $('quickTemplate').onchange=apply;
+    $('quickTemplate').onblur=apply;
+  }
+  if($('playHome'))$('playHome').addEventListener('click',()=>v62MaybeUnlockReceiverAudio('receiver play button'),{once:false});
+  if($('spotifyReceiver'))$('spotifyReceiver').addEventListener('click',()=>v62MaybeUnlockReceiverAudio('receiver Spotify button'),{once:false});
+}
+
 completeSpotifyLogin();
 function loadVoices(){voices='speechSynthesis'in window?speechSynthesis.getVoices():[];}
 if('speechSynthesis'in window){speechSynthesis.onvoiceschanged=loadVoices;loadVoices();}
