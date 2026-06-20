@@ -1,4 +1,4 @@
-const VERSION='6.0';
+const VERSION='6.1';
 const PIN='7900';
 const KEY='poolside-pulse-v6';
 const SPOTIFY_TOKEN_KEY='poolside-pulse-v6-spotify-token';
@@ -313,7 +313,8 @@ connectSpotifyReceiver=async function(){
   return device_id;
 }
 spotifyTargetDevice=async function(){
-  if(spotifyPlayerReady&&spotifyWebDeviceId)return spotifyWebDeviceId;
+  if(S.screen==='home'&&spotifyPlayerReady&&spotifyWebDeviceId)return spotifyWebDeviceId;
+  if(S.screen!=='home')return '';
   if(S.screen==='home'&&spotifyLoggedIn()){
     try{return await connectSpotifyReceiver();}catch{}
   }
@@ -594,7 +595,8 @@ async function v59SpotifyActuallyPlaying(){
 }
 connectSpotifyReceiver=async function(){return await v59StartSpotifyDevice({fromTap:false});}
 spotifyTargetDevice=async function(){
-  if(spotifyPlayerReady&&spotifyWebDeviceId)return spotifyWebDeviceId;
+  if(S.screen==='home'&&spotifyPlayerReady&&spotifyWebDeviceId)return spotifyWebDeviceId;
+  if(S.screen!=='home')return '';
   if(S.screen==='home'&&spotifyLoggedIn()){
     try{return await v59StartSpotifyDevice({fromTap:false});}catch{}
   }
@@ -703,11 +705,15 @@ const v59CompleteSpotifyLoginBase=completeSpotifyLogin;
 completeSpotifyLogin=async function(){
   await v59CompleteSpotifyLoginBase();
   if(spotifyLoggedIn()){
-    v59SetSpotifyStatus('Spotify login saved. Tap Activate + Play Spotify on the speaker-connected receiver.',true);
-    setTimeout(()=>v59PrimeSpotifyPlayer().catch(e=>v59SetSpotifyStatus(`Spotify receiver preload failed: ${e.message}`,false)),400);
+    if(S.screen==='home'){
+      v59SetSpotifyStatus('Spotify login saved. Tap Activate + Play Spotify on the speaker-connected receiver.',true);
+      setTimeout(()=>v59PrimeSpotifyPlayer().catch(e=>v59SetSpotifyStatus(`Spotify receiver preload failed: ${e.message}`,false)),400);
+    }else{
+      v59SetSpotifyStatus('Spotify login saved on this Command device. This browser will not become a receiver unless you switch it to Home.',true);
+    }
   }
 }
-setTimeout(()=>{if(spotifyLoggedIn())v59PrimeSpotifyPlayer().catch(()=>{});},900);
+setTimeout(()=>{if(S.screen==='home'&&spotifyLoggedIn())v59PrimeSpotifyPlayer().catch(()=>{});},900);
 
 // V6: command announcements and weather checks are event-driven. Process a new
 // command/announcement id even if this receiver's local revision is already ahead.
@@ -724,13 +730,15 @@ pullState=async function(){
     const revisionAdvanced=Number(inc.revision||0)>Number(S.revision||0);
     if(!revisionAdvanced&&!newCommand&&!newAnnouncement)return;
     const wasReceiver=S.screen==='home'&&receiverActive;
-    const old={screen:S.screen,admin:S.admin,tab:S.tab,selected:S.selected,editId:S.editId,feedback:S.feedback,lastError:S.lastError,intent:S.intent,current:S.current,spotifyNowPlaying:S.spotifyNowPlaying,spotifyStatus:S.spotifyStatus,spotifyDeviceId:S.spotifyDeviceId,spotifyDeviceName:S.spotifyDeviceName};
+    const old={screen:S.screen,admin:S.admin,tab:S.tab,selected:S.selected,editId:S.editId,quickText:S.quickText,guestName:S.guestName,feedback:S.feedback,lastError:S.lastError,intent:S.intent,current:S.current,spotifyNowPlaying:S.spotifyNowPlaying,spotifyStatus:S.spotifyStatus,spotifyDeviceId:S.spotifyDeviceId,spotifyDeviceName:S.spotifyDeviceName};
     S=normalize({...S,...inc,revision:Math.max(Number(S.revision||0),Number(inc.revision||0))});
     S.screen=old.screen;
     S.admin=old.admin;
     S.tab=old.tab;
     S.selected=old.selected;
     S.editId=old.editId;
+    S.quickText=old.quickText;
+    S.guestName=old.guestName;
     S.feedback=old.feedback;
     S.lastError=old.lastError;
     S.spotifyNowPlaying=old.spotifyNowPlaying||S.spotifyNowPlaying;
@@ -1037,13 +1045,15 @@ pullState=async function(){
     const revisionAdvanced=Number(inc.revision||0)>Number(S.revision||0);
     if(!revisionAdvanced&&!newCommand&&!newAnnouncement)return;
     const wasReceiver=S.screen==='home'&&receiverActive;
-    const old={screen:S.screen,admin:S.admin,tab:S.tab,selected:S.selected,editId:S.editId,feedback:S.feedback,lastError:S.lastError,intent:S.intent,current:S.current,spotifyNowPlaying:S.spotifyNowPlaying,spotifyStatus:S.spotifyStatus,spotifyDeviceId:S.spotifyDeviceId,spotifyDeviceName:S.spotifyDeviceName};
+    const old={screen:S.screen,admin:S.admin,tab:S.tab,selected:S.selected,editId:S.editId,quickText:S.quickText,guestName:S.guestName,feedback:S.feedback,lastError:S.lastError,intent:S.intent,current:S.current,spotifyNowPlaying:S.spotifyNowPlaying,spotifyStatus:S.spotifyStatus,spotifyDeviceId:S.spotifyDeviceId,spotifyDeviceName:S.spotifyDeviceName};
     S=normalize({...S,...inc,revision:Math.max(Number(S.revision||0),Number(inc.revision||0))});
     S.screen=old.screen;
     S.admin=old.admin;
     S.tab=old.tab;
     S.selected=old.selected;
     S.editId=old.editId;
+    S.quickText=old.quickText;
+    S.guestName=old.guestName;
     S.feedback=old.feedback;
     S.lastError=old.lastError;
     S.spotifyNowPlaying=old.spotifyNowPlaying||S.spotifyNowPlaying;
@@ -1086,7 +1096,7 @@ function v6RecentEvents(events){
 function v6MergeById(limit,sortNewestFirst,...lists){
   const map=new Map();
   lists.forEach(list=>v6List(list).forEach(item=>{if(item?.id)map.set(item.id,{...map.get(item.id),...item});}));
-  return [...map.values()].sort((a,b)=>{
+  const sorted=[...map.values()].sort((a,b)=>{
     const av=Number(a.ts||a.createdAt||0)||0,bv=Number(b.ts||b.createdAt||0)||0;
     return sortNewestFirst?bv-av:av-bv;
   });
@@ -1232,13 +1242,15 @@ pullState=async function(){
     const revisionAdvanced=Number(inc.revision||0)>Number(S.revision||0);
     if(!revisionAdvanced&&!newCommand&&!newAnnouncement&&!hasUnhandledEvent)return;
     const wasReceiver=S.screen==='home'&&receiverActive;
-    const old={screen:S.screen,admin:S.admin,tab:S.tab,selected:S.selected,editId:S.editId,feedback:S.feedback,lastError:S.lastError,intent:S.intent,current:S.current,spotifyNowPlaying:S.spotifyNowPlaying,spotifyStatus:S.spotifyStatus,spotifyDeviceId:S.spotifyDeviceId,spotifyDeviceName:S.spotifyDeviceName};
+    const old={screen:S.screen,admin:S.admin,tab:S.tab,selected:S.selected,editId:S.editId,quickText:S.quickText,guestName:S.guestName,feedback:S.feedback,lastError:S.lastError,intent:S.intent,current:S.current,spotifyNowPlaying:S.spotifyNowPlaying,spotifyStatus:S.spotifyStatus,spotifyDeviceId:S.spotifyDeviceId,spotifyDeviceName:S.spotifyDeviceName};
     S=normalize({...S,...inc,events:v6MergeById(V6_EVENT_LIMIT,false,S.events,inc.events),activityLog:v6MergeById(V6_LOG_LIMIT,true,S.activityLog,inc.activityLog),revision:Math.max(Number(S.revision||0),Number(inc.revision||0))});
     S.screen=old.screen;
     S.admin=old.admin;
     S.tab=old.tab;
     S.selected=old.selected;
     S.editId=old.editId;
+    S.quickText=old.quickText;
+    S.guestName=old.guestName;
     S.feedback=old.feedback;
     S.lastError=old.lastError;
     S.spotifyNowPlaying=old.spotifyNowPlaying||S.spotifyNowPlaying;
@@ -1305,9 +1317,49 @@ commandPage=function(){
   return shell(`<section class="panel commandHero"><div><p class="tag">Live Control</p><h1>Command</h1><p>Control every active receiver from this phone. Receivers process a durable V6 event inbox, so commands from phones and laptops are not lost during sync.</p></div>${currentStatusCards()}</section><section class="panel controlPanel"><h2>Receiver Controls</h2><div class="bigControls"><button id="playCmd">Play / Resume</button><button id="pauseCmd" class="secondary">Pause</button><button id="skipCmd" class="secondary">Skip</button><button id="stopCmd" class="danger">Stop</button><button id="checkWeatherCmd" class="secondary">Check Weather</button></div><div class="grid2"><label>Quick Announcement<textarea id="quickText">${esc(S.quickText||selected.text)}</textarea></label><div><label>Saved Announcement<select id="quickTemplate">${S.anns.map(a=>`<option value="${a.id}" ${a.id===S.selected?'selected':''}>${esc(a.label)}</option>`).join('')}</select></label><div class="stackBtns"><button id="quickPlay">Speak Now</button><button id="quickHold" class="secondary">Speak as Safety Hold</button><button id="lightningNow" class="secondary">Lightning Hold</button><button id="windNow" class="secondary">Wind Umbrellas</button></div></div></div></section><section class="panel"><div class="sectionHead"><h2>Receiver Log</h2><button id="clearLog" class="secondary">Clear Local Log</button></div><div class="logList">${logRows()}</div></section>`);
 }
 
+async function v61CommandPlay(){
+  readMusicSettings();
+  if(S.musicProvider==='spotify'){
+    await spotifyPlayUrl(S.spotifyUrl,true);
+    return;
+  }
+  S.musicProvider='suno';
+  await issueCommand('play',{label:'Play Suno',provider:'suno',detail:sourceLabel('suno',S.playlistUrl)},'Play command sent to receivers.');
+}
+async function v61CommandButton(type,label){
+  await issueCommand(type,{label,detail:`${label} requested from ${deviceLabel()}.`},`${label} command sent to receivers.`);
+}
+function v61ApplyQuickTemplate(){
+  const selectedId=val('quickTemplate')||S.selected;
+  const a=S.anns.find(x=>x.id===selectedId);
+  if(!a)return;
+  S.selected=a.id;
+  S.quickText=a.text;
+  const box=$('quickText');
+  if(box)box.value=a.text;
+  localSave();
+}
+function v61QuickText(){
+  const selectedId=val('quickTemplate')||S.selected;
+  const a=S.anns.find(x=>x.id===selectedId);
+  if(a)S.selected=a.id;
+  S.quickText=(val('quickText')||a?.text||S.quickText||'').trim();
+  localSave();
+  return S.quickText;
+}
+
 const v6BindBase=bind;
 bind=function(){
   v6BindBase();
+  if($('playCmd'))$('playCmd').onclick=()=>v61CommandPlay();
+  if($('pauseCmd'))$('pauseCmd').onclick=()=>v61CommandButton('pause','Pause');
+  if($('skipCmd'))$('skipCmd').onclick=()=>v61CommandButton('skip','Skip track');
+  if($('stopCmd'))$('stopCmd').onclick=()=>v61CommandButton('stop','Stop all receivers');
+  if($('quickTemplate')){
+    $('quickTemplate').oninput=v61ApplyQuickTemplate;
+    $('quickTemplate').onchange=v61ApplyQuickTemplate;
+  }
+  if($('quickText'))$('quickText').oninput=()=>{S.quickText=val('quickText');localSave();};
   if($('playHome'))$('playHome').onclick=()=>{
     if(S.musicProvider==='spotify'){
       try{if(spotifyPlayer&&typeof spotifyPlayer.activateElement==='function')spotifyPlayer.activateElement();}catch{}
@@ -1319,10 +1371,10 @@ bind=function(){
   if($('clearLog'))$('clearLog').onclick=()=>{
     storageSet(V6_LOG_CLEAR_KEY,String(Date.now()));
     setFeedback('Local receiver log cleared on this device.',true);
-    renderWhenIdle();
+    render();
   };
-  if($('quickPlay'))$('quickPlay').onclick=()=>{S.quickText=val('quickText');sendAnnouncement(S.quickText,false);};
-  if($('quickHold'))$('quickHold').onclick=()=>{S.quickText=val('quickText');sendAnnouncement(S.quickText,true);};
+  if($('quickPlay'))$('quickPlay').onclick=()=>sendAnnouncement(v61QuickText(),false);
+  if($('quickHold'))$('quickHold').onclick=()=>sendAnnouncement(v61QuickText(),true);
   if($('lightningNow'))$('lightningNow').onclick=()=>sendAnnouncement(S.lightningText,true);
   if($('windNow'))$('windNow').onclick=()=>sendAnnouncement(S.windText,false);
 }

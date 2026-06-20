@@ -1,5 +1,5 @@
 (() => {
-  const PATCH_VERSION = '6.0';
+  const PATCH_VERSION = '6.1';
   const tracked = new Set();
   const ducked = new Map();
   let duckDepth = 0;
@@ -242,17 +242,18 @@
 
   function rewriteVersion() {
     try {
-      document.title = 'Serenity Shores Poolside Pulse V6';
+      document.title = 'Serenity Shores Poolside Pulse V6.1';
       const root = document.getElementById('app');
-      if (root) root.dataset.version = '6.0';
+      if (root) root.dataset.version = '6.1';
       const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
       const nodes = [];
       while (walker.nextNode()) nodes.push(walker.currentNode);
       nodes.forEach(n => {
         if (n.nodeValue) n.nodeValue = n.nodeValue
-          .replaceAll('V5.10','V6').replaceAll('Version 5.10','Version 6')
-          .replaceAll('V5.9','V6').replaceAll('Version 5.9','Version 6')
-          .replaceAll('V5.0','V6').replaceAll('Version 5.0','Version 6')
+          .replaceAll('V6.0','V6.1').replaceAll('Version 6.0','Version 6.1')
+          .replaceAll('V5.10','V6.1').replaceAll('Version 5.10','Version 6.1')
+          .replaceAll('V5.9','V6.1').replaceAll('Version 5.9','Version 6.1')
+          .replaceAll('V5.0','V6.1').replaceAll('Version 5.0','Version 6.1')
           .replaceAll('V4.9','V6').replaceAll('Version 4.9','Version 6')
           .replaceAll('V4.8','V6').replaceAll('Version 4.8','Version 6')
           .replaceAll('V4.7','V6').replaceAll('Version 4.7','Version 6')

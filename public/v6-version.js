@@ -1,6 +1,6 @@
 (() => {
-  const VERSION = '6.0';
-  const TITLE = 'Serenity Shores Poolside Pulse V6';
+  const VERSION = '6.1';
+  const TITLE = 'Serenity Shores Poolside Pulse V6.1';
 
   function ensureMeta(name, value) {
     let tag = document.querySelector(`meta[name="${name}"]`);
@@ -19,7 +19,7 @@
       const root = document.getElementById('app');
       if (root) root.dataset.version = VERSION;
       ensureMeta('app-version', VERSION);
-      ensureMeta('description', 'Serenity Shores Poolside Pulse V6: durable remote commands, reliable receiver announcements, live weather checks, Spotify control, and local log cleanup.');
+      ensureMeta('description', 'Serenity Shores Poolside Pulse V6.1: receiver-only Spotify playback, reliable remote announcements, live weather checks, and local log cleanup.');
 
       const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
       const nodes = [];
@@ -27,12 +27,14 @@
       nodes.forEach(node => {
         if (!node.nodeValue) return;
         node.nodeValue = node.nodeValue
-          .replaceAll('V5.10', 'V6')
-          .replaceAll('Version 5.10', 'Version 6')
-          .replaceAll('V5.9', 'V6')
-          .replaceAll('Version 5.9', 'Version 6')
-          .replaceAll('V5.0', 'V6')
-          .replaceAll('Version 5.0', 'Version 6')
+          .replaceAll('V6.0', 'V6.1')
+          .replaceAll('Version 6.0', 'Version 6.1')
+          .replaceAll('V5.10', 'V6.1')
+          .replaceAll('Version 5.10', 'Version 6.1')
+          .replaceAll('V5.9', 'V6.1')
+          .replaceAll('Version 5.9', 'Version 6.1')
+          .replaceAll('V5.0', 'V6.1')
+          .replaceAll('Version 5.0', 'Version 6.1')
           .replaceAll('V4.9', 'V6')
           .replaceAll('Version 4.9', 'Version 6')
           .replaceAll('V4.8', 'V6')
