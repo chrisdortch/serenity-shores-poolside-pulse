@@ -2159,21 +2159,26 @@ function readinessSteps() {
 
 function receiverActionButtons() {
   const spotifyMode = S.musicProvider === 'spotify';
+  const audioOk = receiverAudioReady();
   const needsLogin = spotifyMode && !spotifyLoggedIn();
-  const needsStart = !receiverAudioReady() || (spotifyMode && !spotifyDeviceReady());
+  const needsStart = !audioOk || (spotifyMode && !spotifyDeviceReady());
   const label = receiverCanPause()
     ? 'Pause Music'
     : needsStart
       ? (spotifyMode ? 'Start Receiver + Spotify' : 'Start Receiver')
       : 'Play / Resume Music';
-  const primary = needsLogin
+  const primary = audioOk && needsLogin
     ? '<button id="spotifyLoginHome" class="primaryWide">Login Spotify on This Receiver</button>'
     : `<button id="playHome" class="primaryWide">${esc(label)}</button>`;
   return `<div class="receiverActions">${primary}<button id="checkWeatherHome" class="secondary">Check Weather</button><button id="skipHome" class="secondary">Skip</button><button id="stopHome" class="secondary">Stop</button></div>`;
 }
 
 function receiverNotice() {
-  const message = S.setupNotice || (!receiverAudioReady() ? 'Tap the big Start Receiver button or the Audio unlocked TODO row. iPhone browsers require one tap here before music or announcements can be heard.' : '');
+  let message = '';
+  if (!receiverAudioReady()) message = 'Tap the big Start Receiver button or the Audio unlocked TODO row. iPhone browsers require one tap here before music or announcements can be heard.';
+  else if (S.musicProvider === 'spotify' && !spotifyLoggedIn()) message = 'Tap Login Spotify on This Receiver. Spotify must be connected on the speaker phone, not on a Command laptop.';
+  else if (S.musicProvider === 'spotify' && !spotifyDeviceReady()) message = 'Tap Start Receiver + Spotify or the Spotify device ready TODO row to make this phone the speaker device.';
+  else message = S.setupNotice || '';
   return message ? `<div class="actionNotice"><b>Next step:</b> ${esc(message)}</div>` : '';
 }
 
@@ -2326,6 +2331,11 @@ function bind() {
   wire('playHome', async () => {
     await ensureReceiverAudio('Home play button');
     if (S.musicProvider === 'spotify') {
+      if (!spotifyLoggedIn()) {
+        setActionNeeded('Receiver audio is unlocked. Now tap Login Spotify on This Receiver.');
+        renderWhenIdle();
+        return;
+      }
       if (receiverCanPause()) await spotifyPause(false);
       else await playSpotifyUrl(S.spotifyUrl, false, { fromTap: true });
     } else {
