@@ -1,11 +1,11 @@
-const VERSION = '8.1';
+const VERSION = '8.2';
 const PIN = '7900';
 const KEY = 'poolside-pulse-v8';
 const DEVICE_KEY = 'poolside-pulse-v8-device-id';
 const HANDLED_KEY = 'poolside-pulse-v8-handled-events';
 const LOG_CLEAR_KEY = 'poolside-pulse-v8-log-cleared-at';
 const SPOTIFY_TOKEN_KEY = 'poolside-pulse-v8-spotify-token';
-const APP_QUERY = '?v=8.1-receiver';
+const APP_QUERY = '?v=8.2-audio';
 const LEGACY_STATE_KEYS = [
   'poolside-pulse-v7',
   'poolside-pulse-v6',
@@ -44,6 +44,7 @@ const EVENT_TTL_MS = 90 * 60 * 1000;
 const EVENT_LIMIT = 120;
 const LOG_LIMIT = 180;
 const EVENT_RETRY_MS = 9000;
+const OLD_AUDIO_BLOCK_PATTERN = /play\(\) failed|goo\.gl\/xX8pDD|play method is not allowed|user did(?:n't| not) interact|user agent or the platform/i;
 
 const DEFAULT_ANNS = [
   ['welcome', 'Welcome', 'Good morning and welcome to Serenity Shores. We are glad your family is here. Please supervise children, keep glass out of the pool area, and follow lifeguard instructions so everyone can enjoy a safe day by the water.'],
@@ -162,6 +163,7 @@ let spotifyPlayer = null;
 let spotifyPlayerReady = false;
 let spotifyWebDeviceId = '';
 let spotifyPrimePromise = null;
+let spotifyWarmPromise = null;
 let statePulling = false;
 let pendingRender = false;
 let weatherRunning = false;
@@ -352,6 +354,8 @@ function normalize(raw) {
   s.events = recentEvents(s.events);
   s.activityLog = mergeById(LOG_LIMIT, true, s.activityLog);
   s.editId = s.editId || 'new';
+  if (OLD_AUDIO_BLOCK_PATTERN.test(String(s.audioStatus || ''))) s.audioStatus = BASE.audioStatus;
+  if (OLD_AUDIO_BLOCK_PATTERN.test(String(s.setupNotice || ''))) s.setupNotice = '';
   if (source.rev && !source.revision) s.revision = Number(source.rev) || 0;
   if (source.cmd && !source.command) s.command = source.cmd;
   if (source.announce && !source.announcement) s.announcement = source.announce;
@@ -860,20 +864,21 @@ function sameUrl(a, b) {
 
 function receiverAudioReady() {
   const status = typeof window.__poolsideV8AudioStatus === 'function' ? window.__poolsideV8AudioStatus() : null;
-  if (status?.unlocked) return true;
-  const text = String(S.audioStatus || '').toLowerCase();
+  if (status?.unlocked || status?.webAudioPrimed || status?.audioContext === 'running') return true;
+  const text = String(status?.status || S.audioStatus || '').toLowerCase();
   if (/not been activated|blocked|failed|unavailable|denied/.test(text)) return false;
   if (/audio activated|activated by|started through|audio ready/.test(text)) return true;
   return false;
 }
 
 async function ensureReceiverAudio(reason = 'receiver action', options = {}) {
-  let unlocked = true;
+  let unlocked = receiverAudioReady();
   if (typeof window.__poolsideV8UnlockAudio === 'function') {
-    unlocked = await window.__poolsideV8UnlockAudio(reason);
+    unlocked = await window.__poolsideV8UnlockAudio(reason, options);
   }
   const status = typeof window.__poolsideV8AudioStatus === 'function' ? window.__poolsideV8AudioStatus() : null;
   S.audioStatus = status?.status || S.audioStatus;
+  unlocked = unlocked || !!status?.unlocked || !!status?.webAudioPrimed || status?.audioContext === 'running';
   receiverActive = true;
   S.receiverStatus = unlocked ? 'Receiver audio ready.' : 'Receiver online; tap Start Receiver once for sound.';
   S.receiverActiveAt = Date.now();
@@ -1266,7 +1271,7 @@ function registerSpotifyListeners() {
     spotifyPlayerReady = true;
     spotifyWebDeviceId = device_id;
     S.spotifyDeviceId = device_id;
-    S.spotifyDeviceName = 'Poolside Pulse V8 Receiver';
+    S.spotifyDeviceName = 'Poolside Pulse V8.2 Receiver';
     S.receiverStatus = 'Spotify receiver ready.';
     S.receiverLastSeen = stamp();
     setSpotifyStatus('Spotify receiver is ready on this device.', true);
@@ -1310,7 +1315,7 @@ async function primeSpotifyPlayer() {
   spotifyPrimePromise = (async () => {
     const Spotify = await ensureSpotifySdk();
     spotifyPlayer = new Spotify.Player({
-      name: 'Poolside Pulse V8 Receiver',
+      name: 'Poolside Pulse V8.2 Receiver',
       getOAuthToken: callback => spotifyAccessToken().then(callback).catch(error => setSpotifyStatus(`Spotify token failed: ${error.message}`, false)),
       volume: (Number(S.spotifyVolume) || 92) / 100
     });
@@ -1334,8 +1339,24 @@ async function activateSpotifyElement() {
   } catch {}
 }
 
+function warmSpotifyReceiver() {
+  if (S.screen !== 'home' || S.musicProvider !== 'spotify' || !spotifyLoggedIn()) return;
+  if (spotifyPlayer || spotifyPrimePromise || spotifyWarmPromise) return;
+  spotifyWarmPromise = primeSpotifyPlayer()
+    .then(() => checkSpotifyHealth(false).catch(() => {}))
+    .catch(error => {
+      S.spotifyStatus = `Spotify receiver warm-up waiting: ${error.message || error}`;
+      localSave();
+    })
+    .finally(() => {
+      spotifyWarmPromise = null;
+      renderWhenIdle();
+    });
+}
+
 async function startSpotifyReceiver({ fromTap = false } = {}) {
   if (S.screen !== 'home') throw Error('Command devices do not play sound. Open Home on the speaker-connected receiver.');
+  if (fromTap) await activateSpotifyElement();
   await ensureReceiverAudio('Spotify receiver activation', { required: true });
   const player = await primeSpotifyPlayer();
   if (fromTap) await activateSpotifyElement();
@@ -1343,7 +1364,7 @@ async function startSpotifyReceiver({ fromTap = false } = {}) {
   if (!ok) throw Error('Spotify receiver did not connect.');
   const deviceId = await waitForSpotifyReady();
   S.spotifyDeviceId = deviceId;
-  S.spotifyDeviceName = 'Poolside Pulse V8 Receiver';
+  S.spotifyDeviceName = 'Poolside Pulse V8.2 Receiver';
   S.receiverStatus = 'Spotify receiver active.';
   S.receiverLastSeen = stamp();
   receiverActive = true;
@@ -1586,7 +1607,7 @@ async function playAnnouncementBlob(blob) {
     const timer = setTimeout(() => {
       if (!started) {
         cleanup();
-        reject(Error('Announcement audio did not start. Tap Activate Receiver on this speaker-connected device.'));
+        reject(Error('Announcement audio did not start. Tap Start Receiver on this speaker-connected device.'));
       }
     }, 6500);
     audio.onplaying = () => { started = true; };
@@ -2107,7 +2128,7 @@ function receiverCanPause() {
 }
 
 function header() {
-  return `<header class="top"><div class="brand"><div class="brandMark">SS</div><div class="brandText"><b>Serenity Shores</b><small>Poolside Pulse · V8.1</small></div></div><nav class="modeSwitch"><button id="home" class="${S.screen === 'home' ? 'on' : ''}">Home</button><button id="cmd" class="${S.screen !== 'home' ? 'on' : ''}">Command</button></nav></header>`;
+  return `<header class="top"><div class="brand"><div class="brandMark">SS</div><div class="brandText"><b>Serenity Shores</b><small>Poolside Pulse · V8.2</small></div></div><nav class="modeSwitch"><button id="home" class="${S.screen === 'home' ? 'on' : ''}">Home</button><button id="cmd" class="${S.screen !== 'home' ? 'on' : ''}">Command</button></nav></header>`;
 }
 
 function nav() {
@@ -2189,7 +2210,7 @@ function homePage() {
   const label = sourceLabel(S.musicProvider, activeProviderUrl());
   const error = visibleLastError();
   const live = receiverCanPause();
-  return `${header()}<main class="home console"><section class="receiverConsole"><div class="receiverLead"><p class="eyebrow">Home Receiver · V8.1</p><h1>Sound Station</h1><p>This phone must stay on Home because it is the only device that plays Spotify, voice announcements, scheduled audio, and weather safety messages through the speakers.</p>${receiverActionButtons()}${receiverNotice()}${error ? `<div class="alert warn">${esc(error)}</div>` : ''}</div><aside class="setupPanel"><h2>Receiver Readiness</h2>${readinessSteps()}<div class="miniFacts"><b>Selected:</b> ${esc(label)}<br><b>Status:</b> ${esc(receiverReadiness())}<br><b>Audio:</b> ${esc(S.audioStatus)}</div></aside></section><section class="nowCompact"><div><p class="eyebrow">${live ? 'Now Playing' : S.intent === 'paused' ? 'Paused' : 'Ready'}</p><h2>${esc(S.musicProvider === 'spotify' ? (S.spotifyNowPlaying || 'Spotify Receiver') : current.title)}</h2><p>${esc(S.musicProvider === 'spotify' ? compactUrl(S.spotifyUrl) : `${current.artist || 'Suno'} · ${current.duration || ''}`)}</p><p class="muted">${esc(S.activeMusicLabel || label)}</p></div><div class="signal ${live ? 'live' : ''}"><span></span><span></span><span></span></div></section><section class="cards"><div class="card"><h3>Next Scheduled</h3>${next || '<p class="muted">No enabled schedule items.</p>'}</div><div class="card"><h3>Recent Receiver Log</h3>${logRows(5)}</div></section></main>`;
+  return `${header()}<main class="home console"><section class="receiverConsole"><div class="receiverLead"><p class="eyebrow">Home Receiver · V8.2</p><h1>Sound Station</h1><p>This phone must stay on Home because it is the only device that plays Spotify, voice announcements, scheduled audio, and weather safety messages through the speakers.</p>${receiverActionButtons()}${receiverNotice()}${error ? `<div class="alert warn">${esc(error)}</div>` : ''}</div><aside class="setupPanel"><h2>Receiver Readiness</h2>${readinessSteps()}<div class="miniFacts"><b>Selected:</b> ${esc(label)}<br><b>Status:</b> ${esc(receiverReadiness())}<br><b>Audio:</b> ${esc(S.audioStatus)}</div></aside></section><section class="nowCompact"><div><p class="eyebrow">${live ? 'Now Playing' : S.intent === 'paused' ? 'Paused' : 'Ready'}</p><h2>${esc(S.musicProvider === 'spotify' ? (S.spotifyNowPlaying || 'Spotify Receiver') : current.title)}</h2><p>${esc(S.musicProvider === 'spotify' ? compactUrl(S.spotifyUrl) : `${current.artist || 'Suno'} · ${current.duration || ''}`)}</p><p class="muted">${esc(S.activeMusicLabel || label)}</p></div><div class="signal ${live ? 'live' : ''}"><span></span><span></span><span></span></div></section><section class="cards"><div class="card"><h3>Next Scheduled</h3>${next || '<p class="muted">No enabled schedule items.</p>'}</div><div class="card"><h3>Recent Receiver Log</h3>${logRows(5)}</div></section></main>`;
 }
 
 function commandPage() {
@@ -2302,6 +2323,7 @@ function bind() {
     S.screen = 'home';
     localSave();
     render();
+    setTimeout(warmSpotifyReceiver, 250);
   });
   wire('cmd', async () => {
     S.screen = 'command';
@@ -2329,6 +2351,7 @@ function bind() {
   });
 
   wire('playHome', async () => {
+    if (S.musicProvider === 'spotify') await activateSpotifyElement();
     await ensureReceiverAudio('Home play button');
     if (S.musicProvider === 'spotify') {
       if (!spotifyLoggedIn()) {
@@ -2420,6 +2443,7 @@ function bind() {
     S.musicProvider = 'spotify';
     localSave();
     render();
+    await activateSpotifyElement();
     await playSpotifyUrl(S.spotifyUrl, false, { fromTap: true });
   });
   wire('makeReceiver', async () => {
@@ -2530,6 +2554,11 @@ function loadVoices() {
 window.addEventListener('poolside-v8-audio-status', event => {
   if (event.detail?.status) {
     S.audioStatus = event.detail.status;
+    if (event.detail.unlocked || event.detail.webAudioPrimed || event.detail.audioContext === 'running') {
+      S.receiverStatus = 'Receiver audio ready.';
+      S.receiverActiveAt = Date.now();
+      S.receiverLastSeen = stamp();
+    }
     localSave();
   }
 });
@@ -2543,7 +2572,7 @@ function normalizeCurrentUrl() {
   try {
     const params = new URLSearchParams(location.search);
     if (params.has('code') || params.has('state')) return;
-    if (params.get('v') === '8.1-receiver') return;
+    if (params.get('v') === '8.2-audio') return;
     history.replaceState(null, '', `/${APP_QUERY}`);
   } catch {}
 }
@@ -2552,6 +2581,7 @@ completeSpotifyLogin().finally(() => {
   normalizeCurrentUrl();
   if (S.screen !== 'home') releaseCommandReceiver('startup');
   render();
+  warmSpotifyReceiver();
   pullState();
   setInterval(pullState, 1500);
   setInterval(tick, 10000);

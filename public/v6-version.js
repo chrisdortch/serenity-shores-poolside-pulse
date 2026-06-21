@@ -1,7 +1,7 @@
 (() => {
   const VERSION = '6.3';
   const TITLE = 'Serenity Shores Poolside Pulse V6.3';
-  const LATEST_URL = '/?v=8.1-receiver&from=v6';
+  const LATEST_URL = '/?v=8.2-audio&from=v6';
 
   function ensureMeta(name, value) {
     let tag = document.querySelector(`meta[name="${name}"]`);
@@ -59,9 +59,9 @@
   function rescueOldRuntime() {
     try {
       const params = new URLSearchParams(location.search);
-      if (params.get('legacy') === '1' || params.get('v') === '8.1-receiver') return;
+      if (params.get('legacy') === '1' || params.get('v') === '8.2-audio') return;
       const banner = document.createElement('div');
-      banner.textContent = 'Updating Poolside Pulse receiver to V8.1...';
+      banner.textContent = 'Updating Poolside Pulse receiver to V8.2...';
       banner.style.cssText = 'position:fixed;z-index:99999;left:10px;right:10px;bottom:10px;padding:12px 14px;border-radius:12px;background:#101d35;color:white;font:800 15px system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;text-align:center;box-shadow:0 12px 26px rgba(0,0,0,.2);';
       document.addEventListener('DOMContentLoaded', () => document.body.appendChild(banner), { once: true });
       setTimeout(() => location.replace(LATEST_URL), 700);

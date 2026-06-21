@@ -1,11 +1,13 @@
 (() => {
-  const VERSION = '8.0';
+  const VERSION = '8.2';
   const SILENT_WAV = 'data:audio/wav;base64,UklGRigAAABXQVZFZm10IBAAAAABAAEAESsAACJWAAACABAAZGF0YQQAAAAAAA==';
   let unlocked = false;
   let unlocking = false;
   let unlockPromise = null;
   let hiddenAudio = null;
   let audioContext = null;
+  let mediaElementPrimed = false;
+  let webAudioPrimed = false;
   let lastStatus = 'Receiver audio has not been activated yet.';
 
   function isiOSLike() {
@@ -38,7 +40,15 @@
       unlocked,
       unlocking,
       isiOSLike: isiOSLike(),
+      mediaElementPrimed,
+      webAudioPrimed,
       audioContext: audioContext ? audioContext.state : 'unavailable',
+      userActivation: navigator.userActivation
+        ? {
+            isActive: !!navigator.userActivation.isActive,
+            hasBeenActive: !!navigator.userActivation.hasBeenActive
+          }
+        : null,
       status: lastStatus
     };
   }
@@ -49,33 +59,81 @@
     } catch {}
   }
 
-  async function unlock(reason = 'receiver tap') {
-    if (unlocked) return true;
-    if (unlockPromise) return await unlockPromise;
-    unlocking = true;
-    unlockPromise = (async () => {
-      const audio = getHiddenAudio();
-      audio.muted = false;
-      audio.volume = 1;
+  function wait(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  async function primeWebAudio(reason) {
+    const ctx = getAudioContext();
+    if (!ctx) return { ok: false, detail: 'Web Audio is unavailable in this browser.' };
+    try {
+      if (ctx.state !== 'running') await ctx.resume();
+      const frames = Math.max(1, Math.floor((ctx.sampleRate || 44100) * 0.03));
+      const buffer = ctx.createBuffer(1, frames, ctx.sampleRate || 44100);
+      const source = ctx.createBufferSource();
+      const gain = ctx.createGain();
+      gain.gain.setValueAtTime(0.0001, ctx.currentTime);
+      source.buffer = buffer;
+      source.connect(gain).connect(ctx.destination);
+      source.start(0);
+      source.stop(ctx.currentTime + 0.03);
+      await wait(40);
+      if (ctx.state === 'running') {
+        webAudioPrimed = true;
+        return { ok: true, detail: `Web Audio unlocked by ${reason}.` };
+      }
+      return { ok: false, detail: `Web Audio is ${ctx.state}.` };
+    } catch (error) {
+      return { ok: false, detail: error.message || String(error) };
+    }
+  }
+
+  async function primeMediaElement() {
+    const audio = getHiddenAudio();
+    try {
+      audio.muted = true;
+      audio.volume = 0;
       audio.src = SILENT_WAV;
       audio.load();
       await audio.play();
       audio.pause();
       try { audio.currentTime = 0; } catch {}
+      mediaElementPrimed = true;
+      return { ok: true, detail: 'Media element primed.' };
+    } catch (error) {
+      return { ok: false, detail: error.message || String(error) };
+    }
+  }
 
-      const ctx = getAudioContext();
-      if (ctx && ctx.state !== 'running') await ctx.resume();
-
-      unlocked = true;
-      lastStatus = `Receiver audio activated by ${reason}.`;
+  async function unlock(reason = 'receiver tap', options = {}) {
+    if (unlocked) return true;
+    if (unlockPromise) return await unlockPromise;
+    unlocking = true;
+    unlockPromise = (async () => {
+      const webAudio = await primeWebAudio(reason);
+      const mediaElement = await primeMediaElement();
+      if (webAudio.ok || mediaElement.ok) {
+        unlocked = true;
+        lastStatus = webAudio.ok
+          ? `Receiver audio unlocked by ${reason}.`
+          : `Receiver media audio unlocked by ${reason}.`;
+        dispatchStatus();
+        return true;
+      }
+      unlocked = false;
+      lastStatus = options.quiet
+        ? 'Tap Start Receiver to unlock audio on this iPhone.'
+        : `Receiver audio is still blocked. Web Audio: ${webAudio.detail} Media element: ${mediaElement.detail}`;
       dispatchStatus();
-      return true;
+      return false;
     })();
     try {
       return await unlockPromise;
     } catch (error) {
       unlocked = false;
-      lastStatus = `Receiver audio is still blocked: ${error.message || error}`;
+      lastStatus = options.quiet
+        ? 'Tap Start Receiver to unlock audio on this iPhone.'
+        : `Receiver audio is still blocked: ${error.message || error}`;
       dispatchStatus();
       return false;
     } finally {
@@ -95,6 +153,7 @@
     const ctx = getAudioContext();
     if (!ctx) return false;
     if (ctx.state !== 'running') await ctx.resume();
+    if (ctx.state !== 'running') throw Error(`Web Audio is ${ctx.state}; tap Start Receiver on this phone.`);
     const buffer = await decodeAudio(ctx, await blob.arrayBuffer());
     const source = ctx.createBufferSource();
     const gain = ctx.createGain();
@@ -157,7 +216,7 @@
       const startTimer = setTimeout(() => {
         if (!started) {
           cleanup();
-          reject(Error('Announcement audio did not start. Tap Activate Receiver on this speaker-connected device.'));
+          reject(Error('Announcement audio did not start. Tap Start Receiver on this speaker-connected device.'));
         }
       }, 6500);
       audio.addEventListener('playing', onPlaying);
@@ -186,9 +245,10 @@
   window.__poolsideV8PlayAnnouncementBlob = playBlob;
 
   const passive = { capture: true, passive: true };
-  document.addEventListener('pointerdown', () => unlock('pointer tap'), passive);
-  document.addEventListener('touchend', () => unlock('touch'), passive);
-  document.addEventListener('click', () => unlock('click'), { capture: true });
+  document.addEventListener('pointerdown', () => unlock('screen tap', { quiet: true }), passive);
+  document.addEventListener('touchend', () => unlock('touch', { quiet: true }), passive);
+  document.addEventListener('click', () => unlock('click', { quiet: true }), { capture: true });
+  document.addEventListener('visibilitychange', dispatchStatus);
   document.addEventListener('DOMContentLoaded', dispatchStatus);
   dispatchStatus();
 })();
