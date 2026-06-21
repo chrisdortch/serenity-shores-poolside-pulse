@@ -5,7 +5,7 @@ function json(res, status, body) {
   res.end(JSON.stringify(body));
 }
 
-const STATE_KEY = 'serenity-shores-poolside-radio-v33';
+const STATE_KEY = 'serenity-shores-poolside-radio-v9';
 
 // Safe fallback: lets preview/admin/Home sync work even before Vercel KV/Upstash is configured.
 // For production/life-safety reliability, add KV_REST_API_URL and KV_REST_API_TOKEN in Vercel.
