@@ -537,11 +537,39 @@ body {
   font-weight: 850;
 }
 
+.stepButton {
+  width: 100%;
+  color: var(--amber);
+  text-align: left;
+  box-shadow: none;
+  cursor: pointer;
+}
+
+.stepButton:hover {
+  filter: none;
+  border-color: var(--amber);
+  background: #fff3dc;
+}
+
 .step span {
   width: 48px;
+  flex: none;
   color: var(--muted);
   font-size: .72rem;
   letter-spacing: .08em;
+}
+
+.step strong {
+  display: block;
+  min-width: 0;
+}
+
+.step small {
+  display: block;
+  color: var(--muted);
+  font-size: .78rem;
+  font-weight: 800;
+  line-height: 1.25;
 }
 
 .step.done {

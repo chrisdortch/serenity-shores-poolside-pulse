@@ -1,7 +1,7 @@
 {
-  "name": "Serenity Shores Poolside Pulse V8",
-  "short_name": "Pulse V8",
-  "start_url": "/?v=8.0-rescue",
+  "name": "Serenity Shores Poolside Pulse V8.1",
+  "short_name": "Pulse V8.1",
+  "start_url": "/?v=8.1-receiver",
   "display": "standalone",
   "background_color": "#f6fbfd",
   "theme_color": "#0789a5",

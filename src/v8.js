@@ -1,11 +1,11 @@
-const VERSION = '8.0';
+const VERSION = '8.1';
 const PIN = '7900';
 const KEY = 'poolside-pulse-v8';
 const DEVICE_KEY = 'poolside-pulse-v8-device-id';
 const HANDLED_KEY = 'poolside-pulse-v8-handled-events';
 const LOG_CLEAR_KEY = 'poolside-pulse-v8-log-cleared-at';
 const SPOTIFY_TOKEN_KEY = 'poolside-pulse-v8-spotify-token';
-const APP_QUERY = '?v=8.0-rescue';
+const APP_QUERY = '?v=8.1-receiver';
 const LEGACY_STATE_KEYS = [
   'poolside-pulse-v7',
   'poolside-pulse-v6',
@@ -2085,19 +2085,29 @@ function logRows(limit = 60) {
 
 function receiverReadiness() {
   if (S.screen !== 'home') return 'Command only; Home receivers play sound.';
-  if (!receiverActive) return 'Tap Activate Receiver on this speaker-connected device.';
+  if (!receiverAudioReady()) return 'Tap Start Receiver on this speaker-connected phone.';
   if (S.musicProvider === 'spotify') {
     if (!spotifyLoggedIn()) return 'Spotify login needed on receiver.';
     if (S.spotifyAccountProduct && S.spotifyAccountProduct !== 'premium') return `Spotify Premium needed: ${S.spotifyAccountProduct}.`;
-    if (S.spotifyNeedsTap) return 'Tap Activate + Play Spotify on receiver.';
+    if (!spotifyDeviceReady()) return 'Tap Start Spotify Receiver on this phone.';
     if (spotifyPlayerReady && spotifyWebDeviceId) return `Ready: ${S.spotifyDeviceName || 'Poolside Pulse receiver'}.`;
     return 'Start Spotify on this receiver.';
   }
   return hasPlayableSuno() ? 'Suno queue ready.' : 'Import Suno queue.';
 }
 
+function spotifyDeviceReady() {
+  return S.musicProvider !== 'spotify' || (spotifyPlayerReady && !!spotifyWebDeviceId && !S.spotifyNeedsTap);
+}
+
+function receiverCanPause() {
+  if (S.intent !== 'playing' || !receiverAudioReady()) return false;
+  if (S.musicProvider === 'spotify') return spotifyDeviceReady();
+  return true;
+}
+
 function header() {
-  return `<header class="top"><div class="brand"><div class="brandMark">SS</div><div class="brandText"><b>Serenity Shores</b><small>Poolside Pulse · V8</small></div></div><nav class="modeSwitch"><button id="home" class="${S.screen === 'home' ? 'on' : ''}">Home</button><button id="cmd" class="${S.screen !== 'home' ? 'on' : ''}">Command</button></nav></header>`;
+  return `<header class="top"><div class="brand"><div class="brandMark">SS</div><div class="brandText"><b>Serenity Shores</b><small>Poolside Pulse · V8.1</small></div></div><nav class="modeSwitch"><button id="home" class="${S.screen === 'home' ? 'on' : ''}">Home</button><button id="cmd" class="${S.screen !== 'home' ? 'on' : ''}">Command</button></nav></header>`;
 }
 
 function nav() {
@@ -2131,28 +2141,39 @@ function statusCards() {
 function readinessSteps() {
   const audioOk = receiverAudioReady();
   const spotifyOk = S.musicProvider !== 'spotify' || spotifyLoggedIn();
-  const deviceOk = S.musicProvider !== 'spotify' || (spotifyPlayerReady && !!spotifyWebDeviceId && !S.spotifyNeedsTap);
+  const deviceOk = spotifyDeviceReady();
   const steps = [
-    ['Home receiver open', true],
-    ['Audio unlocked', audioOk],
-    ['Spotify logged in', spotifyOk],
-    ['Spotify device ready', deviceOk],
-    ['KV sync', !!S.sync]
+    { label: 'Home receiver open', ok: true, action: '', help: 'This screen is open.' },
+    { label: 'Audio unlocked', ok: audioOk, action: 'audio', help: 'Tap to unlock iPhone speaker audio.' },
+    { label: 'Spotify logged in', ok: spotifyOk, action: 'login', help: 'Tap to connect Spotify on this receiver.' },
+    { label: 'Spotify device ready', ok: deviceOk, action: 'spotify', help: 'Tap to make this phone the Spotify speaker device.' },
+    { label: 'KV sync', ok: !!S.sync, action: 'sync', help: 'Tap to refresh cloud sync.' }
   ];
-  return `<div class="steps">${steps.map(([label, ok]) => `<div class="step ${ok ? 'done' : 'todo'}"><span>${ok ? 'OK' : 'TODO'}</span>${esc(label)}</div>`).join('')}</div>`;
+  return `<div class="steps">${steps.map(step => {
+    const inner = `<span>${step.ok ? 'OK' : 'TODO'}</span><strong>${esc(step.label)}</strong>${step.ok ? '' : `<small>${esc(step.help)}</small>`}`;
+    return step.ok || !step.action
+      ? `<div class="step done">${inner}</div>`
+      : `<button type="button" class="step todo stepButton" data-ready-action="${esc(step.action)}">${inner}</button>`;
+  }).join('')}</div>`;
 }
 
 function receiverActionButtons() {
   const spotifyMode = S.musicProvider === 'spotify';
   const needsLogin = spotifyMode && !spotifyLoggedIn();
+  const needsStart = !receiverAudioReady() || (spotifyMode && !spotifyDeviceReady());
+  const label = receiverCanPause()
+    ? 'Pause Music'
+    : needsStart
+      ? (spotifyMode ? 'Start Receiver + Spotify' : 'Start Receiver')
+      : 'Play / Resume Music';
   const primary = needsLogin
     ? '<button id="spotifyLoginHome" class="primaryWide">Login Spotify on This Receiver</button>'
-    : `<button id="playHome" class="primaryWide">${esc(S.intent === 'playing' ? 'Pause Music' : spotifyMode ? 'Start Receiver + Play' : 'Start Receiver')}</button>`;
+    : `<button id="playHome" class="primaryWide">${esc(label)}</button>`;
   return `<div class="receiverActions">${primary}<button id="checkWeatherHome" class="secondary">Check Weather</button><button id="skipHome" class="secondary">Skip</button><button id="stopHome" class="secondary">Stop</button></div>`;
 }
 
 function receiverNotice() {
-  const message = S.setupNotice || (!receiverAudioReady() ? 'Tap Start Receiver once on the speaker-connected phone. iPhone browsers require this before music or announcements can be heard.' : '');
+  const message = S.setupNotice || (!receiverAudioReady() ? 'Tap the big Start Receiver button or the Audio unlocked TODO row. iPhone browsers require one tap here before music or announcements can be heard.' : '');
   return message ? `<div class="actionNotice"><b>Next step:</b> ${esc(message)}</div>` : '';
 }
 
@@ -2162,7 +2183,8 @@ function homePage() {
     .map(item => `<p class="line"><b>${pretty(schedTime(item))}</b><span>${esc(item.label)}</span></p>`).join('');
   const label = sourceLabel(S.musicProvider, activeProviderUrl());
   const error = visibleLastError();
-  return `${header()}<main class="home console"><section class="receiverConsole"><div class="receiverLead"><p class="eyebrow">Home Receiver · V8</p><h1>Sound Station</h1><p>This phone must stay on Home because it is the only device that plays Spotify, voice announcements, scheduled audio, and weather safety messages through the speakers.</p>${receiverActionButtons()}${receiverNotice()}${error ? `<div class="alert warn">${esc(error)}</div>` : ''}</div><aside class="setupPanel"><h2>Receiver Readiness</h2>${readinessSteps()}<div class="miniFacts"><b>Selected:</b> ${esc(label)}<br><b>Status:</b> ${esc(receiverReadiness())}<br><b>Audio:</b> ${esc(S.audioStatus)}</div></aside></section><section class="nowCompact"><div><p class="eyebrow">${S.intent === 'playing' ? 'Now Playing' : S.intent === 'paused' ? 'Paused' : 'Ready'}</p><h2>${esc(S.musicProvider === 'spotify' ? (S.spotifyNowPlaying || 'Spotify Receiver') : current.title)}</h2><p>${esc(S.musicProvider === 'spotify' ? compactUrl(S.spotifyUrl) : `${current.artist || 'Suno'} · ${current.duration || ''}`)}</p><p class="muted">${esc(S.activeMusicLabel || label)}</p></div><div class="signal ${S.intent === 'playing' ? 'live' : ''}"><span></span><span></span><span></span></div></section><section class="cards"><div class="card"><h3>Next Scheduled</h3>${next || '<p class="muted">No enabled schedule items.</p>'}</div><div class="card"><h3>Recent Receiver Log</h3>${logRows(5)}</div></section></main>`;
+  const live = receiverCanPause();
+  return `${header()}<main class="home console"><section class="receiverConsole"><div class="receiverLead"><p class="eyebrow">Home Receiver · V8.1</p><h1>Sound Station</h1><p>This phone must stay on Home because it is the only device that plays Spotify, voice announcements, scheduled audio, and weather safety messages through the speakers.</p>${receiverActionButtons()}${receiverNotice()}${error ? `<div class="alert warn">${esc(error)}</div>` : ''}</div><aside class="setupPanel"><h2>Receiver Readiness</h2>${readinessSteps()}<div class="miniFacts"><b>Selected:</b> ${esc(label)}<br><b>Status:</b> ${esc(receiverReadiness())}<br><b>Audio:</b> ${esc(S.audioStatus)}</div></aside></section><section class="nowCompact"><div><p class="eyebrow">${live ? 'Now Playing' : S.intent === 'paused' ? 'Paused' : 'Ready'}</p><h2>${esc(S.musicProvider === 'spotify' ? (S.spotifyNowPlaying || 'Spotify Receiver') : current.title)}</h2><p>${esc(S.musicProvider === 'spotify' ? compactUrl(S.spotifyUrl) : `${current.artist || 'Suno'} · ${current.duration || ''}`)}</p><p class="muted">${esc(S.activeMusicLabel || label)}</p></div><div class="signal ${live ? 'live' : ''}"><span></span><span></span><span></span></div></section><section class="cards"><div class="card"><h3>Next Scheduled</h3>${next || '<p class="muted">No enabled schedule items.</p>'}</div><div class="card"><h3>Recent Receiver Log</h3>${logRows(5)}</div></section></main>`;
 }
 
 function commandPage() {
@@ -2248,6 +2270,28 @@ function applyQuickTemplate() {
   localSave();
 }
 
+async function handleReadinessAction(action) {
+  if (action === 'login') {
+    await spotifyLogin();
+    return;
+  }
+  if (action === 'sync') {
+    await pushState('KV sync refreshed from receiver.');
+    await pullState();
+    return;
+  }
+  if (action === 'audio') {
+    await ensureReceiverAudio('readiness audio tap', { required: true });
+    setFeedback('Receiver audio is unlocked on this phone.', true);
+    await pushState('Receiver audio activation logged.', { render: false });
+    renderWhenIdle();
+    return;
+  }
+  if (action === 'spotify') {
+    await playSpotifyUrl(S.spotifyUrl, false, { fromTap: true });
+  }
+}
+
 function bind() {
   wire('home', async () => {
     S.screen = 'home';
@@ -2282,10 +2326,10 @@ function bind() {
   wire('playHome', async () => {
     await ensureReceiverAudio('Home play button');
     if (S.musicProvider === 'spotify') {
-      if (S.intent === 'playing') await spotifyPause(false);
+      if (receiverCanPause()) await spotifyPause(false);
       else await playSpotifyUrl(S.spotifyUrl, false, { fromTap: true });
     } else {
-      if (S.intent === 'playing') await pauseSuno(false);
+      if (receiverCanPause()) await pauseSuno(false);
       else await playSuno(false);
     }
   });
@@ -2293,6 +2337,13 @@ function bind() {
   wire('stopHome', () => stopSelected(false));
   wire('checkWeatherHome', () => triggerWeatherCheck());
   wire('spotifyLoginHome', spotifyLogin);
+  document.querySelectorAll('[data-ready-action]').forEach(button => {
+    button.onclick = () => Promise.resolve(handleReadinessAction(button.dataset.readyAction)).catch(error => {
+      if (isActionNeeded(error)) setActionNeeded(error.message || String(error));
+      else setFeedback(error.message || String(error), false);
+      renderWhenIdle();
+    });
+  });
 
   wire('playCmd', () => playSelected(true));
   wire('pauseCmd', () => pauseSelected(true));
@@ -2482,7 +2533,7 @@ function normalizeCurrentUrl() {
   try {
     const params = new URLSearchParams(location.search);
     if (params.has('code') || params.has('state')) return;
-    if (params.get('v') === '8.0-rescue') return;
+    if (params.get('v') === '8.1-receiver') return;
     history.replaceState(null, '', `/${APP_QUERY}`);
   } catch {}
 }
