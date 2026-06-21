@@ -1,11 +1,12 @@
-const VERSION = '8.2';
+const VERSION = '8.3';
 const PIN = '7900';
 const KEY = 'poolside-pulse-v8';
 const DEVICE_KEY = 'poolside-pulse-v8-device-id';
 const HANDLED_KEY = 'poolside-pulse-v8-handled-events';
 const LOG_CLEAR_KEY = 'poolside-pulse-v8-log-cleared-at';
+const RECEIVER_SESSION_KEY = 'poolside-pulse-v8-receiver-session-started-at';
 const SPOTIFY_TOKEN_KEY = 'poolside-pulse-v8-spotify-token';
-const APP_QUERY = '?v=8.2-audio';
+const APP_QUERY = '?v=8.3-fresh-session';
 const LEGACY_STATE_KEYS = [
   'poolside-pulse-v7',
   'poolside-pulse-v6',
@@ -44,6 +45,7 @@ const EVENT_TTL_MS = 90 * 60 * 1000;
 const EVENT_LIMIT = 120;
 const LOG_LIMIT = 180;
 const EVENT_RETRY_MS = 9000;
+const RECEIVER_EVENT_GRACE_MS = 3000;
 const OLD_AUDIO_BLOCK_PATTERN = /play\(\) failed|goo\.gl\/xX8pDD|play method is not allowed|user did(?:n't| not) interact|user agent or the platform/i;
 
 const DEFAULT_ANNS = [
@@ -652,10 +654,52 @@ function unmarkHandled(id) {
   saveHandledMap(map);
 }
 
+function receiverSessionStartedAt() {
+  return Number(storageGet(RECEIVER_SESSION_KEY) || 0) || 0;
+}
+
+function receiverCanProcessEvents() {
+  return S.screen === 'home' && receiverActive && receiverAudioReady() && receiverSessionStartedAt() > 0;
+}
+
+function markOlderEventsHandled(startAt) {
+  const now = Date.now();
+  const map = handledMap();
+  for (const event of recentEvents(S.events)) {
+    if (event?.id && eventTime(event) < startAt - RECEIVER_EVENT_GRACE_MS) {
+      map[event.id] = now;
+      delete retryAfter[event.id];
+    }
+  }
+  saveHandledMap(map);
+}
+
+function beginReceiverSession(reason = 'receiver start') {
+  const startedAt = Date.now();
+  storageSet(RECEIVER_SESSION_KEY, String(startedAt));
+  markOlderEventsHandled(startedAt);
+  if (Number(S.lightningClearAt || 0) && Number(S.lightningClearAt) < startedAt) {
+    S.lightningClearAt = 0;
+    S.lightningAllClearSent = true;
+  }
+  S.setupNotice = '';
+  S.receiverActiveAt = startedAt;
+  S.receiverLastSeen = stamp(startedAt);
+  logEvent('receiver', 'Fresh receiver session', `${reason}; older commands ignored on this receiver.`);
+  localSave();
+  return startedAt;
+}
+
 function shouldProcessEvent(event) {
   if (!event?.id || wasHandled(event.id) || inFlightEvents.has(event.id)) return false;
-  if (eventTime(event) < Date.now() - EVENT_TTL_MS) return false;
+  const ts = eventTime(event);
+  if (ts < Date.now() - EVENT_TTL_MS) return false;
   if (event.target && !/home|receiver|receivers|all/i.test(event.target)) return false;
+  if (S.screen === 'home') {
+    const startedAt = receiverSessionStartedAt();
+    if (!receiverCanProcessEvents()) return false;
+    if (ts < startedAt - RECEIVER_EVENT_GRACE_MS) return false;
+  }
   if (Date.now() < Number(retryAfter[event.id] || 0)) return false;
   return true;
 }
@@ -716,7 +760,7 @@ function commandTitle(type) {
 }
 
 async function processEvents() {
-  if (S.screen !== 'home') return;
+  if (!receiverCanProcessEvents()) return;
   const events = recentEvents(S.events).filter(shouldProcessEvent);
   for (const event of events) {
     await processEvent(event);
@@ -732,13 +776,20 @@ async function processEvent(event) {
     markHandled(event.id);
     await pushState('', { render: false });
   } catch (error) {
-    unmarkHandled(event.id);
-    retryAfter[event.id] = Date.now() + EVENT_RETRY_MS;
     const message = error.message || String(error);
-    logEvent('receiver', 'Event waiting on receiver', message, { eventId: event.id });
-    if (isActionNeeded(error)) setActionNeeded(message);
-    else setFeedback(`Receiver will retry ${event.kind || 'event'}: ${message}`, false);
-    await pushState('Receiver event is waiting and will retry.', { render: false });
+    if (isActionNeeded(error)) {
+      markHandled(event.id);
+      delete retryAfter[event.id];
+      const next = /send the command again/i.test(message) ? message : `${message} After this receiver is ready, send the command again.`;
+      logEvent('receiver', 'Event needs receiver action', next, { eventId: event.id });
+      setActionNeeded(next);
+    } else {
+      unmarkHandled(event.id);
+      retryAfter[event.id] = Date.now() + EVENT_RETRY_MS;
+      logEvent('receiver', 'Event waiting on receiver', message, { eventId: event.id });
+      setFeedback(`Receiver will retry ${event.kind || 'event'}: ${message}`, false);
+    }
+    await pushState('', { render: false });
   } finally {
     inFlightEvents.delete(event.id);
   }
@@ -883,6 +934,7 @@ async function ensureReceiverAudio(reason = 'receiver action', options = {}) {
   S.receiverStatus = unlocked ? 'Receiver audio ready.' : 'Receiver online; tap Start Receiver once for sound.';
   S.receiverActiveAt = Date.now();
   S.receiverLastSeen = stamp();
+  if (unlocked && options.startSession) beginReceiverSession(reason);
   if (!unlocked) {
     S.setupNotice = 'Tap Start Receiver on this speaker-connected phone once. iPhone browsers require that tap before music or announcements can be heard.';
   }
@@ -1271,7 +1323,7 @@ function registerSpotifyListeners() {
     spotifyPlayerReady = true;
     spotifyWebDeviceId = device_id;
     S.spotifyDeviceId = device_id;
-    S.spotifyDeviceName = 'Poolside Pulse V8.2 Receiver';
+    S.spotifyDeviceName = 'Poolside Pulse V8.3 Receiver';
     S.receiverStatus = 'Spotify receiver ready.';
     S.receiverLastSeen = stamp();
     setSpotifyStatus('Spotify receiver is ready on this device.', true);
@@ -1315,7 +1367,7 @@ async function primeSpotifyPlayer() {
   spotifyPrimePromise = (async () => {
     const Spotify = await ensureSpotifySdk();
     spotifyPlayer = new Spotify.Player({
-      name: 'Poolside Pulse V8.2 Receiver',
+      name: 'Poolside Pulse V8.3 Receiver',
       getOAuthToken: callback => spotifyAccessToken().then(callback).catch(error => setSpotifyStatus(`Spotify token failed: ${error.message}`, false)),
       volume: (Number(S.spotifyVolume) || 92) / 100
     });
@@ -1340,7 +1392,7 @@ async function activateSpotifyElement() {
 }
 
 function warmSpotifyReceiver() {
-  if (S.screen !== 'home' || S.musicProvider !== 'spotify' || !spotifyLoggedIn()) return;
+  if (S.screen !== 'home' || !receiverSessionStartedAt() || !receiverAudioReady() || S.musicProvider !== 'spotify' || !spotifyLoggedIn()) return;
   if (spotifyPlayer || spotifyPrimePromise || spotifyWarmPromise) return;
   spotifyWarmPromise = primeSpotifyPlayer()
     .then(() => checkSpotifyHealth(false).catch(() => {}))
@@ -1357,14 +1409,14 @@ function warmSpotifyReceiver() {
 async function startSpotifyReceiver({ fromTap = false } = {}) {
   if (S.screen !== 'home') throw Error('Command devices do not play sound. Open Home on the speaker-connected receiver.');
   if (fromTap) await activateSpotifyElement();
-  await ensureReceiverAudio('Spotify receiver activation', { required: true });
+  await ensureReceiverAudio('Spotify receiver activation', { required: true, startSession: fromTap || !receiverSessionStartedAt() });
   const player = await primeSpotifyPlayer();
   if (fromTap) await activateSpotifyElement();
   const ok = spotifyPlayerReady || await player.connect();
   if (!ok) throw Error('Spotify receiver did not connect.');
   const deviceId = await waitForSpotifyReady();
   S.spotifyDeviceId = deviceId;
-  S.spotifyDeviceName = 'Poolside Pulse V8.2 Receiver';
+  S.spotifyDeviceName = 'Poolside Pulse V8.3 Receiver';
   S.receiverStatus = 'Spotify receiver active.';
   S.receiverLastSeen = stamp();
   receiverActive = true;
@@ -1509,6 +1561,7 @@ async function checkSpotifyHealth(renderAfter = true) {
 function releaseCommandReceiver(reason = 'command mode') {
   if (S.screen === 'home') return;
   receiverActive = false;
+  storageRemove(RECEIVER_SESSION_KEY);
   if (spotifyPlayer && typeof spotifyPlayer.disconnect === 'function') {
     try { spotifyPlayer.disconnect(); } catch {}
   }
@@ -1880,7 +1933,7 @@ function saveRow(index) {
 }
 
 async function tick() {
-  if (S.screen !== 'home' || !receiverActive || speaking) return;
+  if (!receiverCanProcessEvents() || speaking) return;
   if (S.lightningClearAt && Date.now() >= Number(S.lightningClearAt) && !S.lightningAllClearSent) {
     S.lightningAllClearSent = true;
     S.lightningClearAt = 0;
@@ -2106,6 +2159,7 @@ function logRows(limit = 60) {
 
 function receiverReadiness() {
   if (S.screen !== 'home') return 'Command only; Home receivers play sound.';
+  if (!receiverSessionStartedAt()) return 'Tap Start Receiver to begin a fresh receiver session.';
   if (!receiverAudioReady()) return 'Tap Start Receiver on this speaker-connected phone.';
   if (S.musicProvider === 'spotify') {
     if (!spotifyLoggedIn()) return 'Spotify login needed on receiver.';
@@ -2128,7 +2182,7 @@ function receiverCanPause() {
 }
 
 function header() {
-  return `<header class="top"><div class="brand"><div class="brandMark">SS</div><div class="brandText"><b>Serenity Shores</b><small>Poolside Pulse · V8.2</small></div></div><nav class="modeSwitch"><button id="home" class="${S.screen === 'home' ? 'on' : ''}">Home</button><button id="cmd" class="${S.screen !== 'home' ? 'on' : ''}">Command</button></nav></header>`;
+  return `<header class="top"><div class="brand"><div class="brandMark">SS</div><div class="brandText"><b>Serenity Shores</b><small>Poolside Pulse · V8.3</small></div></div><nav class="modeSwitch"><button id="home" class="${S.screen === 'home' ? 'on' : ''}">Home</button><button id="cmd" class="${S.screen !== 'home' ? 'on' : ''}">Command</button></nav></header>`;
 }
 
 function nav() {
@@ -2155,16 +2209,21 @@ function login() {
 }
 
 function statusCards() {
-  const inbox = S.screen === 'home' ? recentEvents(S.events).filter(shouldProcessEvent).length : recentEvents(S.events).length;
+  const startedAt = receiverSessionStartedAt() || Number(S.receiverActiveAt || 0) || Date.now();
+  const inbox = S.screen === 'home'
+    ? recentEvents(S.events).filter(shouldProcessEvent).length
+    : recentEvents(S.events).filter(event => eventTime(event) >= startedAt - RECEIVER_EVENT_GRACE_MS).length;
   return `<div class="stats"><div class="stat"><b>Selected</b><strong>${esc(sourceLabel(S.musicProvider, activeProviderUrl()))}</strong></div><div class="stat"><b>Receiver</b><strong>${esc(S.screen === 'home' ? receiverReadiness() : (S.receiverStatus || 'No receiver report yet.'))}</strong></div><div class="stat"><b>Remote</b><strong>Event inbox ${inbox}</strong></div><div class="stat"><b>Announcements</b><strong>${Math.round(Number(S.announcementGain || 1) * 100)}% / music ${esc(S.spotifyDuckedVolume)}%</strong></div></div>`;
 }
 
 function readinessSteps() {
   const audioOk = receiverAudioReady();
+  const sessionOk = receiverSessionStartedAt() > 0;
   const spotifyOk = S.musicProvider !== 'spotify' || spotifyLoggedIn();
   const deviceOk = spotifyDeviceReady();
   const steps = [
     { label: 'Home receiver open', ok: true, action: '', help: 'This screen is open.' },
+    { label: 'Fresh session', ok: sessionOk, action: 'audio', help: 'Tap to ignore old commands and start clean.' },
     { label: 'Audio unlocked', ok: audioOk, action: 'audio', help: 'Tap to unlock iPhone speaker audio.' },
     { label: 'Spotify logged in', ok: spotifyOk, action: 'login', help: 'Tap to connect Spotify on this receiver.' },
     { label: 'Spotify device ready', ok: deviceOk, action: 'spotify', help: 'Tap to make this phone the Spotify speaker device.' },
@@ -2196,7 +2255,7 @@ function receiverActionButtons() {
 
 function receiverNotice() {
   let message = '';
-  if (!receiverAudioReady()) message = 'Tap the big Start Receiver button or the Audio unlocked TODO row. iPhone browsers require one tap here before music or announcements can be heard.';
+  if (!receiverSessionStartedAt() || !receiverAudioReady()) message = 'Tap the big Start Receiver button. That one tap starts a fresh receiver session, ignores old commands, and unlocks iPhone audio.';
   else if (S.musicProvider === 'spotify' && !spotifyLoggedIn()) message = 'Tap Login Spotify on This Receiver. Spotify must be connected on the speaker phone, not on a Command laptop.';
   else if (S.musicProvider === 'spotify' && !spotifyDeviceReady()) message = 'Tap Start Receiver + Spotify or the Spotify device ready TODO row to make this phone the speaker device.';
   else message = S.setupNotice || '';
@@ -2210,7 +2269,7 @@ function homePage() {
   const label = sourceLabel(S.musicProvider, activeProviderUrl());
   const error = visibleLastError();
   const live = receiverCanPause();
-  return `${header()}<main class="home console"><section class="receiverConsole"><div class="receiverLead"><p class="eyebrow">Home Receiver · V8.2</p><h1>Sound Station</h1><p>This phone must stay on Home because it is the only device that plays Spotify, voice announcements, scheduled audio, and weather safety messages through the speakers.</p>${receiverActionButtons()}${receiverNotice()}${error ? `<div class="alert warn">${esc(error)}</div>` : ''}</div><aside class="setupPanel"><h2>Receiver Readiness</h2>${readinessSteps()}<div class="miniFacts"><b>Selected:</b> ${esc(label)}<br><b>Status:</b> ${esc(receiverReadiness())}<br><b>Audio:</b> ${esc(S.audioStatus)}</div></aside></section><section class="nowCompact"><div><p class="eyebrow">${live ? 'Now Playing' : S.intent === 'paused' ? 'Paused' : 'Ready'}</p><h2>${esc(S.musicProvider === 'spotify' ? (S.spotifyNowPlaying || 'Spotify Receiver') : current.title)}</h2><p>${esc(S.musicProvider === 'spotify' ? compactUrl(S.spotifyUrl) : `${current.artist || 'Suno'} · ${current.duration || ''}`)}</p><p class="muted">${esc(S.activeMusicLabel || label)}</p></div><div class="signal ${live ? 'live' : ''}"><span></span><span></span><span></span></div></section><section class="cards"><div class="card"><h3>Next Scheduled</h3>${next || '<p class="muted">No enabled schedule items.</p>'}</div><div class="card"><h3>Recent Receiver Log</h3>${logRows(5)}</div></section></main>`;
+  return `${header()}<main class="home console"><section class="receiverConsole"><div class="receiverLead"><p class="eyebrow">Home Receiver · V8.3</p><h1>Sound Station</h1><p>This phone must stay on Home because it is the only device that plays Spotify, voice announcements, scheduled audio, and weather safety messages through the speakers.</p>${receiverActionButtons()}${receiverNotice()}${error ? `<div class="alert warn">${esc(error)}</div>` : ''}</div><aside class="setupPanel"><h2>Receiver Readiness</h2>${readinessSteps()}<div class="miniFacts"><b>Selected:</b> ${esc(label)}<br><b>Status:</b> ${esc(receiverReadiness())}<br><b>Audio:</b> ${esc(S.audioStatus)}</div></aside></section><section class="nowCompact"><div><p class="eyebrow">${live ? 'Now Playing' : S.intent === 'paused' ? 'Paused' : 'Ready'}</p><h2>${esc(S.musicProvider === 'spotify' ? (S.spotifyNowPlaying || 'Spotify Receiver') : current.title)}</h2><p>${esc(S.musicProvider === 'spotify' ? compactUrl(S.spotifyUrl) : `${current.artist || 'Suno'} · ${current.duration || ''}`)}</p><p class="muted">${esc(S.activeMusicLabel || label)}</p></div><div class="signal ${live ? 'live' : ''}"><span></span><span></span><span></span></div></section><section class="cards"><div class="card"><h3>Next Scheduled</h3>${next || '<p class="muted">No enabled schedule items.</p>'}</div><div class="card"><h3>Recent Receiver Log</h3>${logRows(5)}</div></section></main>`;
 }
 
 function commandPage() {
@@ -2307,7 +2366,7 @@ async function handleReadinessAction(action) {
     return;
   }
   if (action === 'audio') {
-    await ensureReceiverAudio('readiness audio tap', { required: true });
+    await ensureReceiverAudio('readiness audio tap', { required: true, startSession: true });
     setFeedback('Receiver audio is unlocked on this phone.', true);
     await pushState('Receiver audio activation logged.', { render: false });
     renderWhenIdle();
@@ -2352,7 +2411,7 @@ function bind() {
 
   wire('playHome', async () => {
     if (S.musicProvider === 'spotify') await activateSpotifyElement();
-    await ensureReceiverAudio('Home play button');
+    await ensureReceiverAudio('Home play button', { startSession: true });
     if (S.musicProvider === 'spotify') {
       if (!spotifyLoggedIn()) {
         setActionNeeded('Receiver audio is unlocked. Now tap Login Spotify on This Receiver.');
@@ -2572,7 +2631,7 @@ function normalizeCurrentUrl() {
   try {
     const params = new URLSearchParams(location.search);
     if (params.has('code') || params.has('state')) return;
-    if (params.get('v') === '8.2-audio') return;
+    if (params.get('v') === '8.3-fresh-session') return;
     history.replaceState(null, '', `/${APP_QUERY}`);
   } catch {}
 }

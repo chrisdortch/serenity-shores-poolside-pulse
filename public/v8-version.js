@@ -1,7 +1,7 @@
 (() => {
-  const VERSION = '8.2';
-  const TITLE = 'Serenity Shores Poolside Pulse V8.2';
-  const DESCRIPTION = 'Serenity Shores Poolside Pulse V8.2: iPhone receiver audio unlock, reliable command events, Spotify playback, AI voice announcements, weather checks, and schedule control.';
+  const VERSION = '8.3';
+  const TITLE = 'Serenity Shores Poolside Pulse V8.3';
+  const DESCRIPTION = 'Serenity Shores Poolside Pulse V8.3: fresh receiver sessions, iPhone audio unlock, reliable command events, Spotify playback, AI voice announcements, weather checks, and schedule control.';
 
   function ensureMeta(name, value) {
     let tag = document.querySelector(`meta[name="${name}"]`);

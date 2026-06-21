@@ -1,5 +1,5 @@
 (() => {
-  const VERSION = '8.2';
+  const VERSION = '8.3';
   const SILENT_WAV = 'data:audio/wav;base64,UklGRigAAABXQVZFZm10IBAAAAABAAEAESsAACJWAAACABAAZGF0YQQAAAAAAA==';
   let unlocked = false;
   let unlocking = false;
