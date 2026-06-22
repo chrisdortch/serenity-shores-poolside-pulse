@@ -3261,6 +3261,10 @@ window.addEventListener('poolside-v9-audio-status', event => {
       S.receiverStatus = 'Receiver audio ready.';
       S.receiverActiveAt = Date.now();
       S.receiverLastSeen = stamp();
+    } else if (/not been activated|blocked|failed|unavailable|denied/i.test(event.detail.status)) {
+      receiverActive = false;
+      S.receiverStatus = 'Receiver online; tap Start Receiver once for sound.';
+      S.receiverActiveAt = 0;
     }
     localSave();
   }
