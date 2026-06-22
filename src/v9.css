@@ -69,6 +69,14 @@ input, textarea, select {
   font-weight: 750;
 }
 
+input[type="range"] {
+  min-height: 38px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  accent-color: var(--teal);
+}
+
 textarea {
   min-height: 104px;
   resize: vertical;
@@ -867,6 +875,42 @@ button[aria-busy="true"]::after {
   margin-top: 10px;
 }
 
+.volumeStrip {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px 14px;
+  align-items: end;
+  margin: 14px 0;
+  padding: 14px;
+  border: 1px solid #c8e1e9;
+  border-radius: 12px;
+  background: #f5fbfd;
+}
+
+.volumeStrip label {
+  margin: 0;
+}
+
+.volumeStrip label > span,
+.grid4 label > span {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  align-items: baseline;
+}
+
+.volumeStrip output,
+.grid4 output {
+  color: var(--teal-strong);
+  font-weight: 1000;
+}
+
+.volumeStrip small {
+  grid-column: 1 / -1;
+  color: var(--muted);
+  font-weight: 800;
+}
+
 .announcementEditor {
   margin-top: 14px;
 }
@@ -911,6 +955,11 @@ button[aria-pressed="true"] {
   }
 
   .quickMusic {
+    padding: 12px;
+  }
+
+  .volumeStrip {
+    grid-template-columns: 1fr;
     padding: 12px;
   }
 }

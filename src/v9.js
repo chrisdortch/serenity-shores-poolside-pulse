@@ -350,7 +350,7 @@ function normalize(raw) {
   s.quickMusicUrl = String(s.quickMusicUrl || (s.musicProvider === 'suno' ? s.playlistUrl : s.spotifyUrl) || DEFAULT_SUNO_PLAYLIST);
   s.spotifyClientId = String(s.spotifyClientId || DEFAULT_SPOTIFY_CLIENT_ID);
   s.spotifyRedirectUri = normalizeRedirectUri(s.spotifyRedirectUri || appRedirectDefault());
-  s.spotifyVolume = clampNumber(s.spotifyVolume, 20, 100, 92);
+  s.spotifyVolume = clampNumber(s.spotifyVolume, 0, 100, 92);
   s.spotifyDuckedVolume = clampNumber(s.spotifyDuckedVolume, 0, 20, 0);
   s.announcementGain = clampNumber(s.announcementGain, 1, 3.4, 2.65);
   s.sunoVolume = clampNumber(s.sunoVolume, 20, 100, 95);
@@ -810,6 +810,7 @@ function commandTitle(type) {
     pause: 'Pause music',
     stop: 'Stop music',
     skip: 'Skip track',
+    'spotify-volume': 'Set Spotify volume',
     song: 'Play Suno song',
     suno: 'Play Suno playlist',
     'weather-check': 'Weather check'
@@ -854,7 +855,10 @@ async function processEvent(event) {
 
 async function runCommand(command) {
   if (!command?.type) return;
-  if (command.provider) S.musicProvider = command.provider;
+  if (command.provider && command.type !== 'spotify-volume') S.musicProvider = command.provider;
+  if (command.type === 'spotify-volume') {
+    S.spotifyVolume = clampNumber(command.volume, 0, 100, S.spotifyVolume);
+  }
   if (command.url) {
     if (command.type === 'spotify-play') S.spotifyUrl = command.url;
     else S.playlistUrl = command.url;
@@ -875,6 +879,12 @@ async function runCommand(command) {
     await stopSelected(false);
   } else if (command.type === 'skip') {
     await skipSelected(false);
+  } else if (command.type === 'spotify-volume') {
+    await spotifySetVolume(S.spotifyVolume, '', { preferKnown: true });
+    S.intent = S.intent || 'playing';
+    setSpotifyStatus(`Spotify volume set to ${S.spotifyVolume}% on this receiver.`, true);
+    logEvent('spotify', 'Spotify volume set on receiver', `${S.spotifyVolume}%`, { eventId: command.id, commandType: command.type });
+    await pushState('Receiver Spotify volume logged.', { render: false });
   } else if (command.type === 'song') {
     S.musicProvider = 'suno';
     await playSuno(false);
@@ -910,7 +920,7 @@ function readMusicSettings() {
   if ($('spotifyUrl')) S.spotifyUrl = val('spotifyUrl') || S.spotifyUrl;
   if ($('spotifyClientId')) S.spotifyClientId = val('spotifyClientId') || S.spotifyClientId || DEFAULT_SPOTIFY_CLIENT_ID;
   if ($('spotifyRedirectUri')) S.spotifyRedirectUri = normalizeRedirectUri(val('spotifyRedirectUri') || S.spotifyRedirectUri || appRedirectDefault());
-  S.spotifyVolume = clampNumber($('spotifyVolume') ? val('spotifyVolume') : S.spotifyVolume, 20, 100, 92);
+  S.spotifyVolume = clampNumber($('spotifyVolume') ? val('spotifyVolume') : S.spotifyVolume, 0, 100, 92);
   S.spotifyDuckedVolume = clampNumber($('spotifyDuckedVolume') ? val('spotifyDuckedVolume') : S.spotifyDuckedVolume, 0, 20, 0);
   S.announcementGain = clampNumber($('announcementGain') ? val('announcementGain') : S.announcementGain, 1, 3.4, 2.65);
   S.sunoVolume = clampNumber($('sunoVolume') ? val('sunoVolume') : S.sunoVolume, 20, 100, 95);
@@ -1182,6 +1192,39 @@ async function playAnyMusicUrl(url = S.quickMusicUrl || activeProviderUrl(), pus
   }
   await importSuno('Suno playlist imported for receiver.');
   await playSuno(false);
+}
+
+function readSpotifyVolumeControl() {
+  const el = $('spotifyVolumeCommand') || $('spotifyVolume');
+  S.spotifyVolume = clampNumber(el ? el.value : S.spotifyVolume, 0, 100, 92);
+  localSave();
+  return S.spotifyVolume;
+}
+
+function syncVolumeReadouts() {
+  const volume = String(clampNumber(($('spotifyVolumeCommand') || $('spotifyVolume'))?.value ?? S.spotifyVolume, 0, 100, 92));
+  ['spotifyVolumeOut', 'spotifyVolumeCommandOut'].forEach(id => {
+    const out = $(id);
+    if (out) out.textContent = `${volume}%`;
+  });
+}
+
+async function applySpotifyVolume(push = true) {
+  const volume = readSpotifyVolumeControl();
+  syncVolumeReadouts();
+  if (S.screen !== 'home' && push) {
+    await issueCommand('spotify-volume', {
+      volume,
+      label: `Set Spotify volume to ${volume}%`,
+      detail: `Spotify music volume ${volume}%; announcements stay at full announcement volume.`
+    }, `Spotify volume ${volume}% sent to all active receivers. Announcements stay loud.`);
+    return;
+  }
+  await spotifySetVolume(volume, '', { preferKnown: true, preferActive: true, preferPoolside: true });
+  logEvent('spotify', 'Spotify volume set locally', `${volume}%`);
+  await pushState(`Spotify volume set to ${volume}% on receiver.`, { render: false });
+  setSpotifyStatus(`Spotify volume set to ${volume}% on this receiver. Announcements stay loud.`, true);
+  renderWhenIdle();
 }
 
 function randString(length = 64) {
@@ -1506,13 +1549,21 @@ async function startSpotifyReceiver({ fromTap = false } = {}) {
   if (S.screen !== 'home') throw Error('Command devices do not play sound. Open Home on the speaker-connected receiver.');
   if (fromTap) await activateSpotifyElement();
   await ensureReceiverAudio('Spotify receiver activation', { required: true, startSession: fromTap || !receiverSessionStartedAt() });
-  const player = await primeSpotifyPlayer();
-  if (fromTap) await activateSpotifyElement();
-  const ok = spotifyPlayerReady || await player.connect();
-  if (!ok) throw Error('Spotify receiver did not connect.');
-  const deviceId = await waitForSpotifyReady();
+  let deviceId = '';
+  try {
+    const player = await primeSpotifyPlayer();
+    if (fromTap) await activateSpotifyElement();
+    const ok = spotifyPlayerReady || await player.connect();
+    if (!ok) throw Error('Spotify receiver did not connect.');
+    deviceId = await waitForSpotifyReady();
+  } catch (error) {
+    const fallbackId = await spotifyPreferredDeviceId({ preferKnown: true, preferActive: true, preferPoolside: true });
+    if (!fallbackId) throw error;
+    deviceId = fallbackId;
+    logEvent('spotify', 'Using Spotify Connect device', `${S.spotifyDeviceName || 'Known Spotify device'}; ${error.message || error}`);
+  }
   S.spotifyDeviceId = deviceId;
-  S.spotifyDeviceName = 'Poolside Pulse V9 Receiver';
+  S.spotifyDeviceName = S.spotifyDeviceName || 'Poolside Pulse V9 Receiver';
   S.receiverStatus = 'Spotify receiver active.';
   S.receiverLastSeen = stamp();
   receiverActive = true;
@@ -1525,8 +1576,49 @@ async function startSpotifyReceiver({ fromTap = false } = {}) {
   return deviceId;
 }
 
-async function spotifyTargetDevice() {
+function setSpotifyDevice(device, status = '') {
+  if (!device?.id) return '';
+  S.spotifyDeviceId = device.id;
+  S.spotifyDeviceName = device.name || S.spotifyDeviceName || 'Spotify device';
+  if (status) S.spotifyStatus = status;
+  S.receiverLastSeen = stamp();
+  localSave();
+  return device.id;
+}
+
+async function spotifyPreferredDeviceId(options = {}) {
+  if (!spotifyLoggedIn()) return '';
+  try {
+    const devices = await spotifyDevices();
+    S.spotifyDevicesSummary = devices.length ? `Devices: ${devices.map(device => `${device.name || 'Unnamed'}${device.is_active ? ' active' : ''}`).join(', ')}` : 'Devices: none returned yet';
+    const usable = devices.filter(device => device?.id && !device.is_restricted);
+    const known = options.preferKnown && S.spotifyDeviceId
+      ? usable.find(device => String(device.id) === String(S.spotifyDeviceId))
+      : null;
+    const active = options.preferActive !== false
+      ? usable.find(device => device.is_active)
+      : null;
+    const poolside = options.preferPoolside !== false
+      ? usable.find(device => /poolside pulse|serenity shores/i.test(device.name || ''))
+      : null;
+    const selected = known || active || poolside || null;
+    if (!selected) return '';
+    const label = selected.is_active ? 'active Spotify device' : 'known Spotify device';
+    return setSpotifyDevice(selected, `Using ${label}: ${selected.name || 'Spotify device'}.`);
+  } catch (error) {
+    logEvent('spotify', 'Spotify device lookup failed', error.message || String(error));
+    return '';
+  }
+}
+
+async function spotifyTargetDevice(options = {}) {
   if (S.screen === 'home' && spotifyPlayerReady && spotifyWebDeviceId) return spotifyWebDeviceId;
+  if (options.preferKnown && S.spotifyDeviceId) return S.spotifyDeviceId;
+  if (options.preferActive || options.preferPoolside) {
+    const preferred = await spotifyPreferredDeviceId(options);
+    if (preferred) return preferred;
+  }
+  if (options.allowStart === false) return '';
   if (S.screen !== 'home') return '';
   if (spotifyLoggedIn()) {
     try {
@@ -1538,12 +1630,13 @@ async function spotifyTargetDevice() {
   throw actionNeededError('Spotify is not connected on this receiver. Tap Login Spotify on the speaker-connected Home phone.');
 }
 
-async function spotifySetVolume(percent) {
+async function spotifySetVolume(percent, targetDeviceId = '', options = {}) {
   const volume = Math.max(0, Math.min(100, Math.round(Number(percent) || 0)));
+  S.spotifyVolume = volume;
   try {
-    if (spotifyPlayer && spotifyPlayerReady) await spotifyPlayer.setVolume(volume / 100);
+    if (spotifyPlayer && spotifyPlayerReady && (!targetDeviceId || targetDeviceId === spotifyWebDeviceId)) await spotifyPlayer.setVolume(volume / 100);
   } catch {}
-  const deviceId = await spotifyTargetDevice();
+  const deviceId = targetDeviceId || await spotifyTargetDevice(options);
   if (deviceId) await spotifyApi('PUT', '/me/player/volume', null, { volume_percent: volume, device_id: deviceId });
 }
 
@@ -1563,6 +1656,23 @@ async function spotifyActuallyPlaying(targetDeviceId = '') {
   }
 }
 
+async function sendSpotifyPlayback(playUrl, deviceId) {
+  await spotifyApi('PUT', '/me/player', { device_ids: [deviceId], play: false });
+  await spotifyApi('PUT', '/me/player/play', spotifyBody(playUrl), { device_id: deviceId });
+  await spotifySetVolume(S.spotifyVolume, deviceId, { preferKnown: true });
+  return await spotifyActuallyPlaying(deviceId);
+}
+
+function markSpotifyPlaybackAccepted(playUrl) {
+  S.intent = 'playing';
+  S.spotifyNowPlaying = sourceLabel('spotify', playUrl);
+  S.spotifyStatus = `Spotify play accepted on receiver: ${sourceLabel('spotify', playUrl)}.`;
+  S.spotifyNeedsTap = false;
+  receiverActive = true;
+  logEvent('play', 'Spotify playing on receiver', sourceLabel('spotify', playUrl), { provider: 'spotify', url: playUrl });
+  setSpotifyStatus(`Spotify is playing on this receiver: ${sourceLabel('spotify', playUrl)}.`, true);
+}
+
 async function playSpotifyUrl(url = S.spotifyUrl, push = true, options = {}) {
   readMusicSettings();
   const playUrl = url || S.spotifyUrl;
@@ -1575,19 +1685,28 @@ async function playSpotifyUrl(url = S.spotifyUrl, push = true, options = {}) {
     return;
   }
   if (!spotifyLoggedIn()) throw actionNeededError('Spotify is not connected on this receiver. Tap Login Spotify on the speaker-connected Home phone.');
+  const remotePreferredId = options.fromRemote
+    ? await spotifyTargetDevice({ preferKnown: true, preferActive: true, preferPoolside: true, allowStart: false }).catch(() => '')
+    : '';
+  if (remotePreferredId) {
+    try {
+      const audible = await sendSpotifyPlayback(playUrl, remotePreferredId);
+      if (audible) {
+        markSpotifyPlaybackAccepted(playUrl);
+        await pushState('Receiver Spotify playback logged.', { render: false });
+        renderWhenIdle();
+        return;
+      }
+      logEvent('spotify', 'Known Spotify device did not become audible', S.spotifyDeviceName || remotePreferredId, { provider: 'spotify', url: playUrl });
+    } catch (error) {
+      logEvent('spotify', 'Known Spotify device command failed', error.message || String(error), { provider: 'spotify', url: playUrl });
+    }
+  }
   const deviceId = await startSpotifyReceiver({ fromTap: !!options.fromTap });
   if (options.fromTap) await activateSpotifyElement();
-  await spotifyApi('PUT', '/me/player', { device_ids: [deviceId], play: false });
-  await spotifyApi('PUT', '/me/player/play', spotifyBody(playUrl), { device_id: deviceId });
-  await spotifySetVolume(S.spotifyVolume);
-  const audible = await spotifyActuallyPlaying(deviceId);
+  const audible = await sendSpotifyPlayback(playUrl, deviceId);
   if (audible) {
-    S.intent = 'playing';
-    S.spotifyNowPlaying = sourceLabel('spotify', playUrl);
-    S.spotifyStatus = `Spotify play accepted on receiver: ${sourceLabel('spotify', playUrl)}.`;
-    receiverActive = true;
-    logEvent('play', 'Spotify playing on receiver', sourceLabel('spotify', playUrl), { provider: 'spotify', url: playUrl });
-    setSpotifyStatus(`Spotify is playing on this receiver: ${sourceLabel('spotify', playUrl)}.`, true);
+    markSpotifyPlaybackAccepted(playUrl);
   } else {
     const message = 'Spotify accepted the command, but this Home receiver is not the audible Spotify device yet. Tap Start Receiver + Play on the speaker-connected phone once.';
     S.intent = 'stopped';
@@ -1608,7 +1727,7 @@ async function spotifyPause(push = true) {
     await issueCommand('pause', { label: 'Pause music' }, 'Pause command sent to all active receivers.');
     return;
   }
-  await spotifyApi('PUT', '/me/player/pause', null, { device_id: await spotifyTargetDevice() });
+  await spotifyApi('PUT', '/me/player/pause', null, { device_id: await spotifyTargetDevice({ preferKnown: true, preferActive: true, preferPoolside: true }) });
   S.intent = 'paused';
   setSpotifyStatus('Spotify paused on receiver.', true);
   logEvent('pause', 'Spotify paused', '');
@@ -1631,7 +1750,7 @@ async function spotifyNext(push = true) {
     await issueCommand('skip', { label: 'Skip track' }, 'Skip command sent to all active receivers.');
     return;
   }
-  await spotifyApi('POST', '/me/player/next', null, { device_id: await spotifyTargetDevice() });
+  await spotifyApi('POST', '/me/player/next', null, { device_id: await spotifyTargetDevice({ preferKnown: true, preferActive: true, preferPoolside: true }) });
   S.intent = 'playing';
   setSpotifyStatus('Spotify skipped to next track.', true);
   logEvent('skip', 'Spotify skipped', '');
@@ -1647,6 +1766,9 @@ async function checkSpotifyHealth(renderAfter = true) {
   const devices = await spotifyDevices();
   S.spotifyAccountProduct = String(me.product || 'unknown');
   S.spotifyDevicesSummary = devices.length ? `Devices: ${devices.map(device => `${device.name || 'Unnamed'}${device.is_active ? ' active' : ''}`).join(', ')}` : 'Devices: none returned yet';
+  const active = devices.find(device => device?.id && !device.is_restricted && device.is_active);
+  const known = S.spotifyDeviceId ? devices.find(device => String(device.id) === String(S.spotifyDeviceId)) : null;
+  if (known || active) setSpotifyDevice(known || active, `Spotify device available: ${(known || active).name || 'Spotify device'}.`);
   if (S.spotifyAccountProduct !== 'premium') setSpotifyStatus(`Spotify account is ${S.spotifyAccountProduct}. Web Playback requires Premium.`, false);
   else setSpotifyStatus(`Spotify Premium confirmed. ${S.spotifyDevicesSummary}.`, true);
   logEvent('spotify', 'Spotify health check', `${S.spotifyAccountProduct}; ${S.spotifyDevicesSummary}`);
@@ -1690,7 +1812,7 @@ async function restoreSpotifyAfterAnnouncement(snapshot) {
     if (snapshot.wasPlaying) {
       try {
         const player = await spotifyApi('GET', '/me/player');
-        if (player && player.is_playing === false) await spotifyApi('PUT', '/me/player/play', null, { device_id: await spotifyTargetDevice() });
+        if (player && player.is_playing === false) await spotifyApi('PUT', '/me/player/play', null, { device_id: await spotifyTargetDevice({ preferKnown: true, preferActive: true, preferPoolside: true }) });
       } catch {}
       S.intent = 'playing';
     }
@@ -2357,7 +2479,7 @@ function receiverReadiness() {
 }
 
 function spotifyDeviceReady() {
-  return S.musicProvider !== 'spotify' || (spotifyPlayerReady && !!spotifyWebDeviceId && !S.spotifyNeedsTap);
+  return S.musicProvider !== 'spotify' || (((spotifyPlayerReady && !!spotifyWebDeviceId) || !!S.spotifyDeviceId) && !S.spotifyNeedsTap);
 }
 
 function receiverCanPause() {
@@ -2459,7 +2581,7 @@ function homePage() {
 
 function commandPage() {
   const selected = ann();
-  return shell(`<section class="commandConsole"><div><p class="eyebrow">Live Control</p><h1>Command</h1><p>Command devices send instructions to every active receiver. Speaker phones stay on Home and play all sound.</p></div>${statusCards()}</section><section class="panel controlDeck"><div class="sectionHead"><h2>Receiver Controls</h2><span class="pill ${S.receiverStatus && !receiverActionNeeded(S.receiverStatus) ? 'good' : 'warn'}">${esc(S.receiverStatus || 'No receiver report yet')}</span></div><div class="bigControls"><button id="playCmd">Play / Resume</button><button id="pauseCmd" class="secondary">Pause</button><button id="skipCmd" class="secondary">Skip</button><button id="stopCmd" class="danger">Stop</button><button id="checkWeatherCmd" class="secondary">Check Weather</button></div><div class="quickMusic"><label>Play Spotify or Suno URL<input id="quickMusicUrl" value="${esc(S.quickMusicUrl || activeProviderUrl())}" placeholder="Paste Spotify or Suno playlist URL"></label><div class="buttonStack"><button id="playAnyUrl">Play Pasted URL</button><button id="playDefaultSpotify" class="secondary">Default Spotify</button><button id="playDefaultSuno" class="secondary">Default Suno</button></div></div><div class="splitControls"><label>Announcement<textarea id="quickText">${esc(S.quickText || selected.text)}</textarea></label><div><label>Saved Announcement<select id="quickTemplate">${S.anns.map(item => `<option value="${item.id}" ${item.id === S.selected ? 'selected' : ''}>${esc(item.label)} · ${item.mode === 'suno' ? 'Suno' : 'Voice'}</option>`).join('')}</select></label><div class="buttonStack"><button id="quickPlay">${selected.mode === 'suno' ? 'Play Announcement Track' : 'Speak Now'}</button><button id="quickHold" class="secondary">${selected.mode === 'suno' ? 'Track as Safety Hold' : 'Speak as Safety Hold'}</button><button id="lightningNow" class="secondary">Lightning Hold</button><button id="windNow" class="secondary">Wind Umbrellas</button></div></div></div></section><section class="panel compactLog"><div class="sectionHead"><h2>Receiver Activity</h2><button id="clearLog" class="secondary">Clear Local Log</button></div>${logRows()}</section>`);
+  return shell(`<section class="commandConsole"><div><p class="eyebrow">Live Control</p><h1>Command</h1><p>Command devices send instructions to every active receiver. Speaker phones stay on Home and play all sound.</p></div>${statusCards()}</section><section class="panel controlDeck"><div class="sectionHead"><h2>Receiver Controls</h2><span class="pill ${S.receiverStatus && !receiverActionNeeded(S.receiverStatus) ? 'good' : 'warn'}">${esc(S.receiverStatus || 'No receiver report yet')}</span></div><div class="bigControls"><button id="playCmd">Play / Resume</button><button id="pauseCmd" class="secondary">Pause</button><button id="skipCmd" class="secondary">Skip</button><button id="stopCmd" class="danger">Stop</button><button id="checkWeatherCmd" class="secondary">Check Weather</button></div><div class="volumeStrip"><label><span>Spotify Volume <output id="spotifyVolumeCommandOut">${esc(S.spotifyVolume)}%</output></span><input id="spotifyVolumeCommand" type="range" min="0" max="100" step="1" value="${esc(S.spotifyVolume)}"></label><button id="spotifyVolumeApply" class="secondary">Set Volume on Receivers</button><small>Announcements keep their separate loud boost.</small></div><div class="quickMusic"><label>Play Spotify or Suno URL<input id="quickMusicUrl" value="${esc(S.quickMusicUrl || activeProviderUrl())}" placeholder="Paste Spotify or Suno playlist URL"></label><div class="buttonStack"><button id="playAnyUrl">Play Pasted URL</button><button id="playDefaultSpotify" class="secondary">Default Spotify</button><button id="playDefaultSuno" class="secondary">Default Suno</button></div></div><div class="splitControls"><label>Announcement<textarea id="quickText">${esc(S.quickText || selected.text)}</textarea></label><div><label>Saved Announcement<select id="quickTemplate">${S.anns.map(item => `<option value="${item.id}" ${item.id === S.selected ? 'selected' : ''}>${esc(item.label)} · ${item.mode === 'suno' ? 'Suno' : 'Voice'}</option>`).join('')}</select></label><div class="buttonStack"><button id="quickPlay">${selected.mode === 'suno' ? 'Play Announcement Track' : 'Speak Now'}</button><button id="quickHold" class="secondary">${selected.mode === 'suno' ? 'Track as Safety Hold' : 'Speak as Safety Hold'}</button><button id="lightningNow" class="secondary">Lightning Hold</button><button id="windNow" class="secondary">Wind Umbrellas</button></div></div></div></section><section class="panel compactLog"><div class="sectionHead"><h2>Receiver Activity</h2><button id="clearLog" class="secondary">Clear Local Log</button></div>${logRows()}</section>`);
 }
 
 function spotifyDiagnostics() {
@@ -2471,7 +2593,7 @@ function spotifyDiagnostics() {
 function musicPage() {
   const providers = Object.entries(PROVIDERS).map(([id, label]) => `<option value="${id}" ${S.musicProvider === id ? 'selected' : ''}>${label}</option>`).join('');
   const rows = S.tracks.map((item, index) => `<div class="trackRow ${index === S.current ? 'cur' : ''}"><div><b>${index + 1}. ${esc(item.title)}</b><span>${esc(item.artist || 'Suno')} · ${esc(item.duration || '')} · ${item.audioUrl ? 'ready' : 'title only'}</span></div><div class="rowBtns"><button data-song="${index}" class="slim">Play</button><button data-schedule-song="${index}" class="secondary slim">Schedule</button></div></div>`).join('');
-  return shell(`<section class="panel"><div class="panelHeader"><div><p class="eyebrow">Music Control</p><h1>Music</h1></div><button id="saveMusic">Save</button></div><div class="sourceBoard"><div class="sourceTile"><b>Selected</b><strong>${esc(sourceLabel(S.musicProvider, activeProviderUrl()))}</strong><span>${esc(activeProviderUrl())}</span></div><div class="sourceTile"><b>Receiver</b><strong>${esc(S.receiverStatus || receiverReadiness())}</strong><span>${esc(S.spotifyNowPlaying || S.activeMusicLabel || '')}</span></div><div class="sourceTile"><b>Voice Ducking</b><strong>${esc(S.spotifyDuckedVolume)}% Spotify</strong><span>${Math.round(Number(S.announcementGain || 1) * 100)}% announcement boost</span></div></div><div class="buttonStack"><button id="useSpotify" class="${S.musicProvider === 'spotify' ? '' : 'secondary'}">Use Spotify</button><button id="useSuno" class="${S.musicProvider === 'suno' ? '' : 'secondary'}">Use Suno</button><button id="spotifyPlayNow">Play Spotify on Receivers</button><button id="sunoPlayNow" class="secondary">Play Suno on Receivers</button></div><div class="quickMusic"><label>Play Spotify or Suno URL<input id="quickMusicUrl" value="${esc(S.quickMusicUrl || activeProviderUrl())}" placeholder="Paste Spotify or Suno playlist URL"></label><div class="buttonStack"><button id="playAnyUrl">Play Pasted URL</button><button id="savePastedUrl" class="secondary">Save as Default</button></div></div><div class="grid2"><label>Provider<select id="musicProvider">${providers}</select></label><label>Station Name<input id="playlistName" value="${esc(S.playlistName)}"></label></div><div class="grid2"><label>Suno Playlist URL<input id="playlistUrl" value="${esc(S.playlistUrl)}"></label><label>Spotify Playlist or Song URL<input id="spotifyUrl" value="${esc(S.spotifyUrl)}" placeholder="https://open.spotify.com/playlist/..."></label></div><div class="grid2"><label>Spotify Client ID<input id="spotifyClientId" value="${esc(S.spotifyClientId)}"></label><label>Spotify Redirect URI<input id="spotifyRedirectUri" value="${esc(spotifyRedirectUri())}"></label></div><div class="grid4"><label>Music Volume<input id="spotifyVolume" inputmode="numeric" value="${esc(S.spotifyVolume)}"></label><label>Music During Announcements<input id="spotifyDuckedVolume" inputmode="numeric" value="${esc(S.spotifyDuckedVolume)}"></label><label>Suno Volume<input id="sunoVolume" inputmode="numeric" value="${esc(S.sunoVolume)}"></label><label>Announcement Boost<input id="announcementGain" inputmode="decimal" value="${esc(S.announcementGain)}"></label></div>${spotifyDiagnostics()}<div class="actions"><button id="spotifyLogin" class="secondary">Login with Spotify</button><button id="spotifyCheck" class="secondary">Check Spotify</button><button id="spotifyReceiver">Activate + Play on This Receiver</button><button id="makeReceiver" class="secondary">Show Receiver Screen</button><button id="spotifyClear" class="secondary">Clear Spotify</button><button id="import" class="secondary">Import Suno</button></div></section><section class="panel"><div class="sectionHead"><h2>Suno Queue</h2><button id="playCmd" class="secondary">Play Selected on Receivers</button></div>${rows || '<p class="muted">No Suno queue imported yet.</p>'}</section>`);
+  return shell(`<section class="panel"><div class="panelHeader"><div><p class="eyebrow">Music Control</p><h1>Music</h1></div><button id="saveMusic">Save</button></div><div class="sourceBoard"><div class="sourceTile"><b>Selected</b><strong>${esc(sourceLabel(S.musicProvider, activeProviderUrl()))}</strong><span>${esc(activeProviderUrl())}</span></div><div class="sourceTile"><b>Receiver</b><strong>${esc(S.receiverStatus || receiverReadiness())}</strong><span>${esc(S.spotifyNowPlaying || S.activeMusicLabel || '')}</span></div><div class="sourceTile"><b>Voice Ducking</b><strong>${esc(S.spotifyDuckedVolume)}% Spotify</strong><span>${Math.round(Number(S.announcementGain || 1) * 100)}% announcement boost</span></div></div><div class="buttonStack"><button id="useSpotify" class="${S.musicProvider === 'spotify' ? '' : 'secondary'}">Use Spotify</button><button id="useSuno" class="${S.musicProvider === 'suno' ? '' : 'secondary'}">Use Suno</button><button id="spotifyPlayNow">Play Spotify on Receivers</button><button id="sunoPlayNow" class="secondary">Play Suno on Receivers</button></div><div class="quickMusic"><label>Play Spotify or Suno URL<input id="quickMusicUrl" value="${esc(S.quickMusicUrl || activeProviderUrl())}" placeholder="Paste Spotify or Suno playlist URL"></label><div class="buttonStack"><button id="playAnyUrl">Play Pasted URL</button><button id="savePastedUrl" class="secondary">Save as Default</button></div></div><div class="grid2"><label>Provider<select id="musicProvider">${providers}</select></label><label>Station Name<input id="playlistName" value="${esc(S.playlistName)}"></label></div><div class="grid2"><label>Suno Playlist URL<input id="playlistUrl" value="${esc(S.playlistUrl)}"></label><label>Spotify Playlist or Song URL<input id="spotifyUrl" value="${esc(S.spotifyUrl)}" placeholder="https://open.spotify.com/playlist/..."></label></div><div class="grid2"><label>Spotify Client ID<input id="spotifyClientId" value="${esc(S.spotifyClientId)}"></label><label>Spotify Redirect URI<input id="spotifyRedirectUri" value="${esc(spotifyRedirectUri())}"></label></div><div class="grid4"><label><span>Spotify Volume <output id="spotifyVolumeOut">${esc(S.spotifyVolume)}%</output></span><input id="spotifyVolume" type="range" min="0" max="100" step="1" value="${esc(S.spotifyVolume)}"></label><label>Music During Announcements<input id="spotifyDuckedVolume" type="range" min="0" max="20" step="1" value="${esc(S.spotifyDuckedVolume)}"></label><label>Suno Volume<input id="sunoVolume" type="range" min="20" max="100" step="1" value="${esc(S.sunoVolume)}"></label><label>Announcement Boost<input id="announcementGain" type="range" min="1" max="3.4" step=".05" value="${esc(S.announcementGain)}"></label></div>${spotifyDiagnostics()}<div class="actions"><button id="spotifyLogin" class="secondary">Login with Spotify</button><button id="spotifyCheck" class="secondary">Check Spotify</button><button id="spotifyReceiver">Activate + Play on This Receiver</button><button id="makeReceiver" class="secondary">Show Receiver Screen</button><button id="spotifyClear" class="secondary">Clear Spotify</button><button id="import" class="secondary">Import Suno</button></div></section><section class="panel"><div class="sectionHead"><h2>Suno Queue</h2><button id="playCmd" class="secondary">Play Selected on Receivers</button></div>${rows || '<p class="muted">No Suno queue imported yet.</p>'}</section>`);
 }
 
 function schedulePage() {
@@ -2640,6 +2762,15 @@ function bind() {
   wire('skipCmd', () => skipSelected(true));
   wire('stopCmd', () => stopSelected(true));
   wire('checkWeatherCmd', () => triggerWeatherCheck());
+  wire('spotifyVolumeApply', () => applySpotifyVolume(true));
+  document.querySelectorAll('#spotifyVolumeCommand, #spotifyVolume').forEach(input => {
+    input.oninput = () => syncVolumeReadouts();
+    input.onchange = () => Promise.resolve(applySpotifyVolume(true)).catch(error => {
+      if (isActionNeeded(error)) setActionNeeded(error.message || String(error));
+      else setFeedback(error.message || String(error), false);
+      renderWhenIdle();
+    });
+  });
   wire('playAnyUrl', () => playAnyMusicUrl(val('quickMusicUrl'), true));
   wire('playDefaultSpotify', async () => {
     S.quickMusicUrl = S.spotifyUrl || DEFAULT_SPOTIFY_PLAYLIST;
@@ -2697,6 +2828,7 @@ function bind() {
     readMusicSettings();
     rememberActiveSource(S.musicProvider, activeProviderUrl(), 'selected');
     await save('Music settings saved.');
+    if (S.musicProvider === 'spotify') await applySpotifyVolume(true);
   });
   wire('useSpotify', async () => {
     readMusicSettings();
