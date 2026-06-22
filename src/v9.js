@@ -6,7 +6,7 @@ const HANDLED_KEY = 'poolside-pulse-v9-handled-events';
 const LOG_CLEAR_KEY = 'poolside-pulse-v9-log-cleared-at';
 const RECEIVER_SESSION_KEY = 'poolside-pulse-v9-receiver-session-started-at';
 const SPOTIFY_TOKEN_KEY = 'poolside-pulse-v9-spotify-token';
-const APP_QUERY = '?v=9-ducking-volume';
+const APP_QUERY = '?v=9-iphone-sound-state';
 const LEGACY_STATE_KEYS = [
   'poolside-pulse-v8',
   'poolside-pulse-v7',
@@ -1044,7 +1044,7 @@ function writeWaveAscii(view, offset, text) {
 function fallbackToneUrl() {
   if (fallbackUnlockToneUrl) return fallbackUnlockToneUrl;
   const sampleRate = 22050;
-  const samples = Math.floor(sampleRate * 0.16);
+  const samples = Math.floor(sampleRate * 0.45);
   const bytes = new Uint8Array(44 + samples * 2);
   const view = new DataView(bytes.buffer);
   writeWaveAscii(view, 0, 'RIFF');
@@ -1065,7 +1065,7 @@ function fallbackToneUrl() {
     const release = Math.min(1, (samples - i) / (sampleRate * 0.04));
     const envelope = Math.max(0, Math.min(attack, release));
     const tone = Math.sin((2 * Math.PI * 660 * i) / sampleRate);
-    view.setInt16(44 + i * 2, Math.round(tone * 32767 * 0.28 * envelope), true);
+    view.setInt16(44 + i * 2, Math.round(tone * 32767 * 0.5 * envelope), true);
   }
   fallbackUnlockToneUrl = URL.createObjectURL(new Blob([bytes], { type: 'audio/wav' }));
   return fallbackUnlockToneUrl;
@@ -1090,16 +1090,16 @@ async function fallbackWebAudioTone(reason, audible) {
   const oscillator = ctx.createOscillator();
   const gain = ctx.createGain();
   const start = ctx.currentTime || 0;
-  const duration = audible ? 0.16 : 0.04;
+  const duration = audible ? 0.45 : 0.04;
   oscillator.type = 'sine';
   oscillator.frequency.setValueAtTime(660, start);
-  gain.gain.setValueAtTime(audible ? 0.045 : 0.0001, start);
+  gain.gain.setValueAtTime(audible ? 0.14 : 0.0001, start);
   gain.gain.linearRampToValueAtTime(0.0001, start + duration);
   oscillator.connect(gain).connect(ctx.destination);
   oscillator.start(start);
   oscillator.stop(start + duration);
   await promiseTimeout(resume, 900, 'Web Audio resume timed out.');
-  await new Promise(resolve => setTimeout(resolve, audible ? 180 : 55));
+  await new Promise(resolve => setTimeout(resolve, audible ? 480 : 55));
   if (ctx.state !== 'running') return false;
   fallbackAudioUnlocked = true;
   S.audioStatus = audible ? `Receiver test tone played by ${reason}.` : `Receiver audio unlocked by ${reason}.`;
@@ -1109,11 +1109,11 @@ async function fallbackWebAudioTone(reason, audible) {
 async function fallbackMediaTone(reason, audible) {
   const audio = getFallbackAudio();
   audio.muted = false;
-  audio.volume = audible ? 0.22 : 0.03;
+  audio.volume = audible ? 0.75 : 0.03;
   audio.src = fallbackToneUrl();
   audio.load();
   await promiseTimeout(audio.play(), 1000, 'Media element play timed out.');
-  await new Promise(resolve => setTimeout(resolve, audible ? 180 : 55));
+  await new Promise(resolve => setTimeout(resolve, audible ? 480 : 55));
   audio.pause();
   try { audio.currentTime = 0; } catch {}
   fallbackAudioUnlocked = true;
@@ -1138,11 +1138,15 @@ async function fallbackUnlockReceiverAudio(reason, options = {}) {
 
 function receiverAudioReady() {
   const status = typeof window.__poolsideV9AudioStatus === 'function' ? window.__poolsideV9AudioStatus() : null;
-  if (fallbackAudioUnlocked || status?.unlocked || status?.webAudioPrimed || status?.audioContext === 'running') return true;
+  if (fallbackAudioUnlocked || helperAudioReady(status)) return true;
   const text = String(status?.status || S.audioStatus || '').toLowerCase();
   if (/not been activated|blocked|failed|unavailable|denied/.test(text)) return false;
-  if (/audio activated|activated by|audio unlocked|test tone played|started through|audio ready/.test(text)) return true;
+  if (/activated by|audio unlocked|test tone played|started through/.test(text)) return true;
   return false;
+}
+
+function helperAudioReady(status) {
+  return !!(status?.unlocked || status?.webAudioPrimed || status?.mediaElementPrimed);
 }
 
 async function ensureReceiverAudio(reason = 'receiver action', options = {}) {
@@ -1159,12 +1163,12 @@ async function ensureReceiverAudio(reason = 'receiver action', options = {}) {
     unlocked = results.some(result => result.status === 'fulfilled' && result.value);
   }
   const status = typeof window.__poolsideV9AudioStatus === 'function' ? window.__poolsideV9AudioStatus() : null;
-  const helperReady = !!status?.unlocked || !!status?.webAudioPrimed || status?.audioContext === 'running';
+  const helperReady = helperAudioReady(status);
   if (status?.status && (helperReady || (!fallbackAudioUnlocked && !/not been activated yet/i.test(status.status)))) S.audioStatus = status.status;
   unlocked = unlocked || fallbackAudioUnlocked || helperReady;
-  receiverActive = true;
+  receiverActive = unlocked;
   S.receiverStatus = unlocked ? 'Receiver audio ready.' : 'Receiver online; tap Start Receiver once for sound.';
-  S.receiverActiveAt = Date.now();
+  S.receiverActiveAt = unlocked ? Date.now() : 0;
   S.receiverLastSeen = stamp();
   if (unlocked && options.startSession) beginReceiverSession(reason);
   if (!unlocked) {
@@ -1775,10 +1779,14 @@ async function startSpotifyReceiver({ fromTap = false } = {}) {
     if (!ok) throw Error('Spotify receiver did not connect.');
     deviceId = await waitForSpotifyReady();
   } catch (error) {
-    const fallbackId = await spotifyPreferredDeviceId({ preferKnown: true, preferActive: true, preferPoolside: true });
-    if (!fallbackId) throw error;
-    deviceId = fallbackId;
-    logEvent('spotify', 'Using Spotify Connect device', `${S.spotifyDeviceName || 'Known Spotify device'}; ${error.message || error}`);
+    spotifyPlayerReady = false;
+    spotifyWebDeviceId = '';
+    S.spotifyDeviceId = '';
+    S.spotifyNeedsTap = true;
+    S.receiverStatus = 'Spotify receiver not ready on this phone.';
+    setSpotifyStatus(`Spotify did not start on this iPhone browser: ${error.message || error}. Keep Home open and tap Start Receiver + Spotify again.`, false);
+    localSave();
+    throw error;
   }
   S.spotifyDeviceId = deviceId;
   S.spotifyDeviceName = S.spotifyDeviceName || 'Poolside Pulse V9 Receiver';
@@ -1830,22 +1838,25 @@ async function spotifyPreferredDeviceId(options = {}) {
 }
 
 async function spotifyTargetDevice(options = {}) {
-  if (S.screen === 'home' && spotifyPlayerReady && spotifyWebDeviceId) return spotifyWebDeviceId;
+  if (S.screen === 'home') {
+    if (spotifyPlayerReady && spotifyWebDeviceId) return spotifyWebDeviceId;
+    if (options.allowStart === false) return '';
+    if (spotifyLoggedIn()) {
+      try {
+        return await startSpotifyReceiver();
+      } catch (error) {
+        throw actionNeededError(`Spotify receiver is not ready on this phone yet. Tap Start Receiver + Play on the speaker-connected Home phone. ${error.message || ''}`.trim());
+      }
+    }
+    throw actionNeededError('Spotify is not connected on this receiver. Tap Login Spotify on the speaker-connected Home phone.');
+  }
   if (options.preferKnown && S.spotifyDeviceId) return S.spotifyDeviceId;
   if (options.preferActive || options.preferPoolside) {
     const preferred = await spotifyPreferredDeviceId(options);
     if (preferred) return preferred;
   }
   if (options.allowStart === false) return '';
-  if (S.screen !== 'home') return '';
-  if (spotifyLoggedIn()) {
-    try {
-      return await startSpotifyReceiver();
-    } catch (error) {
-      throw actionNeededError(`Spotify receiver is not ready on this phone yet. Tap Start Receiver + Play on the speaker-connected Home phone. ${error.message || ''}`.trim());
-    }
-  }
-  throw actionNeededError('Spotify is not connected on this receiver. Tap Login Spotify on the speaker-connected Home phone.');
+  return '';
 }
 
 async function spotifySetVolume(percent, targetDeviceId = '', options = {}) {
@@ -2016,7 +2027,7 @@ async function duckSpotifyForAnnouncement() {
   const snapshot = {
     volume: clampNumber(S.spotifyVolume, 0, 100, 92),
     wasPlaying: S.intent === 'playing',
-    deviceId: spotifyWebDeviceId || S.spotifyDeviceId || ''
+    deviceId: S.screen === 'home' ? (spotifyWebDeviceId || '') : (S.spotifyDeviceId || '')
   };
   try {
     if (S.screen !== 'home' || (!spotifyLoggedIn() && !S.spotifyDeviceId)) return null;
@@ -2708,7 +2719,9 @@ function receiverReadiness() {
 }
 
 function spotifyDeviceReady() {
-  return S.musicProvider !== 'spotify' || (((spotifyPlayerReady && !!spotifyWebDeviceId) || !!S.spotifyDeviceId) && !S.spotifyNeedsTap);
+  if (S.musicProvider !== 'spotify') return true;
+  if (S.screen === 'home') return spotifyPlayerReady && !!spotifyWebDeviceId && !S.spotifyNeedsTap;
+  return (((spotifyPlayerReady && !!spotifyWebDeviceId) || !!S.spotifyDeviceId) && !S.spotifyNeedsTap);
 }
 
 function receiverCanPause() {
@@ -2758,7 +2771,7 @@ function readinessSteps() {
   const spotifyOk = S.musicProvider !== 'spotify' || spotifyLoggedIn();
   const deviceOk = spotifyDeviceReady();
   const steps = [
-    { label: 'Home receiver open', ok: true, action: '', help: 'This screen is open.' },
+    { label: 'Home screen open', ok: true, action: '', help: 'This screen is open.' },
     { label: 'Fresh session', ok: sessionOk, action: 'audio', help: 'Tap to ignore old commands and start clean.' },
     { label: 'Audio unlocked', ok: audioOk, action: 'audio', help: 'Tap to unlock iPhone speaker audio.' },
     { label: 'Spotify logged in', ok: spotifyOk, action: 'login', help: 'Tap to connect Spotify on this receiver.' },
@@ -3244,7 +3257,7 @@ function loadVoices() {
 window.addEventListener('poolside-v9-audio-status', event => {
   if (event.detail?.status) {
     S.audioStatus = event.detail.status;
-    if (event.detail.unlocked || event.detail.webAudioPrimed || event.detail.audioContext === 'running') {
+    if (helperAudioReady(event.detail)) {
       S.receiverStatus = 'Receiver audio ready.';
       S.receiverActiveAt = Date.now();
       S.receiverLastSeen = stamp();
@@ -3262,7 +3275,7 @@ function normalizeCurrentUrl() {
   try {
     const params = new URLSearchParams(location.search);
     if (params.has('code') || params.has('state')) return;
-    if (params.get('v') === '9-ducking-volume') return;
+    if (params.get('v') === '9-iphone-sound-state') return;
     history.replaceState(null, '', `/${APP_QUERY}`);
   } catch {}
 }

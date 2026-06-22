@@ -41,7 +41,7 @@
   function getUnlockToneUrl() {
     if (unlockToneUrl) return unlockToneUrl;
     const sampleRate = 22050;
-    const seconds = 0.16;
+    const seconds = 0.45;
     const samples = Math.floor(sampleRate * seconds);
     const bytes = new Uint8Array(44 + samples * 2);
     const view = new DataView(bytes.buffer);
@@ -63,7 +63,7 @@
       const release = Math.min(1, (samples - i) / (sampleRate * 0.04));
       const envelope = Math.max(0, Math.min(attack, release));
       const tone = Math.sin((2 * Math.PI * 660 * i) / sampleRate);
-      view.setInt16(44 + i * 2, Math.round(tone * 32767 * 0.35 * envelope), true);
+      view.setInt16(44 + i * 2, Math.round(tone * 32767 * 0.5 * envelope), true);
     }
     unlockToneUrl = URL.createObjectURL(new Blob([bytes], { type: 'audio/wav' }));
     return unlockToneUrl;
@@ -121,17 +121,17 @@
       const resume = ctx.state !== 'running' ? ctx.resume() : Promise.resolve();
       const oscillator = ctx.createOscillator();
       const gain = ctx.createGain();
-      const duration = options.audible ? 0.16 : 0.04;
+      const duration = options.audible ? 0.45 : 0.04;
       const start = ctx.currentTime || 0;
       oscillator.type = 'sine';
       oscillator.frequency.setValueAtTime(660, start);
-      gain.gain.setValueAtTime(options.audible ? 0.045 : 0.0001, start);
+      gain.gain.setValueAtTime(options.audible ? 0.14 : 0.0001, start);
       gain.gain.linearRampToValueAtTime(0.0001, start + duration);
       oscillator.connect(gain).connect(ctx.destination);
       oscillator.start(start);
       oscillator.stop(start + duration);
       await withTimeout(resume, 900, 'Web Audio resume timed out.');
-      await wait(options.audible ? 180 : 55);
+      await wait(options.audible ? 480 : 55);
       if (ctx.state === 'running') {
         webAudioPrimed = true;
         return { ok: true, detail: options.audible ? `Receiver test tone played by ${reason}.` : `Web Audio unlocked by ${reason}.` };
@@ -146,11 +146,11 @@
     const audio = getHiddenAudio();
     try {
       audio.muted = false;
-      audio.volume = options.audible ? 0.22 : 0.03;
+      audio.volume = options.audible ? 0.75 : 0.03;
       audio.src = getUnlockToneUrl();
       audio.load();
       await withTimeout(audio.play(), 1000, 'Media element play timed out.');
-      await wait(options.audible ? 180 : 55);
+      await wait(options.audible ? 480 : 55);
       audio.pause();
       try { audio.currentTime = 0; } catch {}
       mediaElementPrimed = true;
