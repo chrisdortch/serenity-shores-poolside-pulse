@@ -1,11 +1,11 @@
 (() => {
   const VERSION = '9';
-  const SILENT_WAV = 'data:audio/wav;base64,UklGRigAAABXQVZFZm10IBAAAAABAAEAESsAACJWAAACABAAZGF0YQQAAAAAAA==';
   let unlocked = false;
   let unlocking = false;
   let unlockPromise = null;
   let hiddenAudio = null;
   let audioContext = null;
+  let unlockToneUrl = '';
   let mediaElementPrimed = false;
   let webAudioPrimed = false;
   let lastStatus = 'Receiver audio has not been activated yet.';
@@ -32,6 +32,41 @@
     if (!AudioContext) return null;
     audioContext ||= new AudioContext();
     return audioContext;
+  }
+
+  function writeAscii(view, offset, text) {
+    for (let i = 0; i < text.length; i += 1) view.setUint8(offset + i, text.charCodeAt(i));
+  }
+
+  function getUnlockToneUrl() {
+    if (unlockToneUrl) return unlockToneUrl;
+    const sampleRate = 22050;
+    const seconds = 0.16;
+    const samples = Math.floor(sampleRate * seconds);
+    const bytes = new Uint8Array(44 + samples * 2);
+    const view = new DataView(bytes.buffer);
+    writeAscii(view, 0, 'RIFF');
+    view.setUint32(4, 36 + samples * 2, true);
+    writeAscii(view, 8, 'WAVE');
+    writeAscii(view, 12, 'fmt ');
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);
+    view.setUint16(22, 1, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * 2, true);
+    view.setUint16(32, 2, true);
+    view.setUint16(34, 16, true);
+    writeAscii(view, 36, 'data');
+    view.setUint32(40, samples * 2, true);
+    for (let i = 0; i < samples; i += 1) {
+      const attack = Math.min(1, i / (sampleRate * 0.02));
+      const release = Math.min(1, (samples - i) / (sampleRate * 0.04));
+      const envelope = Math.max(0, Math.min(attack, release));
+      const tone = Math.sin((2 * Math.PI * 660 * i) / sampleRate);
+      view.setInt16(44 + i * 2, Math.round(tone * 32767 * 0.35 * envelope), true);
+    }
+    unlockToneUrl = URL.createObjectURL(new Blob([bytes], { type: 'audio/wav' }));
+    return unlockToneUrl;
   }
 
   function status() {
@@ -63,24 +98,43 @@
     return new Promise(resolve => setTimeout(resolve, ms));
   }
 
-  async function primeWebAudio(reason) {
+  function withTimeout(promise, ms, message) {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(Error(message)), ms);
+      Promise.resolve(promise).then(
+        value => {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        error => {
+          clearTimeout(timer);
+          reject(error);
+        }
+      );
+    });
+  }
+
+  async function primeWebAudio(reason, options = {}) {
     const ctx = getAudioContext();
     if (!ctx) return { ok: false, detail: 'Web Audio is unavailable in this browser.' };
     try {
-      if (ctx.state !== 'running') await ctx.resume();
-      const frames = Math.max(1, Math.floor((ctx.sampleRate || 44100) * 0.03));
-      const buffer = ctx.createBuffer(1, frames, ctx.sampleRate || 44100);
-      const source = ctx.createBufferSource();
+      const resume = ctx.state !== 'running' ? ctx.resume() : Promise.resolve();
+      const oscillator = ctx.createOscillator();
       const gain = ctx.createGain();
-      gain.gain.setValueAtTime(0.0001, ctx.currentTime);
-      source.buffer = buffer;
-      source.connect(gain).connect(ctx.destination);
-      source.start(0);
-      source.stop(ctx.currentTime + 0.03);
-      await wait(40);
+      const duration = options.audible ? 0.16 : 0.04;
+      const start = ctx.currentTime || 0;
+      oscillator.type = 'sine';
+      oscillator.frequency.setValueAtTime(660, start);
+      gain.gain.setValueAtTime(options.audible ? 0.045 : 0.0001, start);
+      gain.gain.linearRampToValueAtTime(0.0001, start + duration);
+      oscillator.connect(gain).connect(ctx.destination);
+      oscillator.start(start);
+      oscillator.stop(start + duration);
+      await withTimeout(resume, 900, 'Web Audio resume timed out.');
+      await wait(options.audible ? 180 : 55);
       if (ctx.state === 'running') {
         webAudioPrimed = true;
-        return { ok: true, detail: `Web Audio unlocked by ${reason}.` };
+        return { ok: true, detail: options.audible ? `Receiver test tone played by ${reason}.` : `Web Audio unlocked by ${reason}.` };
       }
       return { ok: false, detail: `Web Audio is ${ctx.state}.` };
     } catch (error) {
@@ -88,35 +142,60 @@
     }
   }
 
-  async function primeMediaElement() {
+  async function primeMediaElement(options = {}) {
     const audio = getHiddenAudio();
     try {
-      audio.muted = true;
-      audio.volume = 0;
-      audio.src = SILENT_WAV;
+      audio.muted = false;
+      audio.volume = options.audible ? 0.22 : 0.03;
+      audio.src = getUnlockToneUrl();
       audio.load();
-      await audio.play();
+      await withTimeout(audio.play(), 1000, 'Media element play timed out.');
+      await wait(options.audible ? 180 : 55);
       audio.pause();
       try { audio.currentTime = 0; } catch {}
       mediaElementPrimed = true;
-      return { ok: true, detail: 'Media element primed.' };
+      return { ok: true, detail: options.audible ? 'Receiver test tone played through media element.' : 'Media element primed.' };
     } catch (error) {
       return { ok: false, detail: error.message || String(error) };
     }
   }
 
+  async function playTestTone(reason = 'receiver test tone') {
+    const [webAudio, mediaElement] = await Promise.all([
+      primeWebAudio(reason, { audible: true }),
+      primeMediaElement({ audible: true })
+    ]);
+    if (webAudio.ok || mediaElement.ok) {
+      unlocked = true;
+      lastStatus = webAudio.ok ? webAudio.detail : mediaElement.detail;
+      dispatchStatus();
+      return true;
+    }
+    lastStatus = `Receiver test tone blocked. Web Audio: ${webAudio.detail} Media element: ${mediaElement.detail}`;
+    dispatchStatus();
+    return false;
+  }
+
   async function unlock(reason = 'receiver tap', options = {}) {
-    if (unlocked) return true;
+    if (unlocked) {
+      if (options.audible || options.testTone) return await playTestTone(reason);
+      return true;
+    }
     if (unlockPromise) return await unlockPromise;
     unlocking = true;
     unlockPromise = (async () => {
-      const webAudio = await primeWebAudio(reason);
-      const mediaElement = await primeMediaElement();
+      const audible = !!options.audible || !!options.testTone;
+      const [webAudio, mediaElement] = await Promise.all([
+        primeWebAudio(reason, { audible }),
+        primeMediaElement({ audible })
+      ]);
       if (webAudio.ok || mediaElement.ok) {
         unlocked = true;
-        lastStatus = webAudio.ok
-          ? `Receiver audio unlocked by ${reason}.`
-          : `Receiver media audio unlocked by ${reason}.`;
+        lastStatus = audible
+          ? (webAudio.ok ? webAudio.detail : mediaElement.detail)
+          : webAudio.ok
+            ? `Receiver audio unlocked by ${reason}.`
+            : `Receiver media audio unlocked by ${reason}.`;
         dispatchStatus();
         return true;
       }
@@ -243,11 +322,12 @@
   window.__poolsideV9UnlockAudio = unlock;
   window.__poolsideV9AudioStatus = status;
   window.__poolsideV9PlayAnnouncementBlob = playBlob;
+  window.__poolsideV9PlayTestTone = playTestTone;
 
   const passive = { capture: true, passive: true };
-  document.addEventListener('pointerdown', () => unlock('screen tap', { quiet: true }), passive);
-  document.addEventListener('touchend', () => unlock('touch', { quiet: true }), passive);
-  document.addEventListener('click', () => unlock('click', { quiet: true }), { capture: true });
+  document.addEventListener('pointerdown', dispatchStatus, passive);
+  document.addEventListener('touchend', dispatchStatus, passive);
+  document.addEventListener('click', dispatchStatus, { capture: true });
   document.addEventListener('visibilitychange', dispatchStatus);
   document.addEventListener('DOMContentLoaded', dispatchStatus);
   dispatchStatus();

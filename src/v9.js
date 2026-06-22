@@ -174,6 +174,10 @@ let statePulling = false;
 let pendingRender = false;
 let weatherRunning = false;
 let announcementTail = Promise.resolve();
+let fallbackAudioUnlocked = false;
+let fallbackAudioContext = null;
+let fallbackUnlockAudio = null;
+let fallbackUnlockToneUrl = '';
 const retryAfter = {};
 const inFlightEvents = new Set();
 
@@ -988,34 +992,186 @@ function sameUrl(a, b) {
   }
 }
 
+function promiseTimeout(promise, ms, message) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(Error(message)), ms);
+    Promise.resolve(promise).then(
+      value => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      error => {
+        clearTimeout(timer);
+        reject(error);
+      }
+    );
+  });
+}
+
+function writeWaveAscii(view, offset, text) {
+  for (let i = 0; i < text.length; i += 1) view.setUint8(offset + i, text.charCodeAt(i));
+}
+
+function fallbackToneUrl() {
+  if (fallbackUnlockToneUrl) return fallbackUnlockToneUrl;
+  const sampleRate = 22050;
+  const samples = Math.floor(sampleRate * 0.16);
+  const bytes = new Uint8Array(44 + samples * 2);
+  const view = new DataView(bytes.buffer);
+  writeWaveAscii(view, 0, 'RIFF');
+  view.setUint32(4, 36 + samples * 2, true);
+  writeWaveAscii(view, 8, 'WAVE');
+  writeWaveAscii(view, 12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeWaveAscii(view, 36, 'data');
+  view.setUint32(40, samples * 2, true);
+  for (let i = 0; i < samples; i += 1) {
+    const attack = Math.min(1, i / (sampleRate * 0.02));
+    const release = Math.min(1, (samples - i) / (sampleRate * 0.04));
+    const envelope = Math.max(0, Math.min(attack, release));
+    const tone = Math.sin((2 * Math.PI * 660 * i) / sampleRate);
+    view.setInt16(44 + i * 2, Math.round(tone * 32767 * 0.28 * envelope), true);
+  }
+  fallbackUnlockToneUrl = URL.createObjectURL(new Blob([bytes], { type: 'audio/wav' }));
+  return fallbackUnlockToneUrl;
+}
+
+function getFallbackAudio() {
+  if (fallbackUnlockAudio) return fallbackUnlockAudio;
+  fallbackUnlockAudio = new Audio();
+  fallbackUnlockAudio.preload = 'auto';
+  fallbackUnlockAudio.playsInline = true;
+  fallbackUnlockAudio.setAttribute('playsinline', '');
+  fallbackUnlockAudio.setAttribute('webkit-playsinline', '');
+  return fallbackUnlockAudio;
+}
+
+async function fallbackWebAudioTone(reason, audible) {
+  const AudioContext = window.AudioContext || window.webkitAudioContext;
+  if (!AudioContext) return false;
+  fallbackAudioContext ||= new AudioContext();
+  const ctx = fallbackAudioContext;
+  const resume = ctx.state !== 'running' ? ctx.resume() : Promise.resolve();
+  const oscillator = ctx.createOscillator();
+  const gain = ctx.createGain();
+  const start = ctx.currentTime || 0;
+  const duration = audible ? 0.16 : 0.04;
+  oscillator.type = 'sine';
+  oscillator.frequency.setValueAtTime(660, start);
+  gain.gain.setValueAtTime(audible ? 0.045 : 0.0001, start);
+  gain.gain.linearRampToValueAtTime(0.0001, start + duration);
+  oscillator.connect(gain).connect(ctx.destination);
+  oscillator.start(start);
+  oscillator.stop(start + duration);
+  await promiseTimeout(resume, 900, 'Web Audio resume timed out.');
+  await new Promise(resolve => setTimeout(resolve, audible ? 180 : 55));
+  if (ctx.state !== 'running') return false;
+  fallbackAudioUnlocked = true;
+  S.audioStatus = audible ? `Receiver test tone played by ${reason}.` : `Receiver audio unlocked by ${reason}.`;
+  return true;
+}
+
+async function fallbackMediaTone(reason, audible) {
+  const audio = getFallbackAudio();
+  audio.muted = false;
+  audio.volume = audible ? 0.22 : 0.03;
+  audio.src = fallbackToneUrl();
+  audio.load();
+  await promiseTimeout(audio.play(), 1000, 'Media element play timed out.');
+  await new Promise(resolve => setTimeout(resolve, audible ? 180 : 55));
+  audio.pause();
+  try { audio.currentTime = 0; } catch {}
+  fallbackAudioUnlocked = true;
+  S.audioStatus = audible ? `Receiver test tone played by ${reason}.` : `Receiver media audio unlocked by ${reason}.`;
+  return true;
+}
+
+async function fallbackUnlockReceiverAudio(reason, options = {}) {
+  if (fallbackAudioUnlocked && !(options.audible || options.testTone)) return true;
+  const audible = !!options.audible || !!options.testTone;
+  const attempts = await Promise.allSettled([
+    fallbackWebAudioTone(reason, audible),
+    fallbackMediaTone(reason, audible)
+  ]);
+  const ok = attempts.some(result => result.status === 'fulfilled' && result.value);
+  if (!ok) {
+    const details = attempts.map(result => result.status === 'rejected' ? result.reason?.message || String(result.reason) : 'not unlocked').join('; ');
+    S.audioStatus = `Receiver audio is still blocked: ${details}`;
+  }
+  return ok;
+}
+
 function receiverAudioReady() {
   const status = typeof window.__poolsideV9AudioStatus === 'function' ? window.__poolsideV9AudioStatus() : null;
-  if (status?.unlocked || status?.webAudioPrimed || status?.audioContext === 'running') return true;
+  if (fallbackAudioUnlocked || status?.unlocked || status?.webAudioPrimed || status?.audioContext === 'running') return true;
   const text = String(status?.status || S.audioStatus || '').toLowerCase();
   if (/not been activated|blocked|failed|unavailable|denied/.test(text)) return false;
-  if (/audio activated|activated by|started through|audio ready/.test(text)) return true;
+  if (/audio activated|activated by|audio unlocked|test tone played|started through|audio ready/.test(text)) return true;
   return false;
 }
 
 async function ensureReceiverAudio(reason = 'receiver action', options = {}) {
   let unlocked = receiverAudioReady();
-  if (typeof window.__poolsideV9UnlockAudio === 'function') {
-    unlocked = await window.__poolsideV9UnlockAudio(reason, options);
+  const unlockOptions = {
+    ...options,
+    audible: !!options.userGesture && !!(options.testTone || options.audible || (!unlocked && options.startSession))
+  };
+  const attempts = [];
+  if (typeof window.__poolsideV9UnlockAudio === 'function') attempts.push(window.__poolsideV9UnlockAudio(reason, unlockOptions));
+  if (unlockOptions.audible || typeof window.__poolsideV9UnlockAudio !== 'function') attempts.push(fallbackUnlockReceiverAudio(reason, unlockOptions));
+  if (attempts.length) {
+    const results = await Promise.allSettled(attempts);
+    unlocked = results.some(result => result.status === 'fulfilled' && result.value);
   }
   const status = typeof window.__poolsideV9AudioStatus === 'function' ? window.__poolsideV9AudioStatus() : null;
-  S.audioStatus = status?.status || S.audioStatus;
-  unlocked = unlocked || !!status?.unlocked || !!status?.webAudioPrimed || status?.audioContext === 'running';
+  const helperReady = !!status?.unlocked || !!status?.webAudioPrimed || status?.audioContext === 'running';
+  if (status?.status && (helperReady || (!fallbackAudioUnlocked && !/not been activated yet/i.test(status.status)))) S.audioStatus = status.status;
+  unlocked = unlocked || fallbackAudioUnlocked || helperReady;
   receiverActive = true;
   S.receiverStatus = unlocked ? 'Receiver audio ready.' : 'Receiver online; tap Start Receiver once for sound.';
   S.receiverActiveAt = Date.now();
   S.receiverLastSeen = stamp();
   if (unlocked && options.startSession) beginReceiverSession(reason);
   if (!unlocked) {
-    S.setupNotice = 'Tap Start Receiver on this speaker-connected phone once. iPhone browsers require that tap before music or announcements can be heard.';
+    const detail = String(S.audioStatus || '');
+    S.setupNotice = detail && !/not been activated yet/i.test(detail)
+      ? detail
+      : 'Tap Start Receiver on this speaker-connected phone once. iPhone browsers require that tap before music or announcements can be heard.';
   }
   localSave();
   if (!unlocked && options.required) throw actionNeededError(S.setupNotice);
   return unlocked;
+}
+
+async function testReceiverTone(reason = 'iPhone receiver test tone') {
+  S.audioStatus = 'Receiver audio test starting. Listen for a short tone.';
+  localSave();
+  try {
+    const ok = await ensureReceiverAudio(reason, {
+      required: true,
+      startSession: true,
+      userGesture: true,
+      testTone: true
+    });
+    if (!ok) throw actionNeededError(S.setupNotice || 'Tap Start Receiver on this iPhone before sending sound.');
+    setFeedback('Receiver audio test completed on this phone.', true);
+    logEvent('receiver', 'Receiver audio test', 'Start Receiver test tone completed on this Home device.');
+    await pushState('Receiver audio test logged.', { render: false });
+    renderWhenIdle();
+  } catch (error) {
+    const detail = String(S.audioStatus || error.message || error || 'Receiver audio test did not start.');
+    S.receiverStatus = 'Receiver audio still blocked.';
+    S.setupNotice = detail;
+    localSave();
+    renderWhenIdle();
+    throw actionNeededError(detail);
+  }
 }
 
 async function playSuno(push = true) {
@@ -1548,7 +1704,12 @@ function warmSpotifyReceiver() {
 async function startSpotifyReceiver({ fromTap = false } = {}) {
   if (S.screen !== 'home') throw Error('Command devices do not play sound. Open Home on the speaker-connected receiver.');
   if (fromTap) await activateSpotifyElement();
-  await ensureReceiverAudio('Spotify receiver activation', { required: true, startSession: fromTap || !receiverSessionStartedAt() });
+  await ensureReceiverAudio('Spotify receiver activation', {
+    required: true,
+    startSession: fromTap || !receiverSessionStartedAt(),
+    userGesture: fromTap,
+    testTone: fromTap && !receiverAudioReady()
+  });
   let deviceId = '';
   try {
     const player = await primeSpotifyPlayer();
@@ -2557,7 +2718,7 @@ function receiverActionButtons() {
   const primary = audioOk && needsLogin
     ? '<button id="spotifyLoginHome" class="primaryWide">Login Spotify on This Receiver</button>'
     : `<button id="playHome" class="primaryWide">${esc(label)}</button>`;
-  return `<div class="receiverActions">${primary}<button id="checkWeatherHome" class="secondary">Check Weather</button><button id="skipHome" class="secondary">Skip</button><button id="stopHome" class="secondary">Stop</button></div>`;
+  return `<div class="receiverActions">${primary}<button id="testToneHome" class="secondary">Test Tone</button><button id="checkWeatherHome" class="secondary">Check Weather</button><button id="skipHome" class="secondary">Skip</button><button id="stopHome" class="secondary">Stop</button></div>`;
 }
 
 function receiverNotice() {
@@ -2686,7 +2847,7 @@ async function handleReadinessAction(action) {
     return;
   }
   if (action === 'audio') {
-    await ensureReceiverAudio('readiness audio tap', { required: true, startSession: true });
+    await ensureReceiverAudio('readiness audio tap', { required: true, startSession: true, userGesture: true, testTone: true });
     setFeedback('Receiver audio is unlocked on this phone.', true);
     await pushState('Receiver audio activation logged.', { render: false });
     renderWhenIdle();
@@ -2730,8 +2891,9 @@ function bind() {
   });
 
   wire('playHome', async () => {
+    const needsAudioUnlock = !receiverSessionStartedAt() || !receiverAudioReady();
     if (S.musicProvider === 'spotify') await activateSpotifyElement();
-    await ensureReceiverAudio('Home play button', { startSession: true });
+    await ensureReceiverAudio('Home play button', { startSession: true, userGesture: true, testTone: needsAudioUnlock });
     if (S.musicProvider === 'spotify') {
       if (!spotifyLoggedIn()) {
         setActionNeeded('Receiver audio is unlocked. Now tap Login Spotify on This Receiver.');
@@ -2745,6 +2907,7 @@ function bind() {
       else await playSuno(false);
     }
   });
+  wire('testToneHome', () => testReceiverTone('Home test tone button'));
   wire('skipHome', () => skipSelected(false));
   wire('stopHome', () => stopSelected(false));
   wire('checkWeatherHome', () => triggerWeatherCheck());
