@@ -6,7 +6,7 @@ const HANDLED_KEY = 'poolside-pulse-v9-handled-events';
 const LOG_CLEAR_KEY = 'poolside-pulse-v9-log-cleared-at';
 const RECEIVER_SESSION_KEY = 'poolside-pulse-v9-receiver-session-started-at';
 const SPOTIFY_TOKEN_KEY = 'poolside-pulse-v9-spotify-token';
-const APP_QUERY = '?v=9-iphone-sound-state';
+const APP_QUERY = '?v=9-duck-stop-state';
 const LEGACY_STATE_KEYS = [
   'poolside-pulse-v8',
   'poolside-pulse-v7',
@@ -105,6 +105,8 @@ const BASE = {
   activeMusicLabel: 'Nothing has been sent to receivers yet.',
   activeMusicProvider: 'spotify',
   activeMusicUrl: DEFAULT_SPOTIFY_PLAYLIST,
+  manualMusicHoldUntil: 0,
+  manualMusicHoldReason: '',
   command: null,
   announcement: null,
   events: [],
@@ -116,6 +118,7 @@ const BASE = {
   spotifyNowPlaying: '',
   spotifyDeviceId: '',
   spotifyDeviceName: '',
+  spotifyReceiverReadyAt: 0,
   spotifyAccountProduct: '',
   spotifyDevicesSummary: '',
   spotifyNeedsTap: false,
@@ -359,6 +362,9 @@ function normalize(raw) {
   s.announcementGain = clampNumber(s.announcementGain, 1, 3.4, 2.65);
   s.sunoVolume = clampNumber(s.sunoVolume, 20, 100, 95);
   s.sunoDuckedVolume = clampNumber(s.sunoDuckedVolume, 0, 20, 2);
+  s.manualMusicHoldUntil = Math.max(0, Number(s.manualMusicHoldUntil || 0) || 0);
+  s.manualMusicHoldReason = String(s.manualMusicHoldReason || '');
+  s.spotifyReceiverReadyAt = Math.max(0, Number(s.spotifyReceiverReadyAt || 0) || 0);
   s.radius = clampNumber(s.radius, 1, 25, 10);
   s.lightningRadiusMiles = clampNumber(s.lightningRadiusMiles || s.radius, 1, 25, 10);
   s.lightningHoldMinutes = clampNumber(s.lightningHoldMinutes, 5, 90, 30);
@@ -561,10 +567,13 @@ function cloudState() {
       'spotifyNowPlaying',
       'spotifyDeviceId',
       'spotifyDeviceName',
+      'spotifyReceiverReadyAt',
       'spotifyAccountProduct',
       'spotifyDevicesSummary',
       'spotifyNeedsTap',
-      'spotifyLastError'
+      'spotifyLastError',
+      'manualMusicHoldUntil',
+      'manualMusicHoldReason'
     ].forEach(key => delete c[key]);
   }
   return c;
@@ -617,10 +626,13 @@ function preserveLocalBeforeMerge() {
     spotifyNowPlaying: S.spotifyNowPlaying,
     spotifyDeviceId: S.spotifyDeviceId,
     spotifyDeviceName: S.spotifyDeviceName,
+    spotifyReceiverReadyAt: S.spotifyReceiverReadyAt,
     spotifyAccountProduct: S.spotifyAccountProduct,
     spotifyDevicesSummary: S.spotifyDevicesSummary,
     spotifyNeedsTap: S.spotifyNeedsTap,
-    spotifyLastError: S.spotifyLastError
+    spotifyLastError: S.spotifyLastError,
+    manualMusicHoldUntil: S.manualMusicHoldUntil,
+    manualMusicHoldReason: S.manualMusicHoldReason
   };
 }
 
@@ -650,10 +662,13 @@ function restoreLocalAfterMerge(local) {
       'spotifyNowPlaying',
       'spotifyDeviceId',
       'spotifyDeviceName',
+      'spotifyReceiverReadyAt',
       'spotifyAccountProduct',
       'spotifyDevicesSummary',
       'spotifyNeedsTap',
-      'spotifyLastError'
+      'spotifyLastError',
+      'manualMusicHoldUntil',
+      'manualMusicHoldReason'
     ].forEach(key => { S[key] = local[key]; });
   }
 }
@@ -1214,6 +1229,7 @@ async function playSuno(push = true) {
     await issueCommand('play', { provider: 'suno', label: 'Play Suno', detail: sourceLabel('suno', S.playlistUrl) }, 'Play command sent to all active receivers.');
     return;
   }
+  clearManualMusicHold();
   await ensureReceiverAudio('Suno play', { required: true });
   S.musicProvider = 'suno';
   if (!hasPlayableSuno()) {
@@ -1248,6 +1264,7 @@ async function pauseSuno(push = true) {
   music.pause();
   music.volume = Number(S.sunoVolume || 95) / 100;
   S.intent = 'paused';
+  setManualMusicHold('Suno paused manually');
   logEvent('pause', 'Suno paused', '');
   setFeedback('Suno paused on receiver.', true);
   await pushState('Receiver pause logged.', { render: false });
@@ -1264,6 +1281,7 @@ async function stopSuno(push = true) {
   try { music.currentTime = 0; } catch {}
   music.volume = Number(S.sunoVolume || 95) / 100;
   S.intent = 'stopped';
+  setManualMusicHold('Suno stopped manually');
   logEvent('stop', 'Suno stopped', '');
   setFeedback('Suno stopped on receiver.', true);
   await pushState('Receiver stop logged.', { render: false });
@@ -1680,6 +1698,7 @@ function registerSpotifyListeners() {
     spotifyWebDeviceId = device_id;
     S.spotifyDeviceId = device_id;
     S.spotifyDeviceName = 'Poolside Pulse V9 Receiver';
+    S.spotifyReceiverReadyAt = Date.now();
     S.receiverStatus = 'Spotify receiver ready.';
     S.receiverLastSeen = stamp();
     setSpotifyStatus('Spotify receiver is ready on this device.', true);
@@ -1779,17 +1798,27 @@ async function startSpotifyReceiver({ fromTap = false } = {}) {
     if (!ok) throw Error('Spotify receiver did not connect.');
     deviceId = await waitForSpotifyReady();
   } catch (error) {
-    spotifyPlayerReady = false;
-    spotifyWebDeviceId = '';
-    S.spotifyDeviceId = '';
-    S.spotifyNeedsTap = true;
-    S.receiverStatus = 'Spotify receiver not ready on this phone.';
-    setSpotifyStatus(`Spotify did not start on this iPhone browser: ${error.message || error}. Keep Home open and tap Start Receiver + Spotify again.`, false);
-    localSave();
-    throw error;
+    const current = await spotifyCurrentPlaybackDevice();
+    if (current?.deviceId) {
+      deviceId = current.deviceId;
+      S.spotifyNeedsTap = false;
+      S.receiverStatus = 'Spotify receiver active.';
+      setSpotifyStatus(`Using active Spotify device: ${current.name}.`, true);
+      logEvent('spotify', 'Using active Spotify playback device', `${current.name}; ${error.message || error}`);
+    } else {
+      spotifyPlayerReady = false;
+      spotifyWebDeviceId = '';
+      S.spotifyDeviceId = '';
+      S.spotifyNeedsTap = true;
+      S.receiverStatus = 'Spotify receiver not ready on this phone.';
+      setSpotifyStatus(`Spotify did not start on this iPhone browser: ${error.message || error}. Keep Home open and tap Start Receiver + Spotify again.`, false);
+      localSave();
+      throw error;
+    }
   }
   S.spotifyDeviceId = deviceId;
   S.spotifyDeviceName = S.spotifyDeviceName || 'Poolside Pulse V9 Receiver';
+  S.spotifyReceiverReadyAt = Date.now();
   S.receiverStatus = 'Spotify receiver active.';
   S.receiverLastSeen = stamp();
   receiverActive = true;
@@ -1806,6 +1835,7 @@ function setSpotifyDevice(device, status = '') {
   if (!device?.id) return '';
   S.spotifyDeviceId = device.id;
   S.spotifyDeviceName = device.name || S.spotifyDeviceName || 'Spotify device';
+  S.spotifyReceiverReadyAt = Date.now();
   if (status) S.spotifyStatus = status;
   S.receiverLastSeen = stamp();
   localSave();
@@ -1837,9 +1867,38 @@ async function spotifyPreferredDeviceId(options = {}) {
   }
 }
 
+async function spotifyCurrentPlaybackDevice(options = {}) {
+  if (!spotifyLoggedIn()) return null;
+  try {
+    const player = await spotifyApi('GET', '/me/player');
+    const device = player?.device;
+    if (!device?.id || device.is_restricted) return null;
+    if (options.requirePlaying && !player?.is_playing) return null;
+    S.spotifyDeviceId = device.id;
+    S.spotifyDeviceName = device.name || S.spotifyDeviceName || 'Spotify device';
+    S.spotifyReceiverReadyAt = Date.now();
+    if (Number.isFinite(Number(device.volume_percent))) {
+      S.spotifyDevicesSummary = `Active device: ${device.name || 'Spotify device'} at ${device.volume_percent}%`;
+    }
+    S.receiverLastSeen = stamp();
+    localSave();
+    return {
+      deviceId: device.id,
+      name: device.name || 'Spotify device',
+      isPlaying: !!player?.is_playing,
+      volume: Number.isFinite(Number(device.volume_percent)) ? Number(device.volume_percent) : null
+    };
+  } catch (error) {
+    logEvent('spotify', 'Spotify current playback lookup failed', error.message || String(error));
+    return null;
+  }
+}
+
 async function spotifyTargetDevice(options = {}) {
   if (S.screen === 'home') {
     if (spotifyPlayerReady && spotifyWebDeviceId) return spotifyWebDeviceId;
+    const current = await spotifyCurrentPlaybackDevice({ requirePlaying: !!options.requirePlaying });
+    if (current?.deviceId) return current.deviceId;
     if (options.allowStart === false) return '';
     if (spotifyLoggedIn()) {
       try {
@@ -1916,6 +1975,7 @@ async function playSpotifyUrl(url = S.spotifyUrl, push = true, options = {}) {
     await issueCommand('spotify-play', { label: 'Play Spotify', provider: 'spotify', url: playUrl, detail: sourceLabel('spotify', playUrl) }, `Spotify play command sent: ${sourceLabel('spotify', playUrl)}.`);
     return;
   }
+  clearManualMusicHold();
   if (!spotifyLoggedIn()) throw actionNeededError('Spotify is not connected on this receiver. Tap Login Spotify on the speaker-connected Home phone.');
   const remotePreferredId = options.fromRemote
     ? await spotifyTargetDevice({ preferKnown: true, preferActive: true, preferPoolside: true, allowStart: false }).catch(() => '')
@@ -1959,8 +2019,11 @@ async function spotifyPause(push = true) {
     await issueCommand('pause', { label: 'Pause music' }, 'Pause command sent to all active receivers.');
     return;
   }
-  await spotifyApi('PUT', '/me/player/pause', null, { device_id: await spotifyTargetDevice({ preferKnown: true, preferActive: true, preferPoolside: true }) });
+  const deviceId = await spotifyTargetDevice({ preferActive: true, preferPoolside: true, allowStart: false });
+  if (!deviceId) throw actionNeededError('Spotify is playing, but this receiver could not identify the active Spotify device. Tap Start Receiver + Spotify once, then press Stop again.');
+  await spotifyApi('PUT', '/me/player/pause', null, { device_id: deviceId });
   S.intent = 'paused';
+  setManualMusicHold('Spotify paused manually');
   setSpotifyStatus('Spotify paused on receiver.', true);
   logEvent('pause', 'Spotify paused', '');
   await pushState('Receiver Spotify pause logged.', { render: false });
@@ -1974,7 +2037,11 @@ async function spotifyStop(push = true) {
   }
   await spotifyPause(false);
   S.intent = 'stopped';
+  setManualMusicHold('Spotify stopped manually');
   setSpotifyStatus('Spotify stopped on receiver.', true);
+  logEvent('stop', 'Spotify stopped', '');
+  await pushState('Receiver Spotify stop logged.', { render: false });
+  renderWhenIdle();
 }
 
 async function spotifyNext(push = true) {
@@ -2024,15 +2091,19 @@ function releaseCommandReceiver(reason = 'command mode') {
 
 async function duckSpotifyForAnnouncement() {
   if (S.musicProvider !== 'spotify') return null;
+  const current = await spotifyCurrentPlaybackDevice({ requirePlaying: true });
   const snapshot = {
-    volume: clampNumber(S.spotifyVolume, 0, 100, 92),
-    wasPlaying: S.intent === 'playing',
-    deviceId: S.screen === 'home' ? (spotifyWebDeviceId || '') : (S.spotifyDeviceId || '')
+    volume: current?.volume ?? clampNumber(S.spotifyVolume, 0, 100, 92),
+    wasPlaying: !!current?.isPlaying || S.intent === 'playing',
+    deviceId: current?.deviceId || (S.screen === 'home' ? (spotifyWebDeviceId || '') : (S.spotifyDeviceId || ''))
   };
   try {
     if (S.screen !== 'home' || (!spotifyLoggedIn() && !S.spotifyDeviceId)) return null;
-    const deviceId = snapshot.deviceId || await spotifyTargetDevice({ preferKnown: true, preferActive: true, preferPoolside: true, allowStart: false });
-    if (!deviceId) return null;
+    const deviceId = snapshot.deviceId || await spotifyTargetDevice({ preferActive: true, preferPoolside: true, allowStart: false, requirePlaying: true });
+    if (!deviceId) {
+      logEvent('spotify', 'Spotify duck skipped', 'No active Spotify playback device was reported for this receiver.');
+      return null;
+    }
     snapshot.deviceId = deviceId;
     await spotifySetVolume(S.spotifyDuckedVolume, deviceId, { persist: false, preferKnown: true, preferActive: true, preferPoolside: true, allowStart: false });
     setFeedback(`Spotify lowered to ${S.spotifyDuckedVolume}% for announcement. The current song is not restarted.`, true);
@@ -2049,10 +2120,10 @@ async function restoreSpotifyAfterAnnouncement(snapshot) {
   try {
     const restoreVolume = clampNumber(S.spotifyVolume, 0, 100, snapshot.volume ?? 92);
     await spotifySetVolume(restoreVolume, snapshot.deviceId || '', { persist: false, preferKnown: true, preferActive: true, preferPoolside: true, allowStart: false });
-    if (snapshot.wasPlaying) {
+    if (snapshot.wasPlaying && !manualMusicHoldActive()) {
       try {
         const player = await spotifyApi('GET', '/me/player');
-        if (player && player.is_playing === false) await spotifyApi('PUT', '/me/player/play', null, { device_id: await spotifyTargetDevice({ preferKnown: true, preferActive: true, preferPoolside: true }) });
+        if (player && player.is_playing === false && snapshot.deviceId) await spotifyApi('PUT', '/me/player/play', null, { device_id: snapshot.deviceId });
       } catch {}
       S.intent = 'playing';
     }
@@ -2336,6 +2407,46 @@ function openNow() {
   return open <= close ? current >= open && current < close : current >= open || current < close;
 }
 
+function nextPoolCloseMs() {
+  const now = new Date();
+  const current = now.getHours() * 60 + now.getMinutes();
+  const open = mins(S.poolOpen);
+  const close = mins(S.poolClose);
+  const result = new Date(now);
+  result.setHours(Math.floor(close / 60), close % 60, 0, 0);
+  if (open <= close) {
+    if (current >= close) result.setDate(result.getDate() + 1);
+  } else if (current >= open) {
+    result.setDate(result.getDate() + 1);
+  }
+  return result.getTime();
+}
+
+function manualMusicHoldActive() {
+  const until = Number(S.manualMusicHoldUntil || 0);
+  if (!until) return false;
+  if (until > Date.now()) return true;
+  S.manualMusicHoldUntil = 0;
+  S.manualMusicHoldReason = '';
+  localSave();
+  return false;
+}
+
+function setManualMusicHold(reason = 'Manual stop') {
+  if (S.playbackMode === 'hours' && openNow()) S.manualMusicHoldUntil = nextPoolCloseMs() + 60000;
+  else if (S.playbackMode === 'always') S.manualMusicHoldUntil = Date.now() + 24 * 60 * 60 * 1000;
+  else S.manualMusicHoldUntil = 0;
+  S.manualMusicHoldReason = S.manualMusicHoldUntil ? reason : '';
+  localSave();
+}
+
+function clearManualMusicHold() {
+  if (!S.manualMusicHoldUntil && !S.manualMusicHoldReason) return;
+  S.manualMusicHoldUntil = 0;
+  S.manualMusicHoldReason = '';
+  localSave();
+}
+
 function shouldPlayContinuously() {
   return S.playbackMode === 'always' || openNow();
 }
@@ -2486,7 +2597,7 @@ async function tick() {
     S.lightningClearAt = 0;
     await sendAnnouncement(tokens(S.lightningClearText), false, 'Lightning all clear');
   }
-  if (S.autoStart && shouldPlayContinuously() && S.intent !== 'playing') {
+  if (S.autoStart && shouldPlayContinuously() && S.intent !== 'playing' && !manualMusicHoldActive()) {
     try { await playSelected(false); } catch {}
   }
   if (S.autoStop && S.playbackMode === 'hours' && !openNow() && S.intent === 'playing') await stopSelected(false);
@@ -2713,14 +2824,17 @@ function receiverReadiness() {
     if (S.spotifyAccountProduct && S.spotifyAccountProduct !== 'premium') return `Spotify Premium needed: ${S.spotifyAccountProduct}.`;
     if (!spotifyDeviceReady()) return 'Tap Start Spotify Receiver on this phone.';
     if (spotifyPlayerReady && spotifyWebDeviceId) return `Ready: ${S.spotifyDeviceName || 'Poolside Pulse receiver'}.`;
-    return 'Start Spotify on this receiver.';
+    return `Ready: ${S.spotifyDeviceName || 'active Spotify device'}.`;
   }
   return hasPlayableSuno() ? 'Suno queue ready.' : 'Import Suno queue.';
 }
 
 function spotifyDeviceReady() {
   if (S.musicProvider !== 'spotify') return true;
-  if (S.screen === 'home') return spotifyPlayerReady && !!spotifyWebDeviceId && !S.spotifyNeedsTap;
+  if (S.screen === 'home') {
+    const recentlyReady = !!S.spotifyDeviceId && Date.now() - Number(S.spotifyReceiverReadyAt || 0) < 10 * 60 * 1000;
+    return ((spotifyPlayerReady && !!spotifyWebDeviceId) || recentlyReady) && !S.spotifyNeedsTap;
+  }
   return (((spotifyPlayerReady && !!spotifyWebDeviceId) || !!S.spotifyDeviceId) && !S.spotifyNeedsTap);
 }
 
@@ -2807,6 +2921,7 @@ function receiverNotice() {
   if (!receiverSessionStartedAt() || !receiverAudioReady()) message = 'Tap the big Start Receiver button. That one tap starts a fresh receiver session, ignores old commands, and unlocks iPhone audio.';
   else if (S.musicProvider === 'spotify' && !spotifyLoggedIn()) message = 'Tap Login Spotify on This Receiver. Spotify must be connected on the speaker phone, not on a Command laptop.';
   else if (S.musicProvider === 'spotify' && !spotifyDeviceReady()) message = 'Tap Start Receiver + Spotify or the Spotify device ready TODO row to make this phone the speaker device.';
+  else if (manualMusicHoldActive()) message = `${S.manualMusicHoldReason || 'Music stopped manually'}. Auto-start will stay off until the next Play command or pool opening cycle.`;
   else message = S.setupNotice || '';
   return message ? `<div class="actionNotice"><b>Next step:</b> ${esc(message)}</div>` : '';
 }
@@ -3279,7 +3394,7 @@ function normalizeCurrentUrl() {
   try {
     const params = new URLSearchParams(location.search);
     if (params.has('code') || params.has('state')) return;
-    if (params.get('v') === '9-iphone-sound-state') return;
+    if (params.get('v') === '9-duck-stop-state') return;
     history.replaceState(null, '', `/${APP_QUERY}`);
   } catch {}
 }
