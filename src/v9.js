@@ -6,7 +6,7 @@ const HANDLED_KEY = 'poolside-pulse-v9-handled-events';
 const LOG_CLEAR_KEY = 'poolside-pulse-v9-log-cleared-at';
 const RECEIVER_SESSION_KEY = 'poolside-pulse-v9-receiver-session-started-at';
 const SPOTIFY_TOKEN_KEY = 'poolside-pulse-v9-spotify-token';
-const APP_QUERY = '?v=9-verified-duck-fallback';
+const APP_QUERY = '?v=9-volume-suno-control';
 const LEGACY_STATE_KEYS = [
   'poolside-pulse-v8',
   'poolside-pulse-v7',
@@ -175,6 +175,8 @@ let spotifyPrimePromise = null;
 let spotifyWarmPromise = null;
 let statePulling = false;
 let pendingRender = false;
+let spotifyVolumeApplyTimer = null;
+let audioSettingsApplyTimer = null;
 let weatherRunning = false;
 let announcementTail = Promise.resolve();
 let fallbackAudioUnlocked = false;
@@ -859,6 +861,7 @@ function commandTitle(type) {
     stop: 'Stop music',
     skip: 'Skip track',
     'spotify-volume': 'Set Spotify volume',
+    'audio-settings': 'Update audio settings',
     song: 'Play Suno song',
     suno: 'Play Suno playlist',
     'weather-check': 'Weather check'
@@ -906,6 +909,12 @@ async function runCommand(command) {
   if (command.provider && command.type !== 'spotify-volume') S.musicProvider = command.provider;
   if (command.type === 'spotify-volume') {
     S.spotifyVolume = clampNumber(command.volume, 0, 100, S.spotifyVolume);
+  } else if (command.type === 'audio-settings') {
+    if (Number.isFinite(Number(command.spotifyDuckedVolume))) S.spotifyDuckedVolume = clampNumber(command.spotifyDuckedVolume, 0, 20, S.spotifyDuckedVolume);
+    if (Number.isFinite(Number(command.sunoVolume))) S.sunoVolume = clampNumber(command.sunoVolume, 20, 100, S.sunoVolume);
+    if (Number.isFinite(Number(command.announcementGain))) S.announcementGain = clampNumber(command.announcementGain, 1, 3.4, S.announcementGain);
+    if (Number.isFinite(Number(command.rate))) S.rate = clampNumber(command.rate, .75, 1.15, S.rate);
+    if (Number.isFinite(Number(command.pitch))) S.pitch = clampNumber(command.pitch, .85, 1.15, S.pitch);
   }
   if (command.url) {
     if (command.type === 'spotify-play') S.spotifyUrl = command.url;
@@ -928,11 +937,15 @@ async function runCommand(command) {
   } else if (command.type === 'skip') {
     await skipSelected(false);
   } else if (command.type === 'spotify-volume') {
-    await spotifySetVolume(S.spotifyVolume, '', { preferKnown: true });
+    const result = await spotifySetVolume(S.spotifyVolume, '', { preferKnown: true, preferActive: true, preferPoolside: true, allowStart: false });
     S.intent = S.intent || 'playing';
     setSpotifyStatus(`Spotify volume set to ${S.spotifyVolume}% on this receiver.`, true);
-    logEvent('spotify', 'Spotify volume set on receiver', `${S.spotifyVolume}%`, { eventId: command.id, commandType: command.type });
+    logEvent('spotify', 'Spotify volume set on receiver', `${S.spotifyVolume}% via ${result.method || 'receiver'}`, { eventId: command.id, commandType: command.type });
     await pushState('Receiver Spotify volume logged.', { render: false });
+  } else if (command.type === 'audio-settings') {
+    applyReceiverAudioSettings('remote command');
+    logEvent('settings', 'Audio settings updated on receiver', audioSettingsDetail(), { eventId: command.id, commandType: command.type });
+    await pushState('Receiver audio settings logged.', { render: false });
   } else if (command.type === 'song') {
     S.musicProvider = 'suno';
     await playSuno(false);
@@ -1230,11 +1243,12 @@ async function playSuno(push = true) {
   readMusicSettings();
   if (S.screen !== 'home' && push) {
     S.musicProvider = 'suno';
-    await issueCommand('play', { provider: 'suno', label: 'Play Suno', detail: sourceLabel('suno', S.playlistUrl) }, 'Play command sent to all active receivers.');
+    await issueCommand('play', { provider: 'suno', trackIndex: S.current, label: 'Play Suno', detail: `${sourceLabel('suno', S.playlistUrl)} · track ${Number(S.current || 0) + 1}` }, 'Play command sent to all active receivers.');
     return;
   }
   clearManualMusicHold();
   await ensureReceiverAudio('Suno play', { required: true });
+  await pauseSpotifyForSunoPlayback();
   S.musicProvider = 'suno';
   if (!hasPlayableSuno()) {
     await importSuno('Playlist auto-imported for receiver.');
@@ -1257,6 +1271,26 @@ async function playSuno(push = true) {
   setFeedback(`Suno playing on receiver: ${track().title || 'track'}.`, true);
   await pushState('Receiver Suno playback logged.', { render: false });
   renderWhenIdle();
+}
+
+async function pauseSpotifyForSunoPlayback() {
+  if (S.activeMusicProvider !== 'spotify' && S.musicProvider !== 'spotify' && !S.spotifyDeviceId && !spotifyPlayer) return;
+  let state = null;
+  try { state = await spotifyPlaybackState(); } catch {}
+  const deviceId = state?.deviceId || spotifyWebDeviceId || S.spotifyDeviceId || '';
+  if (!state?.isPlaying && !spotifyPlayer && !deviceId) return;
+  const method = await pauseSpotifyForAnnouncement(deviceId);
+  if (method) {
+    S.spotifyStatus = `Spotify paused while Suno plays.`;
+    logEvent('spotify', 'Spotify paused for Suno playback', method);
+  }
+}
+
+async function pauseSunoForSpotifyPlayback() {
+  if (music.paused) return;
+  await fade(music, 0, 220).catch(() => {});
+  music.pause();
+  logEvent('music', 'Suno paused for Spotify playback', track().title || 'Suno track');
 }
 
 async function pauseSuno(push = true) {
@@ -1448,7 +1482,79 @@ function updateRangeDraft(key, value) {
   syncVolumeReadouts();
 }
 
+function audioSettingsPayload() {
+  return {
+    spotifyDuckedVolume: clampNumber(S.spotifyDuckedVolume, 0, 20, 0),
+    sunoVolume: clampNumber(S.sunoVolume, 20, 100, 95),
+    announcementGain: clampNumber(S.announcementGain, 1, 3.4, 2.65),
+    rate: clampNumber(S.rate, .75, 1.15, .94),
+    pitch: clampNumber(S.pitch, .85, 1.15, 1)
+  };
+}
+
+function audioSettingsDetail() {
+  const audio = audioSettingsPayload();
+  return `music during announcements ${audio.spotifyDuckedVolume}%; Suno ${audio.sunoVolume}%; announcements ${Math.round(audio.announcementGain * 100)}%; speed ${audio.rate}; pitch ${audio.pitch}`;
+}
+
+function applyReceiverAudioSettings(reason = 'local setting') {
+  const audio = audioSettingsPayload();
+  S.spotifyDuckedVolume = audio.spotifyDuckedVolume;
+  S.sunoVolume = audio.sunoVolume;
+  S.announcementGain = audio.announcementGain;
+  S.rate = audio.rate;
+  S.pitch = audio.pitch;
+  music.volume = music.paused ? music.volume : Math.max(.01, audio.sunoVolume / 100);
+  if (!announcementMusic.paused) announcementMusic.volume = Math.max(.01, audio.sunoVolume / 100);
+  logEvent('settings', 'Audio settings applied', `${reason}: ${audioSettingsDetail()}`);
+  localSave();
+}
+
+async function applyAudioSettings(push = true) {
+  clearTimeout(audioSettingsApplyTimer);
+  audioSettingsApplyTimer = null;
+  syncVolumeReadouts();
+  applyReceiverAudioSettings(S.screen === 'home' ? 'local slider' : 'command slider');
+  if (S.screen !== 'home' && push) {
+    await issueCommand('audio-settings', {
+      ...audioSettingsPayload(),
+      label: 'Update audio settings',
+      detail: audioSettingsDetail()
+    }, 'Audio slider settings sent to all active receivers.');
+    return;
+  }
+  await pushState('Audio slider settings saved on receiver.', { render: false });
+  setFeedback('Audio slider settings saved for receiver playback.', true);
+  renderWhenIdle();
+}
+
+function scheduleSpotifyVolumeApply() {
+  clearTimeout(spotifyVolumeApplyTimer);
+  spotifyVolumeApplyTimer = setTimeout(() => {
+    spotifyVolumeApplyTimer = null;
+    applySpotifyVolume(true).catch(error => {
+      if (isActionNeeded(error)) setActionNeeded(error.message || String(error));
+      else setFeedback(error.message || String(error), false);
+      renderWhenIdle();
+    });
+  }, 450);
+}
+
+function scheduleAudioSettingsApply() {
+  clearTimeout(audioSettingsApplyTimer);
+  audioSettingsApplyTimer = setTimeout(() => {
+    audioSettingsApplyTimer = null;
+    applyAudioSettings(true).catch(error => {
+      if (isActionNeeded(error)) setActionNeeded(error.message || String(error));
+      else setFeedback(error.message || String(error), false);
+      renderWhenIdle();
+    });
+  }, 450);
+}
+
 async function applySpotifyVolume(push = true) {
+  clearTimeout(spotifyVolumeApplyTimer);
+  spotifyVolumeApplyTimer = null;
   const volume = readSpotifyVolumeControl();
   syncVolumeReadouts();
   if (S.screen !== 'home' && push) {
@@ -1459,8 +1565,8 @@ async function applySpotifyVolume(push = true) {
     }, `Spotify volume ${volume}% sent to all active receivers. Announcements stay loud.`);
     return;
   }
-  await spotifySetVolume(volume, '', { preferKnown: true, preferActive: true, preferPoolside: true });
-  logEvent('spotify', 'Spotify volume set locally', `${volume}%`);
+  const result = await spotifySetVolume(volume, '', { preferKnown: true, preferActive: true, preferPoolside: true, allowStart: false });
+  logEvent('spotify', 'Spotify volume set locally', `${volume}% via ${result.method || 'receiver'}`);
   await pushState(`Spotify volume set to ${volume}% on receiver.`, { render: false });
   setSpotifyStatus(`Spotify volume set to ${volume}% on this receiver. Announcements stay loud.`, true);
   renderWhenIdle();
@@ -1996,9 +2102,45 @@ async function spotifySetVolume(percent, targetDeviceId = '', options = {}) {
     S.spotifyVolume = volume;
     localSave();
   }
-  await spotifySetLocalPlayerVolume(volume);
-  const deviceId = targetDeviceId || await spotifyTargetDevice(options);
-  if (deviceId) await spotifyApi('PUT', '/me/player/volume', null, { volume_percent: volume, device_id: deviceId });
+  const localSet = await spotifySetLocalPlayerVolume(volume);
+  let lastError = '';
+  let remoteSet = false;
+  let method = localSet ? 'receiver SDK' : '';
+  const candidates = [];
+  const addCandidate = id => {
+    const value = String(id || '').trim();
+    if (value && !candidates.includes(value)) candidates.push(value);
+  };
+  addCandidate(targetDeviceId);
+  addCandidate(spotifyWebDeviceId);
+  addCandidate(S.spotifyDeviceId);
+  try { addCandidate((await spotifyPlaybackState())?.deviceId); } catch (error) { lastError = error.message || String(error); }
+  try { addCandidate(await spotifyTargetDevice({ ...options, allowStart: false })); } catch (error) { lastError = error.message || String(error); }
+  if (spotifyLoggedIn()) {
+    for (const deviceId of candidates) {
+      try {
+        await spotifyApi('PUT', '/me/player/volume', null, { volume_percent: volume, device_id: deviceId });
+        remoteSet = true;
+        method = method ? `${method} + Spotify API` : 'Spotify API';
+        S.spotifyDeviceId = deviceId;
+        S.spotifyReceiverReadyAt = Date.now();
+        break;
+      } catch (error) {
+        lastError = error.message || String(error);
+      }
+    }
+    if (!remoteSet) {
+      try {
+        await spotifyApi('PUT', '/me/player/volume', null, { volume_percent: volume });
+        remoteSet = true;
+        method = method ? `${method} + active Spotify API` : 'active Spotify API';
+      } catch (error) {
+        lastError = error.message || String(error);
+      }
+    }
+  }
+  if (!localSet && !remoteSet) throw Error(lastError || 'Spotify volume was not accepted by the receiver or Spotify.');
+  return { localSet, remoteSet, method };
 }
 
 async function spotifyActuallyPlaying(targetDeviceId = '') {
@@ -2046,6 +2188,7 @@ async function playSpotifyUrl(url = S.spotifyUrl, push = true, options = {}) {
     return;
   }
   clearManualMusicHold();
+  await pauseSunoForSpotifyPlayback();
   if (!spotifyLoggedIn()) throw actionNeededError('Spotify is not connected on this receiver. Tap Login Spotify on the speaker-connected Home phone.');
   const remotePreferredId = options.fromRemote
     ? await spotifyTargetDevice({ preferKnown: true, preferActive: true, preferPoolside: true, allowStart: false }).catch(() => '')
@@ -2183,16 +2326,17 @@ async function duckSpotifyForAnnouncement() {
       return null;
     }
     snapshot.deviceId = deviceId;
-    const localSet = await spotifySetLocalPlayerVolume(targetVolume, 'Spotify local duck failed');
+    let localSet = false;
     let remoteSet = false;
     let remoteError = '';
-    if (spotifyLoggedIn() && deviceId) {
-      try {
-        await spotifyApi('PUT', '/me/player/volume', null, { volume_percent: targetVolume, device_id: deviceId });
-        remoteSet = true;
-      } catch (error) {
-        remoteError = error.message || String(error);
-      }
+    let appliedMethod = '';
+    try {
+      const result = await spotifySetVolume(targetVolume, deviceId, { persist: false, preferKnown: true, preferActive: true, preferPoolside: true, allowStart: false });
+      localSet = !!result.localSet;
+      remoteSet = !!result.remoteSet;
+      appliedMethod = result.method || '';
+    } catch (error) {
+      remoteError = error.message || String(error);
     }
     await wait(450);
     let verified = false;
@@ -2221,8 +2365,8 @@ async function duckSpotifyForAnnouncement() {
       throw Error(remoteError || 'Spotify did not accept a local or remote duck command.');
     }
     snapshot.duckMethod = verified
-      ? `${remoteSet ? 'Spotify API' : ''}${remoteSet && localSet ? ' + ' : ''}${localSet ? 'receiver SDK' : ''}` || 'verified'
-      : `${remoteSet ? 'Spotify API' : ''}${remoteSet && localSet ? ' + ' : ''}${localSet ? 'receiver SDK' : ''}` || 'unverified';
+      ? appliedMethod || `${remoteSet ? 'Spotify API' : ''}${remoteSet && localSet ? ' + ' : ''}${localSet ? 'receiver SDK' : ''}` || 'verified'
+      : appliedMethod || `${remoteSet ? 'Spotify API' : ''}${remoteSet && localSet ? ' + ' : ''}${localSet ? 'receiver SDK' : ''}` || 'unverified';
     logEvent(verified ? 'spotify' : 'receiver', verified ? 'Spotify ducked for announcement' : 'Spotify duck sent but unverified', `${targetVolume}% via ${snapshot.duckMethod}.`);
     setFeedback(`Spotify lowered to ${targetVolume}% for announcement. The current song is not restarted.`, true);
     return snapshot;
@@ -3255,7 +3399,10 @@ function bind() {
   wire('checkWeatherCmd', () => triggerWeatherCheck());
   wire('spotifyVolumeApply', () => applySpotifyVolume(true));
   document.querySelectorAll('#spotifyVolumeCommand, #spotifyVolume').forEach(input => {
-    input.oninput = () => updateSpotifyVolumeDraft(input.value);
+    input.oninput = () => {
+      updateSpotifyVolumeDraft(input.value);
+      scheduleSpotifyVolumeApply();
+    };
     input.onchange = () => Promise.resolve(applySpotifyVolume(true)).catch(error => {
       if (isActionNeeded(error)) setActionNeeded(error.message || String(error));
       else setFeedback(error.message || String(error), false);
@@ -3263,15 +3410,13 @@ function bind() {
     });
   });
   document.querySelectorAll('#spotifyDuckedVolume, #sunoVolume, #announcementGain, #rate, #pitch').forEach(input => {
-    input.oninput = () => updateRangeDraft(input.id, input.value);
+    input.oninput = () => {
+      updateRangeDraft(input.id, input.value);
+      scheduleAudioSettingsApply();
+    };
     input.onchange = () => Promise.resolve((async () => {
       updateRangeDraft(input.id, input.value);
-      if (input.id === 'sunoVolume' && S.screen === 'home' && S.musicProvider === 'suno' && !music.paused) {
-        music.volume = clampNumber(S.sunoVolume, 20, 100, 95) / 100;
-      }
-      await pushState('Audio slider setting saved.', { render: false });
-      setFeedback('Audio slider setting saved for receivers.', true);
-      renderWhenIdle();
+      await applyAudioSettings(true);
     })()).catch(error => {
       if (isActionNeeded(error)) setActionNeeded(error.message || String(error));
       else setFeedback(error.message || String(error), false);
@@ -3336,6 +3481,7 @@ function bind() {
     rememberActiveSource(S.musicProvider, activeProviderUrl(), 'selected');
     await save('Music settings saved.');
     if (S.musicProvider === 'spotify') await applySpotifyVolume(true);
+    await applyAudioSettings(true);
   });
   wire('useSpotify', async () => {
     readMusicSettings();
@@ -3526,7 +3672,7 @@ function normalizeCurrentUrl() {
   try {
     const params = new URLSearchParams(location.search);
     if (params.has('code') || params.has('state')) return;
-    if (params.get('v') === '9-verified-duck-fallback') return;
+    if (params.get('v') === '9-volume-suno-control') return;
     history.replaceState(null, '', `/${APP_QUERY}`);
   } catch {}
 }
