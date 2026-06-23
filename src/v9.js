@@ -6,7 +6,7 @@ const HANDLED_KEY = 'poolside-pulse-v9-handled-events';
 const LOG_CLEAR_KEY = 'poolside-pulse-v9-log-cleared-at';
 const RECEIVER_SESSION_KEY = 'poolside-pulse-v9-receiver-session-started-at';
 const SPOTIFY_TOKEN_KEY = 'poolside-pulse-v9-spotify-token';
-const APP_QUERY = '?v=9-duck-stop-state';
+const APP_QUERY = '?v=9-verified-duck-fallback';
 const LEGACY_STATE_KEYS = [
   'poolside-pulse-v8',
   'poolside-pulse-v7',
@@ -1052,6 +1052,10 @@ function promiseTimeout(promise, ms, message) {
   });
 }
 
+function wait(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 function writeWaveAscii(view, offset, text) {
   for (let i = 0; i < text.length; i += 1) view.setUint8(offset + i, text.charCodeAt(i));
 }
@@ -1918,15 +1922,81 @@ async function spotifyTargetDevice(options = {}) {
   return '';
 }
 
+async function spotifySetLocalPlayerVolume(percent, label = 'Spotify local volume failed') {
+  if (S.screen !== 'home' || !spotifyPlayer || typeof spotifyPlayer.setVolume !== 'function') return false;
+  try {
+    await spotifyPlayer.setVolume(clampNumber(percent, 0, 100, 92) / 100);
+    return true;
+  } catch (error) {
+    logEvent('spotify', label, error.message || String(error));
+    return false;
+  }
+}
+
+async function spotifyPlaybackState() {
+  if (!spotifyLoggedIn()) return null;
+  const player = await spotifyApi('GET', '/me/player');
+  const device = player?.device;
+  if (!device?.id || device.is_restricted) return null;
+  return {
+    deviceId: device.id,
+    name: device.name || 'Spotify device',
+    isPlaying: !!player?.is_playing,
+    volume: Number.isFinite(Number(device.volume_percent)) ? Number(device.volume_percent) : null
+  };
+}
+
+async function pauseSpotifyForAnnouncement(deviceId) {
+  let lastError = '';
+  if (spotifyLoggedIn()) {
+    try {
+      await spotifyApi('PUT', '/me/player/pause', null, deviceId ? { device_id: deviceId } : {});
+      return 'Spotify API';
+    } catch (error) {
+      lastError = error.message || String(error);
+    }
+  }
+  if (spotifyPlayer && typeof spotifyPlayer.pause === 'function') {
+    try {
+      await spotifyPlayer.pause();
+      return 'receiver SDK';
+    } catch (error) {
+      lastError = lastError || error.message || String(error);
+    }
+  }
+  if (lastError) logEvent('spotify', 'Spotify pause fallback failed', lastError);
+  return '';
+}
+
+async function resumeSpotifyAfterAnnouncement(deviceId) {
+  let lastError = '';
+  if (spotifyLoggedIn()) {
+    try {
+      await spotifyApi('PUT', '/me/player/play', null, deviceId ? { device_id: deviceId } : {});
+      return 'Spotify API';
+    } catch (error) {
+      lastError = error.message || String(error);
+    }
+  }
+  if (spotifyPlayer && typeof spotifyPlayer.resume === 'function') {
+    try {
+      await spotifyPlayer.resume();
+      return 'receiver SDK';
+    } catch (error) {
+      lastError = lastError || error.message || String(error);
+    }
+  }
+  if (lastError) logEvent('spotify', 'Spotify resume after announcement failed', lastError);
+  return '';
+}
+
 async function spotifySetVolume(percent, targetDeviceId = '', options = {}) {
   const volume = Math.max(0, Math.min(100, Math.round(Number(percent) || 0)));
   if (options.persist !== false) {
     S.spotifyVolume = volume;
     localSave();
   }
-  try {
-    if (spotifyPlayer && spotifyPlayerReady && (!targetDeviceId || targetDeviceId === spotifyWebDeviceId)) await spotifyPlayer.setVolume(volume / 100);
-  } catch {}
+  await spotifySetLocalPlayerVolume(volume);
   const deviceId = targetDeviceId || await spotifyTargetDevice(options);
   if (deviceId) await spotifyApi('PUT', '/me/player/volume', null, { volume_percent: volume, device_id: deviceId });
 }
@@ -2091,22 +2161,70 @@ function releaseCommandReceiver(reason = 'command mode') {
 
 async function duckSpotifyForAnnouncement() {
   if (S.musicProvider !== 'spotify') return null;
+  const targetVolume = clampNumber(S.spotifyDuckedVolume, 0, 20, 0);
   const current = await spotifyCurrentPlaybackDevice({ requirePlaying: true });
   const snapshot = {
     volume: current?.volume ?? clampNumber(S.spotifyVolume, 0, 100, 92),
     wasPlaying: !!current?.isPlaying || S.intent === 'playing',
-    deviceId: current?.deviceId || (S.screen === 'home' ? (spotifyWebDeviceId || '') : (S.spotifyDeviceId || ''))
+    deviceId: current?.deviceId || (S.screen === 'home' ? (spotifyWebDeviceId || S.spotifyDeviceId || '') : (S.spotifyDeviceId || '')),
+    targetVolume,
+    pausedForDuck: false,
+    duckMethod: ''
   };
   try {
-    if (S.screen !== 'home' || (!spotifyLoggedIn() && !S.spotifyDeviceId)) return null;
+    if (S.screen !== 'home') return null;
+    if (!spotifyLoggedIn() && !S.spotifyDeviceId && !spotifyPlayer) {
+      logEvent('spotify', 'Spotify duck skipped', 'Receiver has no Spotify token, device, or local Spotify player.');
+      return null;
+    }
     const deviceId = snapshot.deviceId || await spotifyTargetDevice({ preferActive: true, preferPoolside: true, allowStart: false, requirePlaying: true });
-    if (!deviceId) {
+    if (!deviceId && !spotifyPlayer) {
       logEvent('spotify', 'Spotify duck skipped', 'No active Spotify playback device was reported for this receiver.');
       return null;
     }
     snapshot.deviceId = deviceId;
-    await spotifySetVolume(S.spotifyDuckedVolume, deviceId, { persist: false, preferKnown: true, preferActive: true, preferPoolside: true, allowStart: false });
-    setFeedback(`Spotify lowered to ${S.spotifyDuckedVolume}% for announcement. The current song is not restarted.`, true);
+    const localSet = await spotifySetLocalPlayerVolume(targetVolume, 'Spotify local duck failed');
+    let remoteSet = false;
+    let remoteError = '';
+    if (spotifyLoggedIn() && deviceId) {
+      try {
+        await spotifyApi('PUT', '/me/player/volume', null, { volume_percent: targetVolume, device_id: deviceId });
+        remoteSet = true;
+      } catch (error) {
+        remoteError = error.message || String(error);
+      }
+    }
+    await wait(450);
+    let verified = false;
+    let after = null;
+    try {
+      after = await spotifyPlaybackState();
+    } catch (error) {
+      logEvent('spotify', 'Spotify duck verification failed', error.message || String(error));
+    }
+    if (after?.deviceId) {
+      if (!snapshot.deviceId) snapshot.deviceId = after.deviceId;
+      snapshot.wasPlaying = snapshot.wasPlaying || after.isPlaying;
+      verified = Number.isFinite(after.volume) && after.volume <= targetVolume + 2;
+    }
+    if (!verified && snapshot.wasPlaying) {
+      const pauseMethod = await pauseSpotifyForAnnouncement(snapshot.deviceId);
+      if (pauseMethod) {
+        snapshot.pausedForDuck = true;
+        snapshot.duckMethod = `pause via ${pauseMethod}`;
+        logEvent('spotify', 'Spotify paused for announcement', `Volume duck to ${targetVolume}% was not confirmed${remoteError ? ` (${remoteError})` : ''}; music will resume after the announcement.`);
+        setFeedback('Spotify volume did not confirm, so music paused for the announcement and will resume after.', true);
+        return snapshot;
+      }
+    }
+    if (!verified && !localSet && !remoteSet) {
+      throw Error(remoteError || 'Spotify did not accept a local or remote duck command.');
+    }
+    snapshot.duckMethod = verified
+      ? `${remoteSet ? 'Spotify API' : ''}${remoteSet && localSet ? ' + ' : ''}${localSet ? 'receiver SDK' : ''}` || 'verified'
+      : `${remoteSet ? 'Spotify API' : ''}${remoteSet && localSet ? ' + ' : ''}${localSet ? 'receiver SDK' : ''}` || 'unverified';
+    logEvent(verified ? 'spotify' : 'receiver', verified ? 'Spotify ducked for announcement' : 'Spotify duck sent but unverified', `${targetVolume}% via ${snapshot.duckMethod}.`);
+    setFeedback(`Spotify lowered to ${targetVolume}% for announcement. The current song is not restarted.`, true);
     return snapshot;
   } catch (error) {
     logEvent('spotify', 'Spotify duck failed', error.message || String(error));
@@ -2119,15 +2237,29 @@ async function restoreSpotifyAfterAnnouncement(snapshot) {
   if (!snapshot) return;
   try {
     const restoreVolume = clampNumber(S.spotifyVolume, 0, 100, snapshot.volume ?? 92);
-    await spotifySetVolume(restoreVolume, snapshot.deviceId || '', { persist: false, preferKnown: true, preferActive: true, preferPoolside: true, allowStart: false });
-    if (snapshot.wasPlaying && !manualMusicHoldActive()) {
-      try {
-        const player = await spotifyApi('GET', '/me/player');
-        if (player && player.is_playing === false && snapshot.deviceId) await spotifyApi('PUT', '/me/player/play', null, { device_id: snapshot.deviceId });
-      } catch {}
-      S.intent = 'playing';
+    let restoreError = '';
+    try {
+      await spotifySetVolume(restoreVolume, snapshot.deviceId || '', { persist: false, preferKnown: true, preferActive: true, preferPoolside: true, allowStart: false });
+    } catch (error) {
+      restoreError = error.message || String(error);
+      logEvent('spotify', 'Spotify restore volume failed', restoreError);
     }
-    setFeedback('Announcement finished; Spotify volume restored without restarting the song.', true);
+    if (snapshot.wasPlaying && !manualMusicHoldActive()) {
+      if (snapshot.pausedForDuck) {
+        const resumeMethod = await resumeSpotifyAfterAnnouncement(snapshot.deviceId);
+        if (resumeMethod) {
+          S.intent = 'playing';
+          logEvent('spotify', 'Spotify resumed after announcement', resumeMethod);
+        }
+      } else {
+        try {
+          const player = await spotifyApi('GET', '/me/player');
+          if (player && player.is_playing === false && snapshot.deviceId) await spotifyApi('PUT', '/me/player/play', null, { device_id: snapshot.deviceId });
+        } catch {}
+        S.intent = 'playing';
+      }
+    }
+    setFeedback(restoreError ? `Announcement finished; Spotify restore needs review: ${restoreError}` : 'Announcement finished; Spotify volume restored without restarting the song.', !restoreError);
   } catch (error) {
     setFeedback(`Spotify restore failed: ${error.message}`, false);
   }
@@ -3394,7 +3526,7 @@ function normalizeCurrentUrl() {
   try {
     const params = new URLSearchParams(location.search);
     if (params.has('code') || params.has('state')) return;
-    if (params.get('v') === '9-duck-stop-state') return;
+    if (params.get('v') === '9-verified-duck-fallback') return;
     history.replaceState(null, '', `/${APP_QUERY}`);
   } catch {}
 }
