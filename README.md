@@ -35,6 +35,7 @@ npm run build
 
 ## Version Notes
 
+- Version 12 adds Lake123 branding, a receiver on/off switch independent of Home/Command view, clickable receiver repair notices, stronger button pressed states, receiver-wide volume commands, and denser collapsible party cue cards.
 - Version 11 adds the Weekly Poolside Party Command Page, editable party cues, Gabe/Callie/manager/safety voice profiles, manual checkpoints, Spotify/Suno/custom-audio cue support, import/export JSON, and a mode switch that suspends normal pool automation only while the party schedule is active. Weather monitoring and safety announcements remain active.
 
 ## Vercel settings
