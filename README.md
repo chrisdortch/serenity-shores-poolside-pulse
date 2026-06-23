@@ -33,6 +33,10 @@ npm run dev
 npm run build
 ```
 
+## Version Notes
+
+- Version 11 adds the Weekly Poolside Party Command Page, editable party cues, Gabe/Callie/manager/safety voice profiles, manual checkpoints, Spotify/Suno/custom-audio cue support, import/export JSON, and a mode switch that suspends normal pool automation only while the party schedule is active. Weather monitoring and safety announcements remain active.
+
 ## Vercel settings
 
 - Framework: Vite
