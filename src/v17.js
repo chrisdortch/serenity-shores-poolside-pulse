@@ -54,6 +54,7 @@ const LEGACY_DELETED_SUNO_PLAYLIST = 'https://suno.com/playlist/cf4b536e-9005-4c
 const LEGACY_DELETED_SUNO_ID_PATTERN = /cf4b536e-9005/i;
 const DEFAULT_ADDRESS = '615 Serenity Shores Ln, Kimberling City, MO 65686';
 const DEFAULT_MUSIC_VOLUME = 45;
+const V17_VOLUME_DEFAULTS_ID = '2026-06-24-music45';
 const EVENT_TTL_MS = 90 * 60 * 1000;
 const EVENT_LIMIT = 120;
 const LOG_LIMIT = 180;
@@ -148,6 +149,7 @@ const BASE = {
   autoStart: true,
   autoStop: true,
   v17DefaultsApplied: true,
+  v17VolumeDefaultsApplied: V17_VOLUME_DEFAULTS_ID,
   address: DEFAULT_ADDRESS,
   lat: '36.6337',
   lon: '-93.4166',
@@ -430,6 +432,11 @@ function normalize(raw) {
   s.announcementGain = clampNumber(s.announcementGain, 1, 3.4, 2.65);
   s.sunoVolume = clampNumber(s.sunoVolume, 0, 100, DEFAULT_MUSIC_VOLUME);
   s.sunoDuckedVolume = clampNumber(s.sunoDuckedVolume, 0, 20, 2);
+  if (source.v17VolumeDefaultsApplied !== V17_VOLUME_DEFAULTS_ID) {
+    s.spotifyVolume = DEFAULT_MUSIC_VOLUME;
+    s.sunoVolume = DEFAULT_MUSIC_VOLUME;
+    s.v17VolumeDefaultsApplied = V17_VOLUME_DEFAULTS_ID;
+  }
   s.manualMusicHoldUntil = Math.max(0, Number(s.manualMusicHoldUntil || 0) || 0);
   s.manualMusicHoldReason = String(s.manualMusicHoldReason || '');
   s.spotifyReceiverReadyAt = Math.max(0, Number(s.spotifyReceiverReadyAt || 0) || 0);
