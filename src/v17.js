@@ -51,6 +51,7 @@ const DEFAULT_SPOTIFY_CLIENT_ID = '7e086716aaea4ce98051287b552a676c';
 const DEFAULT_SPOTIFY_PLAYLIST = 'https://open.spotify.com/playlist/0WPOOzy3puLNwxukYt9pTw';
 const DEFAULT_SUNO_PLAYLIST = '';
 const LEGACY_DELETED_SUNO_PLAYLIST = 'https://suno.com/playlist/cf4b536e-9005-4c98-9ea5-a7f01eca116f';
+const LEGACY_DELETED_SUNO_ID_PATTERN = /cf4b536e-9005/i;
 const DEFAULT_ADDRESS = '615 Serenity Shores Ln, Kimberling City, MO 65686';
 const DEFAULT_MUSIC_VOLUME = 45;
 const EVENT_TTL_MS = 90 * 60 * 1000;
@@ -380,6 +381,10 @@ function isDeletedDefaultSunoUrl(url) {
   return !!url && normalizedUrlKey(url) === normalizedUrlKey(LEGACY_DELETED_SUNO_PLAYLIST);
 }
 
+function hasDeletedSunoReference(value) {
+  return isDeletedDefaultSunoUrl(value) || LEGACY_DELETED_SUNO_ID_PATTERN.test(String(value || ''));
+}
+
 function hasStaleReceiverFailure(value) {
   return STALE_RECEIVER_FAILURE_PATTERN.test(String(value || ''));
 }
@@ -406,9 +411,16 @@ function normalize(raw) {
 
   s.musicProvider = PROVIDERS[s.musicProvider] ? s.musicProvider : 'spotify';
   s.spotifyUrl = String(s.spotifyUrl || DEFAULT_SPOTIFY_PLAYLIST);
-  const migratedDeletedSuno = isDeletedDefaultSunoUrl(s.playlistUrl) || isDeletedDefaultSunoUrl(s.quickMusicUrl);
-  s.playlistUrl = isDeletedDefaultSunoUrl(s.playlistUrl) ? '' : String(s.playlistUrl || DEFAULT_SUNO_PLAYLIST);
-  s.quickMusicUrl = isDeletedDefaultSunoUrl(s.quickMusicUrl)
+  const migratedDeletedSuno = [
+    s.playlistUrl,
+    s.quickMusicUrl,
+    s.activeMusicUrl,
+    s.activeMusicLabel,
+    s.receiverStatus,
+    s.spotifyNowPlaying
+  ].some(hasDeletedSunoReference) || list(s.tracks).some(item => hasDeletedSunoReference(item?.sourceUrl) || hasDeletedSunoReference(item?.playlistUrl));
+  s.playlistUrl = hasDeletedSunoReference(s.playlistUrl) ? '' : String(s.playlistUrl || DEFAULT_SUNO_PLAYLIST);
+  s.quickMusicUrl = hasDeletedSunoReference(s.quickMusicUrl)
     ? s.spotifyUrl
     : String(s.quickMusicUrl || (s.musicProvider === 'suno' ? s.playlistUrl : s.spotifyUrl) || s.spotifyUrl || DEFAULT_SPOTIFY_PLAYLIST);
   s.spotifyClientId = String(s.spotifyClientId || DEFAULT_SPOTIFY_CLIENT_ID);
@@ -441,10 +453,14 @@ function normalize(raw) {
   }
   s.schedule = list(s.schedule).length ? list(s.schedule) : clone(DEFAULT_SCHEDULE);
   s.tracks = list(s.tracks).length ? list(s.tracks).slice(0, 300) : clone(BASE.tracks);
-  if (migratedDeletedSuno && !s.tracks.some(item => item?.audioUrl)) {
+  if (migratedDeletedSuno) {
     s.tracks = clone(BASE.tracks);
     s.current = 0;
     s.lastError = '';
+    s.activeMusicLabel = BASE.activeMusicLabel;
+    s.activeMusicProvider = 'spotify';
+    s.activeMusicUrl = s.spotifyUrl || DEFAULT_SPOTIFY_PLAYLIST;
+    s.spotifyNowPlaying = '';
     if (s.musicProvider === 'suno') s.musicProvider = 'spotify';
   }
   s.current = Math.max(0, Math.min(Number(s.current) || 0, Math.max(0, s.tracks.length - 1)));
