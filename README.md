@@ -35,6 +35,7 @@ npm run build
 
 ## Version Notes
 
+- Version 17 rolls forward from the V9 receiver model: one speaker phone stays on Home, Command devices only send controls, music starts at 45%, the deleted default Suno playlist is removed, and weather closure triggers require verified lightning/NWS closure alerts instead of Open-Meteo thunderstorm-code-only hits.
 - Version 13 unifies Spotify and Suno music volume into one receiver-wide Music Volume command, lowers inherited loud music defaults, primes iPhone receiver audio for seamless Suno switching, simplifies the schedule item editor, and improves iPhone/laptop layout behavior.
 - Version 12 adds Lake123 branding, a receiver on/off switch independent of Home/Command view, clickable receiver repair notices, stronger button pressed states, receiver-wide volume commands, and denser collapsible party cue cards.
 - Version 11 adds the Weekly Poolside Party Command Page, editable party cues, Gabe/Callie/manager/safety voice profiles, manual checkpoints, Spotify/Suno/custom-audio cue support, import/export JSON, and a mode switch that suspends normal pool automation only while the party schedule is active. Weather monitoring and safety announcements remain active.

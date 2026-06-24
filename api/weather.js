@@ -382,7 +382,13 @@ function mockSignals(query, lightningRadiusMiles, windGustMph) {
   };
 }
 
-function classify(alerts, lightningHits, thunderHits, windHits, providerErrors) {
+function boolQuery(value, fallback = false) {
+  if (value === true || value === 'true' || value === '1' || value === 'yes') return true;
+  if (value === false || value === 'false' || value === '0' || value === 'no') return false;
+  return fallback;
+}
+
+function classify(alerts, lightningHits, thunderHits, windHits, providerErrors, options = {}) {
   const tornado = alerts.find(a => TORNADO_EVENTS.some(name => a.event.includes(name)));
   if (tornado) return { threat: true, threatType: 'Tornado', summary: `${tornado.event}: ${tornado.headline || tornado.description || 'NWS tornado alert near resort.'}` };
   if (lightningHits.length) {
@@ -392,11 +398,12 @@ function classify(alerts, lightningHits, thunderHits, windHits, providerErrors) 
   }
   const severe = alerts.find(a => STORM_EVENTS.some(name => a.event.includes(name)) && /lightning|thunderstorm|storm/i.test(`${a.headline} ${a.description} ${a.instruction}`));
   if (severe) return { threat: true, threatType: 'Lightning/Thunderstorm', summary: `${severe.event}: ${severe.headline || 'Thunderstorm/lightning-risk alert near resort.'}` };
-  if (thunderHits.length) return { threat: true, threatType: 'Lightning/Thunderstorm', summary: `Thunderstorm weather code detected within radius at ${thunderHits.map(h => h.point).join(', ')}.` };
+  if (thunderHits.length && options.thunderstormCodesClose) return { threat: true, threatType: 'Lightning/Thunderstorm', summary: `Thunderstorm weather code detected within radius at ${thunderHits.map(h => h.point).join(', ')}.` };
   if (windHits.length) {
     const max = windHits.reduce((best, hit) => hit.gustMph > best.gustMph ? hit : best, windHits[0]);
     return { threat: true, threatType: 'Strong Wind', summary: `Strong wind gust detected within radius: ${max.gustMph} mph at ${max.point}.` };
   }
+  if (thunderHits.length) return { threat: false, threatType: 'Weather Watch', summary: `Weather watch: thunderstorm conditions reported by weather-code data at ${thunderHits.map(h => h.point).join(', ')}, but no verified lightning strike was detected within the lightning radius.` };
   if (alerts.length) return { threat: false, threatType: '', summary: `${alerts.length} NWS alert(s), none requiring pool closure by current rules.` };
   if (providerErrors.length) return { threat: false, threatType: '', summary: `No closure trigger detected. Some weather provider checks reported issues: ${providerErrors.slice(0, 2).join(' | ')}` };
   return { threat: false, threatType: '', summary: 'No tornado, thunderstorm/lightning, or strong-wind trigger detected in the monitored radius.' };
@@ -409,6 +416,7 @@ export default async function handler(req, res) {
   const radiusMiles = Math.max(1, Math.min(25, Number(query.radiusMiles) || 10));
   const lightningRadiusMiles = Math.max(1, Math.min(25, Number(query.lightningRadiusMiles) || radiusMiles || 10));
   const windGustMph = Math.max(15, Math.min(80, Number(query.windGustMph) || 35));
+  const thunderstormCodesClose = boolQuery(query.thunderstormCodesClose, false);
   if (lat === null || lon === null) return json(res, 400, { ok: false, error: 'Valid latitude and longitude are required. Use decimal coordinates like 36.6337 and -93.4166.' });
   try {
     const points = ringPoints(lat, lon, radiusMiles);
@@ -418,11 +426,11 @@ export default async function handler(req, res) {
     const windHits = [...mock.windHits, ...meteo.windHits];
     const providerErrors = [...nws.errors, ...meteo.errors, ...noaaGlm.errors, ...xweather.errors];
     const summaryErrors = providerErrors.filter(error => !/NOAA GLM check reached/i.test(error));
-    const result = classify(nws.alerts, lightningHits, meteo.thunderHits, windHits, summaryErrors);
+    const result = classify(nws.alerts, lightningHits, meteo.thunderHits, windHits, summaryErrors, { thunderstormCodesClose });
     if (!result.threat && !summaryErrors.length && noaaGlm.filesChecked) {
       result.summary = `No closure trigger detected. Free NWS, Open-Meteo, and NOAA GLM checks completed; NOAA scanned ${noaaGlm.filesChecked} recent lightning file(s).`;
     }
-    return json(res, 200, { ok: true, radiusMiles, lightningRadiusMiles, windGustMph, lightningProvider: noaaGlm.provider, lightningLookbackMinutes: noaaGlm.lookbackMinutes, lightningFilesChecked: noaaGlm.filesChecked, paidLightningProvider: xweather.provider, checkedPoints: points.length, alerts: nws.alerts, lightningHits, thunderHits: meteo.thunderHits, windHits, providerErrors, ...result });
+    return json(res, 200, { ok: true, radiusMiles, lightningRadiusMiles, windGustMph, thunderstormCodesClose, lightningProvider: noaaGlm.provider, lightningLookbackMinutes: noaaGlm.lookbackMinutes, lightningFilesChecked: noaaGlm.filesChecked, paidLightningProvider: xweather.provider, checkedPoints: points.length, alerts: nws.alerts, lightningHits, thunderHits: meteo.thunderHits, windHits, providerErrors, ...result });
   } catch (error) {
     return json(res, 200, { ok: true, threat: false, threatType: '', radiusMiles, lightningRadiusMiles, windGustMph, checkedPoints: 0, alerts: [], lightningHits: [], thunderHits: [], windHits: [], providerErrors: [error.message], summary: `Weather check did not complete, but the app stayed online. Error: ${error.message || 'Unknown weather error.'}` });
   }
