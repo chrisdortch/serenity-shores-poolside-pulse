@@ -2969,18 +2969,30 @@ function scheduleField(name, key) {
   return document.querySelector(`[data-${name}="${key}"]`);
 }
 
+function hasTrackIndex(item) {
+  return item && item.trackIndex !== undefined && item.trackIndex !== null && item.trackIndex !== '' && Number.isFinite(Number(item.trackIndex));
+}
+
+function clampTrackIndex(value) {
+  return Math.max(0, Math.min(Number(value) || 0, Math.max(0, S.tracks.length - 1)));
+}
+
+function trackForItem(item) {
+  return hasTrackIndex(item) ? S.tracks[clampTrackIndex(item.trackIndex)] || null : null;
+}
+
 function itemBody(item) {
   if (!item) return '';
   if (item.type === 'suno' || item.type === 'spotify') return item.url || '';
   if (item.type === 'sunoAnnouncement') {
     if (item.url) return `Suno announcement URL: ${compactUrl(item.url)}`;
-    const itemTrack = S.tracks[Number(item.trackIndex) || 0];
-    return itemTrack ? `Suno announcement: ${itemTrack.title}` : 'Suno announcement track';
+    const itemTrack = trackForItem(item);
+    return itemTrack ? `Suno announcement: ${itemTrack.title}` : 'Paste a Suno song URL or direct audio URL.';
   }
   if (item.type === 'song') {
     if (item.url) return `Suno music URL: ${compactUrl(item.url)}`;
-    const itemTrack = S.tracks[Number(item.trackIndex) || 0];
-    return itemTrack ? `Specific song: ${itemTrack.title}` : 'Specific Suno song';
+    const itemTrack = trackForItem(item);
+    return itemTrack ? `Specific song: ${itemTrack.title}` : 'Paste a Suno song, playlist, or direct audio URL.';
   }
   if (item.type === 'text') return item.text || '';
   return item.announcementId ? annText(item.announcementId) : (item.text || '');
@@ -3002,7 +3014,8 @@ async function playScheduleItem(item) {
   }
   if (item.type === 'sunoAnnouncement') {
     if (item.url) await sendSunoUrlAnnouncement(item.url, !!item.hold, item.label || 'Scheduled Suno announcement');
-    else await sendSunoAnnouncement(Number(item.trackIndex) || 0, !!item.hold, item.label || 'Scheduled Suno announcement');
+    else if (hasTrackIndex(item)) await sendSunoAnnouncement(clampTrackIndex(item.trackIndex), !!item.hold, item.label || 'Scheduled Suno announcement');
+    else throw Error('This schedule item needs a Suno song URL or direct audio URL.');
     return;
   }
   if (item.type === 'spotify') {
@@ -3017,7 +3030,8 @@ async function playScheduleItem(item) {
       await playSunoUrl(item.url, S.screen !== 'home');
       return;
     }
-    const index = Math.max(0, Math.min(Number(item.trackIndex) || 0, Math.max(0, S.tracks.length - 1)));
+    if (!hasTrackIndex(item)) throw Error('This schedule item needs a Suno song, playlist, or direct audio URL.');
+    const index = clampTrackIndex(item.trackIndex);
     S.current = index;
     S.musicProvider = 'suno';
     if (S.screen !== 'home') await issueCommand('song', { label: item.label, trackIndex: index, provider: 'suno', detail: `Scheduled Suno song: ${(S.tracks[index] || {}).title || 'track'}` }, `Suno song sent to receivers: ${(S.tracks[index] || {}).title || item.label}`);
@@ -3055,45 +3069,56 @@ function saveRow(index, mode = 'daily') {
     setFeedback('Schedule item not found.', false);
     return;
   }
+  const priorHasTrackIndex = hasTrackIndex(row);
   const priorTrackIndex = row.trackIndex;
   const kind = scheduleField('kind', key)?.value || row.type || 'text';
   const body = scheduleField('body', key)?.value.trim() || '';
-  row.label = scheduleField('label', key)?.value || row.label;
-  row.time = scheduleField('row-time', key)?.value || row.time || '10:00';
-  delete row.offsetToClose;
-  delete row.announcementId;
-  delete row.url;
-  delete row.text;
-  delete row.trackIndex;
+  const next = { ...row };
+  next.label = scheduleField('label', key)?.value || row.label;
+  next.time = scheduleField('row-time', key)?.value || row.time || '10:00';
+  delete next.offsetToClose;
+  delete next.announcementId;
+  delete next.url;
+  delete next.text;
+  delete next.trackIndex;
   if (kind === 'song') {
-    row.type = 'song';
-    if (body) row.url = body;
-    else row.trackIndex = Math.max(0, Math.min(Number(priorTrackIndex) || 0, Math.max(0, S.tracks.length - 1)));
+    next.type = 'song';
+    if (body) next.url = body;
+    else if (priorHasTrackIndex) next.trackIndex = clampTrackIndex(priorTrackIndex);
+    else {
+      setFeedback('Paste a Suno song, playlist, or direct audio URL before saving.', false);
+      return;
+    }
   } else if (kind === 'sunoAnnouncement') {
-    row.type = 'sunoAnnouncement';
-    if (body) row.url = body;
-    else row.trackIndex = Math.max(0, Math.min(Number(priorTrackIndex) || 0, Math.max(0, S.tracks.length - 1)));
+    next.type = 'sunoAnnouncement';
+    if (body) next.url = body;
+    else if (priorHasTrackIndex) next.trackIndex = clampTrackIndex(priorTrackIndex);
+    else {
+      setFeedback('Paste a Suno song URL or direct audio URL before saving.', false);
+      return;
+    }
   } else if (kind === 'suno') {
-    row.type = 'suno';
-    row.url = body;
-    if (!row.url) {
+    next.type = 'suno';
+    next.url = body;
+    if (!next.url) {
       setFeedback('Paste a Suno song, playlist, or direct audio URL before saving.', false);
       return;
     }
   } else if (kind === 'spotify') {
-    row.type = 'spotify';
-    row.url = body;
-    if (!row.url) {
+    next.type = 'spotify';
+    next.url = body;
+    if (!next.url) {
       setFeedback('Paste a Spotify URL before saving.', false);
       return;
     }
   } else if (kind === 'text') {
-    row.type = 'text';
-    row.text = body || 'Type announcement text here.';
+    next.type = 'text';
+    next.text = body || 'Type announcement text here.';
   } else {
-    row.type = 'announcement';
-    row.announcementId = scheduleField('selann', key)?.value || S.selected;
+    next.type = 'announcement';
+    next.announcementId = scheduleField('selann', key)?.value || S.selected;
   }
+  Object.assign(row, next);
   save(`${scheduleTitle(mode)} item saved: ${row.label}.`);
 }
 
