@@ -59,6 +59,7 @@ const LOG_LIMIT = 180;
 const EVENT_RETRY_MS = 9000;
 const RECEIVER_EVENT_GRACE_MS = 3000;
 const OLD_AUDIO_BLOCK_PATTERN = /play\(\) failed|goo\.gl\/xX8pDD|play method is not allowed|user did(?:n't| not) interact|user agent or the platform/i;
+const STALE_RECEIVER_FAILURE_PATTERN = /restriction violated|player command failed|device not found|HTTP 429|HTTP 404|receiver will retry|Suno page returned HTTP 404|transfer is not active/i;
 
 const DEFAULT_ANNS = [
   ['welcome', 'Welcome', 'Good morning and welcome to Serenity Shores. We are glad your family is here. Please supervise children, keep glass out of the pool area, and follow lifeguard instructions so everyone can enjoy a safe day by the water.'],
@@ -379,6 +380,25 @@ function isDeletedDefaultSunoUrl(url) {
   return !!url && normalizedUrlKey(url) === normalizedUrlKey(LEGACY_DELETED_SUNO_PLAYLIST);
 }
 
+function hasStaleReceiverFailure(value) {
+  return STALE_RECEIVER_FAILURE_PATTERN.test(String(value || ''));
+}
+
+function clearStaleReceiverFailures(state) {
+  if (!state || typeof state !== 'object') return state;
+  if (hasStaleReceiverFailure(state.setupNotice)) state.setupNotice = '';
+  if (hasStaleReceiverFailure(state.lastError)) state.lastError = '';
+  if (hasStaleReceiverFailure(state.spotifyLastError)) state.spotifyLastError = '';
+  if (hasStaleReceiverFailure(state.spotifyStatus)) {
+    state.spotifyStatus = String(state.spotifyStatus || '')
+      .replace(/\n?Last Spotify issue:.*$/s, '')
+      .trim() || BASE.spotifyStatus;
+  }
+  if (hasStaleReceiverFailure(state.feedback)) state.feedback = 'Ready.';
+  state.activityLog = list(state.activityLog).filter(entry => !hasStaleReceiverFailure(`${entry?.title || ''} ${entry?.detail || ''}`));
+  return state;
+}
+
 function normalize(raw) {
   const source = raw && typeof raw === 'object' ? raw : {};
   const s = { ...clone(BASE), ...clone(source), version: VERSION };
@@ -443,6 +463,7 @@ function normalize(raw) {
   s.editId = s.editId || 'new';
   if (OLD_AUDIO_BLOCK_PATTERN.test(String(s.audioStatus || ''))) s.audioStatus = BASE.audioStatus;
   if (OLD_AUDIO_BLOCK_PATTERN.test(String(s.setupNotice || ''))) s.setupNotice = '';
+  clearStaleReceiverFailures(s);
   if (source.rev && !source.revision) s.revision = Number(source.rev) || 0;
   if (source.cmd && !source.command) s.command = source.cmd;
   if (source.announce && !source.announcement) s.announcement = source.announce;
@@ -679,6 +700,7 @@ function preserveLocalBeforeMerge() {
 }
 
 function restoreLocalAfterMerge(local) {
+  clearStaleReceiverFailures(local);
   S.screen = local.screen;
   S.admin = local.admin;
   S.tab = local.tab;
@@ -713,6 +735,7 @@ function restoreLocalAfterMerge(local) {
       'manualMusicHoldReason'
     ].forEach(key => { S[key] = local[key]; });
   }
+  clearStaleReceiverFailures(S);
 }
 
 async function pullState() {
