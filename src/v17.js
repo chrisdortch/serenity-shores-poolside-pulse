@@ -772,8 +772,9 @@ async function pullState() {
     if (data.state) {
       const local = preserveLocalBeforeMerge();
       S = normalize({
-        ...S,
         ...data.state,
+        sync: S.sync,
+        syncMode: S.syncMode,
         events: mergeById(EVENT_LIMIT, false, S.events, data.state.events),
         activityLog: mergeById(LOG_LIMIT, true, S.activityLog, data.state.activityLog),
         revision: Math.max(Number(S.revision || 0), Number(data.state.revision || 0))
