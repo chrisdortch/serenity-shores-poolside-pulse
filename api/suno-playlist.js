@@ -24,6 +24,37 @@ function extractPlaylistId(input) {
   return '';
 }
 
+function directAudioUrl(input) {
+  return /^https?:\/\//i.test(String(input || '')) && /\.(mp3|m4a|aac|wav|ogg|oga|webm)(\?|#|$)/i.test(String(input || ''));
+}
+
+function trackFromDirectAudio(input) {
+  const raw = String(input || '').trim();
+  let title = 'Direct Suno/audio track';
+  try {
+    const parsed = new URL(raw);
+    const file = decodeURIComponent(parsed.pathname.split('/').filter(Boolean).pop() || '');
+    if (file) title = file.replace(/\.(mp3|m4a|aac|wav|ogg|oga|webm)$/i, '').replace(/[-_]+/g, ' ').trim() || title;
+  } catch {}
+  return {
+    id: raw,
+    no: 1,
+    title,
+    artist: 'Suno / Direct Audio',
+    duration: '3:00',
+    tags: '',
+    audioUrl: raw,
+    sourceUrl: raw,
+    imageUrl: ''
+  };
+}
+
+function sunoStatus(error) {
+  const text = String(error?.message || error || '');
+  if (/deleted|trashed|HTTP 404|returned HTTP 404/i.test(text)) return 410;
+  return 500;
+}
+
 function queryParams(req) {
   const rawUrl = String(req.url || '');
   if (rawUrl) {
@@ -80,7 +111,14 @@ async function fetchJson(url, playlistUrl) {
     }
   });
   const text = await response.text();
-  if (!response.ok) throw new Error(`HTTP ${response.status} from ${url}`);
+  if (!response.ok) {
+    let detail = '';
+    try {
+      const data = JSON.parse(text);
+      detail = data.detail || data.detail_fallback || data.error || '';
+    } catch {}
+    throw new Error(`HTTP ${response.status} from ${url}${detail ? `: ${detail}` : ''}`);
+  }
   try { return JSON.parse(text); }
   catch { throw new Error(`Suno returned non-JSON from ${url}`); }
 }
@@ -180,6 +218,18 @@ async function fetchFromHtml(playlistUrl) {
 
 export default async function handler(req, res) {
   const playlistUrl = String(queryParams(req).url || '');
+  if (directAudioUrl(playlistUrl)) {
+    const track = trackFromDirectAudio(playlistUrl);
+    return json(res, 200, {
+      ok: true,
+      tracks: [track],
+      count: 1,
+      playlistName: track.title,
+      playlistImage: '',
+      source: 'direct-audio',
+      audioWarning: ''
+    });
+  }
   const playlistId = extractPlaylistId(playlistUrl);
   if (!playlistId) return json(res, 400, { ok: false, error: 'Provide a valid Suno playlist URL or playlist ID.' });
 
@@ -200,7 +250,10 @@ export default async function handler(req, res) {
       if (!htmlTracks.length) throw new Error('HTML fallback found no tracks.');
       return json(res, 200, { ok: true, tracks: htmlTracks, count: htmlTracks.length, source: 'html-fallback', warning: apiError.message, audioWarning: htmlTracks.some(t => t.audioUrl) ? '' : 'titles only; no public playable audio URLs found' });
     } catch (htmlError) {
-      return json(res, 500, { ok: false, error: `${apiError.message}; fallback: ${htmlError.message}` });
+      const apiStatus = sunoStatus(apiError);
+      const htmlStatus = sunoStatus(htmlError);
+      const status = apiStatus === 410 || htmlStatus === 410 ? 410 : 500;
+      return json(res, status, { ok: false, error: `${apiError.message}; fallback: ${htmlError.message}` });
     }
   }
 }
