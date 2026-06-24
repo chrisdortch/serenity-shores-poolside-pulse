@@ -7,6 +7,7 @@ function json(res, status, body) {
 
 const DEFAULT_STATE_KEY = 'serenity-shores-poolside-radio-v9';
 const VERSIONED_STATE_KEYS = {
+  '16': 'serenity-shores-poolside-radio-v16',
   '15': 'serenity-shores-poolside-radio-v15',
   '14': 'serenity-shores-poolside-radio-v14'
 };
