@@ -5,11 +5,14 @@ function json(res, status, body) {
   res.end(JSON.stringify(body));
 }
 
-const STATE_KEY = 'serenity-shores-poolside-radio-v9';
+const DEFAULT_STATE_KEY = 'serenity-shores-poolside-radio-v9';
+const VERSIONED_STATE_KEYS = {
+  '14': 'serenity-shores-poolside-radio-v14'
+};
 
 // Safe fallback: lets preview/admin/Home sync work even before Vercel KV/Upstash is configured.
 // For production/life-safety reliability, add KV_REST_API_URL and KV_REST_API_TOKEN in Vercel.
-globalThis.__POOL_SIDE_MEMORY_STATE__ ||= null;
+globalThis.__POOL_SIDE_MEMORY_STATES__ ||= {};
 
 async function readBody(req) {
   if (req.body && typeof req.body === 'object') return req.body;
@@ -46,6 +49,16 @@ function parseState(raw) {
   if (!raw) return null;
   if (typeof raw === 'object') return raw;
   try { return JSON.parse(raw); } catch { return null; }
+}
+
+function requestVersion(req, body = {}) {
+  const queryVersion = req.query?.v || req.query?.version;
+  const bodyVersion = body.version || body.state?.version;
+  return String(queryVersion || bodyVersion || '').trim();
+}
+
+function stateKeyFor(req, body = {}) {
+  return VERSIONED_STATE_KEYS[requestVersion(req, body)] || DEFAULT_STATE_KEY;
 }
 
 function mergeById(limit, sortNewestFirst, ...lists) {
@@ -87,15 +100,16 @@ export default async function handler(req, res) {
     const hasKv = kvReady();
 
     if (req.method === 'GET') {
+      const stateKey = stateKeyFor(req);
       if (hasKv) {
-        const raw = await kv(['GET', STATE_KEY]);
+        const raw = await kv(['GET', stateKey]);
         return json(res, 200, { ok: true, cloudSync: true, syncMode: 'kv', state: raw ? JSON.parse(raw) : null, note: 'KV cloud sync active.' });
       }
       return json(res, 200, {
         ok: true,
         cloudSync: true,
         syncMode: 'memory',
-        state: globalThis.__POOL_SIDE_MEMORY_STATE__,
+        state: globalThis.__POOL_SIDE_MEMORY_STATES__[stateKey] || null,
         note: 'Preview sync active using temporary server memory. Add Vercel KV/Upstash for production-grade persistence.'
       });
     }
@@ -104,21 +118,22 @@ export default async function handler(req, res) {
       const body = await readBody(req);
       const state = body.state || {};
       if (!state || typeof state !== 'object') return json(res, 400, { ok: false, error: 'state object required.' });
+      const stateKey = stateKeyFor(req, body);
 
       let previous = null;
-      if (hasKv) previous = parseState(await kv(['GET', STATE_KEY]));
-      else previous = globalThis.__POOL_SIDE_MEMORY_STATE__;
+      if (hasKv) previous = parseState(await kv(['GET', stateKey]));
+      else previous = globalThis.__POOL_SIDE_MEMORY_STATES__[stateKey] || null;
 
       const safe = finalizeState(state, previous);
       const raw = JSON.stringify(safe);
       if (raw.length > 200000) return json(res, 400, { ok: false, error: 'State too large.' });
 
       if (hasKv) {
-        await kv(['SET', STATE_KEY, raw]);
+        await kv(['SET', stateKey, raw]);
         return json(res, 200, { ok: true, cloudSync: true, syncMode: 'kv', state: safe, note: 'KV cloud sync active.' });
       }
 
-      globalThis.__POOL_SIDE_MEMORY_STATE__ = safe;
+      globalThis.__POOL_SIDE_MEMORY_STATES__[stateKey] = safe;
       return json(res, 200, {
         ok: true,
         cloudSync: true,
