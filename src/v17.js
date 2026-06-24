@@ -1396,12 +1396,18 @@ async function playSuno(push = true) {
   readMusicSettings();
   if (S.screen !== 'home' && push) {
     S.musicProvider = 'suno';
-    await issueCommand('play', { provider: 'suno', trackIndex: S.current, label: 'Play Suno', detail: `${sourceLabel('suno', S.playlistUrl)} · track ${Number(S.current || 0) + 1}` }, 'Play command sent to all active receivers.');
+    const raw = String(S.playlistUrl || DEFAULT_SUNO_PLAYLIST || '').trim();
+    if (raw) {
+      await playSunoUrl(raw, true);
+      return;
+    }
+    if (!hasPlayableSuno()) throw Error('Paste and save a Suno URL before playing Suno.');
+    await issueCommand('song', { provider: 'suno', trackIndex: S.current, label: 'Play Suno', detail: `${sourceLabel('suno', S.playlistUrl)} · track ${Number(S.current || 0) + 1}` }, 'Suno song command sent to all active receivers.');
     return;
   }
   clearManualMusicHold();
+  if (!String(S.playlistUrl || DEFAULT_SUNO_PLAYLIST || '').trim() && !hasPlayableSuno()) throw Error('Paste and save a Suno URL before playing Suno.');
   await ensureReceiverAudio('Suno play', { required: true });
-  await pauseSpotifyForSunoPlayback();
   S.musicProvider = 'suno';
   if (!hasPlayableSuno()) {
     await importSuno('Playlist auto-imported for receiver.');
@@ -1413,6 +1419,7 @@ async function playSuno(push = true) {
   }
   const url = track().audioUrl;
   if (!url) throw Error('This Suno item has no playable audio URL.');
+  await pauseSpotifyForSunoPlayback();
   if (!sameUrl(music.src, url)) music.src = url;
   music.muted = false;
   music.volume = musicGain();
