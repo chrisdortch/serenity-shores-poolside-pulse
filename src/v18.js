@@ -56,14 +56,14 @@ const LEGACY_DELETED_SUNO_PLAYLIST = 'https://suno.com/playlist/cf4b536e-9005-4c
 const LEGACY_DELETED_SUNO_ID_PATTERN = /cf4b536e-9005/i;
 const DEFAULT_ADDRESS = '615 Serenity Shores Ln, Kimberling City, MO 65686';
 const DEFAULT_MUSIC_VOLUME = 15;
-const V18_VOLUME_DEFAULTS_ID = '2026-06-24-final-v18-music15-duck0-ann300';
+const V18_VOLUME_DEFAULTS_ID = '2026-06-24-final-v18b-music15-duck0-ann300-clean';
 const EVENT_TTL_MS = 90 * 60 * 1000;
 const EVENT_LIMIT = 120;
 const LOG_LIMIT = 180;
 const EVENT_RETRY_MS = 9000;
 const RECEIVER_EVENT_GRACE_MS = 3000;
 const OLD_AUDIO_BLOCK_PATTERN = /play\(\) failed|goo\.gl\/xX8pDD|play method is not allowed|user did(?:n't| not) interact|user agent or the platform/i;
-const STALE_RECEIVER_FAILURE_PATTERN = /restriction violated|player command failed|device not found|HTTP 429|HTTP 404|receiver will retry|Suno page returned HTTP 404|transfer is not active/i;
+const STALE_RECEIVER_FAILURE_PATTERN = /restriction violated|player command failed|device not found|HTTP 429|HTTP 404|receiver will retry|Suno page returned HTTP 404|transfer is not active|not the audible Spotify device|Start Speaker Phone/i;
 
 const DEFAULT_ANNS = [
   ['welcome', 'Welcome', 'Good morning and welcome to Serenity Shores. We are glad your family is here. Please supervise children, keep glass out of the pool area, and follow lifeguard instructions so everyone can enjoy a safe day by the water.'],
@@ -450,6 +450,10 @@ function normalize(raw) {
     s.spotifyDuckedVolume = 0;
     s.sunoVolume = DEFAULT_MUSIC_VOLUME;
     s.announcementGain = 3;
+    s.feedback = 'Ready.';
+    s.lastError = '';
+    s.setupNotice = '';
+    s.spotifyLastError = '';
     s.v18VolumeDefaultsApplied = V18_VOLUME_DEFAULTS_ID;
   }
   s.manualMusicHoldUntil = Math.max(0, Number(s.manualMusicHoldUntil || 0) || 0);
