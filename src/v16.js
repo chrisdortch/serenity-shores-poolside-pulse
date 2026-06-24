@@ -226,16 +226,22 @@ const BASE = {
 
 function clearStaleReceiverFailures(state) {
   if (!state || typeof state !== 'object') return state;
-  if (STALE_RECEIVER_FAILURE_PATTERN.test(String(state.setupNotice || ''))) state.setupNotice = '';
-  if (STALE_RECEIVER_FAILURE_PATTERN.test(String(state.lastError || ''))) state.lastError = '';
-  if (STALE_RECEIVER_FAILURE_PATTERN.test(String(state.spotifyLastError || ''))) state.spotifyLastError = '';
-  if (STALE_RECEIVER_FAILURE_PATTERN.test(String(state.spotifyStatus || ''))) {
+  if (hasStaleReceiverFailure(state.setupNotice)) state.setupNotice = '';
+  if (hasStaleReceiverFailure(state.lastError)) state.lastError = '';
+  if (hasStaleReceiverFailure(state.spotifyLastError)) state.spotifyLastError = '';
+  if (hasStaleReceiverFailure(state.spotifyStatus)) {
     state.spotifyStatus = String(state.spotifyStatus || '')
       .replace(/\n?Last Spotify issue:.*$/s, '')
       .trim() || BASE.spotifyStatus;
   }
-  if (STALE_RECEIVER_FAILURE_PATTERN.test(String(state.feedback || ''))) state.feedback = 'Ready.';
+  if (hasStaleReceiverFailure(state.feedback)) state.feedback = 'Ready.';
+  state.activityLog = list(state.activityLog).filter(entry => !hasStaleReceiverFailure(`${entry?.title || ''} ${entry?.detail || ''}`));
+  state.partyLog = list(state.partyLog).filter(entry => !hasStaleReceiverFailure(`${entry?.title || ''} ${entry?.detail || ''}`));
   return state;
+}
+
+function hasStaleReceiverFailure(value) {
+  return STALE_RECEIVER_FAILURE_PATTERN.test(String(value || ''));
 }
 
 const memoryStore = {};
