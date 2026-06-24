@@ -67,6 +67,7 @@ const LOG_LIMIT = 180;
 const EVENT_RETRY_MS = 9000;
 const RECEIVER_EVENT_GRACE_MS = 3000;
 const OLD_AUDIO_BLOCK_PATTERN = /play\(\) failed|goo\.gl\/xX8pDD|play method is not allowed|user did(?:n't| not) interact|user agent or the platform/i;
+const STALE_RECEIVER_FAILURE_PATTERN = /restriction violated|player command failed|device not found|HTTP 429|HTTP 404|receiver will retry|Suno page returned HTTP 404/i;
 
 const DEFAULT_ANNS = [
   ['welcome', 'Welcome', 'Good morning and welcome to Serenity Shores. We are glad your family is here. Please supervise children, keep glass out of the pool area, and follow lifeguard instructions so everyone can enjoy a safe day by the water.'],
@@ -222,6 +223,20 @@ const BASE = {
   partyImportText: '',
   partyExportText: ''
 };
+
+function clearStaleReceiverFailures(state) {
+  if (!state || typeof state !== 'object') return state;
+  if (STALE_RECEIVER_FAILURE_PATTERN.test(String(state.setupNotice || ''))) state.setupNotice = '';
+  if (STALE_RECEIVER_FAILURE_PATTERN.test(String(state.lastError || ''))) state.lastError = '';
+  if (STALE_RECEIVER_FAILURE_PATTERN.test(String(state.spotifyLastError || ''))) state.spotifyLastError = '';
+  if (STALE_RECEIVER_FAILURE_PATTERN.test(String(state.spotifyStatus || ''))) {
+    state.spotifyStatus = String(state.spotifyStatus || '')
+      .replace(/\n?Last Spotify issue:.*$/s, '')
+      .trim() || BASE.spotifyStatus;
+  }
+  if (STALE_RECEIVER_FAILURE_PATTERN.test(String(state.feedback || ''))) state.feedback = 'Ready.';
+  return state;
+}
 
 const memoryStore = {};
 let S = loadState();
@@ -632,13 +647,7 @@ function normalize(raw) {
   if (/old default Suno playlist was deleted/i.test(String(s.lastError || '')) && s.musicProvider !== 'suno') s.lastError = '';
   if (OLD_AUDIO_BLOCK_PATTERN.test(String(s.audioStatus || ''))) s.audioStatus = BASE.audioStatus;
   if (OLD_AUDIO_BLOCK_PATTERN.test(String(s.setupNotice || ''))) s.setupNotice = '';
-  if (importedFromOlderVersion && /restriction violated|player command failed|device not found|HTTP 429|HTTP 404|receiver will retry/i.test(`${s.setupNotice || ''} ${s.lastError || ''}`)) {
-    s.setupNotice = '';
-    s.lastError = '';
-    if (/restriction violated|player command failed|device not found|HTTP 429|HTTP 404|receiver will retry/i.test(String(s.feedback || ''))) {
-      s.feedback = 'Ready.';
-    }
-  }
+  clearStaleReceiverFailures(s);
   if (source.rev && !source.revision) s.revision = Number(source.rev) || 0;
   if (source.cmd && !source.command) s.command = source.cmd;
   if (source.announce && !source.announcement) s.announcement = source.announce;
@@ -890,6 +899,7 @@ function preserveLocalBeforeMerge() {
 }
 
 function restoreLocalAfterMerge(local) {
+  clearStaleReceiverFailures(local);
   S.screen = local.screen;
   S.admin = local.admin;
   S.tab = local.tab;
@@ -932,6 +942,7 @@ function restoreLocalAfterMerge(local) {
     if (local.partySchedule && S.tab === 'party') S.partySchedule = local.partySchedule;
     ['partySelectedCueId', 'partyEditing', 'partyCollapsedCueIds', 'partyImportText', 'partyExportText'].forEach(key => { S[key] = local[key]; });
   }
+  clearStaleReceiverFailures(S);
 }
 
 async function pullState() {
