@@ -51,8 +51,19 @@ function parseState(raw) {
   try { return JSON.parse(raw); } catch { return null; }
 }
 
+function queryParams(req) {
+  const rawUrl = String(req.url || '');
+  if (rawUrl) {
+    try {
+      return Object.fromEntries(new URL(rawUrl, 'https://poolside.local').searchParams.entries());
+    } catch {}
+  }
+  return req.query || {};
+}
+
 function requestVersion(req, body = {}) {
-  const queryVersion = req.query?.v || req.query?.version;
+  const query = queryParams(req);
+  const queryVersion = query.v || query.version;
   const bodyVersion = body.version || body.state?.version;
   return String(queryVersion || bodyVersion || '').trim();
 }

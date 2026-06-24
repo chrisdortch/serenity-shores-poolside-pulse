@@ -24,6 +24,16 @@ function extractPlaylistId(input) {
   return '';
 }
 
+function queryParams(req) {
+  const rawUrl = String(req.url || '');
+  if (rawUrl) {
+    try {
+      return Object.fromEntries(new URL(rawUrl, 'https://poolside.local').searchParams.entries());
+    } catch {}
+  }
+  return req.query || {};
+}
+
 function durationFromSeconds(seconds) {
   const n = Number(seconds);
   if (!Number.isFinite(n) || n <= 0) return '3:00';
@@ -169,7 +179,7 @@ async function fetchFromHtml(playlistUrl) {
 }
 
 export default async function handler(req, res) {
-  const playlistUrl = String(req.query?.url || '');
+  const playlistUrl = String(queryParams(req).url || '');
   const playlistId = extractPlaylistId(playlistUrl);
   if (!playlistId) return json(res, 400, { ok: false, error: 'Provide a valid Suno playlist URL or playlist ID.' });
 

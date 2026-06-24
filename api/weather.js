@@ -42,6 +42,16 @@ function coord(value) {
   return Number.isFinite(n) ? n : null;
 }
 
+function queryParams(req) {
+  const rawUrl = String(req.url || '');
+  if (rawUrl) {
+    try {
+      return Object.fromEntries(new URL(rawUrl, 'https://poolside.local').searchParams.entries());
+    } catch {}
+  }
+  return req.query || {};
+}
+
 function ringPoints(lat, lon, radiusMiles) {
   const radiusKm = radiusMiles * 1.609344;
   const bearings = [0, 45, 90, 135, 180, 225, 270, 315];
@@ -393,16 +403,17 @@ function classify(alerts, lightningHits, thunderHits, windHits, providerErrors) 
 }
 
 export default async function handler(req, res) {
-  const lat = coord(req.query?.lat);
-  const lon = coord(req.query?.lon);
-  const radiusMiles = Math.max(1, Math.min(25, Number(req.query?.radiusMiles) || 10));
-  const lightningRadiusMiles = Math.max(1, Math.min(25, Number(req.query?.lightningRadiusMiles) || radiusMiles || 10));
-  const windGustMph = Math.max(15, Math.min(80, Number(req.query?.windGustMph) || 35));
+  const query = queryParams(req);
+  const lat = coord(query.lat);
+  const lon = coord(query.lon);
+  const radiusMiles = Math.max(1, Math.min(25, Number(query.radiusMiles) || 10));
+  const lightningRadiusMiles = Math.max(1, Math.min(25, Number(query.lightningRadiusMiles) || radiusMiles || 10));
+  const windGustMph = Math.max(15, Math.min(80, Number(query.windGustMph) || 35));
   if (lat === null || lon === null) return json(res, 400, { ok: false, error: 'Valid latitude and longitude are required. Use decimal coordinates like 36.6337 and -93.4166.' });
   try {
     const points = ringPoints(lat, lon, radiusMiles);
-    const [nws, meteo, noaaGlm, xweather] = await Promise.all([getNwsAlerts(points), getOpenMeteoSignals(points, windGustMph), getNoaaGlmLightning(lat, lon, lightningRadiusMiles, req.query || {}), getXweatherLightning(lat, lon, lightningRadiusMiles)]);
-    const mock = mockSignals(req.query || {}, lightningRadiusMiles, windGustMph);
+    const [nws, meteo, noaaGlm, xweather] = await Promise.all([getNwsAlerts(points), getOpenMeteoSignals(points, windGustMph), getNoaaGlmLightning(lat, lon, lightningRadiusMiles, query), getXweatherLightning(lat, lon, lightningRadiusMiles)]);
+    const mock = mockSignals(query, lightningRadiusMiles, windGustMph);
     const lightningHits = [...mock.lightningHits, ...noaaGlm.lightningHits, ...xweather.lightningHits];
     const windHits = [...mock.windHits, ...meteo.windHits];
     const providerErrors = [...nws.errors, ...meteo.errors, ...noaaGlm.errors, ...xweather.errors];

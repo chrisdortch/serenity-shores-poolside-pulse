@@ -18,8 +18,18 @@ function looksLikeResort(address) {
   return a.includes('serenity shores') || (a.includes('kimberling') && a.includes('615')) || a.includes('table rock lake resort');
 }
 
+function queryParams(req) {
+  const rawUrl = String(req.url || '');
+  if (rawUrl) {
+    try {
+      return Object.fromEntries(new URL(rawUrl, 'https://poolside.local').searchParams.entries());
+    } catch {}
+  }
+  return req.query || {};
+}
+
 export default async function handler(req, res) {
-  const address = String(req.query?.address || '').trim();
+  const address = String(queryParams(req).address || '').trim();
   if (!address) return json(res, 400, { ok: false, error: 'Address is required.' });
   try {
     const url = new URL('https://geocoding.geo.census.gov/geocoder/locations/onelineaddress');
