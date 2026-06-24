@@ -28,6 +28,10 @@ function directAudioUrl(input) {
   return /^https?:\/\//i.test(String(input || '')) && /\.(mp3|m4a|aac|wav|ogg|oga|webm)(\?|#|$)/i.test(String(input || ''));
 }
 
+function sunoSongUrl(input) {
+  return /^https?:\/\//i.test(String(input || '')) && /suno\.com\/(?:song|songs)\//i.test(String(input || ''));
+}
+
 function trackFromDirectAudio(input) {
   const raw = String(input || '').trim();
   let title = 'Direct Suno/audio track';
@@ -230,8 +234,25 @@ export default async function handler(req, res) {
       audioWarning: ''
     });
   }
+  if (sunoSongUrl(playlistUrl)) {
+    try {
+      const tracks = await fetchFromHtml(playlistUrl);
+      if (!tracks.length) throw new Error('Suno song page returned no playable track data.');
+      return json(res, 200, {
+        ok: true,
+        tracks,
+        count: tracks.length,
+        playlistName: tracks[0]?.title || 'Suno song',
+        playlistImage: '',
+        source: 'suno-song-html',
+        audioWarning: tracks.some(t => t.audioUrl) ? '' : 'title only; paste a direct audio URL if this Suno song page does not expose playable audio'
+      });
+    } catch (error) {
+      return json(res, sunoStatus(error), { ok: false, error: error.message });
+    }
+  }
   const playlistId = extractPlaylistId(playlistUrl);
-  if (!playlistId) return json(res, 400, { ok: false, error: 'Provide a valid Suno playlist URL or playlist ID.' });
+  if (!playlistId) return json(res, 400, { ok: false, error: 'Provide a valid Suno playlist URL, Suno song URL, direct audio URL, or playlist ID.' });
 
   try {
     const apiResult = await fetchFromSunoPlaylistApi(playlistId, playlistUrl);

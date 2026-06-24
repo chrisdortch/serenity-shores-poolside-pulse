@@ -53,8 +53,8 @@ const DEFAULT_SUNO_PLAYLIST = '';
 const LEGACY_DELETED_SUNO_PLAYLIST = 'https://suno.com/playlist/cf4b536e-9005-4c98-9ea5-a7f01eca116f';
 const LEGACY_DELETED_SUNO_ID_PATTERN = /cf4b536e-9005/i;
 const DEFAULT_ADDRESS = '615 Serenity Shores Ln, Kimberling City, MO 65686';
-const DEFAULT_MUSIC_VOLUME = 45;
-const V17_VOLUME_DEFAULTS_ID = '2026-06-24-music45-b';
+const DEFAULT_MUSIC_VOLUME = 25;
+const V17_VOLUME_DEFAULTS_ID = '2026-06-24-music25-schedules';
 const EVENT_TTL_MS = 90 * 60 * 1000;
 const EVENT_LIMIT = 120;
 const LOG_LIMIT = 180;
@@ -87,6 +87,13 @@ const DEFAULT_SCHEDULE = [
   { id: 'hydrate', label: 'Afternoon Hydration', type: 'announcement', time: '15:00', announcementId: 'hydrate', enabled: true },
   { id: 'close15', label: 'Closing 15', type: 'announcement', offsetToClose: 15, announcementId: 'close15', enabled: true },
   { id: 'close5', label: 'Closing 5', type: 'announcement', offsetToClose: 5, announcementId: 'close5', enabled: true }
+];
+
+const DEFAULT_PARTY_SCHEDULE = [
+  { id: 'party-welcome', label: 'Party Welcome', type: 'text', time: '18:00', text: 'Welcome to the Serenity Shores poolside party. Music is starting now. Please keep glass away from the pool, supervise children, and enjoy the evening.', enabled: true },
+  { id: 'party-music', label: 'Party Music', type: 'spotify', time: '18:05', url: DEFAULT_SPOTIFY_PLAYLIST, enabled: true },
+  { id: 'party-hydrate', label: 'Party Hydration', type: 'announcement', time: '19:30', announcementId: 'hydrate', enabled: true },
+  { id: 'party-close', label: 'Party Closing', type: 'announcement', offsetToClose: 15, announcementId: 'close15', enabled: true }
 ];
 
 const BASE = {
@@ -140,7 +147,9 @@ const BASE = {
   selected: 'welcome',
   quickText: '',
   guestName: '',
+  activeSchedule: 'daily',
   schedule: DEFAULT_SCHEDULE,
+  partySchedule: DEFAULT_PARTY_SCHEDULE,
   editId: 'new',
   lastRun: {},
   poolOpen: '09:00',
@@ -458,7 +467,9 @@ function normalize(raw) {
   for (const item of DEFAULT_ANNS) {
     if (!annIds.has(item.id)) s.anns.push(normalizeAnnItem(item));
   }
+  s.activeSchedule = s.activeSchedule === 'party' ? 'party' : 'daily';
   s.schedule = list(s.schedule).length ? list(s.schedule) : clone(DEFAULT_SCHEDULE);
+  s.partySchedule = list(s.partySchedule).length ? list(s.partySchedule) : clone(DEFAULT_PARTY_SCHEDULE);
   s.tracks = list(s.tracks).length ? list(s.tracks).slice(0, 300) : clone(BASE.tracks);
   if (migratedDeletedSuno) {
     s.tracks = clone(BASE.tracks);
@@ -931,6 +942,21 @@ async function sendSunoAnnouncement(trackIndex, hold = false, label = '') {
   renderWhenIdle();
 }
 
+async function sendSunoUrlAnnouncement(url, hold = false, label = '') {
+  const raw = String(url || '').trim();
+  if (!raw) throw Error('Paste a Suno song, playlist, or direct audio URL before sending this announcement.');
+  const event = appendEvent('announcement', {
+    mode: 'suno-url',
+    url: raw,
+    hold: !!hold,
+    label: label || (hold ? 'Safety Suno URL announcement' : 'Suno URL announcement')
+  });
+  logEvent('announcement', hold ? 'Safety Suno URL announcement sent' : 'Suno URL announcement sent', compactUrl(raw), { eventId: event.id, url: raw });
+  await pushState('Suno URL announcement command sent to all active receivers.');
+  if (S.screen === 'home') await processEvent(event);
+  renderWhenIdle();
+}
+
 async function playSavedAnnouncement(item, hold = false, label = '') {
   const saved = item || ann();
   if (saved?.mode === 'suno') {
@@ -950,7 +976,7 @@ function commandTitle(type) {
     'spotify-volume': 'Set Spotify volume',
     'audio-settings': 'Update audio settings',
     song: 'Play Suno song',
-    suno: 'Play Suno playlist',
+    suno: 'Play Suno URL',
     'weather-check': 'Weather check'
   })[type] || type || 'Command';
 }
@@ -1035,12 +1061,11 @@ async function runCommand(command) {
     await pushState('Receiver audio settings logged.', { render: false });
   } else if (command.type === 'song') {
     S.musicProvider = 'suno';
-    await playSuno(false);
+    if (command.url) await playSunoUrl(command.url, false);
+    else await playSuno(false);
   } else if (command.type === 'suno') {
     S.musicProvider = 'suno';
-    S.playlistUrl = command.url || S.playlistUrl;
-    await importSuno('Remote Suno URL imported.');
-    await playSuno(false);
+    await playSunoUrl(command.url || S.playlistUrl, false);
   } else if (command.type === 'weather-check') {
     await weather({ announce: true, reason: 'remote command' });
   }
@@ -1052,6 +1077,11 @@ async function runAnnouncement(event) {
     const chosen = playableTrackAt(event.trackIndex);
     logEvent('receiver', 'Suno announcement received', chosen?.item?.title || event.label || 'Selected Suno track', { eventId: event.id, trackIndex: event.trackIndex });
     await announceSunoTrack(Number(event.trackIndex) || 0, { hold: !!event.hold, eventId: event.id });
+    return;
+  }
+  if (event.mode === 'suno-url') {
+    logEvent('receiver', 'Suno URL announcement received', event.label || compactUrl(event.url), { eventId: event.id, url: event.url });
+    await announceSunoUrl(event.url, { hold: !!event.hold, eventId: event.id, label: event.label });
     return;
   }
   if (!event.text) return;
@@ -1095,28 +1125,43 @@ function nextPlayableIndex(from = S.current) {
   return -1;
 }
 
-async function importSuno(message = 'Suno playlist imported.') {
-  readMusicSettings();
-  S.musicProvider = 'suno';
-  setFeedback('Importing Suno playlist...', true);
-  renderWhenIdle();
-  const response = await fetch(API.suno + encodeURIComponent(S.playlistUrl));
+async function fetchSunoTracksForUrl(url) {
+  const raw = String(url || '').trim();
+  if (!raw) throw Error('Paste a Suno song, playlist, or direct audio URL first.');
+  const response = await fetch(API.suno + encodeURIComponent(raw));
   const data = await response.json().catch(() => ({}));
-  if (!response.ok || !data.tracks?.length) throw Error(data.error || `Suno import HTTP ${response.status}`);
-  S.tracks = data.tracks.map(item => ({
+  if (!response.ok || !data.tracks?.length) throw Error(data.error || `Suno URL HTTP ${response.status}`);
+  const tracks = data.tracks.map(item => ({
     title: item.title || 'Untitled',
     artist: item.artist || 'Suno',
     duration: item.duration || '3:00',
     audioUrl: item.audioUrl || '',
-    sourceUrl: item.sourceUrl || S.playlistUrl,
+    sourceUrl: item.sourceUrl || raw,
     imageUrl: item.imageUrl || ''
   }));
+  return { tracks, data, url: raw };
+}
+
+async function loadSunoTracksFromUrl(url, message = 'Suno URL loaded.') {
+  const { tracks, data, url: raw } = await fetchSunoTracksForUrl(url);
+  S.tracks = tracks;
   const first = S.tracks.findIndex(item => item.audioUrl);
   S.current = first >= 0 ? first : 0;
+  S.playlistUrl = raw;
   S.playlistName = data.playlistName || S.playlistName;
-  S.lastError = data.audioWarning || '';
-  logEvent('music', 'Suno imported', `${S.tracks.length} track(s). ${data.audioWarning || ''}`.trim());
-  await pushState(`${message} ${S.tracks.length} track(s) loaded.`);
+  S.lastError = data.audioWarning || data.warning || '';
+  logEvent('music', 'Suno loaded', `${S.tracks.length} track(s) from ${compactUrl(raw)}. ${S.lastError || ''}`.trim());
+  await pushState(`${message} ${S.tracks.length} track(s) loaded.`, { render: false });
+}
+
+async function importSuno(message = 'Suno playlist imported.') {
+  readMusicSettings();
+  if (!String(S.playlistUrl || '').trim()) throw Error('Paste a Suno song, playlist, or direct audio URL first.');
+  S.musicProvider = 'suno';
+  setFeedback('Loading Suno URL...', true);
+  renderWhenIdle();
+  await loadSunoTracksFromUrl(S.playlistUrl, message);
+  renderWhenIdle();
 }
 
 async function fade(media, target, ms = 550) {
@@ -1326,6 +1371,27 @@ async function testReceiverTone(reason = 'iPhone receiver test tone') {
   }
 }
 
+async function playSunoUrl(url, push = true) {
+  readMusicSettings();
+  const raw = String(url || S.playlistUrl || '').trim();
+  if (!raw) throw Error('Paste a Suno song, playlist, or direct audio URL first.');
+  S.musicProvider = 'suno';
+  S.quickMusicUrl = raw;
+  S.playlistUrl = raw;
+  rememberActiveSource('suno', raw, push ? 'sent to receivers' : 'playing on receiver');
+  if (S.screen !== 'home' && push) {
+    await issueCommand('suno', {
+      label: 'Play Suno URL',
+      provider: 'suno',
+      url: raw,
+      detail: sourceLabel('suno', raw)
+    }, `Suno command sent to all active receivers: ${sourceLabel('suno', raw)}.`);
+    return;
+  }
+  await loadSunoTracksFromUrl(raw, 'Suno URL loaded for receiver.');
+  await playSuno(false);
+}
+
 async function playSuno(push = true) {
   readMusicSettings();
   if (S.screen !== 'home' && push) {
@@ -1452,7 +1518,8 @@ function activeProviderUrl() {
 
 function providerFromUrl(url) {
   const raw = String(url || '').trim();
-  if (/suno\.com\/playlist\//i.test(raw)) return 'suno';
+  if (/suno\.com\/(?:playlist|playlists|song|songs)\//i.test(raw)) return 'suno';
+  if (/\.(mp3|m4a|aac|wav|ogg|oga|webm)(\?|#|$)/i.test(raw)) return 'suno';
   if (/spotify:|open\.spotify\.com\//i.test(raw)) return 'spotify';
   return '';
 }
@@ -1463,7 +1530,9 @@ function sourceKind(url) {
   if (/spotify:album:|open\.spotify\.com\/album\//i.test(raw)) return 'Spotify album';
   if (/spotify:artist:|open\.spotify\.com\/artist\//i.test(raw)) return 'Spotify artist';
   if (/spotify:playlist:|open\.spotify\.com\/playlist\//i.test(raw)) return 'Spotify playlist';
-  if (/suno\.com\/playlist\//i.test(raw)) return 'Suno playlist';
+  if (/suno\.com\/(?:song|songs)\//i.test(raw)) return 'Suno song';
+  if (/suno\.com\/(?:playlist|playlists)\//i.test(raw)) return 'Suno playlist';
+  if (/\.(mp3|m4a|aac|wav|ogg|oga|webm)(\?|#|$)/i.test(raw)) return 'Direct audio';
   return raw ? 'Music source' : 'No source selected';
 }
 
@@ -1491,7 +1560,7 @@ function compactUrl(url) {
 function sourceLabel(provider = S.musicProvider, url = activeProviderUrl()) {
   const id = sourceId(url);
   if (provider === 'spotify') return `${sourceKind(url)}${id ? ` ${id.slice(0, 14)}` : ''}`;
-  if (provider === 'suno') return `Suno playlist${id ? ` ${id.slice(0, 14)}` : ''}`;
+  if (provider === 'suno') return `${sourceKind(url)}${id ? ` ${id.slice(0, 14)}` : ''}`;
   return PROVIDERS[provider] || 'Music';
 }
 
@@ -1507,7 +1576,7 @@ async function playAnyMusicUrl(url = S.quickMusicUrl || activeProviderUrl(), pus
   const raw = String(url || S.quickMusicUrl || activeProviderUrl() || '').trim();
   if (!raw) throw Error('Paste a Spotify or Suno playlist URL first.');
   const provider = providerFromUrl(raw);
-  if (!provider) throw Error('Paste a Suno playlist URL or Spotify playlist, album, artist, or track URL.');
+  if (!provider) throw Error('Paste a Suno song, Suno playlist, direct audio URL, or Spotify playlist, album, artist, or track URL.');
   S.quickMusicUrl = raw;
   if (provider === 'spotify') {
     S.musicProvider = 'spotify';
@@ -1515,15 +1584,7 @@ async function playAnyMusicUrl(url = S.quickMusicUrl || activeProviderUrl(), pus
     await playSpotifyUrl(raw, push);
     return;
   }
-  S.musicProvider = 'suno';
-  S.playlistUrl = raw;
-  rememberActiveSource('suno', raw, push ? 'sent to receivers' : 'playing on receiver');
-  if (S.screen !== 'home' && push) {
-    await issueCommand('suno', { label: 'Play Suno playlist', provider: 'suno', url: raw, detail: sourceLabel('suno', raw) }, `Suno playlist command sent to all active receivers: ${sourceLabel('suno', raw)}.`);
-    return;
-  }
-  await importSuno('Suno playlist imported for receiver.');
-  await playSuno(false);
+  await playSunoUrl(raw, push);
 }
 
 function readSpotifyVolumeControl() {
@@ -1592,7 +1653,7 @@ function applyReceiverAudioSettings(reason = 'local setting') {
   S.rate = audio.rate;
   S.pitch = audio.pitch;
   music.volume = music.paused ? music.volume : audio.sunoVolume / 100;
-  if (!announcementMusic.paused) announcementMusic.volume = audio.sunoVolume / 100;
+  if (!announcementMusic.paused) announcementMusic.volume = 1;
   logEvent('settings', 'Audio settings applied', `${reason}: ${audioSettingsDetail()}`);
   localSave();
 }
@@ -1650,6 +1711,18 @@ async function applySpotifyVolume(push = true) {
       label: `Set Spotify volume to ${volume}%`,
       detail: `Spotify music volume ${volume}%; announcements stay at full announcement volume.`
     }, `Spotify volume ${volume}% sent to all active receivers. Announcements stay loud.`);
+    if (spotifyLoggedIn()) {
+      try {
+        const result = await spotifySetVolume(volume, '', { preferKnown: true, preferActive: true, preferPoolside: true, allowStart: false });
+        logEvent('spotify', 'Spotify volume set from Command', `${volume}% via ${result.method || 'Spotify API'}`);
+        await pushState(`Spotify volume ${volume}% applied from Command and sent to receivers.`, { render: false });
+        setSpotifyStatus(`Spotify volume ${volume}% applied from Command and sent to receivers. Announcements stay loud.`, true);
+      } catch (error) {
+        logEvent('spotify', 'Command Spotify volume API failed', error.message || String(error));
+        setFeedback(`Spotify volume command sent to receivers. Command API volume could not confirm: ${error.message}`, false);
+      }
+      renderWhenIdle();
+    }
     return;
   }
   const result = await spotifySetVolume(volume, '', { preferKnown: true, preferActive: true, preferPoolside: true, allowStart: false });
@@ -2558,6 +2631,48 @@ async function announceSunoTrack(trackIndex, options = {}) {
   return await job;
 }
 
+async function announceSunoUrl(url, options = {}) {
+  const job = announcementTail.then(() => performSunoUrlAnnouncement(url, options));
+  announcementTail = job.catch(() => {});
+  return await job;
+}
+
+async function performSunoUrlAnnouncement(url, options = {}) {
+  if (S.screen !== 'home') throw Error('Suno announcements play only on receiver screens.');
+  const raw = String(url || '').trim();
+  if (!raw) throw Error('Paste a Suno song, playlist, or direct audio URL first.');
+  speaking = true;
+  try {
+    await ensureReceiverAudio('Suno URL announcement', { required: true });
+    const { tracks } = await fetchSunoTracksForUrl(raw);
+    const chosen = tracks.find(item => item.audioUrl) || null;
+    if (!chosen?.audioUrl) throw Error('That Suno URL did not expose playable audio. Paste a direct audio URL or a public Suno URL that includes playable audio.');
+    const spotifySnapshot = await duckSpotifyForAnnouncement();
+    const sunoSnapshot = await duckSunoForAnnouncement();
+    try {
+      announcementMusic.pause();
+      announcementMusic.src = chosen.audioUrl;
+      announcementMusic.muted = false;
+      announcementMusic.volume = 1;
+      await playAudioElementToEnd(announcementMusic);
+      logEvent('announcement', options.hold ? 'Safety Suno URL announcement played' : 'Suno URL announcement played', `${chosen.title || options.label || 'Suno track'} · ${compactUrl(raw)}`, { eventId: options.eventId || '', url: raw });
+      setFeedback(`Suno announcement completed: ${chosen.title || compactUrl(raw)}.`, true);
+      return true;
+    } finally {
+      await restoreSpotifyAfterAnnouncement(spotifySnapshot);
+      await restoreSunoAfterAnnouncement(sunoSnapshot);
+      announcementMusic.pause();
+      try { announcementMusic.currentTime = 0; } catch {}
+    }
+  } catch (error) {
+    throw actionNeededError(`Receiver could not start the Suno URL announcement: ${error.message}. Tap Start Speaker Phone on the speaker-connected phone, then send it again.`);
+  } finally {
+    speaking = false;
+    localSave();
+    renderWhenIdle();
+  }
+}
+
 async function performSunoAnnouncement(trackIndex, options = {}) {
   if (S.screen !== 'home') throw Error('Suno announcements play only on receiver screens.');
   speaking = true;
@@ -2572,7 +2687,7 @@ async function performSunoAnnouncement(trackIndex, options = {}) {
       announcementMusic.pause();
       announcementMusic.src = chosen.item.audioUrl;
       announcementMusic.muted = false;
-      announcementMusic.volume = Math.max(.01, musicGain());
+      announcementMusic.volume = 1;
       await playAudioElementToEnd(announcementMusic);
       logEvent('announcement', options.hold ? 'Safety Suno announcement played' : 'Suno announcement played', `${chosen.item.title || 'Suno track'} · ${chosen.item.artist || ''}`, { eventId: options.eventId || '', trackIndex: chosen.index });
       setFeedback(`Suno announcement completed: ${chosen.item.title || 'track'}.`, true);
@@ -2830,14 +2945,40 @@ function tokens(text) {
     .replaceAll('{resort}', 'Serenity Shores');
 }
 
+function scheduleMode(mode = S.activeSchedule) {
+  return mode === 'party' ? 'party' : 'daily';
+}
+
+function scheduleItems(mode = S.activeSchedule) {
+  return scheduleMode(mode) === 'party' ? S.partySchedule : S.schedule;
+}
+
+function scheduleTitle(mode = S.activeSchedule) {
+  return scheduleMode(mode) === 'party' ? 'Party Schedule' : 'Daily Schedule';
+}
+
+function scheduleTab(mode = S.activeSchedule) {
+  return scheduleMode(mode) === 'party' ? 'party' : 'schedule';
+}
+
+function scheduleFieldKey(mode, index) {
+  return `${scheduleMode(mode)}-${index}`;
+}
+
+function scheduleField(name, key) {
+  return document.querySelector(`[data-${name}="${key}"]`);
+}
+
 function itemBody(item) {
   if (!item) return '';
   if (item.type === 'suno' || item.type === 'spotify') return item.url || '';
   if (item.type === 'sunoAnnouncement') {
+    if (item.url) return `Suno announcement URL: ${compactUrl(item.url)}`;
     const itemTrack = S.tracks[Number(item.trackIndex) || 0];
     return itemTrack ? `Suno announcement: ${itemTrack.title}` : 'Suno announcement track';
   }
   if (item.type === 'song') {
+    if (item.url) return `Suno music URL: ${compactUrl(item.url)}`;
     const itemTrack = S.tracks[Number(item.trackIndex) || 0];
     return itemTrack ? `Specific song: ${itemTrack.title}` : 'Specific Suno song';
   }
@@ -2860,7 +3001,8 @@ async function playScheduleItem(item) {
     return;
   }
   if (item.type === 'sunoAnnouncement') {
-    await sendSunoAnnouncement(Number(item.trackIndex) || 0, !!item.hold, item.label || 'Scheduled Suno announcement');
+    if (item.url) await sendSunoUrlAnnouncement(item.url, !!item.hold, item.label || 'Scheduled Suno announcement');
+    else await sendSunoAnnouncement(Number(item.trackIndex) || 0, !!item.hold, item.label || 'Scheduled Suno announcement');
     return;
   }
   if (item.type === 'spotify') {
@@ -2871,6 +3013,10 @@ async function playScheduleItem(item) {
     return;
   }
   if (item.type === 'song') {
+    if (item.url) {
+      await playSunoUrl(item.url, S.screen !== 'home');
+      return;
+    }
     const index = Math.max(0, Math.min(Number(item.trackIndex) || 0, Math.max(0, S.tracks.length - 1)));
     S.current = index;
     S.musicProvider = 'suno';
@@ -2880,44 +3026,40 @@ async function playScheduleItem(item) {
   }
   if (item.type === 'suno') {
     if (!item.url) throw Error('This schedule item has no Suno URL.');
-    S.musicProvider = 'suno';
-    S.playlistUrl = item.url;
-    if (S.screen !== 'home') await issueCommand('suno', { label: item.label, url: item.url, detail: `Scheduled Suno URL: ${compactUrl(item.url)}` }, `Suno item sent to receivers: ${item.label}`);
-    else {
-      await importSuno('Scheduled Suno URL imported.');
-      await playSuno(false);
-    }
+    await playSunoUrl(item.url, S.screen !== 'home');
     return;
   }
   await sendAnnouncement(itemBody(item), !!item.hold, item.label || 'Scheduled announcement');
 }
 
-function createScheduleItem() {
-  const item = { id: `sched-${uid()}`, label: 'New Schedule Item', type: 'announcement', time: '10:00', announcementId: S.selected, enabled: true };
-  S.schedule.push(item);
+function createScheduleItem(mode = 'daily') {
+  const item = { id: `sched-${uid()}`, label: 'New Schedule Item', type: 'text', time: '10:00', text: '', enabled: true };
+  scheduleItems(mode).push(item);
   S.editId = item.id;
-  save('New schedule item added.');
+  save(`New ${scheduleTitle(mode).toLowerCase()} item added.`);
 }
 
-function addSongSchedule(index) {
+function addSongSchedule(index, mode = S.activeSchedule) {
   const itemTrack = S.tracks[Math.max(0, Math.min(Number(index) || 0, Math.max(0, S.tracks.length - 1)))] || {};
   const item = { id: `sched-${uid()}`, label: `Play ${itemTrack.title || 'Suno song'}`, type: 'song', time: '10:00', trackIndex: Number(index) || 0, enabled: true };
-  S.schedule.push(item);
+  scheduleItems(mode).push(item);
   S.editId = item.id;
-  S.tab = 'schedule';
-  save(`Added ${item.label} to the daily schedule.`);
+  S.tab = scheduleTab(mode);
+  save(`Added ${item.label} to the ${scheduleTitle(mode).toLowerCase()}.`);
 }
 
-function saveRow(index) {
-  const row = S.schedule[index];
+function saveRow(index, mode = 'daily') {
+  const key = scheduleFieldKey(mode, index);
+  const row = scheduleItems(mode)[index];
   if (!row) {
     setFeedback('Schedule item not found.', false);
     return;
   }
-  const kind = document.querySelector(`[data-kind="${index}"]`)?.value || 'announcement';
-  const body = document.querySelector(`[data-body="${index}"]`)?.value.trim() || '';
-  row.label = document.querySelector(`[data-label="${index}"]`)?.value || row.label;
-  row.time = document.querySelector(`[data-row-time="${index}"]`)?.value || row.time || '10:00';
+  const priorTrackIndex = row.trackIndex;
+  const kind = scheduleField('kind', key)?.value || row.type || 'text';
+  const body = scheduleField('body', key)?.value.trim() || '';
+  row.label = scheduleField('label', key)?.value || row.label;
+  row.time = scheduleField('row-time', key)?.value || row.time || '10:00';
   delete row.offsetToClose;
   delete row.announcementId;
   delete row.url;
@@ -2925,20 +3067,22 @@ function saveRow(index) {
   delete row.trackIndex;
   if (kind === 'song') {
     row.type = 'song';
-    row.trackIndex = Math.max(0, Math.min(Number(document.querySelector(`[data-track="${index}"]`)?.value) || 0, Math.max(0, S.tracks.length - 1)));
+    if (body) row.url = body;
+    else row.trackIndex = Math.max(0, Math.min(Number(priorTrackIndex) || 0, Math.max(0, S.tracks.length - 1)));
   } else if (kind === 'sunoAnnouncement') {
     row.type = 'sunoAnnouncement';
-    row.trackIndex = Math.max(0, Math.min(Number(document.querySelector(`[data-track="${index}"]`)?.value) || 0, Math.max(0, S.tracks.length - 1)));
+    if (body) row.url = body;
+    else row.trackIndex = Math.max(0, Math.min(Number(priorTrackIndex) || 0, Math.max(0, S.tracks.length - 1)));
   } else if (kind === 'suno') {
     row.type = 'suno';
-    row.url = body || S.playlistUrl;
+    row.url = body;
     if (!row.url) {
-      setFeedback('Paste a Suno URL before saving.', false);
+      setFeedback('Paste a Suno song, playlist, or direct audio URL before saving.', false);
       return;
     }
   } else if (kind === 'spotify') {
     row.type = 'spotify';
-    row.url = body || S.spotifyUrl;
+    row.url = body;
     if (!row.url) {
       setFeedback('Paste a Spotify URL before saving.', false);
       return;
@@ -2948,9 +3092,26 @@ function saveRow(index) {
     row.text = body || 'Type announcement text here.';
   } else {
     row.type = 'announcement';
-    row.announcementId = document.querySelector(`[data-selann="${index}"]`)?.value || S.selected;
+    row.announcementId = scheduleField('selann', key)?.value || S.selected;
   }
-  save(`Schedule item saved: ${row.label}.`);
+  save(`${scheduleTitle(mode)} item saved: ${row.label}.`);
+}
+
+function updateScheduleTypeDraft(index, mode, nextKind) {
+  const key = scheduleFieldKey(mode, index);
+  const row = scheduleItems(mode)[index];
+  if (!row) return;
+  const body = scheduleField('body', key)?.value.trim() || '';
+  row.label = scheduleField('label', key)?.value || row.label;
+  row.time = scheduleField('row-time', key)?.value || row.time || '10:00';
+  if (row.type === 'text') row.text = body;
+  else if (['suno', 'spotify', 'sunoAnnouncement', 'song'].includes(row.type) && body) row.url = body;
+  row.type = nextKind || 'text';
+  if (row.type === 'announcement') row.announcementId ||= S.selected;
+  if (row.type === 'text') row.text ||= '';
+  if (['suno', 'spotify', 'sunoAnnouncement', 'song'].includes(row.type)) row.url ||= '';
+  localSave();
+  render();
 }
 
 async function tick() {
@@ -2965,9 +3126,10 @@ async function tick() {
   }
   if (S.autoStop && S.playbackMode === 'hours' && !openNow() && S.intent === 'playing') await stopSelected(false);
   const now = hm(new Date().getHours() * 60 + new Date().getMinutes());
-  for (const item of S.schedule) {
+  const mode = scheduleMode(S.activeSchedule);
+  for (const item of scheduleItems(mode)) {
     if (!item.enabled || schedTime(item) !== now) continue;
-    const key = `${today()}:${item.id}:${schedTime(item)}`;
+    const key = `${today()}:${mode}:${item.id}:${schedTime(item)}`;
     if (S.lastRun[item.id] === key) continue;
     S.lastRun[item.id] = key;
     localSave();
@@ -3216,6 +3378,7 @@ function nav() {
   const tabs = [
     ['command', 'Command'],
     ['music', 'Music'],
+    ['party', 'Party'],
     ['schedule', 'Schedule'],
     ['weather', 'Weather'],
     ['voice', 'Voice'],
@@ -3292,17 +3455,18 @@ function receiverNotice() {
 
 function homePage() {
   const current = track();
-  const next = S.schedule.filter(item => item.enabled).sort((a, b) => mins(schedTime(a)) - mins(schedTime(b))).slice(0, 5)
+  const activeMode = scheduleMode(S.activeSchedule);
+  const next = scheduleItems(activeMode).filter(item => item.enabled).sort((a, b) => mins(schedTime(a)) - mins(schedTime(b))).slice(0, 5)
     .map(item => `<p class="line"><b>${pretty(schedTime(item))}</b><span>${esc(item.label)}</span></p>`).join('');
   const label = sourceLabel(S.musicProvider, activeProviderUrl());
   const error = visibleLastError();
   const live = receiverCanPause();
-  return `${header()}<main class="home console"><section class="receiverConsole"><div class="receiverLead"><p class="eyebrow">Home Receiver · V17</p><h1>Sound Station</h1><p>This phone must stay on Home because it is the only device that plays Spotify, voice announcements, scheduled audio, and weather safety messages through the speakers.</p>${receiverActionButtons()}${receiverNotice()}${error ? `<div class="alert warn">${esc(error)}</div>` : ''}</div><aside class="setupPanel"><h2>Receiver Readiness</h2>${readinessSteps()}<div class="miniFacts"><b>Selected:</b> ${esc(label)}<br><b>Status:</b> ${esc(receiverReadiness())}<br><b>Audio:</b> ${esc(S.audioStatus)}</div></aside></section><section class="nowCompact"><div><p class="eyebrow">${live ? 'Now Playing' : S.intent === 'paused' ? 'Paused' : 'Ready'}</p><h2>${esc(S.musicProvider === 'spotify' ? (S.spotifyNowPlaying || 'Spotify Receiver') : current.title)}</h2><p>${esc(S.musicProvider === 'spotify' ? compactUrl(S.spotifyUrl) : `${current.artist || 'Suno'} · ${current.duration || ''}`)}</p><p class="muted">${esc(S.activeMusicLabel || label)}</p></div><div class="signal ${live ? 'live' : ''}"><span></span><span></span><span></span></div></section><section class="cards"><div class="card"><h3>Next Scheduled</h3>${next || '<p class="muted">No enabled schedule items.</p>'}</div><div class="card"><h3>Recent Receiver Log</h3>${logRows(5)}</div></section></main>`;
+  return `${header()}<main class="home console"><section class="receiverConsole"><div class="receiverLead"><p class="eyebrow">Home Receiver · V17</p><h1>Sound Station</h1><p>This phone must stay on Home because it is the only device that plays Spotify, voice announcements, scheduled audio, and weather safety messages through the speakers.</p>${receiverActionButtons()}${receiverNotice()}${error ? `<div class="alert warn">${esc(error)}</div>` : ''}</div><aside class="setupPanel"><h2>Receiver Readiness</h2>${readinessSteps()}<div class="miniFacts"><b>Selected:</b> ${esc(label)}<br><b>Schedule:</b> ${esc(scheduleTitle(activeMode))}<br><b>Status:</b> ${esc(receiverReadiness())}<br><b>Audio:</b> ${esc(S.audioStatus)}</div></aside></section><section class="nowCompact"><div><p class="eyebrow">${live ? 'Now Playing' : S.intent === 'paused' ? 'Paused' : 'Ready'}</p><h2>${esc(S.musicProvider === 'spotify' ? (S.spotifyNowPlaying || 'Spotify Receiver') : current.title)}</h2><p>${esc(S.musicProvider === 'spotify' ? compactUrl(S.spotifyUrl) : `${current.artist || 'Suno'} · ${current.duration || ''}`)}</p><p class="muted">${esc(S.activeMusicLabel || label)}</p></div><div class="signal ${live ? 'live' : ''}"><span></span><span></span><span></span></div></section><section class="cards"><div class="card"><h3>Next Scheduled · ${esc(scheduleTitle(activeMode))}</h3>${next || '<p class="muted">No enabled schedule items.</p>'}</div><div class="card"><h3>Recent Receiver Log</h3>${logRows(5)}</div></section></main>`;
 }
 
 function commandPage() {
   const selected = ann();
-  return shell(`<section class="commandConsole"><div><p class="eyebrow">Live Control</p><h1>Command</h1><p>Command devices send instructions to every active receiver. Speaker phones stay on Home and play all sound.</p></div>${statusCards()}</section><section class="panel controlDeck"><div class="sectionHead"><h2>Receiver Controls</h2><span class="pill ${S.receiverStatus && !receiverActionNeeded(S.receiverStatus) ? 'good' : 'warn'}">${esc(S.receiverStatus || 'No receiver report yet')}</span></div><div class="bigControls"><button id="playCmd">Play / Resume</button><button id="pauseCmd" class="secondary">Pause</button><button id="skipCmd" class="secondary">Skip</button><button id="stopCmd" class="danger">Stop</button><button id="checkWeatherCmd" class="secondary">Check Weather</button></div><div class="volumeStrip"><label><span>Spotify Volume <output id="spotifyVolumeCommandOut">${esc(S.spotifyVolume)}%</output></span><input id="spotifyVolumeCommand" type="range" min="0" max="100" step="1" value="${esc(S.spotifyVolume)}"></label><button id="spotifyVolumeApply" class="secondary">Set Volume on Receivers</button><small>Announcements keep their separate loud boost.</small></div><div class="quickMusic"><label>Play Spotify or Suno URL<input id="quickMusicUrl" value="${esc(S.quickMusicUrl || activeProviderUrl())}" placeholder="Paste Spotify or Suno playlist URL"></label><div class="buttonStack"><button id="playAnyUrl">Play Pasted URL</button><button id="playDefaultSpotify" class="secondary">Default Spotify</button><button id="playDefaultSuno" class="secondary">Default Suno</button></div></div><div class="splitControls"><label>Announcement<textarea id="quickText">${esc(S.quickText || selected.text)}</textarea></label><div><label>Saved Announcement<select id="quickTemplate">${S.anns.map(item => `<option value="${item.id}" ${item.id === S.selected ? 'selected' : ''}>${esc(item.label)} · ${item.mode === 'suno' ? 'Suno' : 'Voice'}</option>`).join('')}</select></label><div class="buttonStack"><button id="quickPlay">${selected.mode === 'suno' ? 'Play Announcement Track' : 'Speak Now'}</button><button id="quickHold" class="secondary">${selected.mode === 'suno' ? 'Track as Safety Hold' : 'Speak as Safety Hold'}</button><button id="lightningNow" class="secondary">Lightning Hold</button><button id="windNow" class="secondary">Wind Umbrellas</button></div></div></div></section><section class="panel compactLog"><div class="sectionHead"><h2>Receiver Activity</h2><button id="clearLog" class="secondary">Clear Local Log</button></div>${logRows()}</section>`);
+  return shell(`<section class="commandConsole"><div><p class="eyebrow">Live Control</p><h1>Command</h1><p>Command devices send instructions to every active receiver. Speaker phones stay on Home and play all sound.</p></div>${statusCards()}</section><section class="panel controlDeck"><div class="sectionHead"><h2>Receiver Controls</h2><span class="pill ${S.receiverStatus && !receiverActionNeeded(S.receiverStatus) ? 'good' : 'warn'}">${esc(S.receiverStatus || 'No receiver report yet')}</span></div><div class="bigControls"><button id="playCmd">Play / Resume</button><button id="pauseCmd" class="secondary">Pause</button><button id="skipCmd" class="secondary">Skip</button><button id="stopCmd" class="danger">Stop</button><button id="checkWeatherCmd" class="secondary">Check Weather</button></div><div class="volumeStrip"><label><span>Spotify Volume <output id="spotifyVolumeCommandOut">${esc(S.spotifyVolume)}%</output></span><input id="spotifyVolumeCommand" type="range" min="0" max="100" step="1" value="${esc(S.spotifyVolume)}"></label><button id="spotifyVolumeApply" class="secondary">Set Volume on Receivers</button><small>Announcements keep their separate loud boost.</small></div><div class="quickMusic"><label>Play Spotify or Suno URL<input id="quickMusicUrl" value="${esc(S.quickMusicUrl || activeProviderUrl())}" placeholder="Paste Spotify, Suno, or direct audio URL"></label><div class="buttonStack"><button id="playAnyUrl">Play Pasted URL</button><button id="playDefaultSpotify" class="secondary">Default Spotify</button><button id="playDefaultSuno" class="secondary">Default Suno</button></div></div><div class="splitControls"><label>Announcement<textarea id="quickText">${esc(S.quickText || selected.text)}</textarea></label><div><label>Saved Announcement<select id="quickTemplate">${S.anns.map(item => `<option value="${item.id}" ${item.id === S.selected ? 'selected' : ''}>${esc(item.label)} · ${item.mode === 'suno' ? 'Suno' : 'Voice'}</option>`).join('')}</select></label><div class="buttonStack"><button id="quickPlay">${selected.mode === 'suno' ? 'Play Announcement Track' : 'Speak Now'}</button><button id="quickHold" class="secondary">${selected.mode === 'suno' ? 'Track as Safety Hold' : 'Speak as Safety Hold'}</button><button id="lightningNow" class="secondary">Lightning Hold</button><button id="windNow" class="secondary">Wind Umbrellas</button></div></div></div></section><section class="panel compactLog"><div class="sectionHead"><h2>Receiver Activity</h2><button id="clearLog" class="secondary">Clear Local Log</button></div>${logRows()}</section>`);
 }
 
 function spotifyDiagnostics() {
@@ -3314,20 +3478,74 @@ function spotifyDiagnostics() {
 function musicPage() {
   const providers = Object.entries(PROVIDERS).map(([id, label]) => `<option value="${id}" ${S.musicProvider === id ? 'selected' : ''}>${label}</option>`).join('');
   const rows = S.tracks.map((item, index) => `<div class="trackRow ${index === S.current ? 'cur' : ''}"><div><b>${index + 1}. ${esc(item.title)}</b><span>${esc(item.artist || 'Suno')} · ${esc(item.duration || '')} · ${item.audioUrl ? 'ready' : 'title only'}</span></div><div class="rowBtns"><button data-song="${index}" class="slim">Play</button><button data-schedule-song="${index}" class="secondary slim">Schedule</button></div></div>`).join('');
-  return shell(`<section class="panel"><div class="panelHeader"><div><p class="eyebrow">Music Control</p><h1>Music</h1></div><button id="saveMusic">Save</button></div><div class="sourceBoard"><div class="sourceTile"><b>Selected</b><strong>${esc(sourceLabel(S.musicProvider, activeProviderUrl()))}</strong><span>${esc(activeProviderUrl())}</span></div><div class="sourceTile"><b>Receiver</b><strong>${esc(S.receiverStatus || receiverReadiness())}</strong><span>${esc(S.spotifyNowPlaying || S.activeMusicLabel || '')}</span></div><div class="sourceTile"><b>Voice Ducking</b><strong>${esc(S.spotifyDuckedVolume)}% Spotify</strong><span>${Math.round(Number(S.announcementGain || 1) * 100)}% announcement boost</span></div></div><div class="buttonStack"><button id="useSpotify" class="${S.musicProvider === 'spotify' ? '' : 'secondary'}">Use Spotify</button><button id="useSuno" class="${S.musicProvider === 'suno' ? '' : 'secondary'}">Use Suno</button><button id="spotifyPlayNow">Play Spotify on Receivers</button><button id="sunoPlayNow" class="secondary">Play Suno on Receivers</button></div><div class="quickMusic"><label>Play Spotify or Suno URL<input id="quickMusicUrl" value="${esc(S.quickMusicUrl || activeProviderUrl())}" placeholder="Paste Spotify or Suno playlist URL"></label><div class="buttonStack"><button id="playAnyUrl">Play Pasted URL</button><button id="savePastedUrl" class="secondary">Save as Default</button></div></div><div class="grid2"><label>Provider<select id="musicProvider">${providers}</select></label><label>Station Name<input id="playlistName" value="${esc(S.playlistName)}"></label></div><div class="grid2"><label>Suno Playlist URL<input id="playlistUrl" value="${esc(S.playlistUrl)}"></label><label>Spotify Playlist or Song URL<input id="spotifyUrl" value="${esc(S.spotifyUrl)}" placeholder="https://open.spotify.com/playlist/..."></label></div><div class="grid2"><label>Spotify Client ID<input id="spotifyClientId" value="${esc(S.spotifyClientId)}"></label><label>Spotify Redirect URI<input id="spotifyRedirectUri" value="${esc(spotifyRedirectUri())}"></label></div><div class="grid4"><label><span>Spotify Volume <output id="spotifyVolumeOut">${esc(S.spotifyVolume)}%</output></span><input id="spotifyVolume" type="range" min="0" max="100" step="1" value="${esc(S.spotifyVolume)}"></label><label><span>Music During Announcements <output id="spotifyDuckedVolumeOut">${esc(S.spotifyDuckedVolume)}%</output></span><input id="spotifyDuckedVolume" type="range" min="0" max="20" step="1" value="${esc(S.spotifyDuckedVolume)}"></label><label><span>Suno Volume <output id="sunoVolumeOut">${esc(S.sunoVolume)}%</output></span><input id="sunoVolume" type="range" min="0" max="100" step="1" value="${esc(S.sunoVolume)}"></label><label><span>Announcement Boost <output id="announcementGainOut">${Math.round(Number(S.announcementGain || 1) * 100)}%</output></span><input id="announcementGain" type="range" min="1" max="3.4" step=".05" value="${esc(S.announcementGain)}"></label></div>${spotifyDiagnostics()}<div class="actions"><button id="spotifyLogin" class="secondary">Login with Spotify</button><button id="spotifyCheck" class="secondary">Check Spotify</button><button id="spotifyReceiver">Start Speaker Phone</button><button id="makeReceiver" class="secondary">Show Receiver Screen</button><button id="spotifyClear" class="secondary">Clear Spotify</button><button id="import" class="secondary">Import Suno</button></div></section><section class="panel"><div class="sectionHead"><h2>Suno Queue</h2><button id="playCmd" class="secondary">Play Selected on Receivers</button></div>${rows || '<p class="muted">No Suno queue imported yet.</p>'}</section>`);
+  return shell(`<section class="panel"><div class="panelHeader"><div><p class="eyebrow">Music Control</p><h1>Music</h1></div><button id="saveMusic">Save</button></div><div class="sourceBoard"><div class="sourceTile"><b>Selected</b><strong>${esc(sourceLabel(S.musicProvider, activeProviderUrl()))}</strong><span>${esc(activeProviderUrl())}</span></div><div class="sourceTile"><b>Receiver</b><strong>${esc(S.receiverStatus || receiverReadiness())}</strong><span>${esc(S.spotifyNowPlaying || S.activeMusicLabel || '')}</span></div><div class="sourceTile"><b>Voice Ducking</b><strong>${esc(S.spotifyDuckedVolume)}% Spotify</strong><span>${Math.round(Number(S.announcementGain || 1) * 100)}% announcement boost</span></div></div><div class="buttonStack"><button id="useSpotify" class="${S.musicProvider === 'spotify' ? '' : 'secondary'}">Use Spotify</button><button id="useSuno" class="${S.musicProvider === 'suno' ? '' : 'secondary'}">Use Suno</button><button id="spotifyPlayNow">Play Spotify on Receivers</button><button id="sunoPlayNow" class="secondary">Play Suno on Receivers</button></div><div class="quickMusic"><label>Play Spotify or Suno URL<input id="quickMusicUrl" value="${esc(S.quickMusicUrl || activeProviderUrl())}" placeholder="Paste Spotify, Suno, or direct audio URL"></label><div class="buttonStack"><button id="playAnyUrl">Play Pasted URL</button><button id="savePastedUrl" class="secondary">Save as Default</button></div></div><div class="grid2"><label>Provider<select id="musicProvider">${providers}</select></label><label>Station Name<input id="playlistName" value="${esc(S.playlistName)}"></label></div><div class="grid2"><label>Suno Track, Playlist, or Audio URL<input id="playlistUrl" value="${esc(S.playlistUrl)}"></label><label>Spotify Playlist or Song URL<input id="spotifyUrl" value="${esc(S.spotifyUrl)}" placeholder="https://open.spotify.com/playlist/..."></label></div><div class="grid2"><label>Spotify Client ID<input id="spotifyClientId" value="${esc(S.spotifyClientId)}"></label><label>Spotify Redirect URI<input id="spotifyRedirectUri" value="${esc(spotifyRedirectUri())}"></label></div><div class="grid4"><label><span>Spotify Volume <output id="spotifyVolumeOut">${esc(S.spotifyVolume)}%</output></span><input id="spotifyVolume" type="range" min="0" max="100" step="1" value="${esc(S.spotifyVolume)}"></label><label><span>Music During Announcements <output id="spotifyDuckedVolumeOut">${esc(S.spotifyDuckedVolume)}%</output></span><input id="spotifyDuckedVolume" type="range" min="0" max="20" step="1" value="${esc(S.spotifyDuckedVolume)}"></label><label><span>Suno Volume <output id="sunoVolumeOut">${esc(S.sunoVolume)}%</output></span><input id="sunoVolume" type="range" min="0" max="100" step="1" value="${esc(S.sunoVolume)}"></label><label><span>Announcement Boost <output id="announcementGainOut">${Math.round(Number(S.announcementGain || 1) * 100)}%</output></span><input id="announcementGain" type="range" min="1" max="3.4" step=".05" value="${esc(S.announcementGain)}"></label></div>${spotifyDiagnostics()}<div class="actions"><button id="spotifyLogin" class="secondary">Login with Spotify</button><button id="spotifyCheck" class="secondary">Check Spotify</button><button id="spotifyReceiver">Start Speaker Phone</button><button id="makeReceiver" class="secondary">Show Receiver Screen</button><button id="spotifyClear" class="secondary">Clear Spotify</button><button id="import" class="secondary">Load Suno URL</button></div></section><section class="panel"><div class="sectionHead"><h2>Suno Queue</h2><button id="playCmd" class="secondary">Play Selected on Receivers</button></div>${rows || '<p class="muted">No Suno queue imported yet.</p>'}</section>`);
 }
 
-function schedulePage() {
-  const annOptions = S.anns.map(item => `<option value="${item.id}">${esc(item.label)}</option>`).join('');
-  const rows = S.schedule.map((item, index) => ({ item, index }))
+function scheduleBodyLabel(kind) {
+  return ({
+    text: 'Spoken Text',
+    sunoAnnouncement: 'Suno Announcement URL',
+    song: 'Suno Music URL',
+    suno: 'Suno Track or Playlist URL',
+    spotify: 'Spotify Track, Playlist, Album, or Artist URL'
+  })[kind] || 'Text or URL';
+}
+
+function scheduleBodyPlaceholder(kind) {
+  return ({
+    text: 'Type the announcement to speak on all active receivers.',
+    sunoAnnouncement: 'Paste a Suno song URL or direct audio URL to play loudly as an announcement.',
+    song: 'Paste a Suno song, playlist, or direct audio URL to play as music.',
+    suno: 'Paste a Suno song, playlist, or direct audio URL.',
+    spotify: 'Paste a Spotify track, playlist, album, or artist URL.'
+  })[kind] || '';
+}
+
+function scheduleBodyValue(item) {
+  if (!item) return '';
+  if (item.type === 'text') return item.text || '';
+  if (['sunoAnnouncement', 'song', 'suno', 'spotify'].includes(item.type)) return item.url || '';
+  return '';
+}
+
+function scheduleEditor(item, index, mode, annOptions) {
+  const key = scheduleFieldKey(mode, index);
+  const kind = item.type || 'text';
+  const typeOptions = [
+    ['announcement', 'Saved announcement'],
+    ['text', 'Spoken text'],
+    ['sunoAnnouncement', 'Loud Suno announcement URL'],
+    ['song', 'Suno music URL'],
+    ['suno', 'Suno track or playlist URL'],
+    ['spotify', 'Spotify URL']
+  ].map(([value, label]) => `<option value="${value}" ${kind === value ? 'selected' : ''}>${esc(label)}</option>`).join('');
+  const body = ['text', 'sunoAnnouncement', 'song', 'suno', 'spotify'].includes(kind)
+    ? `<label>${scheduleBodyLabel(kind)}<textarea data-body="${key}" placeholder="${esc(scheduleBodyPlaceholder(kind))}">${esc(scheduleBodyValue(item))}</textarea></label>`
+    : '';
+  const saved = kind === 'announcement'
+    ? `<label>Saved Announcement<select data-selann="${key}">${annOptions}</select></label>`
+    : '';
+  return `<div class="editBox"><div class="grid3"><label>Time<input data-row-time="${key}" type="time" value="${schedTime(item)}"></label><label>Type<select data-kind="${key}" data-kind-row="${index}" data-schedule-mode="${scheduleMode(mode)}">${typeOptions}</select></label><label>Label<input data-label="${key}" value="${esc(item.label)}"></label></div>${body}${saved}<button data-save-row="${index}" data-schedule-mode="${scheduleMode(mode)}">Save Item</button></div>`;
+}
+
+function schedulePage(mode = 'daily') {
+  const activeMode = scheduleMode(mode);
+  const items = scheduleItems(activeMode);
+  const annOptionsFor = selected => S.anns.map(item => `<option value="${item.id}" ${item.id === selected ? 'selected' : ''}>${esc(item.label)}</option>`).join('');
+  const rows = items.map((item, index) => ({ item, index }))
     .sort((a, b) => mins(schedTime(a.item)) - mins(schedTime(b.item)))
     .map(({ item, index }) => {
       const active = S.editId === item.id;
-      const mode = item.type || 'announcement';
-      const edit = active ? `<div class="editBox"><div class="grid3"><label>Time<input data-row-time="${index}" type="time" value="${schedTime(item)}"></label><label>Type<select data-kind="${index}"><option value="announcement" ${mode === 'announcement' ? 'selected' : ''}>Saved announcement</option><option value="text" ${mode === 'text' ? 'selected' : ''}>Custom announcement</option><option value="sunoAnnouncement" ${mode === 'sunoAnnouncement' ? 'selected' : ''}>Suno announcement track</option><option value="song" ${mode === 'song' ? 'selected' : ''}>Suno music song</option><option value="suno" ${mode === 'suno' ? 'selected' : ''}>Suno playlist URL</option><option value="spotify" ${mode === 'spotify' ? 'selected' : ''}>Spotify URL</option></select></label><label>Label<input data-label="${index}" value="${esc(item.label)}"></label></div><label>Text or URL<textarea data-body="${index}">${esc(item.url || item.text || '')}</textarea></label><div class="grid2"><label>Suno Track<select data-track="${index}">${trackOptions(item.trackIndex)}</select></label><label>Saved Announcement<select data-selann="${index}">${annOptions}</select></label></div><button data-save-row="${index}">Save Item</button></div>` : '';
-      return `<div class="scheduleRow ${item.enabled ? '' : 'off'} ${active ? 'editing' : ''}"><div><b>${pretty(schedTime(item))} · ${esc(item.label)}</b><span>${item.enabled ? 'enabled' : 'off'} · ${esc(mode)}</span><p>${esc(tokens(itemBody(item)))}</p>${edit}</div><div class="rowBtns"><button data-play-row="${index}" class="slim">Play</button><button data-edit="${index}" class="secondary slim">${active ? 'Close' : 'Edit'}</button><button data-toggle="${index}" class="secondary slim">${item.enabled ? 'Off' : 'On'}</button><button data-delete="${index}" class="secondary slim">Delete</button></div></div>`;
+      const kind = item.type || 'text';
+      const edit = active ? scheduleEditor(item, index, activeMode, annOptionsFor(item.announcementId || S.selected)) : '';
+      return `<div class="scheduleRow ${item.enabled ? '' : 'off'} ${active ? 'editing' : ''}"><div><b>${pretty(schedTime(item))} · ${esc(item.label)}</b><span>${item.enabled ? 'enabled' : 'off'} · ${esc(kind)}</span><p>${esc(tokens(itemBody(item)))}</p>${edit}</div><div class="rowBtns"><button data-play-row="${index}" data-schedule-mode="${activeMode}" class="slim">Play</button><button data-edit="${index}" data-schedule-mode="${activeMode}" class="secondary slim">${active ? 'Close' : 'Edit'}</button><button data-toggle="${index}" data-schedule-mode="${activeMode}" class="secondary slim">${item.enabled ? 'Off' : 'On'}</button><button data-delete="${index}" data-schedule-mode="${activeMode}" class="secondary slim">Delete</button></div></div>`;
     }).join('');
-  return shell(`<section class="panel"><div class="panelHeader"><div><p class="eyebrow">Daily Automation</p><h1>Schedule</h1></div><button id="addSched">Add Item</button></div><p>Schedule saved announcements, custom announcements, Suno announcement tracks, Suno music, or Spotify URLs. Active receivers execute the schedule.</p>${rows}</section>`);
+  const active = S.activeSchedule === activeMode;
+  const eyebrow = activeMode === 'party' ? 'Party Automation' : 'Daily Automation';
+  const copy = activeMode === 'party'
+    ? 'Party schedule uses the same controls as the daily schedule. Turn it on when you want party cues to replace the normal pool schedule.'
+    : 'Daily schedule runs by default during pool hours unless the party schedule is active.';
+  return shell(`<section class="panel"><div class="panelHeader"><div><p class="eyebrow">${eyebrow}</p><h1>${scheduleTitle(activeMode)}</h1></div><div class="actions tight"><button data-activate-schedule="${activeMode}" class="${active ? '' : 'secondary'}">${active ? 'Using This Schedule' : 'Use This Schedule'}</button><button data-add-sched="${activeMode}" class="secondary">Add Item</button></div></div><p>${copy}</p><div class="statusBar"><b>Active schedule:</b> ${esc(scheduleTitle(S.activeSchedule))}</div>${rows || '<p class="muted">No enabled schedule items.</p>'}</section>`);
 }
 
 function weatherPage() {
@@ -3360,7 +3578,7 @@ function render() {
       ? homePage()
       : !S.admin
         ? login()
-        : ({ command: commandPage, music: musicPage, schedule: schedulePage, weather: weatherPage, voice: voicePage, hours: hoursPage }[S.tab] || commandPage)();
+        : ({ command: commandPage, music: musicPage, party: () => schedulePage('party'), schedule: () => schedulePage('daily'), weather: weatherPage, voice: voicePage, hours: hoursPage }[S.tab] || commandPage)();
     bind();
   } catch (error) {
     $('app').innerHTML = `<main class="wrap"><section class="panel"><h1>Poolside Pulse V${VERSION}</h1><div class="alert bad"><b>Recovered from runtime error:</b> ${esc(error.message)}</div><button onclick="location.reload()">Reload app</button></section></main>`;
@@ -3517,7 +3735,7 @@ function bind() {
     await playAnyMusicUrl(S.quickMusicUrl, true);
   });
   wire('playDefaultSuno', async () => {
-    if (!String(S.playlistUrl || DEFAULT_SUNO_PLAYLIST || '').trim()) throw Error('Paste and save a Suno playlist URL before using Default Suno.');
+    if (!String(S.playlistUrl || DEFAULT_SUNO_PLAYLIST || '').trim()) throw Error('Paste and save a Suno URL before using Default Suno.');
     S.quickMusicUrl = S.playlistUrl || DEFAULT_SUNO_PLAYLIST;
     await playAnyMusicUrl(S.quickMusicUrl, true);
   });
@@ -3625,13 +3843,24 @@ function bind() {
     button.onclick = () => addSongSchedule(Number(button.dataset.scheduleSong));
   });
 
-  wire('addSched', createScheduleItem);
+  document.querySelectorAll('[data-activate-schedule]').forEach(button => {
+    button.onclick = () => {
+      S.activeSchedule = scheduleMode(button.dataset.activateSchedule);
+      save(`${scheduleTitle(S.activeSchedule)} is now active.`);
+    };
+  });
+  document.querySelectorAll('[data-add-sched]').forEach(button => {
+    button.onclick = () => createScheduleItem(button.dataset.addSched);
+  });
   document.querySelectorAll('[data-play-row]').forEach(button => {
-    button.onclick = () => Promise.resolve(playScheduleItem(S.schedule[Number(button.dataset.playRow)])).catch(error => isActionNeeded(error) ? setActionNeeded(error.message) : setFeedback(error.message, false));
+    button.onclick = () => {
+      const mode = scheduleMode(button.dataset.scheduleMode);
+      return Promise.resolve(playScheduleItem(scheduleItems(mode)[Number(button.dataset.playRow)])).catch(error => isActionNeeded(error) ? setActionNeeded(error.message) : setFeedback(error.message, false));
+    };
   });
   document.querySelectorAll('[data-edit]').forEach(button => {
     button.onclick = () => {
-      const row = S.schedule[Number(button.dataset.edit)];
+      const row = scheduleItems(button.dataset.scheduleMode)[Number(button.dataset.edit)];
       S.editId = S.editId === row.id ? 'new' : row.id;
       localSave();
       render();
@@ -3639,25 +3868,25 @@ function bind() {
   });
   document.querySelectorAll('[data-toggle]').forEach(button => {
     button.onclick = () => {
-      const row = S.schedule[Number(button.dataset.toggle)];
+      const row = scheduleItems(button.dataset.scheduleMode)[Number(button.dataset.toggle)];
       row.enabled = !row.enabled;
       save(`${row.label} turned ${row.enabled ? 'on' : 'off'}.`);
     };
   });
   document.querySelectorAll('[data-delete]').forEach(button => {
     button.onclick = () => {
-      const row = S.schedule[Number(button.dataset.delete)];
-      S.schedule.splice(Number(button.dataset.delete), 1);
+      const items = scheduleItems(button.dataset.scheduleMode);
+      const row = items[Number(button.dataset.delete)];
+      items.splice(Number(button.dataset.delete), 1);
       S.editId = 'new';
-      save(`${row.label} deleted from schedule.`);
+      save(`${row.label} deleted from ${scheduleTitle(button.dataset.scheduleMode).toLowerCase()}.`);
     };
   });
   document.querySelectorAll('[data-save-row]').forEach(button => {
-    button.onclick = () => saveRow(Number(button.dataset.saveRow));
+    button.onclick = () => saveRow(Number(button.dataset.saveRow), button.dataset.scheduleMode);
   });
-  document.querySelectorAll('[data-selann]').forEach(select => {
-    const row = S.schedule[Number(select.dataset.selann)];
-    if (row?.announcementId) select.value = row.announcementId;
+  document.querySelectorAll('[data-kind-row]').forEach(select => {
+    select.onchange = () => updateScheduleTypeDraft(Number(select.dataset.kindRow), select.dataset.scheduleMode, select.value);
   });
 
   wire('checkWeather', triggerWeatherCheck);

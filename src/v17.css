@@ -388,11 +388,24 @@ h3 { margin-bottom: 10px; }
 .trackRow.cur, .scheduleRow.editing { border-color: var(--teal); background: #ecfbfe; }
 .scheduleRow.off { opacity: .55; }
 
+.trackRow > div,
+.scheduleRow > div,
+.logRow > div {
+  min-width: 0;
+}
+
 .trackRow span, .scheduleRow span, .logRow span {
   display: block;
   margin-top: 4px;
   color: var(--muted);
   font-weight: 750;
+  overflow-wrap: anywhere;
+}
+
+.trackRow p,
+.scheduleRow p,
+.logRow p {
+  overflow-wrap: anywhere;
 }
 
 .logRow {
@@ -466,6 +479,8 @@ h3 { margin-bottom: 10px; }
   .now { padding: 16px; }
   .art { width: 100%; max-width: 130px; }
   .trackRow, .scheduleRow, .logRow { grid-template-columns: 1fr; }
+  .rowBtns { justify-content: flex-start; width: 100%; }
+  .scheduleRow .rowBtns button, .trackRow .rowBtns button { flex: 1 1 76px; min-width: 0; }
   .logRow small { text-align: left; }
   button { width: auto; }
 }
