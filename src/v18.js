@@ -131,6 +131,8 @@ const BASE = {
   activeMusicUrl: DEFAULT_SPOTIFY_PLAYLIST,
   manualMusicHoldUntil: 0,
   manualMusicHoldReason: '',
+  manualMusicStartUntil: 0,
+  manualMusicStartReason: '',
   command: null,
   announcement: null,
   events: [],
@@ -461,6 +463,8 @@ function normalize(raw) {
   }
   s.manualMusicHoldUntil = Math.max(0, Number(s.manualMusicHoldUntil || 0) || 0);
   s.manualMusicHoldReason = String(s.manualMusicHoldReason || '');
+  s.manualMusicStartUntil = Math.max(0, Number(s.manualMusicStartUntil || 0) || 0);
+  s.manualMusicStartReason = String(s.manualMusicStartReason || '');
   s.spotifyReceiverReadyAt = Math.max(0, Number(s.spotifyReceiverReadyAt || 0) || 0);
   s.radius = clampNumber(s.radius, 1, 25, 10);
   s.lightningRadiusMiles = clampNumber(s.lightningRadiusMiles || s.radius, 1, 25, 10);
@@ -854,7 +858,9 @@ function cloudState() {
       'spotifyNeedsTap',
       'spotifyLastError',
       'manualMusicHoldUntil',
-      'manualMusicHoldReason'
+      'manualMusicHoldReason',
+      'manualMusicStartUntil',
+      'manualMusicStartReason'
     ].forEach(key => delete c[key]);
   }
   return c;
@@ -914,7 +920,9 @@ function preserveLocalBeforeMerge() {
     spotifyNeedsTap: S.spotifyNeedsTap,
     spotifyLastError: S.spotifyLastError,
     manualMusicHoldUntil: S.manualMusicHoldUntil,
-    manualMusicHoldReason: S.manualMusicHoldReason
+    manualMusicHoldReason: S.manualMusicHoldReason,
+    manualMusicStartUntil: S.manualMusicStartUntil,
+    manualMusicStartReason: S.manualMusicStartReason
   };
 }
 
@@ -952,7 +960,9 @@ function restoreLocalAfterMerge(local) {
       'spotifyNeedsTap',
       'spotifyLastError',
       'manualMusicHoldUntil',
-      'manualMusicHoldReason'
+      'manualMusicHoldReason',
+      'manualMusicStartUntil',
+      'manualMusicStartReason'
     ].forEach(key => { S[key] = local[key]; });
   }
   clearStaleReceiverFailures(S);
@@ -1701,7 +1711,7 @@ function activeProviderUrl() {
 
 function providerFromUrl(url) {
   const raw = String(url || '').trim();
-  if (/suno\.com\/(?:playlist|playlists|song|songs)\//i.test(raw)) return 'suno';
+  if (/suno\.com\/(?:playlist|playlists|song|songs|s)\//i.test(raw)) return 'suno';
   if (/\.(mp3|m4a|aac|wav|ogg|oga|webm)(\?|#|$)/i.test(raw)) return 'suno';
   if (/spotify:|open\.spotify\.com\//i.test(raw)) return 'spotify';
   return '';
@@ -1714,6 +1724,7 @@ function sourceKind(url) {
   if (/spotify:artist:|open\.spotify\.com\/artist\//i.test(raw)) return 'Spotify artist';
   if (/spotify:playlist:|open\.spotify\.com\/playlist\//i.test(raw)) return 'Spotify playlist';
   if (/suno\.com\/(?:song|songs)\//i.test(raw)) return 'Suno song';
+  if (/suno\.com\/s\//i.test(raw)) return 'Suno song';
   if (/suno\.com\/(?:playlist|playlists)\//i.test(raw)) return 'Suno playlist';
   if (/\.(mp3|m4a|aac|wav|ogg|oga|webm)(\?|#|$)/i.test(raw)) return 'Direct audio';
   return raw ? 'Music source' : 'No source selected';
@@ -2634,6 +2645,7 @@ function markSpotifyPlaybackAccepted(playUrl) {
   S.spotifyStatus = `Spotify play accepted on receiver: ${sourceLabel('spotify', playUrl)}.`;
   S.spotifyNeedsTap = false;
   receiverActive = true;
+  setManualMusicStart('Spotify started manually');
   markMatchingSpotifyPlayEventsHandled(playUrl);
   logEvent('play', 'Spotify playing on receiver', sourceLabel('spotify', playUrl), { provider: 'spotify', url: playUrl });
   setSpotifyStatus(`Spotify is playing on this receiver: ${sourceLabel('spotify', playUrl)}.`, true);
@@ -2987,6 +2999,7 @@ async function performSunoUrlCue(url, options = {}) {
     }
     S.musicProvider = 'spotify';
     S.intent = 'playing';
+    setManualMusicStart('Suno cue restored Spotify');
     S.activeMusicProvider = 'spotify';
     S.activeMusicUrl = S.spotifyUrl || DEFAULT_SPOTIFY_PLAYLIST;
     S.activeMusicLabel = `Spotify bed restored after Suno cue: ${title}`;
@@ -3276,7 +3289,33 @@ function manualMusicHoldActive() {
   return false;
 }
 
+function manualMusicStartActive() {
+  const until = Number(S.manualMusicStartUntil || 0);
+  if (!until) return false;
+  if (until > Date.now()) return true;
+  S.manualMusicStartUntil = 0;
+  S.manualMusicStartReason = '';
+  localSave();
+  return false;
+}
+
+function setManualMusicStart(reason = 'Manual play') {
+  if (S.playbackMode === 'hours') S.manualMusicStartUntil = nextPoolCloseMs() + 60000;
+  else if (S.playbackMode === 'always') S.manualMusicStartUntil = Date.now() + 24 * 60 * 60 * 1000;
+  else S.manualMusicStartUntil = 0;
+  S.manualMusicStartReason = S.manualMusicStartUntil ? reason : '';
+  localSave();
+}
+
+function clearManualMusicStart() {
+  if (!S.manualMusicStartUntil && !S.manualMusicStartReason) return;
+  S.manualMusicStartUntil = 0;
+  S.manualMusicStartReason = '';
+  localSave();
+}
+
 function setManualMusicHold(reason = 'Manual stop') {
+  clearManualMusicStart();
   if (S.playbackMode === 'hours' && openNow()) S.manualMusicHoldUntil = nextPoolCloseMs() + 60000;
   else if (S.playbackMode === 'always') S.manualMusicHoldUntil = Date.now() + 24 * 60 * 60 * 1000;
   else S.manualMusicHoldUntil = 0;
@@ -3508,7 +3547,7 @@ async function tick() {
   if (S.autoStart && shouldPlayContinuously() && S.intent !== 'playing' && !manualMusicHoldActive()) {
     try { await playSelected(false); } catch {}
   }
-  if (S.autoStop && S.playbackMode === 'hours' && !openNow() && S.intent === 'playing') await stopSelected(false);
+  if (S.autoStop && S.playbackMode === 'hours' && !openNow() && S.intent === 'playing' && !manualMusicStartActive()) await stopSelected(false);
   const now = hm(new Date().getHours() * 60 + new Date().getMinutes());
   const mode = scheduleMode(S.activeSchedule);
   for (const item of scheduleItems(mode)) {

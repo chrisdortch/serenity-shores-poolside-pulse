@@ -32,6 +32,10 @@ function sunoSongUrl(input) {
   return /^https?:\/\//i.test(String(input || '')) && /suno\.com\/(?:song|songs)\//i.test(String(input || ''));
 }
 
+function sunoShareUrl(input) {
+  return /^https?:\/\//i.test(String(input || '')) && /suno\.com\/s\/[a-zA-Z0-9-]+/i.test(String(input || ''));
+}
+
 function trackFromDirectAudio(input) {
   const raw = String(input || '').trim();
   let title = 'Direct Suno/audio track';
@@ -234,7 +238,7 @@ export default async function handler(req, res) {
       audioWarning: ''
     });
   }
-  if (sunoSongUrl(playlistUrl)) {
+  if (sunoSongUrl(playlistUrl) || sunoShareUrl(playlistUrl)) {
     try {
       const tracks = await fetchFromHtml(playlistUrl);
       if (!tracks.length) throw new Error('Suno song page returned no playable track data.');
