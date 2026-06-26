@@ -35,6 +35,7 @@ npm run build
 
 ## Version Notes
 
+- Version 20 rolls forward from V18.7: Spotify volume commands now prefer the currently active audible Spotify device, foreground voice/Suno audio verifies Spotify is actually lowered and pauses/resumes Spotify if lowering cannot be verified, and scheduled Suno cues can be stopped from Command or Home while they are playing.
 - Version 17 rolls forward from the V9 receiver model: one speaker phone stays on Home, Command devices only send controls, music starts at 45%, the deleted default Suno playlist is removed, and weather closure triggers require verified lightning/NWS closure alerts instead of Open-Meteo thunderstorm-code-only hits.
 - Version 13 unifies Spotify and Suno music volume into one receiver-wide Music Volume command, lowers inherited loud music defaults, primes iPhone receiver audio for seamless Suno switching, simplifies the schedule item editor, and improves iPhone/laptop layout behavior.
 - Version 12 adds Lake123 branding, a receiver on/off switch independent of Home/Command view, clickable receiver repair notices, stronger button pressed states, receiver-wide volume commands, and denser collapsible party cue cards.

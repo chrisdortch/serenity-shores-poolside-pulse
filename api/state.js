@@ -7,6 +7,7 @@ function json(res, status, body) {
 
 const DEFAULT_STATE_KEY = 'serenity-shores-poolside-radio-v9';
 const VERSIONED_STATE_KEYS = {
+  '20': 'serenity-shores-poolside-radio-v20',
   '18': 'serenity-shores-poolside-radio-v18',
   '17': 'serenity-shores-poolside-radio-v17',
   '16': 'serenity-shores-poolside-radio-v16',
@@ -15,6 +16,7 @@ const VERSIONED_STATE_KEYS = {
 };
 const V18_STALE_SUNO_COMMAND_CUTOFF = 1782483347041;
 const V18_AUDIO_DEFAULTS_ID = '2026-06-26-v18e-spotify2-suno85-duck0-ann500';
+const V20_AUDIO_DEFAULTS_ID = '2026-06-26-v20-spotify2-suno85-pause-duck-stop';
 const V18_STALE_SUNO_TYPES = new Set(['suno-cue', 'suno', 'song']);
 
 // Safe fallback: lets preview/admin/Home sync work even before Vercel KV/Upstash is configured.
@@ -120,19 +122,22 @@ function clampNumber(value, min, max, fallback) {
 
 function sanitizeState(state) {
   if (!state || typeof state !== 'object') return state;
-  if (String(state.version || '') !== '18') return state;
+  const version = String(state.version || '');
+  if (!['18', '20'].includes(version)) return state;
   const clean = { ...state };
-  if (Array.isArray(clean.events)) clean.events = clean.events.filter(event => !staleV18SunoCommand(event));
-  if (staleV18SunoCommand(clean.command)) clean.command = null;
+  if (version === '18' && Array.isArray(clean.events)) clean.events = clean.events.filter(event => !staleV18SunoCommand(event));
+  if (version === '18' && staleV18SunoCommand(clean.command)) clean.command = null;
   if (staleV18SunoNotice(clean.setupNotice)) clean.setupNotice = '';
   if (staleV18SunoNotice(clean.feedback)) clean.feedback = 'Ready.';
   if (staleV18SunoNotice(clean.lastError)) clean.lastError = '';
-  if (clean.v18VolumeDefaultsApplied !== V18_AUDIO_DEFAULTS_ID) {
+  const defaultsKey = version === '20' ? 'v20VolumeDefaultsApplied' : 'v18VolumeDefaultsApplied';
+  const defaultsId = version === '20' ? V20_AUDIO_DEFAULTS_ID : V18_AUDIO_DEFAULTS_ID;
+  if (clean[defaultsKey] !== defaultsId) {
     clean.spotifyVolume = 2;
     clean.sunoVolume = 85;
     clean.announcementGain = 5;
     clean.spotifyDuckedVolume = 0;
-    clean.v18VolumeDefaultsApplied = V18_AUDIO_DEFAULTS_ID;
+    clean[defaultsKey] = defaultsId;
   }
   clean.spotifyVolume = clampNumber(clean.spotifyVolume, 0, 20, 2);
   clean.sunoVolume = clampNumber(clean.sunoVolume, 0, 100, 85);
