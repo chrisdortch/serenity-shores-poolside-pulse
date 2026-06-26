@@ -14,7 +14,7 @@ const VERSIONED_STATE_KEYS = {
   '14': 'serenity-shores-poolside-radio-v14'
 };
 const V18_STALE_SUNO_COMMAND_CUTOFF = 1782483347041;
-const V18_AUDIO_DEFAULTS_ID = '2026-06-26-v18d-music4-duck0-ann500-slider-stable';
+const V18_AUDIO_DEFAULTS_ID = '2026-06-26-v18e-spotify2-suno85-duck0-ann500';
 const V18_STALE_SUNO_TYPES = new Set(['suno-cue', 'suno', 'song']);
 
 // Safe fallback: lets preview/admin/Home sync work even before Vercel KV/Upstash is configured.
@@ -128,15 +128,15 @@ function sanitizeState(state) {
   if (staleV18SunoNotice(clean.feedback)) clean.feedback = 'Ready.';
   if (staleV18SunoNotice(clean.lastError)) clean.lastError = '';
   if (clean.v18VolumeDefaultsApplied !== V18_AUDIO_DEFAULTS_ID) {
-    clean.spotifyVolume = 4;
-    clean.sunoVolume = 4;
+    clean.spotifyVolume = 2;
+    clean.sunoVolume = 85;
     clean.announcementGain = 5;
     clean.spotifyDuckedVolume = 0;
     clean.v18VolumeDefaultsApplied = V18_AUDIO_DEFAULTS_ID;
   }
-  clean.spotifyVolume = clampNumber(clean.spotifyVolume, 0, 30, 4);
-  clean.sunoVolume = clampNumber(clean.sunoVolume, 0, 30, 4);
-  clean.spotifyDuckedVolume = clampNumber(clean.spotifyDuckedVolume, 0, 20, 0);
+  clean.spotifyVolume = clampNumber(clean.spotifyVolume, 0, 20, 2);
+  clean.sunoVolume = clampNumber(clean.sunoVolume, 0, 100, 85);
+  clean.spotifyDuckedVolume = 0;
   clean.announcementGain = clampNumber(clean.announcementGain, 1, 6, 5);
   return clean;
 }
