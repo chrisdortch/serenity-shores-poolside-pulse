@@ -98,6 +98,27 @@
     return new Promise(resolve => setTimeout(resolve, ms));
   }
 
+  function clampNumber(value, min, max, fallback) {
+    const n = Number(value);
+    return Math.max(min, Math.min(max, Number.isFinite(n) ? n : fallback));
+  }
+
+  function playbackOptions(options = {}) {
+    const raw = options && typeof options === 'object' ? options : { gain: options };
+    const minGain = Number.isFinite(Number(raw.minGain)) ? Number(raw.minGain) : 1;
+    const maxGain = Number.isFinite(Number(raw.maxGain)) ? Number(raw.maxGain) : 6;
+    const fallbackGain = raw.volume !== undefined ? Number(raw.volume) : 1;
+    const gain = clampNumber(raw.gain, minGain, maxGain, fallbackGain);
+    return {
+      label: String(raw.label || 'Announcement'),
+      gain,
+      minGain,
+      maxGain,
+      volume: clampNumber(raw.volume, 0, 1, Math.max(0, Math.min(1, gain))),
+      revokeUrl: raw.revokeUrl || ''
+    };
+  }
+
   function withTimeout(promise, ms, message) {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => reject(Error(message)), ms);
@@ -228,7 +249,8 @@
     return await new Promise((resolve, reject) => ctx.decodeAudioData(copy, resolve, reject));
   }
 
-  async function playWithWebAudio(blob, gainValue) {
+  async function playWithWebAudio(blob, rawOptions = {}) {
+    const options = playbackOptions(rawOptions);
     const ctx = getAudioContext();
     if (!ctx) return false;
     if (ctx.state !== 'running') await ctx.resume();
@@ -236,7 +258,7 @@
     const buffer = await decodeAudio(ctx, await blob.arrayBuffer());
     const source = ctx.createBufferSource();
     const gain = ctx.createGain();
-    gain.gain.value = Math.max(1, Math.min(3.4, Number(gainValue) || 1));
+    gain.gain.value = options.gain;
     source.buffer = buffer;
     source.connect(gain).connect(ctx.destination);
     return await new Promise((resolve, reject) => {
@@ -246,7 +268,7 @@
         source.start(0);
         started = true;
         unlocked = true;
-        lastStatus = 'Announcement started through receiver Web Audio.';
+        lastStatus = `${options.label} started through receiver Web Audio.`;
         dispatchStatus();
       } catch (error) {
         if (!started) reject(error);
@@ -254,17 +276,17 @@
     });
   }
 
-  async function playWithElement(blob) {
+  async function playElementSource(src, rawOptions = {}) {
+    const options = playbackOptions(rawOptions);
     const audio = getHiddenAudio();
-    const url = URL.createObjectURL(blob);
     audio.pause();
-    audio.src = url;
+    audio.src = src;
     audio.preload = 'auto';
     audio.playsInline = true;
     audio.setAttribute('playsinline', '');
     audio.setAttribute('webkit-playsinline', '');
     audio.muted = false;
-    audio.volume = 1;
+    audio.volume = options.volume;
     audio.load();
     return await new Promise((resolve, reject) => {
       let started = false;
@@ -276,12 +298,14 @@
         audio.removeEventListener('playing', onPlaying);
         audio.removeEventListener('ended', onEnded);
         audio.removeEventListener('error', onError);
-        try { URL.revokeObjectURL(url); } catch {}
+        if (options.revokeUrl) {
+          try { URL.revokeObjectURL(options.revokeUrl); } catch {}
+        }
       };
       const onPlaying = () => {
         started = true;
         unlocked = true;
-        lastStatus = 'Announcement started through receiver audio element.';
+        lastStatus = `${options.label} started through receiver audio element.`;
         dispatchStatus();
       };
       const onEnded = () => {
@@ -290,12 +314,12 @@
       };
       const onError = () => {
         cleanup();
-        reject(Error(started ? 'Announcement audio ended with an element error.' : 'Announcement audio failed before it started.'));
+        reject(Error(started ? `${options.label} audio ended with an element error.` : `${options.label} audio failed before it started.`));
       };
       const startTimer = setTimeout(() => {
         if (!started) {
           cleanup();
-          reject(Error('Announcement audio did not start. Tap Start Speaker Phone on this speaker-connected device.'));
+          reject(Error(`${options.label} audio did not start. Tap Start Speaker Phone on this speaker-connected device.`));
         }
       }, 6500);
       audio.addEventListener('playing', onPlaying);
@@ -308,20 +332,37 @@
     });
   }
 
+  async function playWithElement(blob, rawOptions = {}) {
+    const url = URL.createObjectURL(blob);
+    return await playElementSource(url, { ...playbackOptions(rawOptions), revokeUrl: url });
+  }
+
   async function playBlob(blob, options = {}) {
-    const gain = Number(options.gain || 1);
     try {
-      return await playWithWebAudio(blob, gain);
+      return await playWithWebAudio(blob, options);
     } catch (webAudioError) {
-      lastStatus = `Web Audio voice path failed; trying audio element. ${webAudioError.message || webAudioError}`;
+      lastStatus = `Web Audio playback path failed; trying audio element. ${webAudioError.message || webAudioError}`;
       dispatchStatus();
-      return await playWithElement(blob);
+      return await playWithElement(blob, options);
+    }
+  }
+
+  async function playAudioUrl(url, options = {}) {
+    try {
+      const response = await fetch(url, { cache: 'no-store', mode: 'cors' });
+      if (!response.ok) throw Error(`Audio URL returned HTTP ${response.status}`);
+      return await playBlob(await response.blob(), options);
+    } catch (error) {
+      lastStatus = `Direct audio fetch failed; trying receiver audio element. ${error.message || error}`;
+      dispatchStatus();
+      return await playElementSource(url, options);
     }
   }
 
   window.__poolsideV18UnlockAudio = unlock;
   window.__poolsideV18AudioStatus = status;
   window.__poolsideV18PlayAnnouncementBlob = playBlob;
+  window.__poolsideV18PlayAudioUrl = playAudioUrl;
   window.__poolsideV18PlayTestTone = playTestTone;
 
   const passive = { capture: true, passive: true };

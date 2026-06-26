@@ -55,8 +55,10 @@ const DEFAULT_SUNO_PLAYLIST = '';
 const LEGACY_DELETED_SUNO_PLAYLIST = 'https://suno.com/playlist/cf4b536e-9005-4c98-9ea5-a7f01eca116f';
 const LEGACY_DELETED_SUNO_ID_PATTERN = /cf4b536e-9005/i;
 const DEFAULT_ADDRESS = '615 Serenity Shores Ln, Kimberling City, MO 65686';
-const DEFAULT_MUSIC_VOLUME = 15;
-const V18_VOLUME_DEFAULTS_ID = '2026-06-24-final-v18b-music15-duck0-ann300-clean';
+const DEFAULT_MUSIC_VOLUME = 8;
+const DEFAULT_ANNOUNCEMENT_GAIN = 5;
+const MAX_ANNOUNCEMENT_GAIN = 6;
+const V18_VOLUME_DEFAULTS_ID = '2026-06-26-v18c-music8-duck0-ann500-clean';
 const EVENT_TTL_MS = 90 * 60 * 1000;
 const EVENT_LIMIT = 120;
 const LOG_LIMIT = 180;
@@ -120,7 +122,7 @@ const BASE = {
   spotifyRedirectUri: '',
   spotifyVolume: DEFAULT_MUSIC_VOLUME,
   spotifyDuckedVolume: 0,
-  announcementGain: 3,
+  announcementGain: DEFAULT_ANNOUNCEMENT_GAIN,
   sunoVolume: DEFAULT_MUSIC_VOLUME,
   sunoDuckedVolume: 2,
   tracks: [{ title: 'Import the Serenity Shores playlist', artist: 'Poolside Pulse', duration: '3:00', audioUrl: '' }],
@@ -447,14 +449,14 @@ function normalize(raw) {
   s.spotifyRedirectUri = normalizeRedirectUri(s.spotifyRedirectUri || appRedirectDefault());
   s.spotifyVolume = clampNumber(s.spotifyVolume, 0, 100, DEFAULT_MUSIC_VOLUME);
   s.spotifyDuckedVolume = clampNumber(s.spotifyDuckedVolume, 0, 20, 0);
-  s.announcementGain = clampNumber(s.announcementGain, 1, 3.4, 3);
+  s.announcementGain = clampNumber(s.announcementGain, 1, MAX_ANNOUNCEMENT_GAIN, DEFAULT_ANNOUNCEMENT_GAIN);
   s.sunoVolume = clampNumber(s.sunoVolume, 0, 100, DEFAULT_MUSIC_VOLUME);
   s.sunoDuckedVolume = clampNumber(s.sunoDuckedVolume, 0, 20, 2);
   if (source.v18VolumeDefaultsApplied !== V18_VOLUME_DEFAULTS_ID) {
     s.spotifyVolume = DEFAULT_MUSIC_VOLUME;
     s.spotifyDuckedVolume = 0;
     s.sunoVolume = DEFAULT_MUSIC_VOLUME;
-    s.announcementGain = 3;
+    s.announcementGain = DEFAULT_ANNOUNCEMENT_GAIN;
     s.feedback = 'Ready.';
     s.lastError = '';
     s.setupNotice = '';
@@ -621,7 +623,7 @@ function audioDraftControls() {
     ['spotifyVolume', 'spotifyVolume', 0, 100, DEFAULT_MUSIC_VOLUME],
     ['spotifyDuckedVolume', 'spotifyDuckedVolume', 0, 20, 0],
     ['sunoVolume', 'sunoVolume', 0, 100, DEFAULT_MUSIC_VOLUME],
-    ['announcementGain', 'announcementGain', 1, 3.4, 3],
+    ['announcementGain', 'announcementGain', 1, MAX_ANNOUNCEMENT_GAIN, DEFAULT_ANNOUNCEMENT_GAIN],
     ['rate', 'rate', .75, 1.15, .94],
     ['pitch', 'pitch', .85, 1.15, 1]
   ];
@@ -860,7 +862,8 @@ function cloudState() {
       'manualMusicHoldUntil',
       'manualMusicHoldReason',
       'manualMusicStartUntil',
-      'manualMusicStartReason'
+      'manualMusicStartReason',
+      'lastRun'
     ].forEach(key => delete c[key]);
   }
   return c;
@@ -922,7 +925,8 @@ function preserveLocalBeforeMerge() {
     manualMusicHoldUntil: S.manualMusicHoldUntil,
     manualMusicHoldReason: S.manualMusicHoldReason,
     manualMusicStartUntil: S.manualMusicStartUntil,
-    manualMusicStartReason: S.manualMusicStartReason
+    manualMusicStartReason: S.manualMusicStartReason,
+    lastRun: clone(S.lastRun)
   };
 }
 
@@ -962,7 +966,8 @@ function restoreLocalAfterMerge(local) {
       'manualMusicHoldUntil',
       'manualMusicHoldReason',
       'manualMusicStartUntil',
-      'manualMusicStartReason'
+      'manualMusicStartReason',
+      'lastRun'
     ].forEach(key => { S[key] = local[key]; });
   }
   clearStaleReceiverFailures(S);
@@ -1041,6 +1046,11 @@ function receiverCanProcessEvents() {
 
 function isRetryableMusicCommand(event) {
   return event?.kind === 'command' && RETRYABLE_MUSIC_COMMANDS.has(event.type);
+}
+
+function shouldRetryActionNeededEvent(event, message = '') {
+  if (!isRetryableMusicCommand(event)) return false;
+  return !OLD_AUDIO_BLOCK_PATTERN.test(String(message || ''));
 }
 
 function markOlderEventsHandled(startAt) {
@@ -1218,7 +1228,7 @@ async function processEvent(event) {
   } catch (error) {
     const message = error.message || String(error);
     if (isActionNeeded(error)) {
-      const retryableMusicCommand = event.kind === 'command' && ['spotify-play', 'play', 'suno', 'suno-cue', 'song'].includes(event.type);
+      const retryableMusicCommand = shouldRetryActionNeededEvent(event, message);
       if (retryableMusicCommand) {
         unmarkHandled(event.id);
         retryAfter[event.id] = Date.now() + EVENT_RETRY_MS;
@@ -1251,7 +1261,7 @@ async function runCommand(command) {
   } else if (command.type === 'audio-settings') {
     if (Number.isFinite(Number(command.spotifyDuckedVolume))) S.spotifyDuckedVolume = clampNumber(command.spotifyDuckedVolume, 0, 20, S.spotifyDuckedVolume);
     if (Number.isFinite(Number(command.sunoVolume))) S.sunoVolume = clampNumber(command.sunoVolume, 0, 100, S.sunoVolume);
-    if (Number.isFinite(Number(command.announcementGain))) S.announcementGain = clampNumber(command.announcementGain, 1, 3.4, S.announcementGain);
+    if (Number.isFinite(Number(command.announcementGain))) S.announcementGain = clampNumber(command.announcementGain, 1, MAX_ANNOUNCEMENT_GAIN, S.announcementGain);
     if (Number.isFinite(Number(command.rate))) S.rate = clampNumber(command.rate, .75, 1.15, S.rate);
     if (Number.isFinite(Number(command.pitch))) S.pitch = clampNumber(command.pitch, .85, 1.15, S.pitch);
   }
@@ -1322,7 +1332,7 @@ function readMusicSettings() {
   if ($('spotifyRedirectUri')) S.spotifyRedirectUri = normalizeRedirectUri(val('spotifyRedirectUri').trim() || S.spotifyRedirectUri || appRedirectDefault());
   S.spotifyVolume = clampNumber($('spotifyVolume') ? val('spotifyVolume') : S.spotifyVolume, 0, 100, DEFAULT_MUSIC_VOLUME);
   S.spotifyDuckedVolume = clampNumber($('spotifyDuckedVolume') ? val('spotifyDuckedVolume') : S.spotifyDuckedVolume, 0, 20, 0);
-  S.announcementGain = clampNumber($('announcementGain') ? val('announcementGain') : S.announcementGain, 1, 3.4, 3);
+  S.announcementGain = clampNumber($('announcementGain') ? val('announcementGain') : S.announcementGain, 1, MAX_ANNOUNCEMENT_GAIN, DEFAULT_ANNOUNCEMENT_GAIN);
   S.sunoVolume = clampNumber($('sunoVolume') ? val('sunoVolume') : S.sunoVolume, 0, 100, DEFAULT_MUSIC_VOLUME);
   S.sunoDuckedVolume = clampNumber($('sunoDuckedVolume') ? val('sunoDuckedVolume') : S.sunoDuckedVolume, 0, 20, 2);
   S.activeMusicProvider = 'spotify';
@@ -1806,7 +1816,7 @@ function syncVolumeReadouts() {
   const suno = $('sunoVolumeOut');
   if (suno) suno.textContent = `${clampNumber(S.sunoVolume, 0, 100, DEFAULT_MUSIC_VOLUME)}%`;
   const gain = $('announcementGainOut');
-  if (gain) gain.textContent = `${Math.round(clampNumber(S.announcementGain, 1, 3.4, 3) * 100)}%`;
+  if (gain) gain.textContent = `${Math.round(clampNumber(S.announcementGain, 1, MAX_ANNOUNCEMENT_GAIN, DEFAULT_ANNOUNCEMENT_GAIN) * 100)}%`;
   const rate = $('rateOut');
   if (rate) rate.textContent = String(clampNumber(S.rate, .75, 1.15, .94));
   const pitch = $('pitchOut');
@@ -1817,7 +1827,7 @@ function updateRangeDraft(key, value) {
   if (key === 'spotifyVolume') S.spotifyVolume = clampNumber(value, 0, 100, DEFAULT_MUSIC_VOLUME);
   else if (key === 'spotifyDuckedVolume') S.spotifyDuckedVolume = clampNumber(value, 0, 20, 0);
   else if (key === 'sunoVolume') S.sunoVolume = clampNumber(value, 0, 100, DEFAULT_MUSIC_VOLUME);
-  else if (key === 'announcementGain') S.announcementGain = clampNumber(value, 1, 3.4, 3);
+  else if (key === 'announcementGain') S.announcementGain = clampNumber(value, 1, MAX_ANNOUNCEMENT_GAIN, DEFAULT_ANNOUNCEMENT_GAIN);
   else if (key === 'rate') S.rate = clampNumber(value, .75, 1.15, .94);
   else if (key === 'pitch') S.pitch = clampNumber(value, .85, 1.15, 1);
   localSave();
@@ -1828,7 +1838,7 @@ function audioSettingsPayload() {
   return {
     spotifyDuckedVolume: clampNumber(S.spotifyDuckedVolume, 0, 20, 0),
     sunoVolume: clampNumber(S.sunoVolume, 0, 100, DEFAULT_MUSIC_VOLUME),
-    announcementGain: clampNumber(S.announcementGain, 1, 3.4, 3),
+    announcementGain: clampNumber(S.announcementGain, 1, MAX_ANNOUNCEMENT_GAIN, DEFAULT_ANNOUNCEMENT_GAIN),
     rate: clampNumber(S.rate, .75, 1.15, .94),
     pitch: clampNumber(S.pitch, .85, 1.15, 1)
   };
@@ -2953,6 +2963,43 @@ function playAudioElementToEnd(audio, timeoutMs = 8 * 60 * 1000) {
   });
 }
 
+async function playReceiverAudioUrl(url, options = {}) {
+  const raw = String(url || '').trim();
+  if (!raw) throw Error('No playable audio URL was provided.');
+  const volume = clampNumber(options.volume, 0, 1, 1);
+  const label = options.label || 'Receiver audio';
+  if (typeof window.__poolsideV18PlayAudioUrl === 'function') {
+    return await window.__poolsideV18PlayAudioUrl(raw, {
+      label,
+      volume,
+      gain: volume,
+      minGain: 0,
+      maxGain: 1
+    });
+  }
+  if (typeof window.__poolsideV18PlayAnnouncementBlob === 'function') {
+    try {
+      const response = await fetch(raw, { cache: 'no-store' });
+      if (!response.ok) throw Error(`Audio URL returned HTTP ${response.status}`);
+      const blob = await response.blob();
+      return await window.__poolsideV18PlayAnnouncementBlob(blob, {
+        label,
+        volume,
+        gain: volume,
+        minGain: 0,
+        maxGain: 1
+      });
+    } catch (error) {
+      logEvent('receiver', `${label} Web Audio path failed`, error.message || String(error));
+    }
+  }
+  announcementMusic.pause();
+  announcementMusic.src = raw;
+  announcementMusic.muted = false;
+  announcementMusic.volume = volume;
+  return await playAudioElementToEnd(announcementMusic);
+}
+
 async function announceSunoTrack(trackIndex, options = {}) {
   const job = announcementTail.then(() => performSunoAnnouncement(trackIndex, options));
   announcementTail = job.catch(() => {});
@@ -2986,11 +3033,7 @@ async function performSunoUrlCue(url, options = {}) {
     title = chosen.title || compactUrl(raw);
     const spotifySnapshot = await duckSpotifyForAnnouncement();
     try {
-      announcementMusic.pause();
-      announcementMusic.src = chosen.audioUrl;
-      announcementMusic.muted = false;
-      announcementMusic.volume = musicGain(S.sunoVolume);
-      await playAudioElementToEnd(announcementMusic);
+      await playReceiverAudioUrl(chosen.audioUrl, { label: 'Suno cue', volume: musicGain(S.sunoVolume) });
     } finally {
       await restoreSpotifyAfterAnnouncement(spotifySnapshot);
       announcementMusic.pause();
@@ -3029,11 +3072,7 @@ async function performSunoUrlAnnouncement(url, options = {}) {
     const spotifySnapshot = await duckSpotifyForAnnouncement();
     const sunoSnapshot = await duckSunoForAnnouncement();
     try {
-      announcementMusic.pause();
-      announcementMusic.src = chosen.audioUrl;
-      announcementMusic.muted = false;
-      announcementMusic.volume = 1;
-      await playAudioElementToEnd(announcementMusic);
+      await playReceiverAudioUrl(chosen.audioUrl, { label: 'Suno announcement', volume: 1 });
       logEvent('announcement', options.hold ? 'Safety Suno URL announcement played' : 'Suno URL announcement played', `${chosen.title || options.label || 'Suno track'} · ${compactUrl(raw)}`, { eventId: options.eventId || '', url: raw });
       setFeedback(`Suno announcement completed: ${chosen.title || compactUrl(raw)}.`, true);
       return true;
@@ -3063,11 +3102,7 @@ async function performSunoAnnouncement(trackIndex, options = {}) {
     const spotifySnapshot = await duckSpotifyForAnnouncement();
     const sunoSnapshot = await duckSunoForAnnouncement();
     try {
-      announcementMusic.pause();
-      announcementMusic.src = chosen.item.audioUrl;
-      announcementMusic.muted = false;
-      announcementMusic.volume = 1;
-      await playAudioElementToEnd(announcementMusic);
+      await playReceiverAudioUrl(chosen.item.audioUrl, { label: 'Suno announcement', volume: 1 });
       logEvent('announcement', options.hold ? 'Safety Suno announcement played' : 'Suno announcement played', `${chosen.item.title || 'Suno track'} · ${chosen.item.artist || ''}`, { eventId: options.eventId || '', trackIndex: chosen.index });
       setFeedback(`Suno announcement completed: ${chosen.item.title || 'track'}.`, true);
       return true;
@@ -3103,7 +3138,13 @@ async function fetchAiVoiceBlob(message) {
 
 async function playAnnouncementBlob(blob) {
   if (typeof window.__poolsideV18PlayAnnouncementBlob === 'function') {
-    return await window.__poolsideV18PlayAnnouncementBlob(blob, { gain: S.announcementGain });
+    return await window.__poolsideV18PlayAnnouncementBlob(blob, {
+      label: 'Voice announcement',
+      gain: S.announcementGain,
+      minGain: 1,
+      maxGain: MAX_ANNOUNCEMENT_GAIN,
+      volume: 1
+    });
   }
   const url = URL.createObjectURL(blob);
   const audio = new Audio(url);
@@ -3889,12 +3930,12 @@ function spotifyDiagnostics() {
 function musicPage() {
   const providers = Object.entries(PROVIDERS).map(([id, label]) => `<option value="${id}" ${S.musicProvider === id ? 'selected' : ''}>${label}</option>`).join('');
   const rows = S.tracks.map((item, index) => `<div class="trackRow ${index === S.current ? 'cur' : ''}"><div><b>${index + 1}. ${esc(item.title)}</b><span>${esc(item.artist || 'Suno')} · ${esc(item.duration || '')} · ${item.audioUrl ? 'ready' : 'title only'}</span></div><div class="rowBtns"><button data-song="${index}" class="slim">Play</button><button data-schedule-song="${index}" class="secondary slim">Schedule</button></div></div>`).join('');
-  return shell(`<section class="panel"><div class="panelHeader"><div><p class="eyebrow">Music Control</p><h1>Music</h1></div><button id="saveMusic">Save</button></div><div class="sourceBoard"><div class="sourceTile"><b>Selected</b><strong>${esc(sourceLabel(S.musicProvider, activeProviderUrl()))}</strong><span>${esc(activeProviderUrl())}</span></div><div class="sourceTile"><b>Receiver</b><strong>${esc(S.receiverStatus || receiverReadiness())}</strong><span>${esc(S.spotifyNowPlaying || S.activeMusicLabel || '')}</span></div><div class="sourceTile"><b>Voice Ducking</b><strong>${esc(S.spotifyDuckedVolume)}% Spotify</strong><span>${Math.round(Number(S.announcementGain || 1) * 100)}% announcement boost</span></div></div><div class="buttonStack"><button id="useSpotify" class="${S.musicProvider === 'spotify' ? '' : 'secondary'}">Use Spotify</button><button id="useSuno" class="${S.musicProvider === 'suno' ? '' : 'secondary'}">Use Suno</button><button id="spotifyPlayNow">Play Spotify on Receivers</button><button id="sunoPlayNow" class="secondary">Play Suno on Receivers</button></div><div class="quickMusic"><label>Play Spotify or Suno Cue URL<input id="quickMusicUrl" value="${esc(S.quickMusicUrl || activeProviderUrl())}" placeholder="Paste Spotify, Suno, or direct audio URL"></label><div class="buttonStack"><button id="playAnyUrl">Play Pasted URL</button><button id="savePastedUrl" class="secondary">Save as Default</button></div></div><div class="grid2"><label>Provider<select id="musicProvider">${providers}</select></label><label>Station Name<input id="playlistName" value="${esc(S.playlistName)}"></label></div><div class="grid2"><label>Suno Track, Playlist, or Audio URL<input id="playlistUrl" value="${esc(S.playlistUrl)}"></label><label>Spotify Playlist or Song URL<input id="spotifyUrl" value="${esc(S.spotifyUrl)}" placeholder="https://open.spotify.com/playlist/..."></label></div><div class="grid2"><label>Spotify Client ID<input id="spotifyClientId" value="${esc(S.spotifyClientId)}"></label><label>Spotify Redirect URI<input id="spotifyRedirectUri" value="${esc(spotifyRedirectUri())}"></label></div><div class="grid4"><label><span>Spotify Volume <output id="spotifyVolumeOut">${esc(S.spotifyVolume)}%</output></span><input id="spotifyVolume" type="range" min="0" max="100" step="1" value="${esc(S.spotifyVolume)}"></label><label><span>Music During Announcements <output id="spotifyDuckedVolumeOut">${esc(S.spotifyDuckedVolume)}%</output></span><input id="spotifyDuckedVolume" type="range" min="0" max="20" step="1" value="${esc(S.spotifyDuckedVolume)}"></label><label><span>Suno Volume <output id="sunoVolumeOut">${esc(S.sunoVolume)}%</output></span><input id="sunoVolume" type="range" min="0" max="100" step="1" value="${esc(S.sunoVolume)}"></label><label><span>Announcement Boost <output id="announcementGainOut">${Math.round(Number(S.announcementGain || 1) * 100)}%</output></span><input id="announcementGain" type="range" min="1" max="3.4" step=".05" value="${esc(S.announcementGain)}"></label></div>${spotifyDiagnostics()}<div class="actions"><button id="spotifyLogin" class="secondary">Login with Spotify</button><button id="spotifyCheck" class="secondary">Check Spotify</button><button id="spotifyReceiver">Start Receiver + Play Spotify</button><button id="makeReceiver" class="secondary">Show Receiver Screen</button><button id="spotifyClear" class="secondary">Clear Spotify</button><button id="import" class="secondary">Load Suno URL</button></div></section><section class="panel"><div class="sectionHead"><h2>Suno Queue</h2><button id="playCmd" class="secondary">Play Selected on Receivers</button></div>${rows || '<p class="muted">No Suno queue imported yet.</p>'}</section>`);
+  return shell(`<section class="panel"><div class="panelHeader"><div><p class="eyebrow">Music Control</p><h1>Music</h1></div><button id="saveMusic">Save</button></div><div class="sourceBoard"><div class="sourceTile"><b>Selected</b><strong>${esc(sourceLabel(S.musicProvider, activeProviderUrl()))}</strong><span>${esc(activeProviderUrl())}</span></div><div class="sourceTile"><b>Receiver</b><strong>${esc(S.receiverStatus || receiverReadiness())}</strong><span>${esc(S.spotifyNowPlaying || S.activeMusicLabel || '')}</span></div><div class="sourceTile"><b>Voice Ducking</b><strong>${esc(S.spotifyDuckedVolume)}% Spotify</strong><span>${Math.round(Number(S.announcementGain || 1) * 100)}% announcement boost</span></div></div><div class="buttonStack"><button id="useSpotify" class="${S.musicProvider === 'spotify' ? '' : 'secondary'}">Use Spotify</button><button id="useSuno" class="${S.musicProvider === 'suno' ? '' : 'secondary'}">Use Suno</button><button id="spotifyPlayNow">Play Spotify on Receivers</button><button id="sunoPlayNow" class="secondary">Play Suno on Receivers</button></div><div class="quickMusic"><label>Play Spotify or Suno Cue URL<input id="quickMusicUrl" value="${esc(S.quickMusicUrl || activeProviderUrl())}" placeholder="Paste Spotify, Suno, or direct audio URL"></label><div class="buttonStack"><button id="playAnyUrl">Play Pasted URL</button><button id="savePastedUrl" class="secondary">Save as Default</button></div></div><div class="grid2"><label>Provider<select id="musicProvider">${providers}</select></label><label>Station Name<input id="playlistName" value="${esc(S.playlistName)}"></label></div><div class="grid2"><label>Suno Track, Playlist, or Audio URL<input id="playlistUrl" value="${esc(S.playlistUrl)}"></label><label>Spotify Playlist or Song URL<input id="spotifyUrl" value="${esc(S.spotifyUrl)}" placeholder="https://open.spotify.com/playlist/..."></label></div><div class="grid2"><label>Spotify Client ID<input id="spotifyClientId" value="${esc(S.spotifyClientId)}"></label><label>Spotify Redirect URI<input id="spotifyRedirectUri" value="${esc(spotifyRedirectUri())}"></label></div><div class="grid4"><label><span>Spotify Volume <output id="spotifyVolumeOut">${esc(S.spotifyVolume)}%</output></span><input id="spotifyVolume" type="range" min="0" max="100" step="1" value="${esc(S.spotifyVolume)}"></label><label><span>Music During Announcements <output id="spotifyDuckedVolumeOut">${esc(S.spotifyDuckedVolume)}%</output></span><input id="spotifyDuckedVolume" type="range" min="0" max="20" step="1" value="${esc(S.spotifyDuckedVolume)}"></label><label><span>Suno Volume <output id="sunoVolumeOut">${esc(S.sunoVolume)}%</output></span><input id="sunoVolume" type="range" min="0" max="100" step="1" value="${esc(S.sunoVolume)}"></label><label><span>Announcement Boost <output id="announcementGainOut">${Math.round(Number(S.announcementGain || 1) * 100)}%</output></span><input id="announcementGain" type="range" min="1" max="${MAX_ANNOUNCEMENT_GAIN}" step=".05" value="${esc(S.announcementGain)}"></label></div>${spotifyDiagnostics()}<div class="actions"><button id="spotifyLogin" class="secondary">Login with Spotify</button><button id="spotifyCheck" class="secondary">Check Spotify</button><button id="spotifyReceiver">Start Receiver + Play Spotify</button><button id="makeReceiver" class="secondary">Show Receiver Screen</button><button id="spotifyClear" class="secondary">Clear Spotify</button><button id="import" class="secondary">Load Suno URL</button></div></section><section class="panel"><div class="sectionHead"><h2>Suno Queue</h2><button id="playCmd" class="secondary">Play Selected on Receivers</button></div>${rows || '<p class="muted">No Suno queue imported yet.</p>'}</section>`);
 }
 
 function musicPageV18() {
   const sunoReady = String(S.playlistUrl || '').trim();
-  return shell(`<section class="panel"><div class="panelHeader"><div><p class="eyebrow">Music Control</p><h1>Music</h1></div><button id="saveMusic">Save</button></div><div class="sourceBoard"><div class="sourceTile"><b>Spotify Bed</b><strong>${esc(sourceLabel('spotify', activeProviderUrl()))}</strong><span>${esc(S.spotifyUrl || DEFAULT_SPOTIFY_PLAYLIST)}</span></div><div class="sourceTile"><b>Suno Cue</b><strong>${esc(sunoReady ? sourceLabel('suno', S.playlistUrl) : 'No saved cue')}</strong><span>${esc(sunoReady ? S.playlistUrl : 'Paste a Suno song, playlist, or direct audio URL below.')}</span></div><div class="sourceTile"><b>Ducking</b><strong>${esc(S.spotifyDuckedVolume)}% Spotify during cues</strong><span>${Math.round(Number(S.announcementGain || 1) * 100)}% voice announcements</span></div></div><div class="buttonStack"><button id="spotifyPlayNow">Play Spotify on Receivers</button><button id="sunoPlayNow" class="secondary">Play Saved Suno Cue</button></div><div class="quickMusic"><label>Play Spotify or Suno Cue URL<input id="quickMusicUrl" value="${esc(S.quickMusicUrl || S.spotifyUrl || DEFAULT_SPOTIFY_PLAYLIST)}" placeholder="Paste Spotify, Suno, or direct audio URL"></label><div class="buttonStack"><button id="playAnyUrl">Play Pasted URL</button><button id="savePastedUrl" class="secondary">Save URL</button></div></div><div class="grid2"><label>Station Name<input id="playlistName" value="${esc(S.playlistName)}"></label><label>Spotify Playlist or Track URL<input id="spotifyUrl" value="${esc(S.spotifyUrl)}" placeholder="https://open.spotify.com/playlist/..."></label></div><label>Saved Suno Cue URL<input id="playlistUrl" value="${esc(S.playlistUrl)}" placeholder="Paste a Suno song, playlist, or direct audio URL"></label><div class="grid2"><label>Spotify Client ID<input id="spotifyClientId" value="${esc(S.spotifyClientId)}"></label><label>Spotify Redirect URI<input id="spotifyRedirectUri" value="${esc(spotifyRedirectUri())}"></label></div><div class="grid4"><label><span>Spotify Volume <output id="spotifyVolumeOut">${esc(S.spotifyVolume)}%</output></span><input id="spotifyVolume" type="range" min="0" max="100" step="1" value="${esc(S.spotifyVolume)}"></label><label><span>Music During Announcements <output id="spotifyDuckedVolumeOut">${esc(S.spotifyDuckedVolume)}%</output></span><input id="spotifyDuckedVolume" type="range" min="0" max="20" step="1" value="${esc(S.spotifyDuckedVolume)}"></label><label><span>Suno Cue Volume <output id="sunoVolumeOut">${esc(S.sunoVolume)}%</output></span><input id="sunoVolume" type="range" min="0" max="100" step="1" value="${esc(S.sunoVolume)}"></label><label><span>Announcement Boost <output id="announcementGainOut">${Math.round(Number(S.announcementGain || 1) * 100)}%</output></span><input id="announcementGain" type="range" min="1" max="3.4" step=".05" value="${esc(S.announcementGain)}"></label></div>${spotifyDiagnostics()}<div class="actions"><button id="spotifyLogin" class="secondary">Login with Spotify</button><button id="spotifyCheck" class="secondary">Check Spotify</button><button id="spotifyClear" class="secondary">Clear Spotify</button><button id="import" class="secondary">Check Suno URL</button></div></section>`);
+  return shell(`<section class="panel"><div class="panelHeader"><div><p class="eyebrow">Music Control</p><h1>Music</h1></div><button id="saveMusic">Save</button></div><div class="sourceBoard"><div class="sourceTile"><b>Spotify Bed</b><strong>${esc(sourceLabel('spotify', activeProviderUrl()))}</strong><span>${esc(S.spotifyUrl || DEFAULT_SPOTIFY_PLAYLIST)}</span></div><div class="sourceTile"><b>Suno Cue</b><strong>${esc(sunoReady ? sourceLabel('suno', S.playlistUrl) : 'No saved cue')}</strong><span>${esc(sunoReady ? S.playlistUrl : 'Paste a Suno song, playlist, or direct audio URL below.')}</span></div><div class="sourceTile"><b>Ducking</b><strong>${esc(S.spotifyDuckedVolume)}% Spotify during cues</strong><span>${Math.round(Number(S.announcementGain || 1) * 100)}% voice announcements</span></div></div><div class="buttonStack"><button id="spotifyPlayNow">Play Spotify on Receivers</button><button id="sunoPlayNow" class="secondary">Play Saved Suno Cue</button></div><div class="quickMusic"><label>Play Spotify or Suno Cue URL<input id="quickMusicUrl" value="${esc(S.quickMusicUrl || S.spotifyUrl || DEFAULT_SPOTIFY_PLAYLIST)}" placeholder="Paste Spotify, Suno, or direct audio URL"></label><div class="buttonStack"><button id="playAnyUrl">Play Pasted URL</button><button id="savePastedUrl" class="secondary">Save URL</button></div></div><div class="grid2"><label>Station Name<input id="playlistName" value="${esc(S.playlistName)}"></label><label>Spotify Playlist or Track URL<input id="spotifyUrl" value="${esc(S.spotifyUrl)}" placeholder="https://open.spotify.com/playlist/..."></label></div><label>Saved Suno Cue URL<input id="playlistUrl" value="${esc(S.playlistUrl)}" placeholder="Paste a Suno song, playlist, or direct audio URL"></label><div class="grid2"><label>Spotify Client ID<input id="spotifyClientId" value="${esc(S.spotifyClientId)}"></label><label>Spotify Redirect URI<input id="spotifyRedirectUri" value="${esc(spotifyRedirectUri())}"></label></div><div class="grid4"><label><span>Spotify Volume <output id="spotifyVolumeOut">${esc(S.spotifyVolume)}%</output></span><input id="spotifyVolume" type="range" min="0" max="100" step="1" value="${esc(S.spotifyVolume)}"></label><label><span>Music During Announcements <output id="spotifyDuckedVolumeOut">${esc(S.spotifyDuckedVolume)}%</output></span><input id="spotifyDuckedVolume" type="range" min="0" max="20" step="1" value="${esc(S.spotifyDuckedVolume)}"></label><label><span>Suno Cue Volume <output id="sunoVolumeOut">${esc(S.sunoVolume)}%</output></span><input id="sunoVolume" type="range" min="0" max="100" step="1" value="${esc(S.sunoVolume)}"></label><label><span>Announcement Boost <output id="announcementGainOut">${Math.round(Number(S.announcementGain || 1) * 100)}%</output></span><input id="announcementGain" type="range" min="1" max="${MAX_ANNOUNCEMENT_GAIN}" step=".05" value="${esc(S.announcementGain)}"></label></div>${spotifyDiagnostics()}<div class="actions"><button id="spotifyLogin" class="secondary">Login with Spotify</button><button id="spotifyCheck" class="secondary">Check Spotify</button><button id="spotifyClear" class="secondary">Clear Spotify</button><button id="import" class="secondary">Check Suno URL</button></div></section>`);
 }
 
 function scheduleBodyLabel(kind) {
@@ -3978,7 +4019,7 @@ function voicePage() {
   const receiverAudio = S.screen === 'home'
     ? S.audioStatus
     : (S.receiverStatus || 'Command devices send voice events; the Home receiver plays them.');
-  return shell(`<section class="panel"><div class="panelHeader"><div><p class="eyebrow">Announcement Audio</p><h1>Voice</h1></div><button id="voiceHealth" class="secondary">Check Voice</button></div><div class="statusBar"><b>Voice health:</b> ${esc(S.voiceHealth)}<br><b>Receiver audio:</b> ${esc(receiverAudio)}<br><b>Current boost:</b> ${Math.round(Number(S.announcementGain || 1) * 100)}%</div><div class="grid2"><label>Voice Mode<select id="voiceMode"><option value="ai" ${S.voiceMode === 'ai' ? 'selected' : ''}>AI first, device fallback</option><option value="device" ${S.voiceMode === 'device' ? 'selected' : ''}>Device only</option></select></label><label>AI Voice<select id="aiVoice"><option value="marin" ${S.aiVoice === 'marin' ? 'selected' : ''}>Marin</option><option value="cedar" ${S.aiVoice === 'cedar' ? 'selected' : ''}>Cedar</option><option value="coral" ${S.aiVoice === 'coral' ? 'selected' : ''}>Coral</option><option value="nova" ${S.aiVoice === 'nova' ? 'selected' : ''}>Nova</option><option value="sage" ${S.aiVoice === 'sage' ? 'selected' : ''}>Sage</option><option value="shimmer" ${S.aiVoice === 'shimmer' ? 'selected' : ''}>Shimmer</option><option value="onyx" ${S.aiVoice === 'onyx' ? 'selected' : ''}>Onyx</option></select></label></div><label>Device Voice<select id="deviceVoice"><option value="">Best available</option>${voiceOptions}</select></label><div class="grid3"><label><span>AI Announcement Boost <output id="announcementGainOut">${Math.round(Number(S.announcementGain || 1) * 100)}%</output></span><input id="announcementGain" type="range" min="1" max="3.4" step=".05" value="${esc(S.announcementGain)}"></label><label><span>Speed <output id="rateOut">${esc(S.rate)}</output></span><input id="rate" type="range" min=".75" max="1.15" step=".01" value="${esc(S.rate)}"></label><label><span>Pitch <output id="pitchOut">${esc(S.pitch)}</output></span><input id="pitch" type="range" min=".85" max="1.15" step=".01" value="${esc(S.pitch)}"></label></div><div class="actions"><button id="saveVoice">Save Voice</button><button id="testVoice" class="secondary">Send Voice Test</button><button id="testDevice" class="secondary">Send Device Voice Test</button></div></section>${announcementEditor()}`);
+  return shell(`<section class="panel"><div class="panelHeader"><div><p class="eyebrow">Announcement Audio</p><h1>Voice</h1></div><button id="voiceHealth" class="secondary">Check Voice</button></div><div class="statusBar"><b>Voice health:</b> ${esc(S.voiceHealth)}<br><b>Receiver audio:</b> ${esc(receiverAudio)}<br><b>Current boost:</b> ${Math.round(Number(S.announcementGain || 1) * 100)}%</div><div class="grid2"><label>Voice Mode<select id="voiceMode"><option value="ai" ${S.voiceMode === 'ai' ? 'selected' : ''}>AI first, device fallback</option><option value="device" ${S.voiceMode === 'device' ? 'selected' : ''}>Device only</option></select></label><label>AI Voice<select id="aiVoice"><option value="marin" ${S.aiVoice === 'marin' ? 'selected' : ''}>Marin</option><option value="cedar" ${S.aiVoice === 'cedar' ? 'selected' : ''}>Cedar</option><option value="coral" ${S.aiVoice === 'coral' ? 'selected' : ''}>Coral</option><option value="nova" ${S.aiVoice === 'nova' ? 'selected' : ''}>Nova</option><option value="sage" ${S.aiVoice === 'sage' ? 'selected' : ''}>Sage</option><option value="shimmer" ${S.aiVoice === 'shimmer' ? 'selected' : ''}>Shimmer</option><option value="onyx" ${S.aiVoice === 'onyx' ? 'selected' : ''}>Onyx</option></select></label></div><label>Device Voice<select id="deviceVoice"><option value="">Best available</option>${voiceOptions}</select></label><div class="grid3"><label><span>AI Announcement Boost <output id="announcementGainOut">${Math.round(Number(S.announcementGain || 1) * 100)}%</output></span><input id="announcementGain" type="range" min="1" max="${MAX_ANNOUNCEMENT_GAIN}" step=".05" value="${esc(S.announcementGain)}"></label><label><span>Speed <output id="rateOut">${esc(S.rate)}</output></span><input id="rate" type="range" min=".75" max="1.15" step=".01" value="${esc(S.rate)}"></label><label><span>Pitch <output id="pitchOut">${esc(S.pitch)}</output></span><input id="pitch" type="range" min=".85" max="1.15" step=".01" value="${esc(S.pitch)}"></label></div><div class="actions"><button id="saveVoice">Save Voice</button><button id="testVoice" class="secondary">Send Voice Test</button><button id="testDevice" class="secondary">Send Device Voice Test</button></div></section>${announcementEditor()}`);
 }
 
 function hoursPage() {
@@ -4334,7 +4375,7 @@ function bind() {
     S.voiceMode = val('voiceMode') || S.voiceMode;
     S.aiVoice = val('aiVoice') || S.aiVoice;
     S.deviceVoice = val('deviceVoice');
-    S.announcementGain = clampNumber(val('announcementGain') || S.announcementGain, 1, 3.4, 3);
+    S.announcementGain = clampNumber(val('announcementGain') || S.announcementGain, 1, MAX_ANNOUNCEMENT_GAIN, DEFAULT_ANNOUNCEMENT_GAIN);
     S.rate = Number(val('rate')) || .94;
     S.pitch = Number(val('pitch')) || 1;
     await save('Voice settings saved.');
