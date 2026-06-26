@@ -35,6 +35,7 @@ npm run build
 
 ## Version Notes
 
+- Version 20.2 keeps Spotify music at 33%, changes Spotify during voice to 0%, sends Spotify volume slider changes live without re-rendering the slider during drag, and verifies the requested Spotify volume against the audible Spotify device before reporting success.
 - Version 20.1 keeps the V20 receiver model and fixes the live audio balance: all music defaults to 33%, voice announcements default to the maximum 600% boost, Spotify ducks to 33% for spoken voice, Spotify pauses during Suno foreground tracks, stale Spotify play retries are stopped, and scheduled Suno cues can be stopped from Command or Home while they are playing.
 - Version 17 rolls forward from the V9 receiver model: one speaker phone stays on Home, Command devices only send controls, music starts at 45%, the deleted default Suno playlist is removed, and weather closure triggers require verified lightning/NWS closure alerts instead of Open-Meteo thunderstorm-code-only hits.
 - Version 13 unifies Spotify and Suno music volume into one receiver-wide Music Volume command, lowers inherited loud music defaults, primes iPhone receiver audio for seamless Suno switching, simplifies the schedule item editor, and improves iPhone/laptop layout behavior.

@@ -1,7 +1,7 @@
 (() => {
-  const VERSION = '20.1';
-  const TITLE = 'Lake123 - Poolside Pulse - v20.1';
-  const DESCRIPTION = 'Lake123 Poolside Pulse v20.1: music defaults to one-third announcement volume, Spotify ducks for voice, pauses for Suno, stale Spotify play retries are stopped, cancellable scheduled Suno cues, schedules, and weather safety holds.';
+  const VERSION = '20.2';
+  const TITLE = 'Lake123 - Poolside Pulse - v20.2';
+  const DESCRIPTION = 'Lake123 Poolside Pulse v20.2: Spotify music defaults to 33%, Spotify ducks to 0% for voice, slider changes are sent live and verified on the audible Spotify device, Suno pauses Spotify, cancellable scheduled Suno cues, schedules, and weather safety holds.';
 
   function ensureMeta(name, value) {
     let tag = document.querySelector(`meta[name="${name}"]`);

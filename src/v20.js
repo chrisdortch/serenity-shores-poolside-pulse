@@ -1,5 +1,5 @@
 const VERSION = '20';
-const DISPLAY_VERSION = 'v20.1';
+const DISPLAY_VERSION = 'v20.2';
 const PIN = '7900';
 const KEY = 'poolside-pulse-v20';
 const DEVICE_KEY = 'poolside-pulse-v20-device-id';
@@ -60,13 +60,15 @@ const LEGACY_DELETED_SUNO_ID_PATTERN = /cf4b536e-9005/i;
 const DEFAULT_ADDRESS = '615 Serenity Shores Ln, Kimberling City, MO 65686';
 const MUSIC_VOLUME_PERCENT = 33;
 const DEFAULT_SPOTIFY_VOLUME = MUSIC_VOLUME_PERCENT;
-const DEFAULT_SPOTIFY_DUCKED_VOLUME = MUSIC_VOLUME_PERCENT;
+const DEFAULT_SPOTIFY_DUCKED_VOLUME = 0;
 const DEFAULT_SUNO_VOLUME = MUSIC_VOLUME_PERCENT;
 const SPOTIFY_VOLUME_SLIDER_MAX = 100;
 const SUNO_VOLUME_SLIDER_MAX = 100;
 const DEFAULT_ANNOUNCEMENT_GAIN = 6;
 const MAX_ANNOUNCEMENT_GAIN = 6;
-const V20_VOLUME_DEFAULTS_ID = '2026-06-26-v20-1-music33-ann600-no-stale-retry';
+const V20_VOLUME_DEFAULTS_ID = '2026-06-26-v20-2-spotify33-duck0-live-verified';
+const LIVE_SPOTIFY_VOLUME_APPLY_MS = 550;
+const SPOTIFY_VOLUME_VERIFY_TOLERANCE = 2;
 const EVENT_TTL_MS = 90 * 60 * 1000;
 const EVENT_LIMIT = 120;
 const LOG_LIMIT = 180;
@@ -1243,10 +1245,26 @@ function commandTitle(type) {
 
 async function processEvents() {
   if (!receiverCanProcessEvents()) return;
-  const events = recentEvents(S.events).filter(shouldProcessEvent);
+  const events = coalesceReceiverEvents(recentEvents(S.events).filter(shouldProcessEvent));
   for (const event of events) {
     await processEvent(event);
   }
+}
+
+function coalesceReceiverEvents(events) {
+  let latestSpotifyVolume = '';
+  for (const event of events) {
+    if (event?.kind === 'command' && event.type === 'spotify-volume') latestSpotifyVolume = event.id;
+  }
+  if (!latestSpotifyVolume) return events;
+  return events.filter(event => {
+    if (event?.kind === 'command' && event.type === 'spotify-volume' && event.id !== latestSpotifyVolume) {
+      markHandled(event.id);
+      delete retryAfter[event.id];
+      return false;
+    }
+    return true;
+  });
 }
 
 async function processEvent(event) {
@@ -1279,6 +1297,11 @@ async function processEvent(event) {
       const next = `${message} Send the music command again after the Home receiver is ready.`;
       logEvent('receiver', 'Music command stopped', next, { eventId: event.id });
       setActionNeeded(next);
+    } else if (event?.kind === 'command' && event.type === 'spotify-volume' && /not verified|did not report|still reports/i.test(message)) {
+      markHandled(event.id);
+      delete retryAfter[event.id];
+      logEvent('spotify', 'Spotify volume not verified', message, { eventId: event.id, commandType: event.type });
+      setFeedback(`Spotify volume was not verified on the audible device: ${message}`, false);
     } else {
       unmarkHandled(event.id);
       retryAfter[event.id] = Date.now() + EVENT_RETRY_MS;
@@ -1327,8 +1350,8 @@ async function runCommand(command) {
   } else if (command.type === 'spotify-volume') {
     const result = await enforceSpotifyBedVolume('remote volume command', '', { attempts: 2, preferKnown: true, preferActive: true, preferPoolside: true, allowStart: false });
     S.intent = S.intent || 'playing';
-    setSpotifyStatus(`Spotify volume set to ${S.spotifyVolume}% on this receiver.`, true);
-    logEvent('spotify', 'Spotify volume set on receiver', `${S.spotifyVolume}% via ${result.method || 'receiver'}`, { eventId: command.id, commandType: command.type });
+    setSpotifyStatus(`Spotify volume verified at ${S.spotifyVolume}% on this receiver.`, true);
+    logEvent('spotify', 'Spotify volume verified on receiver', `${S.spotifyVolume}% via ${result.method || 'receiver'}${result.actualVolume !== undefined ? `; Spotify reports ${result.actualVolume}%` : ''}`, { eventId: command.id, commandType: command.type });
     await pushState('Receiver Spotify volume logged.', { render: false });
   } else if (command.type === 'audio-settings') {
     applyReceiverAudioSettings('remote command');
@@ -1989,12 +2012,12 @@ function scheduleSpotifyVolumeApply() {
   clearTimeout(spotifyVolumeApplyTimer);
   spotifyVolumeApplyTimer = setTimeout(() => {
     spotifyVolumeApplyTimer = null;
-    applySpotifyVolume(true).catch(error => {
+    applySpotifyVolume(true, { live: true, silent: true }).catch(error => {
       if (isActionNeeded(error)) setActionNeeded(error.message || String(error));
       else setFeedback(error.message || String(error), false);
       renderWhenIdle();
     });
-  }, 450);
+  }, LIVE_SPOTIFY_VOLUME_APPLY_MS);
 }
 
 function scheduleAudioSettingsApply() {
@@ -2009,26 +2032,53 @@ function scheduleAudioSettingsApply() {
   }, 450);
 }
 
-async function applySpotifyVolume(push = true) {
+async function sendSpotifyVolumeCommand(volume, options = {}) {
+  const safeVolume = clampNumber(volume, 0, SPOTIFY_VOLUME_SLIDER_MAX, DEFAULT_SPOTIFY_VOLUME);
+  const event = appendEvent('command', {
+    type: 'spotify-volume',
+    volume: safeVolume,
+    live: !!options.live,
+    label: `${options.live ? 'Preview' : 'Set'} Spotify volume to ${safeVolume}%`,
+    detail: `Spotify music volume ${safeVolume}%; announcements stay at full announcement volume.`
+  });
+  if (!options.live) {
+    logEvent('command', 'Set Spotify volume', `${safeVolume}%`, { commandType: 'spotify-volume', eventId: event.id });
+  }
+  await pushState(options.message || '', { render: false });
+  if (S.screen === 'home') await processEvent(event);
+  return event;
+}
+
+async function applySpotifyVolume(push = true, options = {}) {
   clearTimeout(spotifyVolumeApplyTimer);
   spotifyVolumeApplyTimer = null;
   const volume = readSpotifyVolumeControl();
   syncVolumeReadouts();
   if (S.screen !== 'home' && push) {
-    await issueCommand('spotify-volume', {
-      volume,
-      label: `Set Spotify volume to ${volume}%`,
-      detail: `Spotify music volume ${volume}%; announcements stay at full announcement volume.`
-    }, `Spotify volume ${volume}% sent to all active receivers. Announcements stay loud.`);
-    setSpotifyStatus(`Spotify volume ${volume}% sent to receivers. The Home receiver applies it to the speaker phone.`, true);
-    renderWhenIdle();
+    await sendSpotifyVolumeCommand(volume, {
+      live: !!options.live,
+      message: options.silent ? '' : `Spotify volume ${volume}% sent to all active receivers. Announcements stay loud.`
+    });
+    if (!options.silent) {
+      setSpotifyStatus(`Spotify volume ${volume}% sent to receivers. The Home receiver verifies it on the audible Spotify device.`, true);
+      renderWhenIdle();
+    }
     return;
   }
-  const result = await enforceSpotifyBedVolume('local volume control', '', { attempts: 2, preferKnown: true, preferActive: true, preferPoolside: true, allowStart: false });
-  logEvent('spotify', 'Spotify volume set locally', `${volume}% via ${result.method || 'receiver'}`);
-  await pushState(`Spotify volume set to ${volume}% on receiver.`, { render: false });
-  setSpotifyStatus(`Spotify volume set to ${volume}% on this receiver. Announcements stay loud.`, true);
-  renderWhenIdle();
+  const result = await enforceSpotifyBedVolume(options.live ? 'live local volume slider' : 'local volume control', '', {
+    attempts: options.live ? 1 : 2,
+    preferKnown: true,
+    preferActive: true,
+    preferPoolside: true,
+    allowStart: false,
+    log: !options.live
+  });
+  if (!options.silent) {
+    logEvent('spotify', 'Spotify volume set locally', `${volume}% via ${result.method || 'receiver'}${result.verified ? `; verified ${result.actualVolume}%` : ''}`);
+    await pushState(`Spotify volume set to ${volume}% on receiver.`, { render: false });
+    setSpotifyStatus(`Spotify volume verified at ${volume}% on this receiver. Announcements stay loud.`, true);
+    renderWhenIdle();
+  }
 }
 
 function randString(length = 64) {
@@ -2561,6 +2611,59 @@ async function spotifyPlaybackState() {
   };
 }
 
+async function spotifyVolumeSnapshot(targetDeviceId = '') {
+  const target = String(targetDeviceId || '').trim();
+  let lastError = '';
+  try {
+    const active = await spotifyPlaybackState();
+    if (active?.deviceId && Number.isFinite(Number(active.volume))) {
+      if (!target || String(active.deviceId) === target || String(S.spotifyDeviceId || '') === String(active.deviceId)) {
+        return { ...active, source: 'active playback' };
+      }
+    }
+  } catch (error) {
+    lastError = error.message || String(error);
+  }
+  try {
+    const devices = await spotifyDevices();
+    const usable = devices.filter(device => device?.id && !device.is_restricted);
+    const selected =
+      (target ? usable.find(device => String(device.id) === target) : null) ||
+      usable.find(device => device.is_active) ||
+      (S.spotifyDeviceId ? usable.find(device => String(device.id) === String(S.spotifyDeviceId)) : null) ||
+      usable.find(device => /poolside pulse|serenity shores/i.test(device.name || '')) ||
+      null;
+    if (selected && Number.isFinite(Number(selected.volume_percent))) {
+      return {
+        deviceId: selected.id,
+        name: selected.name || 'Spotify device',
+        isPlaying: !!selected.is_active,
+        volume: Number(selected.volume_percent),
+        source: selected.is_active ? 'active device list' : 'device list'
+      };
+    }
+  } catch (error) {
+    lastError = lastError || error.message || String(error);
+  }
+  return { error: lastError || 'Spotify did not return a device volume.' };
+}
+
+async function verifySpotifyVolume(percent, targetDeviceId = '', options = {}) {
+  const expected = Math.max(0, Math.min(SPOTIFY_VOLUME_SLIDER_MAX, Math.round(Number(percent) || 0)));
+  await wait(Number(options.delayMs ?? 450));
+  const snapshot = await spotifyVolumeSnapshot(targetDeviceId);
+  if (!snapshot?.deviceId || !Number.isFinite(Number(snapshot.volume))) {
+    return { verified: false, expected, actualVolume: null, detail: snapshot?.error || 'Spotify did not report an active device volume.' };
+  }
+  const actualVolume = Math.round(Number(snapshot.volume));
+  const delta = Math.abs(actualVolume - expected);
+  const verified = delta <= SPOTIFY_VOLUME_VERIFY_TOLERANCE;
+  const detail = verified
+    ? `${snapshot.name || 'Spotify device'} reports ${actualVolume}% via ${snapshot.source || 'Spotify'}.`
+    : `${snapshot.name || 'Spotify device'} still reports ${actualVolume}% after a ${expected}% request.`;
+  return { verified, expected, actualVolume, deviceId: snapshot.deviceId, name: snapshot.name, source: snapshot.source, detail };
+}
+
 async function pauseSpotifyForAnnouncement(deviceId) {
   let lastError = '';
   if (spotifyLoggedIn()) {
@@ -2656,7 +2759,20 @@ async function spotifySetVolume(percent, targetDeviceId = '', options = {}) {
     }
   }
   if (!localSet && !remoteSet) throw Error(lastError || 'Spotify volume was not accepted by the receiver or Spotify.');
-  return { localSet, remoteSet, method };
+  if (options.verify !== false) {
+    const verifyTarget = targetDeviceId || activeState?.deviceId || S.spotifyDeviceId || spotifyWebDeviceId || '';
+    const verification = await verifySpotifyVolume(volume, verifyTarget, { delayMs: options.verifyDelayMs });
+    if (verification.verified) {
+      S.spotifyDevicesSummary = `Verified ${verification.name || 'Spotify device'} at ${verification.actualVolume}%`;
+      localSave();
+      return { localSet, remoteSet, method: `${method || 'Spotify'} + verified`, verified: true, actualVolume: verification.actualVolume, detail: verification.detail };
+    }
+    if (options.requireVerified === false) {
+      return { localSet, remoteSet, method, verified: false, actualVolume: verification.actualVolume, detail: verification.detail };
+    }
+    throw Error(`Spotify volume command was accepted but not verified: ${verification.detail}`);
+  }
+  return { localSet, remoteSet, method, verified: false };
 }
 
 async function enforceSpotifyBedVolume(reason = 'Spotify bed volume', targetDeviceId = '', options = {}) {
@@ -2681,7 +2797,9 @@ async function enforceSpotifyBedVolume(reason = 'Spotify bed volume', targetDevi
     if (i < attempts - 1) await wait(Number(options.delayMs || 550) || 550);
   }
   if (lastError && !lastResult) throw Error(lastError);
-  logEvent('spotify', 'Spotify bed volume enforced', `${volume}%${reason ? ` after ${reason}` : ''}${lastResult?.method ? ` via ${lastResult.method}` : ''}`);
+  if (options.log !== false) {
+    logEvent('spotify', 'Spotify bed volume enforced', `${volume}%${reason ? ` after ${reason}` : ''}${lastResult?.method ? ` via ${lastResult.method}` : ''}${lastResult?.actualVolume !== undefined ? ` (${lastResult.actualVolume}% reported)` : ''}`);
+  }
   return lastResult || { localSet: false, remoteSet: false, method: '' };
 }
 
@@ -4434,6 +4552,7 @@ function bind() {
     input.oninput = () => {
       markRangeEditing(2500);
       updateSpotifyVolumeDraft(input.value);
+      scheduleSpotifyVolumeApply();
     };
     input.onchange = () => Promise.resolve(applySpotifyVolume(true)).catch(error => {
       if (isActionNeeded(error)) setActionNeeded(error.message || String(error));
