@@ -16,8 +16,10 @@ const VERSIONED_STATE_KEYS = {
 };
 const V18_STALE_SUNO_COMMAND_CUTOFF = 1782483347041;
 const V18_AUDIO_DEFAULTS_ID = '2026-06-26-v18e-spotify2-suno85-duck0-ann500';
-const V20_AUDIO_DEFAULTS_ID = '2026-06-26-v20-spotify2-suno85-pause-duck-stop';
+const V20_AUDIO_DEFAULTS_ID = '2026-06-26-v20-1-music33-ann600-no-stale-retry';
+const V20_STALE_SPOTIFY_COMMAND_CUTOFF = 1782499126000;
 const V18_STALE_SUNO_TYPES = new Set(['suno-cue', 'suno', 'song']);
+const V20_STALE_SPOTIFY_TYPES = new Set(['spotify-play', 'play']);
 
 // Safe fallback: lets preview/admin/Home sync work even before Vercel KV/Upstash is configured.
 // For production/life-safety reliability, add KV_REST_API_URL and KV_REST_API_TOKEN in Vercel.
@@ -111,6 +113,13 @@ function staleV18SunoCommand(event) {
     Number(event.createdAt || 0) < V18_STALE_SUNO_COMMAND_CUTOFF;
 }
 
+function staleV20SpotifyCommand(event) {
+  return event &&
+    V20_STALE_SPOTIFY_TYPES.has(event.type) &&
+    Number(event.createdAt || 0) > 0 &&
+    Number(event.createdAt || 0) < V20_STALE_SPOTIFY_COMMAND_CUTOFF;
+}
+
 function staleV18SunoNotice(value) {
   return /Receiver could not start the Suno cue|will retry this music command|not allowed by the user agent/i.test(String(value || ''));
 }
@@ -127,22 +136,24 @@ function sanitizeState(state) {
   const clean = { ...state };
   if (version === '18' && Array.isArray(clean.events)) clean.events = clean.events.filter(event => !staleV18SunoCommand(event));
   if (version === '18' && staleV18SunoCommand(clean.command)) clean.command = null;
+  if (version === '20' && Array.isArray(clean.events)) clean.events = clean.events.filter(event => !staleV20SpotifyCommand(event));
+  if (version === '20' && staleV20SpotifyCommand(clean.command)) clean.command = null;
   if (staleV18SunoNotice(clean.setupNotice)) clean.setupNotice = '';
   if (staleV18SunoNotice(clean.feedback)) clean.feedback = 'Ready.';
   if (staleV18SunoNotice(clean.lastError)) clean.lastError = '';
   const defaultsKey = version === '20' ? 'v20VolumeDefaultsApplied' : 'v18VolumeDefaultsApplied';
   const defaultsId = version === '20' ? V20_AUDIO_DEFAULTS_ID : V18_AUDIO_DEFAULTS_ID;
   if (clean[defaultsKey] !== defaultsId) {
-    clean.spotifyVolume = 2;
-    clean.sunoVolume = 85;
-    clean.announcementGain = 5;
-    clean.spotifyDuckedVolume = 0;
+    clean.spotifyVolume = version === '20' ? 33 : 2;
+    clean.sunoVolume = version === '20' ? 33 : 85;
+    clean.announcementGain = version === '20' ? 6 : 5;
+    clean.spotifyDuckedVolume = version === '20' ? 33 : 0;
     clean[defaultsKey] = defaultsId;
   }
-  clean.spotifyVolume = clampNumber(clean.spotifyVolume, 0, 20, 2);
-  clean.sunoVolume = clampNumber(clean.sunoVolume, 0, 100, 85);
-  clean.spotifyDuckedVolume = 0;
-  clean.announcementGain = clampNumber(clean.announcementGain, 1, 6, 5);
+  clean.spotifyVolume = clampNumber(clean.spotifyVolume, 0, version === '20' ? 100 : 20, version === '20' ? 33 : 2);
+  clean.sunoVolume = clampNumber(clean.sunoVolume, 0, 100, version === '20' ? 33 : 85);
+  clean.spotifyDuckedVolume = version === '20' ? clampNumber(clean.spotifyDuckedVolume, 0, 100, 33) : 0;
+  clean.announcementGain = clampNumber(clean.announcementGain, 1, 6, version === '20' ? 6 : 5);
   return clean;
 }
 
