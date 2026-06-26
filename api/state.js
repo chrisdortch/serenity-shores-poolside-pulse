@@ -13,6 +13,9 @@ const VERSIONED_STATE_KEYS = {
   '15': 'serenity-shores-poolside-radio-v15',
   '14': 'serenity-shores-poolside-radio-v14'
 };
+const V18_STALE_SUNO_COMMAND_CUTOFF = 1782483347041;
+const V18_AUDIO_DEFAULTS_ID = '2026-06-26-v18c-music8-duck0-ann500-clean';
+const V18_STALE_SUNO_TYPES = new Set(['suno-cue', 'suno', 'song']);
 
 // Safe fallback: lets preview/admin/Home sync work even before Vercel KV/Upstash is configured.
 // For production/life-safety reliability, add KV_REST_API_URL and KV_REST_API_TOKEN in Vercel.
@@ -99,15 +102,47 @@ function recentEvents(events) {
     .filter(event => event && event.id && Number(event.createdAt || 0) >= cutoff);
 }
 
+function staleV18SunoCommand(event) {
+  return event &&
+    V18_STALE_SUNO_TYPES.has(event.type) &&
+    Number(event.createdAt || 0) > 0 &&
+    Number(event.createdAt || 0) < V18_STALE_SUNO_COMMAND_CUTOFF;
+}
+
+function staleV18SunoNotice(value) {
+  return /Receiver could not start the Suno cue|will retry this music command|not allowed by the user agent/i.test(String(value || ''));
+}
+
+function sanitizeState(state) {
+  if (!state || typeof state !== 'object') return state;
+  if (String(state.version || '') !== '18') return state;
+  const clean = { ...state };
+  if (Array.isArray(clean.events)) clean.events = clean.events.filter(event => !staleV18SunoCommand(event));
+  if (staleV18SunoCommand(clean.command)) clean.command = null;
+  if (staleV18SunoNotice(clean.setupNotice)) clean.setupNotice = '';
+  if (staleV18SunoNotice(clean.feedback)) clean.feedback = 'Ready.';
+  if (staleV18SunoNotice(clean.lastError)) clean.lastError = '';
+  if (clean.v18VolumeDefaultsApplied !== V18_AUDIO_DEFAULTS_ID) {
+    clean.spotifyVolume = 8;
+    clean.sunoVolume = 8;
+    clean.announcementGain = 5;
+    clean.spotifyDuckedVolume = 0;
+    clean.v18VolumeDefaultsApplied = V18_AUDIO_DEFAULTS_ID;
+  }
+  return clean;
+}
+
 function finalizeState(state, previous = null) {
-  const merged = { ...(previous || {}), ...state };
-  merged.events = mergeById(80, false, recentEvents(previous?.events), recentEvents(state.events));
-  merged.activityLog = mergeById(160, true, previous?.activityLog, state.activityLog);
-  return {
+  const previousSafe = sanitizeState(previous);
+  const stateSafe = sanitizeState(state);
+  const merged = { ...(previousSafe || {}), ...stateSafe };
+  merged.events = mergeById(80, false, recentEvents(previousSafe?.events), recentEvents(stateSafe.events));
+  merged.activityLog = mergeById(160, true, previousSafe?.activityLog, stateSafe.activityLog);
+  return sanitizeState({
     ...merged,
     savedAt: Date.now(),
     revision: Math.max(Number(previous?.revision || 0), Number(state.revision || 0)) + 1
-  };
+  });
 }
 
 export default async function handler(req, res) {
@@ -118,13 +153,13 @@ export default async function handler(req, res) {
       const stateKey = stateKeyFor(req);
       if (hasKv) {
         const raw = await kv(['GET', stateKey]);
-        return json(res, 200, { ok: true, cloudSync: true, syncMode: 'kv', state: raw ? JSON.parse(raw) : null, note: 'KV cloud sync active.' });
+        return json(res, 200, { ok: true, cloudSync: true, syncMode: 'kv', state: sanitizeState(raw ? JSON.parse(raw) : null), note: 'KV cloud sync active.' });
       }
       return json(res, 200, {
         ok: true,
         cloudSync: true,
         syncMode: 'memory',
-        state: globalThis.__POOL_SIDE_MEMORY_STATES__[stateKey] || null,
+        state: sanitizeState(globalThis.__POOL_SIDE_MEMORY_STATES__[stateKey] || null),
         note: 'Preview sync active using temporary server memory. Add Vercel KV/Upstash for production-grade persistence.'
       });
     }
