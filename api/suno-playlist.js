@@ -180,6 +180,26 @@ function collectObjects(value, out = []) {
   return out;
 }
 
+function parseJsonPayload(raw, out) {
+  const input = String(raw || '').trim();
+  const variants = [
+    input,
+    input.replace(/\\"/g, '"').replace(/\\\\/g, '\\')
+  ];
+  for (const variant of variants) {
+    const payloads = [variant];
+    const colon = variant.indexOf(':');
+    if (colon > 0 && /^[\w$-]+:/.test(variant)) payloads.push(variant.slice(colon + 1));
+    for (const payload of payloads) {
+      try {
+        collectObjects(JSON.parse(payload), out);
+        return true;
+      } catch {}
+    }
+  }
+  return false;
+}
+
 function parseJsonScripts(html) {
   const tracks = [];
   const scriptRegex = /<script[^>]*>([\s\S]*?)<\/script>/gi;
@@ -187,18 +207,93 @@ function parseJsonScripts(html) {
   while ((match = scriptRegex.exec(html))) {
     const body = match[1].trim();
     if (!body || (!body.includes('playlist') && !body.includes('audio') && !body.includes('clip') && !body.includes('title'))) continue;
-    if (body.startsWith('{') || body.startsWith('[')) {
-      try { collectObjects(JSON.parse(body), tracks); } catch {}
-    }
+    if (body.startsWith('{') || body.startsWith('[')) parseJsonPayload(body, tracks);
     const pushedMatches = body.match(/self\.__next_f\.push\(\[(?:1|2),"([\s\S]*?)"\]\)/g) || [];
     pushedMatches.forEach(segment => {
-      try {
-        const text = segment.replace(/^self\.__next_f\.push\(\[(?:1|2),"/, '').replace(/"\]\)$/, '').replace(/\\"/g, '"').replace(/\\\\/g, '\\');
-        collectObjects(JSON.parse(text), tracks);
-      } catch {}
+      const text = segment.replace(/^self\.__next_f\.push\(\[(?:1|2),"/, '').replace(/"\]\)$/, '');
+      parseJsonPayload(text, tracks);
     });
   }
   return tracks;
+}
+
+function decodeLooseJsonValue(value) {
+  return String(value || '')
+    .replace(/\\u0026/g, '&')
+    .replace(/\\u002F/g, '/')
+    .replace(/\\\//g, '/')
+    .replace(/\\"/g, '"')
+    .replace(/\\\\/g, '\\')
+    .trim();
+}
+
+function looseJsonValues(html, key) {
+  const values = [];
+  const sources = [
+    String(html || ''),
+    String(html || '').replace(/\\"/g, '"').replace(/\\\\/g, '\\')
+  ];
+  const pattern = new RegExp(`"${key}"\\s*:\\s*"([^"\\\\]*(?:\\\\.[^"\\\\]*)*)"`, 'gi');
+  for (const source of sources) {
+    let match;
+    pattern.lastIndex = 0;
+    while ((match = pattern.exec(source))) {
+      const value = decodeLooseJsonValue(match[1]);
+      if (value && !values.includes(value)) values.push(value);
+    }
+  }
+  return values;
+}
+
+function decodeHtmlAttr(value) {
+  return String(value || '')
+    .replace(/&amp;/g, '&')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .trim();
+}
+
+function metaContent(html, name) {
+  const pattern = new RegExp(`<meta[^>]+(?:property|name)=["']${name}["'][^>]+content=["']([^"']+)["']`, 'i');
+  return decodeHtmlAttr(html.match(pattern)?.[1] || '');
+}
+
+function canonicalUrl(html) {
+  return decodeHtmlAttr(html.match(/<link[^>]+rel=["']canonical["'][^>]+href=["']([^"']+)["']/i)?.[1] || '');
+}
+
+function artistFromHtml(html) {
+  const description = metaContent(html, 'description');
+  return decodeHtmlAttr(description.match(/\sby\s+(.+?)(?:\s+\(@|\.|$)/i)?.[1] || '');
+}
+
+function parseEmbeddedAudioPatterns(html) {
+  const urls = [
+    ...looseJsonValues(html, 'audio_url'),
+    ...looseJsonValues(html, 'audioUrl'),
+    ...looseJsonValues(html, 'stream_audio_url')
+  ].filter(url => /^https?:\/\//i.test(url));
+  const audioUrls = urls.length
+    ? urls
+    : [...looseJsonValues(html, 'video_url'), ...looseJsonValues(html, 'videoUrl')].filter(url => /^https?:\/\//i.test(url));
+  const uniqueUrls = [...new Set(audioUrls)];
+  if (!uniqueUrls.length) return [];
+  const title = metaContent(html, 'og:title') || looseJsonValues(html, 'title')[0] || 'Suno song';
+  const artist = artistFromHtml(html) || looseJsonValues(html, 'display_name')[0] || looseJsonValues(html, 'user_display_name')[0] || 'Suno';
+  const duration = durationFromSeconds(looseJsonValues(html, 'duration')[0]);
+  const sourceUrl = canonicalUrl(html);
+  const imageUrl = metaContent(html, 'og:image') || looseJsonValues(html, 'image_url')[0] || looseJsonValues(html, 'image_large_url')[0] || '';
+  return uniqueUrls.map((audioUrl, index) => ({
+    id: audioUrl.split('/').pop()?.replace(/\.(mp3|m4a|aac|wav|ogg|oga|webm|mp4)(\?.*)?$/i, '') || audioUrl,
+    no: index + 1,
+    title,
+    artist,
+    duration,
+    tags: '',
+    audioUrl,
+    sourceUrl,
+    imageUrl
+  }));
 }
 
 function parseLoosePatterns(html) {
@@ -221,7 +316,7 @@ async function fetchFromHtml(playlistUrl) {
   });
   const html = await response.text();
   if (!response.ok) throw new Error(`Suno page returned HTTP ${response.status}`);
-  return uniqueTracks([...parseJsonScripts(html), ...parseLoosePatterns(html)]);
+  return uniqueTracks([...parseJsonScripts(html), ...parseEmbeddedAudioPatterns(html), ...parseLoosePatterns(html)]);
 }
 
 export default async function handler(req, res) {
