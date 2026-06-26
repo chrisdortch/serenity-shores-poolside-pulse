@@ -635,6 +635,177 @@ function restoreAudioDrafts(draft) {
   for (const [key, value] of Object.entries(draft)) S[key] = value;
 }
 
+function formDraftIds() {
+  return [
+    'playlistName',
+    'playlistUrl',
+    'quickMusicUrl',
+    'spotifyUrl',
+    'spotifyClientId',
+    'spotifyRedirectUri',
+    'quickTemplate',
+    'quickText',
+    'annSelect',
+    'annMode',
+    'annLabel',
+    'annText',
+    'annTrack',
+    'address',
+    'lat',
+    'lon',
+    'radius',
+    'lightningRadiusMiles',
+    'lightningHoldMinutes',
+    'windGustMph',
+    'weatherAuto',
+    'lightningText',
+    'windText',
+    'lightningClearText',
+    'playbackMode',
+    'autoStart',
+    'poolOpen',
+    'poolClose',
+    'autoStop',
+    'voiceMode',
+    'aiVoice',
+    'deviceVoice'
+  ];
+}
+
+function applyFormFieldDraft(id, value) {
+  const text = String(value ?? '');
+  if (id === 'playlistName') S.playlistName = text || S.playlistName;
+  else if (id === 'playlistUrl') S.playlistUrl = text.trim();
+  else if (id === 'quickMusicUrl') S.quickMusicUrl = text.trim();
+  else if (id === 'spotifyUrl') S.spotifyUrl = text.trim() || S.spotifyUrl || DEFAULT_SPOTIFY_PLAYLIST;
+  else if (id === 'spotifyClientId') S.spotifyClientId = text.trim() || S.spotifyClientId || DEFAULT_SPOTIFY_CLIENT_ID;
+  else if (id === 'spotifyRedirectUri') S.spotifyRedirectUri = text.trim() || S.spotifyRedirectUri || appRedirectDefault();
+  else if (id === 'quickTemplate' || id === 'annSelect') S.selected = text || S.selected;
+  else if (id === 'quickText') S.quickText = text;
+  else if (id === 'annMode') ann().mode = text === 'suno' ? 'suno' : 'voice';
+  else if (id === 'annLabel') ann().label = text || ann().label;
+  else if (id === 'annText') {
+    ann().text = text;
+    S.quickText = text;
+  } else if (id === 'annTrack') ann().trackIndex = clampTrackIndex(text);
+  else if (id === 'address') S.address = text || S.address;
+  else if (id === 'lat') S.lat = text;
+  else if (id === 'lon') S.lon = text;
+  else if (id === 'radius') S.radius = clampNumber(text, 1, 25, S.radius);
+  else if (id === 'lightningRadiusMiles') S.lightningRadiusMiles = clampNumber(text, 1, 25, S.lightningRadiusMiles);
+  else if (id === 'lightningHoldMinutes') S.lightningHoldMinutes = clampNumber(text, 5, 90, S.lightningHoldMinutes);
+  else if (id === 'windGustMph') S.windGustMph = clampNumber(text, 15, 80, S.windGustMph);
+  else if (id === 'weatherAuto') S.weatherAuto = text === 'true';
+  else if (id === 'lightningText') S.lightningText = text;
+  else if (id === 'windText') S.windText = text;
+  else if (id === 'lightningClearText') S.lightningClearText = text;
+  else if (id === 'playbackMode') S.playbackMode = text === 'always' ? 'always' : 'hours';
+  else if (id === 'autoStart') S.autoStart = text !== 'false';
+  else if (id === 'poolOpen') S.poolOpen = text || S.poolOpen;
+  else if (id === 'poolClose') S.poolClose = text || S.poolClose;
+  else if (id === 'autoStop') S.autoStop = text !== 'false';
+  else if (id === 'voiceMode') S.voiceMode = text === 'device' ? 'device' : 'ai';
+  else if (id === 'aiVoice') S.aiVoice = text || S.aiVoice;
+  else if (id === 'deviceVoice') S.deviceVoice = text;
+}
+
+function updateScheduleRowDraft(index, mode = 'daily') {
+  const activeMode = scheduleMode(mode);
+  const key = scheduleFieldKey(activeMode, index);
+  const row = scheduleItems(activeMode)[index];
+  if (!row) return;
+  const kind = scheduleField('kind', key)?.value || row.type || 'text';
+  const labelEl = scheduleField('label', key);
+  const timeEl = scheduleField('row-time', key);
+  const bodyEl = scheduleField('body', key);
+  const annEl = scheduleField('selann', key);
+  row.type = kind;
+  row.label = labelEl ? labelEl.value : row.label;
+  if (timeEl?.value) {
+    row.time = timeEl.value;
+    delete row.offsetToClose;
+  }
+  if (kind === 'announcement') {
+    row.announcementId = annEl?.value || row.announcementId || S.selected;
+    delete row.text;
+    delete row.url;
+    delete row.trackIndex;
+  } else if (kind === 'text') {
+    row.text = bodyEl ? bodyEl.value : (row.text || '');
+    delete row.announcementId;
+    delete row.url;
+    delete row.trackIndex;
+  } else if (['suno', 'spotify', 'sunoAnnouncement', 'song'].includes(kind)) {
+    row.url = bodyEl ? bodyEl.value.trim() : (row.url || '');
+    delete row.announcementId;
+    delete row.text;
+    delete row.trackIndex;
+  }
+  localSave();
+}
+
+function captureActiveFormDrafts() {
+  const hasDraftableControls = formDraftIds().some(id => !!$(id)) || !!document.querySelector('[data-kind-row]');
+  if (!uiIsEditing() && !(S.screen !== 'home' && hasDraftableControls)) return null;
+  const draft = { fields: {}, schedule: [] };
+  for (const id of formDraftIds()) {
+    const el = $(id);
+    if (el) draft.fields[id] = el.value ?? '';
+  }
+  document.querySelectorAll('[data-kind-row]').forEach(select => {
+    const mode = scheduleMode(select.dataset.scheduleMode);
+    const index = Number(select.dataset.kindRow);
+    if (!Number.isFinite(index)) return;
+    const key = scheduleFieldKey(mode, index);
+    draft.schedule.push({
+      mode,
+      index,
+      type: select.value || scheduleItems(mode)[index]?.type || 'text',
+      time: scheduleField('row-time', key)?.value || '',
+      label: scheduleField('label', key)?.value ?? '',
+      body: scheduleField('body', key)?.value ?? '',
+      announcementId: scheduleField('selann', key)?.value || ''
+    });
+  });
+  return Object.keys(draft.fields).length || draft.schedule.length ? draft : null;
+}
+
+function restoreFormDrafts(draft) {
+  if (!draft) return;
+  Object.entries(draft.fields || {}).forEach(([id, value]) => applyFormFieldDraft(id, value));
+  for (const item of draft.schedule || []) {
+    const row = scheduleItems(item.mode)[item.index];
+    if (!row) continue;
+    row.type = item.type || row.type || 'text';
+    row.label = item.label || row.label;
+    if (item.time) {
+      row.time = item.time;
+      delete row.offsetToClose;
+    }
+    if (row.type === 'announcement') {
+      row.announcementId = item.announcementId || row.announcementId || S.selected;
+      delete row.text;
+      delete row.url;
+      delete row.trackIndex;
+    } else if (row.type === 'text') {
+      row.text = item.body ?? row.text ?? '';
+      delete row.announcementId;
+      delete row.url;
+      delete row.trackIndex;
+    } else if (['suno', 'spotify', 'sunoAnnouncement', 'song'].includes(row.type)) {
+      row.url = String(item.body ?? row.url ?? '').trim();
+      delete row.announcementId;
+      delete row.text;
+      delete row.trackIndex;
+    }
+  }
+}
+
+function updateFormDraftField(id, value) {
+  applyFormFieldDraft(id, value);
+  localSave();
+}
+
 function renderWhenIdle() {
   if (S.screen !== 'home' && uiIsEditing()) {
     pendingRender = true;
@@ -716,6 +887,7 @@ function preserveLocalBeforeMerge() {
     admin: S.admin,
     tab: S.tab,
     audioDrafts: captureActiveAudioDrafts(),
+    formDrafts: captureActiveFormDrafts(),
     selected: S.selected,
     quickText: S.quickText,
     guestName: S.guestName,
@@ -753,6 +925,7 @@ function restoreLocalAfterMerge(local) {
   S.guestName = local.guestName;
   S.editId = local.editId;
   restoreAudioDrafts(local.audioDrafts);
+  restoreFormDrafts(local.formDrafts);
   S.feedback = local.feedback;
   S.lastError = S.screen !== 'home' && receiverOnlyError(S.lastError) ? local.lastError : S.lastError;
   if (S.screen !== 'home' && receiverActionNeeded(S.lastError)) S.lastError = '';
@@ -1010,9 +1183,17 @@ async function processEvent(event) {
   } catch (error) {
     const message = error.message || String(error);
     if (isActionNeeded(error)) {
-      markHandled(event.id);
-      delete retryAfter[event.id];
-      const next = /send the command again/i.test(message) ? message : `${message} After this receiver is ready, send the command again.`;
+      const retryableMusicCommand = event.kind === 'command' && ['spotify-play', 'play', 'suno', 'suno-cue', 'song'].includes(event.type);
+      if (retryableMusicCommand) {
+        unmarkHandled(event.id);
+        retryAfter[event.id] = Date.now() + EVENT_RETRY_MS;
+      } else {
+        markHandled(event.id);
+        delete retryAfter[event.id];
+      }
+      const next = retryableMusicCommand
+        ? `${message} The receiver will retry this music command after it is ready.`
+        : (/send the command again/i.test(message) ? message : `${message} After this receiver is ready, send the command again.`);
       logEvent('receiver', 'Event needs receiver action', next, { eventId: event.id });
       setActionNeeded(next);
     } else {
@@ -1098,12 +1279,12 @@ async function runAnnouncement(event) {
 
 function readMusicSettings() {
   S.musicProvider = 'spotify';
-  if ($('playlistName')) S.playlistName = val('playlistName') || S.playlistName;
-  if ($('playlistUrl')) S.playlistUrl = val('playlistUrl') || S.playlistUrl;
-  if ($('quickMusicUrl')) S.quickMusicUrl = val('quickMusicUrl') || S.quickMusicUrl;
-  if ($('spotifyUrl')) S.spotifyUrl = val('spotifyUrl') || S.spotifyUrl;
-  if ($('spotifyClientId')) S.spotifyClientId = val('spotifyClientId') || S.spotifyClientId || DEFAULT_SPOTIFY_CLIENT_ID;
-  if ($('spotifyRedirectUri')) S.spotifyRedirectUri = normalizeRedirectUri(val('spotifyRedirectUri') || S.spotifyRedirectUri || appRedirectDefault());
+  if ($('playlistName')) S.playlistName = val('playlistName').trim() || S.playlistName;
+  if ($('playlistUrl')) S.playlistUrl = val('playlistUrl').trim();
+  if ($('quickMusicUrl')) S.quickMusicUrl = val('quickMusicUrl').trim();
+  if ($('spotifyUrl')) S.spotifyUrl = val('spotifyUrl').trim() || S.spotifyUrl || DEFAULT_SPOTIFY_PLAYLIST;
+  if ($('spotifyClientId')) S.spotifyClientId = val('spotifyClientId').trim() || S.spotifyClientId || DEFAULT_SPOTIFY_CLIENT_ID;
+  if ($('spotifyRedirectUri')) S.spotifyRedirectUri = normalizeRedirectUri(val('spotifyRedirectUri').trim() || S.spotifyRedirectUri || appRedirectDefault());
   S.spotifyVolume = clampNumber($('spotifyVolume') ? val('spotifyVolume') : S.spotifyVolume, 0, 100, DEFAULT_MUSIC_VOLUME);
   S.spotifyDuckedVolume = clampNumber($('spotifyDuckedVolume') ? val('spotifyDuckedVolume') : S.spotifyDuckedVolume, 0, 20, 0);
   S.announcementGain = clampNumber($('announcementGain') ? val('announcementGain') : S.announcementGain, 1, 3.4, 3);
@@ -2286,12 +2467,74 @@ async function spotifyActuallyPlaying(targetDeviceId = '') {
   }
 }
 
+function spotifyErrorMessage(error) {
+  return error?.message || String(error || 'Spotify command failed.');
+}
+
+function spotifyRestrictionLike(message) {
+  return /restriction violated|not allowed|not active|no active device|autoplay|platform|denied|rate|HTTP 429/i.test(String(message || ''));
+}
+
+async function spotifyAttempt(label, fn, errors) {
+  try {
+    await fn();
+    return true;
+  } catch (error) {
+    const first = spotifyErrorMessage(error);
+    errors.push(`${label}: ${first}`);
+    if (/HTTP 429|rate/i.test(first)) {
+      await wait(1800);
+      try {
+        await fn();
+        return true;
+      } catch (retryError) {
+        errors.push(`${label} retry: ${spotifyErrorMessage(retryError)}`);
+      }
+    }
+    return false;
+  }
+}
+
 async function sendSpotifyPlayback(playUrl, deviceId) {
-  await spotifyApi('PUT', '/me/player', { device_ids: [deviceId], play: false });
-  await spotifySetVolume(S.spotifyVolume, deviceId, { preferKnown: true });
-  await spotifyApi('PUT', '/me/player/play', spotifyBody(playUrl), { device_id: deviceId });
-  await spotifySetVolume(S.spotifyVolume, deviceId, { preferKnown: true });
-  return await spotifyActuallyPlaying(deviceId);
+  const target = String(deviceId || '').trim();
+  if (!target) throw actionNeededError('Spotify receiver is not ready yet. Tap Start Receiver + Play Spotify on the speaker-connected Home phone.');
+  const body = spotifyBody(playUrl);
+  const errors = [];
+
+  await spotifySetVolume(S.spotifyVolume, target, { preferKnown: true, allowStart: false }).catch(error => {
+    errors.push(`set volume before play: ${spotifyErrorMessage(error)}`);
+  });
+  const transferred = await spotifyAttempt('transfer to receiver', () => spotifyApi('PUT', '/me/player', { device_ids: [target], play: false }), errors);
+  if (transferred) await wait(450);
+
+  let played = await spotifyAttempt('play on receiver', () => spotifyApi('PUT', '/me/player/play', body, { device_id: target }), errors);
+  if (!played && spotifyRestrictionLike(errors.join(' ')) && spotifyPlayer && typeof spotifyPlayer.resume === 'function') {
+    if (target === spotifyWebDeviceId || target === S.spotifyDeviceId) {
+      await activateSpotifyElement();
+      played = await spotifyAttempt('resume receiver SDK', () => spotifyPlayer.resume(), errors);
+    }
+  }
+  if (!played && spotifyRestrictionLike(errors.join(' '))) {
+    played = await spotifyAttempt('play on active Spotify device', () => spotifyApi('PUT', '/me/player/play', body), errors);
+  }
+
+  await spotifySetVolume(S.spotifyVolume, target, { preferKnown: true, allowStart: false }).catch(error => {
+    errors.push(`set volume after play: ${spotifyErrorMessage(error)}`);
+  });
+  if (await spotifyActuallyPlaying(target)) return true;
+
+  if (played && spotifyRestrictionLike(errors.join(' '))) {
+    const active = await spotifyPlaybackState().catch(() => null);
+    if (active?.isPlaying && active.deviceId) {
+      S.spotifyDeviceId = active.deviceId;
+      S.spotifyDeviceName = active.name || S.spotifyDeviceName || 'Spotify device';
+      S.receiverLastSeen = stamp();
+      localSave();
+      return true;
+    }
+  }
+
+  throw Error(errors.join(' · ') || 'Spotify did not report active playback on the receiver.');
 }
 
 function markSpotifyPlaybackAccepted(playUrl) {
@@ -3137,11 +3380,11 @@ function updateScheduleTypeDraft(index, mode, nextKind) {
   const key = scheduleFieldKey(mode, index);
   const row = scheduleItems(mode)[index];
   if (!row) return;
-  const body = scheduleField('body', key)?.value.trim() || '';
+  const body = scheduleField('body', key)?.value || '';
   row.label = scheduleField('label', key)?.value || row.label;
   row.time = scheduleField('row-time', key)?.value || row.time || '10:00';
   if (row.type === 'text') row.text = body;
-  else if (['suno', 'spotify', 'sunoAnnouncement', 'song'].includes(row.type) && body) row.url = body;
+  else if (['suno', 'spotify', 'sunoAnnouncement', 'song'].includes(row.type)) row.url = body.trim();
   row.type = nextKind || 'text';
   if (row.type === 'announcement') row.announcementId ||= S.selected;
   if (row.type === 'text') row.text ||= '';
@@ -3543,18 +3786,18 @@ function scheduleEditor(item, index, mode, annOptions) {
   const typeOptions = [
     ['announcement', 'Saved announcement'],
     ['text', 'Spoken text'],
-    ['sunoAnnouncement', 'Loud Suno announcement URL'],
+    ['sunoAnnouncement', 'Suno announcement URL'],
     ['song', 'Suno music URL'],
-    ['suno', 'Suno track or playlist URL'],
+    ['suno', 'Suno URL'],
     ['spotify', 'Spotify URL']
   ].map(([value, label]) => `<option value="${value}" ${kind === value ? 'selected' : ''}>${esc(label)}</option>`).join('');
   const body = ['text', 'sunoAnnouncement', 'song', 'suno', 'spotify'].includes(kind)
-    ? `<label>${scheduleBodyLabel(kind)}<textarea data-body="${key}" placeholder="${esc(scheduleBodyPlaceholder(kind))}">${esc(scheduleBodyValue(item))}</textarea></label>`
+    ? `<label>${scheduleBodyLabel(kind)}<textarea data-body="${key}" data-row-index="${index}" data-schedule-mode="${scheduleMode(mode)}" placeholder="${esc(scheduleBodyPlaceholder(kind))}">${esc(scheduleBodyValue(item))}</textarea></label>`
     : '';
   const saved = kind === 'announcement'
-    ? `<label>Saved Announcement<select data-selann="${key}">${annOptions}</select></label>`
+    ? `<label>Saved Announcement<select data-selann="${key}" data-row-index="${index}" data-schedule-mode="${scheduleMode(mode)}">${annOptions}</select></label>`
     : '';
-  return `<div class="editBox"><div class="grid3"><label>Time<input data-row-time="${key}" type="time" value="${schedTime(item)}"></label><label>Type<select data-kind="${key}" data-kind-row="${index}" data-schedule-mode="${scheduleMode(mode)}">${typeOptions}</select></label><label>Label<input data-label="${key}" value="${esc(item.label)}"></label></div>${body}${saved}<button data-save-row="${index}" data-schedule-mode="${scheduleMode(mode)}">Save Item</button></div>`;
+  return `<div class="editBox"><div class="grid3"><label>Time<input data-row-time="${key}" data-row-index="${index}" data-schedule-mode="${scheduleMode(mode)}" type="time" value="${schedTime(item)}"></label><label>Type<select data-kind="${key}" data-kind-row="${index}" data-schedule-mode="${scheduleMode(mode)}">${typeOptions}</select></label><label>Label<input data-label="${key}" data-row-index="${index}" data-schedule-mode="${scheduleMode(mode)}" value="${esc(item.label)}"></label></div>${body}${saved}<button data-save-row="${index}" data-schedule-mode="${scheduleMode(mode)}">Save Item</button></div>`;
 }
 
 function schedulePage(mode = 'daily') {
@@ -3665,6 +3908,21 @@ async function handleReadinessAction(action) {
   }
 }
 
+function bindDraftControls() {
+  for (const id of formDraftIds()) {
+    const el = $(id);
+    if (!el) continue;
+    const update = () => updateFormDraftField(id, el.value);
+    el.addEventListener('input', update);
+    el.addEventListener('change', update);
+  }
+  document.querySelectorAll('[data-row-index][data-schedule-mode]').forEach(el => {
+    const update = () => updateScheduleRowDraft(Number(el.dataset.rowIndex), el.dataset.scheduleMode);
+    el.addEventListener('input', update);
+    el.addEventListener('change', update);
+  });
+}
+
 function bind() {
   wire('home', async () => {
     S.screen = 'home';
@@ -3753,6 +4011,7 @@ function bind() {
       renderWhenIdle();
     });
   });
+  bindDraftControls();
   wire('playAnyUrl', () => playAnyMusicUrl(val('quickMusicUrl'), true));
   wire('playDefaultSpotify', async () => {
     S.quickMusicUrl = S.spotifyUrl || DEFAULT_SPOTIFY_PLAYLIST;
