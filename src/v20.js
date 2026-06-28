@@ -1,5 +1,5 @@
 const VERSION = '20';
-const DISPLAY_VERSION = 'v20.2';
+const DISPLAY_VERSION = 'v20.3';
 const PIN = '7900';
 const KEY = 'poolside-pulse-v20';
 const DEVICE_KEY = 'poolside-pulse-v20-device-id';
@@ -7,7 +7,7 @@ const HANDLED_KEY = 'poolside-pulse-v20-handled-events';
 const LOG_CLEAR_KEY = 'poolside-pulse-v20-log-cleared-at';
 const RECEIVER_SESSION_KEY = 'poolside-pulse-v20-receiver-session-started-at';
 const SPOTIFY_TOKEN_KEY = 'poolside-pulse-v20-spotify-token';
-const APP_QUERY = '?v=20';
+const APP_QUERY = '?v=20.3';
 const LEGACY_STATE_KEYS = [
   'poolside-pulse-v18',
   'poolside-pulse-v17',
@@ -64,9 +64,9 @@ const DEFAULT_SPOTIFY_DUCKED_VOLUME = 0;
 const DEFAULT_SUNO_VOLUME = MUSIC_VOLUME_PERCENT;
 const SPOTIFY_VOLUME_SLIDER_MAX = 100;
 const SUNO_VOLUME_SLIDER_MAX = 100;
-const DEFAULT_ANNOUNCEMENT_GAIN = 6;
-const MAX_ANNOUNCEMENT_GAIN = 6;
-const V20_VOLUME_DEFAULTS_ID = '2026-06-26-v20-2-spotify33-duck0-live-verified';
+const DEFAULT_ANNOUNCEMENT_GAIN = 1;
+const MAX_ANNOUNCEMENT_GAIN = 1;
+const V20_VOLUME_DEFAULTS_ID = '2026-06-28-v20-3-spotify33-voice100-pause-solid';
 const LIVE_SPOTIFY_VOLUME_APPLY_MS = 550;
 const SPOTIFY_VOLUME_VERIFY_TOLERANCE = 2;
 const EVENT_TTL_MS = 90 * 60 * 1000;
@@ -1348,7 +1348,7 @@ async function runCommand(command) {
   } else if (command.type === 'skip') {
     await skipSelected(false);
   } else if (command.type === 'spotify-volume') {
-    const result = await enforceSpotifyBedVolume('remote volume command', '', { attempts: 2, preferKnown: true, preferActive: true, preferPoolside: true, allowStart: false });
+    const result = await enforceSpotifyBedVolume('remote volume command', '', { attempts: 2, preferKnown: true, preferPoolside: true, allowStart: false });
     S.intent = S.intent || 'playing';
     setSpotifyStatus(`Spotify volume verified at ${S.spotifyVolume}% on this receiver.`, true);
     logEvent('spotify', 'Spotify volume verified on receiver', `${S.spotifyVolume}% via ${result.method || 'receiver'}${result.actualVolume !== undefined ? `; Spotify reports ${result.actualVolume}%` : ''}`, { eventId: command.id, commandType: command.type });
@@ -1696,8 +1696,9 @@ async function pauseSpotifyForSunoPlayback() {
   if (S.activeMusicProvider !== 'spotify' && S.musicProvider !== 'spotify' && !S.spotifyDeviceId && !spotifyPlayer) return;
   let state = null;
   try { state = await spotifyPlaybackState(); } catch {}
-  const deviceId = state?.deviceId || spotifyWebDeviceId || S.spotifyDeviceId || '';
-  if (!state?.isPlaying && !spotifyPlayer && !deviceId) return;
+  const stateIsReceiver = state?.deviceId && isSavedReceiverDevice({ id: state.deviceId, name: state.name });
+  const deviceId = stateIsReceiver ? state.deviceId : savedReceiverDeviceId();
+  if (!(stateIsReceiver && state?.isPlaying) && !spotifyPlayer && !deviceId) return;
   const method = await pauseSpotifyForAnnouncement(deviceId);
   if (method) {
     S.spotifyStatus = `Spotify paused while Suno plays.`;
@@ -1974,7 +1975,7 @@ function audioSettingsPayload() {
 
 function audioSettingsDetail() {
   const audio = audioSettingsPayload();
-  return `music during announcements ${audio.spotifyDuckedVolume}%; Suno ${audio.sunoVolume}%; announcements ${Math.round(audio.announcementGain * 100)}%; speed ${audio.rate}; pitch ${audio.pitch}`;
+  return `Spotify pause/restore for voice; Suno ${audio.sunoVolume}%; voice ${Math.round(audio.announcementGain * 100)}%; speed ${audio.rate}; pitch ${audio.pitch}`;
 }
 
 function applyReceiverAudioSettings(reason = 'local setting', options = {}) {
@@ -2039,7 +2040,7 @@ async function sendSpotifyVolumeCommand(volume, options = {}) {
     volume: safeVolume,
     live: !!options.live,
     label: `${options.live ? 'Preview' : 'Set'} Spotify volume to ${safeVolume}%`,
-    detail: `Spotify music volume ${safeVolume}%; announcements stay at full announcement volume.`
+    detail: `Spotify music volume ${safeVolume}%; voice stays at 100% receiver volume.`
   });
   if (!options.live) {
     logEvent('command', 'Set Spotify volume', `${safeVolume}%`, { commandType: 'spotify-volume', eventId: event.id });
@@ -2068,7 +2069,6 @@ async function applySpotifyVolume(push = true, options = {}) {
   const result = await enforceSpotifyBedVolume(options.live ? 'live local volume slider' : 'local volume control', '', {
     attempts: options.live ? 1 : 2,
     preferKnown: true,
-    preferActive: true,
     preferPoolside: true,
     allowStart: false,
     log: !options.live
@@ -2285,6 +2285,22 @@ function isIOSLikeBrowser() {
     (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
 }
 
+function isPoolsideReceiverName(name = '') {
+  return /poolside pulse|serenity shores/i.test(String(name || ''));
+}
+
+function savedReceiverDeviceId() {
+  return String((S.screen === 'home' && spotifyWebDeviceId) || S.spotifyDeviceId || '').trim();
+}
+
+function isSavedReceiverDevice(device) {
+  if (!device?.id || device.is_restricted) return false;
+  const id = String(device.id);
+  const saved = String(S.spotifyDeviceId || '');
+  const sdk = String(spotifyWebDeviceId || '');
+  return (!!sdk && id === sdk) || (!!saved && id === saved) || isPoolsideReceiverName(device.name);
+}
+
 async function spotifyDevices() {
   const data = await spotifyApi('GET', '/me/player/devices');
   return Array.isArray(data.devices) ? data.devices : [];
@@ -2342,7 +2358,7 @@ function registerSpotifyListeners() {
     spotifyPlayerReady = true;
     spotifyWebDeviceId = device_id;
     S.spotifyDeviceId = device_id;
-    S.spotifyDeviceName = 'Poolside Pulse V20 Receiver';
+    S.spotifyDeviceName = 'Poolside Pulse V20.3 Receiver';
     S.spotifyReceiverReadyAt = Date.now();
     S.receiverStatus = 'Spotify receiver ready.';
     S.receiverLastSeen = stamp();
@@ -2387,7 +2403,7 @@ async function primeSpotifyPlayer() {
   spotifyPrimePromise = (async () => {
     const Spotify = await ensureSpotifySdk();
     spotifyPlayer = new Spotify.Player({
-      name: 'Poolside Pulse V20 Receiver',
+      name: 'Poolside Pulse V20.3 Receiver',
       getOAuthToken: callback => spotifyAccessToken().then(callback).catch(error => setSpotifyStatus(`Spotify token failed: ${error.message}`, false)),
       volume: clampNumber(S.spotifyVolume, 0, SPOTIFY_VOLUME_SLIDER_MAX, DEFAULT_SPOTIFY_VOLUME) / 100
     });
@@ -2461,26 +2477,17 @@ async function startSpotifyReceiver({ fromTap = false } = {}) {
     if (!ok) throw Error('Spotify receiver did not connect.');
     deviceId = await waitForSpotifyReady();
   } catch (error) {
-    const current = await spotifyCurrentPlaybackDevice();
-    if (current?.deviceId) {
-      deviceId = current.deviceId;
-      S.spotifyNeedsTap = false;
-      S.receiverStatus = 'Spotify receiver active.';
-      setSpotifyStatus(`Using active Spotify device: ${current.name}.`, true);
-      logEvent('spotify', 'Using active Spotify playback device', `${current.name}; ${error.message || error}`);
-    } else {
-      spotifyPlayerReady = false;
-      spotifyWebDeviceId = '';
-      S.spotifyDeviceId = '';
-      S.spotifyNeedsTap = true;
-      S.receiverStatus = 'Spotify receiver not ready on this phone.';
-      setSpotifyStatus(`Spotify did not start on this iPhone browser: ${error.message || error}. Keep Home open and tap Start Receiver + Play Spotify again.`, false);
-      localSave();
-      throw error;
-    }
+    spotifyPlayerReady = false;
+    spotifyWebDeviceId = '';
+    S.spotifyDeviceId = '';
+    S.spotifyNeedsTap = true;
+    S.receiverStatus = 'Spotify receiver not ready on this phone.';
+    setSpotifyStatus(`Spotify did not start on this iPhone browser: ${error.message || error}. Keep Home open on the speaker-connected iPhone and tap Start Receiver + Play Spotify again.`, false);
+    localSave();
+    throw error;
   }
   S.spotifyDeviceId = deviceId;
-  S.spotifyDeviceName = S.spotifyDeviceName || 'Poolside Pulse V20 Receiver';
+  S.spotifyDeviceName = S.spotifyDeviceName || 'Poolside Pulse V20.3 Receiver';
   S.spotifyReceiverReadyAt = Date.now();
   S.receiverStatus = 'Spotify receiver active.';
   S.receiverLastSeen = stamp();
@@ -2511,18 +2518,21 @@ async function spotifyPreferredDeviceId(options = {}) {
     const devices = await spotifyDevices();
     S.spotifyDevicesSummary = devices.length ? `Devices: ${devices.map(device => `${device.name || 'Unnamed'}${device.is_active ? ' active' : ''}`).join(', ')}` : 'Devices: none returned yet';
     const usable = devices.filter(device => device?.id && !device.is_restricted);
-    const active = options.preferActive !== false
-      ? usable.find(device => device.is_active)
-      : null;
     const known = options.preferKnown && S.spotifyDeviceId
       ? usable.find(device => String(device.id) === String(S.spotifyDeviceId))
       : null;
-    const poolside = options.preferPoolside !== false
-      ? usable.find(device => /poolside pulse|serenity shores/i.test(device.name || ''))
+    const sdk = spotifyWebDeviceId
+      ? usable.find(device => String(device.id) === String(spotifyWebDeviceId))
       : null;
-    const selected = active || known || poolside || null;
+    const poolside = options.preferPoolside !== false
+      ? usable.find(device => isPoolsideReceiverName(device.name))
+      : null;
+    const active = options.allowActiveFallback === true
+      ? usable.find(device => device.is_active)
+      : null;
+    const selected = sdk || known || poolside || active || null;
     if (!selected) return '';
-    const label = selected.is_active ? 'active Spotify device' : 'known Spotify device';
+    const label = selected.is_active ? 'active receiver device' : 'saved receiver device';
     return setSpotifyDevice(selected, `Using ${label}: ${selected.name || 'Spotify device'}.`);
   } catch (error) {
     logEvent('spotify', 'Spotify device lookup failed', error.message || String(error));
@@ -2537,9 +2547,11 @@ async function spotifyCurrentPlaybackDevice(options = {}) {
     const device = player?.device;
     if (!device?.id || device.is_restricted) return null;
     if (options.requirePlaying && !player?.is_playing) return null;
-    S.spotifyDeviceId = device.id;
-    S.spotifyDeviceName = device.name || S.spotifyDeviceName || 'Spotify device';
-    S.spotifyReceiverReadyAt = Date.now();
+    if (isSavedReceiverDevice(device) || options.allowActiveFallback === true) {
+      S.spotifyDeviceId = device.id;
+      S.spotifyDeviceName = device.name || S.spotifyDeviceName || 'Spotify device';
+      S.spotifyReceiverReadyAt = Date.now();
+    }
     if (Number.isFinite(Number(device.volume_percent))) {
       S.spotifyDevicesSummary = `Active device: ${device.name || 'Spotify device'} at ${device.volume_percent}%`;
     }
@@ -2563,8 +2575,10 @@ async function spotifyCurrentPlaybackDevice(options = {}) {
 async function spotifyTargetDevice(options = {}) {
   if (S.screen === 'home') {
     if (spotifyPlayerReady && spotifyWebDeviceId) return spotifyWebDeviceId;
+    const saved = savedReceiverDeviceId();
+    if (saved && options.allowStart === false) return saved;
     const current = await spotifyCurrentPlaybackDevice({ requirePlaying: !!options.requirePlaying });
-    if (current?.deviceId) return current.deviceId;
+    if (current?.deviceId && isSavedReceiverDevice({ id: current.deviceId, name: current.name })) return current.deviceId;
     if (options.allowStart === false) return '';
     if (spotifyLoggedIn()) {
       try {
@@ -2577,7 +2591,7 @@ async function spotifyTargetDevice(options = {}) {
   }
   if (options.preferKnown && S.spotifyDeviceId) return S.spotifyDeviceId;
   if (options.preferActive || options.preferPoolside) {
-    const preferred = await spotifyPreferredDeviceId(options);
+    const preferred = await spotifyPreferredDeviceId({ ...options, allowActiveFallback: options.allowActiveFallback === true });
     if (preferred) return preferred;
   }
   if (options.allowStart === false) return '';
@@ -2629,9 +2643,10 @@ async function spotifyVolumeSnapshot(targetDeviceId = '') {
     const usable = devices.filter(device => device?.id && !device.is_restricted);
     const selected =
       (target ? usable.find(device => String(device.id) === target) : null) ||
-      usable.find(device => device.is_active) ||
       (S.spotifyDeviceId ? usable.find(device => String(device.id) === String(S.spotifyDeviceId)) : null) ||
-      usable.find(device => /poolside pulse|serenity shores/i.test(device.name || '')) ||
+      (spotifyWebDeviceId ? usable.find(device => String(device.id) === String(spotifyWebDeviceId)) : null) ||
+      usable.find(device => isPoolsideReceiverName(device.name)) ||
+      (!target ? usable.find(device => device.is_active) : null) ||
       null;
     if (selected && Number.isFinite(Number(selected.volume_percent))) {
       return {
@@ -2666,9 +2681,9 @@ async function verifySpotifyVolume(percent, targetDeviceId = '', options = {}) {
 
 async function pauseSpotifyForAnnouncement(deviceId) {
   let lastError = '';
-  if (spotifyLoggedIn()) {
+  if (spotifyLoggedIn() && deviceId) {
     try {
-      await spotifyApi('PUT', '/me/player/pause', null, deviceId ? { device_id: deviceId } : {});
+      await spotifyApi('PUT', '/me/player/pause', null, { device_id: deviceId });
       return 'Spotify API';
     } catch (error) {
       lastError = error.message || String(error);
@@ -2688,9 +2703,9 @@ async function pauseSpotifyForAnnouncement(deviceId) {
 
 async function resumeSpotifyAfterAnnouncement(deviceId) {
   let lastError = '';
-  if (spotifyLoggedIn()) {
+  if (spotifyLoggedIn() && deviceId) {
     try {
-      await spotifyApi('PUT', '/me/player/play', null, deviceId ? { device_id: deviceId } : {});
+      await spotifyApi('PUT', '/me/player/play', null, { device_id: deviceId });
       return 'Spotify API';
     } catch (error) {
       lastError = error.message || String(error);
@@ -2716,7 +2731,7 @@ async function spotifySetVolume(percent, targetDeviceId = '', options = {}) {
   }
   let activeState = null;
   try {
-    activeState = await spotifyCurrentPlaybackDevice();
+    activeState = await spotifyCurrentPlaybackDevice({ allowActiveFallback: false });
   } catch (error) {
     logEvent('spotify', 'Active Spotify device lookup failed', error.message || String(error));
   }
@@ -2729,11 +2744,15 @@ async function spotifySetVolume(percent, targetDeviceId = '', options = {}) {
     const value = String(id || '').trim();
     if (value && !candidates.includes(value)) candidates.push(value);
   };
-  addCandidate(activeState?.deviceId);
   addCandidate(targetDeviceId);
   addCandidate(spotifyWebDeviceId);
   addCandidate(S.spotifyDeviceId);
-  try { addCandidate((await spotifyPlaybackState())?.deviceId); } catch (error) { lastError = error.message || String(error); }
+  if (activeState?.deviceId && (!targetDeviceId || String(activeState.deviceId) === String(targetDeviceId) || isSavedReceiverDevice({ id: activeState.deviceId, name: activeState.name }))) {
+    addCandidate(activeState.deviceId);
+  }
+  if (options.allowActiveFallback === true) {
+    try { addCandidate((await spotifyPlaybackState())?.deviceId); } catch (error) { lastError = error.message || String(error); }
+  }
   try { addCandidate(await spotifyTargetDevice({ ...options, allowStart: false })); } catch (error) { lastError = error.message || String(error); }
   if (spotifyLoggedIn()) {
     for (const deviceId of candidates) {
@@ -2748,7 +2767,7 @@ async function spotifySetVolume(percent, targetDeviceId = '', options = {}) {
         lastError = error.message || String(error);
       }
     }
-    if (!remoteSet) {
+    if (!remoteSet && options.allowActiveFallback === true) {
       try {
         await spotifyApi('PUT', '/me/player/volume', null, { volume_percent: volume });
         remoteSet = true;
@@ -2760,12 +2779,26 @@ async function spotifySetVolume(percent, targetDeviceId = '', options = {}) {
   }
   if (!localSet && !remoteSet) throw Error(lastError || 'Spotify volume was not accepted by the receiver or Spotify.');
   if (options.verify !== false) {
-    const verifyTarget = targetDeviceId || activeState?.deviceId || S.spotifyDeviceId || spotifyWebDeviceId || '';
+    const verifyTarget = targetDeviceId || spotifyWebDeviceId || S.spotifyDeviceId || (options.allowActiveFallback === true ? activeState?.deviceId : '') || '';
     const verification = await verifySpotifyVolume(volume, verifyTarget, { delayMs: options.verifyDelayMs });
     if (verification.verified) {
       S.spotifyDevicesSummary = `Verified ${verification.name || 'Spotify device'} at ${verification.actualVolume}%`;
       localSave();
       return { localSet, remoteSet, method: `${method || 'Spotify'} + verified`, verified: true, actualVolume: verification.actualVolume, detail: verification.detail };
+    }
+    const localReceiverSet = localSet && S.screen === 'home' && spotifyPlayerReady && spotifyWebDeviceId &&
+      (!verifyTarget || String(verifyTarget) === String(spotifyWebDeviceId) || String(verifyTarget) === String(S.spotifyDeviceId || ''));
+    if (localReceiverSet && options.trustLocalSdk !== false) {
+      S.spotifyDevicesSummary = `Receiver SDK accepted ${volume}% on ${S.spotifyDeviceName || 'Poolside Pulse receiver'}; Spotify did not report device volume.`;
+      localSave();
+      return {
+        localSet,
+        remoteSet,
+        method: `${method || 'receiver SDK'} + trusted receiver SDK`,
+        verified: true,
+        actualVolume: volume,
+        detail: 'The speaker receiver SDK accepted the volume; Spotify did not return a device volume.'
+      };
     }
     if (options.requireVerified === false) {
       return { localSet, remoteSet, method, verified: false, actualVolume: verification.actualVolume, detail: verification.detail };
@@ -2785,7 +2818,6 @@ async function enforceSpotifyBedVolume(reason = 'Spotify bed volume', targetDevi
       lastResult = await spotifySetVolume(volume, targetDeviceId, {
         persist: false,
         preferKnown: true,
-        preferActive: true,
         preferPoolside: true,
         allowStart: false,
         ...options
@@ -2816,7 +2848,6 @@ function startSpotifyDuckHold(deviceId = '', targetVolume = DEFAULT_SPOTIFY_DUCK
     spotifySetVolume(holdVolume, deviceId || S.spotifyDeviceId || spotifyWebDeviceId || '', {
       persist: false,
       preferKnown: true,
-      preferActive: true,
       preferPoolside: true,
       allowStart: false
     }).catch(error => {
@@ -2907,25 +2938,11 @@ async function sendSpotifyPlayback(playUrl, deviceId) {
       played = await spotifyAttempt('resume receiver SDK', () => spotifyPlayer.resume(), errors);
     }
   }
-  if (!played && spotifyRestrictionLike(errors.join(' '))) {
-    played = await spotifyAttempt('play on active Spotify device', () => spotifyApi('PUT', '/me/player/play', body), errors);
-  }
 
   await enforceSpotifyBedVolume('Spotify playback started', target, { attempts: 2, preferKnown: true, allowStart: false }).catch(error => {
     errors.push(`set volume after play: ${spotifyErrorMessage(error)}`);
   });
   if (await spotifyActuallyPlaying(target)) return true;
-
-  if (played && spotifyRestrictionLike(errors.join(' '))) {
-    const active = await spotifyPlaybackState().catch(() => null);
-    if (active?.isPlaying && active.deviceId) {
-      S.spotifyDeviceId = active.deviceId;
-      S.spotifyDeviceName = active.name || S.spotifyDeviceName || 'Spotify device';
-      S.receiverLastSeen = stamp();
-      localSave();
-      return true;
-    }
-  }
 
   const detail = errors.join(' · ');
   if (spotifyRestrictionLike(detail)) {
@@ -2961,7 +2978,7 @@ async function playSpotifyUrl(url = S.spotifyUrl, push = true, options = {}) {
   await pauseSunoForSpotifyPlayback();
   if (!spotifyLoggedIn()) throw actionNeededError('Spotify is not connected on this receiver. Tap Login Spotify on the speaker-connected Home phone.');
   const remotePreferredId = options.fromRemote
-    ? await spotifyTargetDevice({ preferKnown: true, preferActive: true, preferPoolside: true, allowStart: false }).catch(() => '')
+    ? await spotifyTargetDevice({ preferKnown: true, preferPoolside: true, allowStart: false }).catch(() => '')
     : '';
   if (remotePreferredId) {
     try {
@@ -3015,8 +3032,8 @@ async function spotifyPause(push = true) {
     await issueCommand('pause', { label: 'Pause music' }, 'Pause command sent to all active receivers.');
     return;
   }
-  const deviceId = await spotifyTargetDevice({ preferActive: true, preferPoolside: true, allowStart: false });
-  if (!deviceId) throw actionNeededError('Spotify is playing, but this receiver could not identify the active Spotify device. Tap Start Receiver + Play Spotify once, then press Stop again.');
+  const deviceId = await spotifyTargetDevice({ preferKnown: true, preferPoolside: true, allowStart: false });
+  if (!deviceId) throw actionNeededError('Spotify is playing, but this receiver could not identify the speaker-connected Spotify receiver. Tap Start Receiver + Play Spotify once, then press Stop again.');
   await spotifyApi('PUT', '/me/player/pause', null, { device_id: deviceId });
   S.intent = 'paused';
   setManualMusicHold('Spotify paused manually');
@@ -3045,7 +3062,9 @@ async function spotifyNext(push = true) {
     await issueCommand('skip', { label: 'Skip track' }, 'Skip command sent to all active receivers.');
     return;
   }
-  await spotifyApi('POST', '/me/player/next', null, { device_id: await spotifyTargetDevice({ preferKnown: true, preferActive: true, preferPoolside: true }) });
+  const deviceId = await spotifyTargetDevice({ preferKnown: true, preferPoolside: true, allowStart: false });
+  if (!deviceId) throw actionNeededError('Spotify receiver is not ready on this speaker phone. Tap Start Receiver + Play Spotify once, then send Skip again.');
+  await spotifyApi('POST', '/me/player/next', null, { device_id: deviceId });
   S.intent = 'playing';
   setSpotifyStatus('Spotify skipped to next track.', true);
   logEvent('skip', 'Spotify skipped', '');
@@ -3061,9 +3080,10 @@ async function checkSpotifyHealth(renderAfter = true) {
   const devices = await spotifyDevices();
   S.spotifyAccountProduct = String(me.product || 'unknown');
   S.spotifyDevicesSummary = devices.length ? `Devices: ${devices.map(device => `${device.name || 'Unnamed'}${device.is_active ? ' active' : ''}`).join(', ')}` : 'Devices: none returned yet';
-  const active = devices.find(device => device?.id && !device.is_restricted && device.is_active);
+  const active = devices.find(device => device?.id && !device.is_restricted && device.is_active && isPoolsideReceiverName(device.name));
   const known = S.spotifyDeviceId ? devices.find(device => String(device.id) === String(S.spotifyDeviceId)) : null;
-  if (known || active) setSpotifyDevice(known || active, `Spotify device available: ${(known || active).name || 'Spotify device'}.`);
+  const poolside = devices.find(device => device?.id && !device.is_restricted && isPoolsideReceiverName(device.name));
+  if (known || poolside || active) setSpotifyDevice(known || poolside || active, `Spotify receiver available: ${(known || poolside || active).name || 'Spotify device'}.`);
   if (S.spotifyAccountProduct !== 'premium') setSpotifyStatus(`Spotify account is ${S.spotifyAccountProduct}. Web Playback requires Premium.`, false);
   else setSpotifyStatus(`Spotify Premium confirmed. ${S.spotifyDevicesSummary}.`, true);
   logEvent('spotify', 'Spotify health check', `${S.spotifyAccountProduct}; ${S.spotifyDevicesSummary}`);
@@ -3087,15 +3107,16 @@ function releaseCommandReceiver(reason = 'command mode') {
 
 async function duckSpotifyForAnnouncement(options = {}) {
   if (S.musicProvider !== 'spotify') return null;
-  const pauseSpotify = !!options.pauseSpotify;
+  const pauseSpotify = options.pauseSpotify !== false;
   const targetVolume = pauseSpotify
     ? 0
     : clampNumber(S.spotifyDuckedVolume, 0, SPOTIFY_VOLUME_SLIDER_MAX, DEFAULT_SPOTIFY_DUCKED_VOLUME);
   const current = await spotifyCurrentPlaybackDevice({ requirePlaying: true });
+  const currentIsReceiver = current?.deviceId && isSavedReceiverDevice({ id: current.deviceId, name: current.name });
   const snapshot = {
-    volume: current?.volume ?? clampNumber(S.spotifyVolume, 0, SPOTIFY_VOLUME_SLIDER_MAX, DEFAULT_SPOTIFY_VOLUME),
-    wasPlaying: !!current?.isPlaying || S.intent === 'playing',
-    deviceId: current?.deviceId || (S.screen === 'home' ? (spotifyWebDeviceId || S.spotifyDeviceId || '') : (S.spotifyDeviceId || '')),
+    volume: currentIsReceiver && Number.isFinite(Number(current.volume)) ? current.volume : clampNumber(S.spotifyVolume, 0, SPOTIFY_VOLUME_SLIDER_MAX, DEFAULT_SPOTIFY_VOLUME),
+    wasPlaying: (!!currentIsReceiver && !!current?.isPlaying) || S.intent === 'playing',
+    deviceId: currentIsReceiver ? current.deviceId : savedReceiverDeviceId(),
     targetVolume,
     pausedForDuck: false,
     duckMethod: ''
@@ -3106,7 +3127,7 @@ async function duckSpotifyForAnnouncement(options = {}) {
       logEvent('spotify', 'Spotify duck skipped', 'Receiver has no Spotify token, device, or local Spotify player.');
       return null;
     }
-    const deviceId = snapshot.deviceId || await spotifyTargetDevice({ preferActive: true, preferPoolside: true, allowStart: false, requirePlaying: true });
+    const deviceId = snapshot.deviceId || await spotifyTargetDevice({ preferKnown: true, preferPoolside: true, allowStart: false, requirePlaying: true });
     if (!deviceId && !spotifyPlayer) {
       logEvent('spotify', 'Spotify duck skipped', 'No active Spotify playback device was reported for this receiver.');
       return null;
@@ -3127,12 +3148,12 @@ async function duckSpotifyForAnnouncement(options = {}) {
     let remoteError = '';
     let appliedMethod = '';
     try {
-      const result = await spotifySetVolume(targetVolume, deviceId, { persist: false, preferKnown: true, preferActive: true, preferPoolside: true, allowStart: false });
+      const result = await spotifySetVolume(targetVolume, deviceId, { persist: false, preferKnown: true, preferPoolside: true, allowStart: false });
       localSet = !!result.localSet;
       remoteSet = !!result.remoteSet;
       appliedMethod = result.method || '';
       await wait(250);
-      const repeat = await spotifySetVolume(targetVolume, deviceId, { persist: false, preferKnown: true, preferActive: true, preferPoolside: true, allowStart: false }).catch(() => null);
+      const repeat = await spotifySetVolume(targetVolume, deviceId, { persist: false, preferKnown: true, preferPoolside: true, allowStart: false }).catch(() => null);
       localSet = localSet || !!repeat?.localSet;
       remoteSet = remoteSet || !!repeat?.remoteSet;
       appliedMethod = repeat?.method || appliedMethod;
@@ -3187,7 +3208,7 @@ async function restoreSpotifyAfterAnnouncement(snapshot) {
     let restoreError = '';
     S.spotifyVolume = restoreVolume;
     try {
-      await enforceSpotifyBedVolume('pre-resume restore', snapshot.deviceId || '', { attempts: 1, preferKnown: true, preferActive: true, preferPoolside: true, allowStart: false });
+      await enforceSpotifyBedVolume('pre-resume restore', snapshot.deviceId || '', { attempts: 1, preferKnown: true, preferPoolside: true, allowStart: false });
     } catch (error) {
       restoreError = error.message || String(error);
       logEvent('spotify', 'Spotify restore volume failed', restoreError);
@@ -3199,7 +3220,7 @@ async function restoreSpotifyAfterAnnouncement(snapshot) {
           S.intent = 'playing';
           logEvent('spotify', 'Spotify resumed after announcement', resumeMethod);
           try {
-            await enforceSpotifyBedVolume('post-resume restore', snapshot.deviceId || '', { attempts: 2, preferKnown: true, preferActive: true, preferPoolside: true, allowStart: false });
+            await enforceSpotifyBedVolume('post-resume restore', snapshot.deviceId || '', { attempts: 2, preferKnown: true, preferPoolside: true, allowStart: false });
           } catch (error) {
             restoreError = restoreError || error.message || String(error);
             logEvent('spotify', 'Spotify post-resume volume failed', error.message || String(error));
@@ -3212,7 +3233,7 @@ async function restoreSpotifyAfterAnnouncement(snapshot) {
         } catch {}
         S.intent = 'playing';
         try {
-          await enforceSpotifyBedVolume('active Spotify restore', snapshot.deviceId || '', { attempts: 2, preferKnown: true, preferActive: true, preferPoolside: true, allowStart: false });
+          await enforceSpotifyBedVolume('active Spotify restore', snapshot.deviceId || '', { attempts: 2, preferKnown: true, preferPoolside: true, allowStart: false });
         } catch (error) {
           restoreError = restoreError || error.message || String(error);
           logEvent('spotify', 'Spotify active restore volume failed', error.message || String(error));
@@ -3591,7 +3612,7 @@ async function performAnnouncement(text, options = {}) {
     await ensureReceiverAudio('announcement', { required: true });
     if (voiceBlob) {
       await playAnnouncementBlob(voiceBlob);
-      setFeedback(`AI voice announcement completed at ${Math.round(Number(S.announcementGain || 1) * 100)}% boost.`, true);
+      setFeedback(`AI voice announcement completed at ${Math.round(Number(S.announcementGain || 1) * 100)}% receiver volume.`, true);
     } else {
       if (aiError) logEvent('voice', 'AI voice fallback', aiError);
       await playDeviceSpeech(message);
@@ -4185,7 +4206,7 @@ function receiverReadiness() {
   if (S.spotifyAccountProduct && S.spotifyAccountProduct !== 'premium') return `Spotify Premium needed: ${S.spotifyAccountProduct}.`;
   if (!spotifyDeviceReady()) return 'Tap Start Receiver + Play Spotify on this phone.';
   if (spotifyPlayerReady && spotifyWebDeviceId) return `Ready: ${S.spotifyDeviceName || 'Poolside Pulse receiver'}.`;
-  return `Ready: ${S.spotifyDeviceName || 'active Spotify device'}.`;
+  return `Ready: ${S.spotifyDeviceName || 'Poolside receiver'}.`;
 }
 
 function spotifyDeviceReady() {
@@ -4234,7 +4255,7 @@ function statusCards() {
   const inbox = S.screen === 'home'
     ? recentEvents(S.events).filter(shouldProcessEvent).length
     : recentEvents(S.events).filter(event => eventTime(event) >= startedAt - RECEIVER_EVENT_GRACE_MS).length;
-  return `<div class="stats"><div class="stat"><b>Spotify Bed</b><strong>${esc(sourceLabel('spotify', activeProviderUrl()))}</strong></div><div class="stat"><b>Receiver</b><strong>${esc(S.screen === 'home' ? receiverReadiness() : (S.receiverStatus || 'No receiver report yet.'))}</strong></div><div class="stat"><b>Remote</b><strong>Event inbox ${inbox}</strong></div><div class="stat"><b>Announcements</b><strong>${Math.round(Number(S.announcementGain || 1) * 100)}% / music ${esc(S.spotifyDuckedVolume)}%</strong></div></div>`;
+  return `<div class="stats"><div class="stat"><b>Spotify Bed</b><strong>${esc(sourceLabel('spotify', activeProviderUrl()))}</strong></div><div class="stat"><b>Receiver</b><strong>${esc(S.screen === 'home' ? receiverReadiness() : (S.receiverStatus || 'No receiver report yet.'))}</strong></div><div class="stat"><b>Remote</b><strong>Event inbox ${inbox}</strong></div><div class="stat"><b>Voice</b><strong>${Math.round(Number(S.announcementGain || 1) * 100)}% / Spotify pauses</strong></div></div>`;
 }
 
 function readinessSteps() {
@@ -4290,7 +4311,7 @@ function homePage() {
 
 function commandPage() {
   const selected = ann();
-  return shell(`<section class="commandConsole"><div><p class="eyebrow">Live Control</p><h1>Command</h1><p>Command devices send instructions to every active receiver. Speaker phones stay on Home and play all sound.</p></div>${statusCards()}</section><section class="panel controlDeck"><div class="sectionHead"><h2>Receiver Controls</h2><span class="pill ${S.receiverStatus && !receiverActionNeeded(S.receiverStatus) ? 'good' : 'warn'}">${esc(S.receiverStatus || 'No receiver report yet')}</span></div><div class="bigControls"><button id="playCmd">Play / Resume</button><button id="pauseCmd" class="secondary">Pause</button><button id="skipCmd" class="secondary">Skip</button><button id="stopCmd" class="danger">Stop</button><button id="checkWeatherCmd" class="secondary">Check Weather</button></div><div class="volumeStrip"><label><span>Spotify Volume <output id="spotifyVolumeCommandOut">${esc(S.spotifyVolume)}%</output></span><input id="spotifyVolumeCommand" type="range" min="0" max="${SPOTIFY_VOLUME_SLIDER_MAX}" step="1" value="${esc(S.spotifyVolume)}"></label><button id="spotifyVolumeApply" class="secondary">Set Volume on Receivers</button><small>Announcements keep their separate loud boost.</small></div><div class="quickMusic"><label>Play Spotify or Suno Cue URL<input id="quickMusicUrl" value="${esc(S.quickMusicUrl || activeProviderUrl())}" placeholder="Paste Spotify, Suno, or direct audio URL"></label><div class="buttonStack"><button id="playAnyUrl">Play Pasted URL</button><button id="playDefaultSpotify" class="secondary">Default Spotify</button><button id="playDefaultSuno" class="secondary">Saved Suno Cue</button></div></div><div class="splitControls"><label>Announcement<textarea id="quickText">${esc(S.quickText || selected.text)}</textarea></label><div><label>Saved Announcement<select id="quickTemplate">${S.anns.map(item => `<option value="${item.id}" ${item.id === S.selected ? 'selected' : ''}>${esc(item.label)} · ${item.mode === 'suno' ? 'Suno' : 'Voice'}</option>`).join('')}</select></label><div class="buttonStack"><button id="quickPlay">${selected.mode === 'suno' ? 'Play Announcement Track' : 'Speak Now'}</button><button id="quickHold" class="secondary">${selected.mode === 'suno' ? 'Track as Safety Hold' : 'Speak as Safety Hold'}</button><button id="lightningNow" class="secondary">Lightning Hold</button><button id="windNow" class="secondary">Wind Umbrellas</button></div></div></div></section><section class="panel compactLog"><div class="sectionHead"><h2>Receiver Activity</h2><button id="clearLog" class="secondary">Clear Local Log</button></div>${logRows()}</section>`);
+  return shell(`<section class="commandConsole"><div><p class="eyebrow">Live Control</p><h1>Command</h1><p>Command devices send instructions to every active receiver. Speaker phones stay on Home and play all sound.</p></div>${statusCards()}</section><section class="panel controlDeck"><div class="sectionHead"><h2>Receiver Controls</h2><span class="pill ${S.receiverStatus && !receiverActionNeeded(S.receiverStatus) ? 'good' : 'warn'}">${esc(S.receiverStatus || 'No receiver report yet')}</span></div><div class="bigControls"><button id="playCmd">Play / Resume</button><button id="pauseCmd" class="secondary">Pause</button><button id="skipCmd" class="secondary">Skip</button><button id="stopCmd" class="danger">Stop</button><button id="checkWeatherCmd" class="secondary">Check Weather</button></div><div class="volumeStrip"><label><span>Spotify Volume <output id="spotifyVolumeCommandOut">${esc(S.spotifyVolume)}%</output></span><input id="spotifyVolumeCommand" type="range" min="0" max="${SPOTIFY_VOLUME_SLIDER_MAX}" step="1" value="${esc(S.spotifyVolume)}"></label><button id="spotifyVolumeApply" class="secondary">Set Volume on Receivers</button><small>Voice plays at 100%; Spotify pauses and resumes on the Home receiver.</small></div><div class="quickMusic"><label>Play Spotify or Suno Cue URL<input id="quickMusicUrl" value="${esc(S.quickMusicUrl || activeProviderUrl())}" placeholder="Paste Spotify, Suno, or direct audio URL"></label><div class="buttonStack"><button id="playAnyUrl">Play Pasted URL</button><button id="playDefaultSpotify" class="secondary">Default Spotify</button><button id="playDefaultSuno" class="secondary">Saved Suno Cue</button></div></div><div class="splitControls"><label>Announcement<textarea id="quickText">${esc(S.quickText || selected.text)}</textarea></label><div><label>Saved Announcement<select id="quickTemplate">${S.anns.map(item => `<option value="${item.id}" ${item.id === S.selected ? 'selected' : ''}>${esc(item.label)} · ${item.mode === 'suno' ? 'Suno' : 'Voice'}</option>`).join('')}</select></label><div class="buttonStack"><button id="quickPlay">${selected.mode === 'suno' ? 'Play Announcement Track' : 'Speak Now'}</button><button id="quickHold" class="secondary">${selected.mode === 'suno' ? 'Track as Safety Hold' : 'Speak as Safety Hold'}</button><button id="lightningNow" class="secondary">Lightning Hold</button><button id="windNow" class="secondary">Wind Umbrellas</button></div></div></div></section><section class="panel compactLog"><div class="sectionHead"><h2>Receiver Activity</h2><button id="clearLog" class="secondary">Clear Local Log</button></div>${logRows()}</section>`);
 }
 
 function spotifyDiagnostics() {
@@ -4307,7 +4328,7 @@ function musicPage() {
 
 function musicPageV20() {
   const sunoReady = String(S.playlistUrl || '').trim();
-  return shell(`<section class="panel"><div class="panelHeader"><div><p class="eyebrow">Music Control</p><h1>Music</h1></div><button id="saveMusic">Save</button></div><div class="sourceBoard"><div class="sourceTile"><b>Spotify Bed</b><strong>${esc(sourceLabel('spotify', activeProviderUrl()))}</strong><span>${esc(S.spotifyUrl || DEFAULT_SPOTIFY_PLAYLIST)}</span></div><div class="sourceTile"><b>Suno Cue</b><strong>${esc(sunoReady ? sourceLabel('suno', S.playlistUrl) : 'No saved cue')}</strong><span>${esc(sunoReady ? S.playlistUrl : 'Paste a Suno song, playlist, or direct audio URL below.')}</span></div><div class="sourceTile"><b>Balance</b><strong>${esc(S.spotifyDuckedVolume)}% music under voice</strong><span>${Math.round(Number(S.announcementGain || 1) * 100)}% voice; Suno pauses Spotify</span></div></div><div class="buttonStack"><button id="spotifyPlayNow">Play Spotify on Receivers</button><button id="sunoPlayNow" class="secondary">Play Saved Suno Cue</button></div><div class="quickMusic"><label>Play Spotify or Suno Cue URL<input id="quickMusicUrl" value="${esc(S.quickMusicUrl || S.spotifyUrl || DEFAULT_SPOTIFY_PLAYLIST)}" placeholder="Paste Spotify, Suno, or direct audio URL"></label><div class="buttonStack"><button id="playAnyUrl">Play Pasted URL</button><button id="savePastedUrl" class="secondary">Save URL</button></div></div><div class="grid2"><label>Station Name<input id="playlistName" value="${esc(S.playlistName)}"></label><label>Spotify Playlist or Track URL<input id="spotifyUrl" value="${esc(S.spotifyUrl)}" placeholder="https://open.spotify.com/playlist/..."></label></div><label>Saved Suno Cue URL<input id="playlistUrl" value="${esc(S.playlistUrl)}" placeholder="Paste a Suno song, playlist, or direct audio URL"></label><div class="grid2"><label>Spotify Client ID<input id="spotifyClientId" value="${esc(S.spotifyClientId)}"></label><label>Spotify Redirect URI<input id="spotifyRedirectUri" value="${esc(spotifyRedirectUri())}"></label></div><div class="grid4"><label><span>Spotify Volume <output id="spotifyVolumeOut">${esc(S.spotifyVolume)}%</output></span><input id="spotifyVolume" type="range" min="0" max="${SPOTIFY_VOLUME_SLIDER_MAX}" step="1" value="${esc(S.spotifyVolume)}"></label><label><span>Spotify During Voice <output id="spotifyDuckedVolumeOut">${esc(S.spotifyDuckedVolume)}%</output></span><input id="spotifyDuckedVolume" type="range" min="0" max="${SPOTIFY_VOLUME_SLIDER_MAX}" step="1" value="${esc(S.spotifyDuckedVolume)}"></label><label><span>Suno Cue Volume <output id="sunoVolumeOut">${esc(S.sunoVolume)}%</output></span><input id="sunoVolume" type="range" min="0" max="${SUNO_VOLUME_SLIDER_MAX}" step="1" value="${esc(S.sunoVolume)}"></label><label><span>Announcement Boost <output id="announcementGainOut">${Math.round(Number(S.announcementGain || 1) * 100)}%</output></span><input id="announcementGain" type="range" min="1" max="${MAX_ANNOUNCEMENT_GAIN}" step=".05" value="${esc(S.announcementGain)}"></label></div>${spotifyDiagnostics()}<div class="actions"><button id="spotifyLogin" class="secondary">Login with Spotify</button><button id="spotifyCheck" class="secondary">Check Spotify</button><button id="spotifyClear" class="secondary">Clear Spotify</button><button id="import" class="secondary">Check Suno URL</button></div></section>`);
+  return shell(`<section class="panel"><div class="panelHeader"><div><p class="eyebrow">Music Control</p><h1>Music</h1></div><button id="saveMusic">Save</button></div><div class="sourceBoard"><div class="sourceTile"><b>Spotify Bed</b><strong>${esc(sourceLabel('spotify', activeProviderUrl()))}</strong><span>${esc(S.spotifyUrl || DEFAULT_SPOTIFY_PLAYLIST)}</span></div><div class="sourceTile"><b>Suno Cue</b><strong>${esc(sunoReady ? sourceLabel('suno', S.playlistUrl) : 'No saved cue')}</strong><span>${esc(sunoReady ? S.playlistUrl : 'Paste a Suno song, playlist, or direct audio URL below.')}</span></div><div class="sourceTile"><b>Balance</b><strong>Voice pauses Spotify</strong><span>Spotify bed ${esc(S.spotifyVolume)}%; voice ${Math.round(Number(S.announcementGain || 1) * 100)}%</span></div></div><div class="buttonStack"><button id="spotifyPlayNow">Play Spotify on Receivers</button><button id="sunoPlayNow" class="secondary">Play Saved Suno Cue</button></div><div class="quickMusic"><label>Play Spotify or Suno Cue URL<input id="quickMusicUrl" value="${esc(S.quickMusicUrl || S.spotifyUrl || DEFAULT_SPOTIFY_PLAYLIST)}" placeholder="Paste Spotify, Suno, or direct audio URL"></label><div class="buttonStack"><button id="playAnyUrl">Play Pasted URL</button><button id="savePastedUrl" class="secondary">Save URL</button></div></div><div class="grid2"><label>Station Name<input id="playlistName" value="${esc(S.playlistName)}"></label><label>Spotify Playlist or Track URL<input id="spotifyUrl" value="${esc(S.spotifyUrl)}" placeholder="https://open.spotify.com/playlist/..."></label></div><label>Saved Suno Cue URL<input id="playlistUrl" value="${esc(S.playlistUrl)}" placeholder="Paste a Suno song, playlist, or direct audio URL"></label><div class="grid2"><label>Spotify Client ID<input id="spotifyClientId" value="${esc(S.spotifyClientId)}"></label><label>Spotify Redirect URI<input id="spotifyRedirectUri" value="${esc(spotifyRedirectUri())}"></label></div><div class="grid4"><label><span>Spotify Volume <output id="spotifyVolumeOut">${esc(S.spotifyVolume)}%</output></span><input id="spotifyVolume" type="range" min="0" max="${SPOTIFY_VOLUME_SLIDER_MAX}" step="1" value="${esc(S.spotifyVolume)}"></label><label><span>Spotify Under Voice Fallback <output id="spotifyDuckedVolumeOut">${esc(S.spotifyDuckedVolume)}%</output></span><input id="spotifyDuckedVolume" type="range" min="0" max="${SPOTIFY_VOLUME_SLIDER_MAX}" step="1" value="${esc(S.spotifyDuckedVolume)}"></label><label><span>Suno Cue Volume <output id="sunoVolumeOut">${esc(S.sunoVolume)}%</output></span><input id="sunoVolume" type="range" min="0" max="${SUNO_VOLUME_SLIDER_MAX}" step="1" value="${esc(S.sunoVolume)}"></label><label><span>Voice Volume <output id="announcementGainOut">${Math.round(Number(S.announcementGain || 1) * 100)}%</output></span><input id="announcementGain" type="range" min="1" max="${MAX_ANNOUNCEMENT_GAIN}" step=".05" value="${esc(S.announcementGain)}"></label></div>${spotifyDiagnostics()}<div class="actions"><button id="spotifyLogin" class="secondary">Login with Spotify</button><button id="spotifyCheck" class="secondary">Check Spotify</button><button id="spotifyClear" class="secondary">Clear Spotify</button><button id="import" class="secondary">Check Suno URL</button></div></section>`);
 }
 
 function scheduleBodyLabel(kind) {
@@ -4391,7 +4412,7 @@ function voicePage() {
   const receiverAudio = S.screen === 'home'
     ? S.audioStatus
     : (S.receiverStatus || 'Command devices send voice events; the Home receiver plays them.');
-  return shell(`<section class="panel"><div class="panelHeader"><div><p class="eyebrow">Announcement Audio</p><h1>Voice</h1></div><button id="voiceHealth" class="secondary">Check Voice</button></div><div class="statusBar"><b>Voice health:</b> ${esc(S.voiceHealth)}<br><b>Receiver audio:</b> ${esc(receiverAudio)}<br><b>Current boost:</b> ${Math.round(Number(S.announcementGain || 1) * 100)}%</div><div class="grid2"><label>Voice Mode<select id="voiceMode"><option value="ai" ${S.voiceMode === 'ai' ? 'selected' : ''}>AI first, device fallback</option><option value="device" ${S.voiceMode === 'device' ? 'selected' : ''}>Device only</option></select></label><label>AI Voice<select id="aiVoice"><option value="marin" ${S.aiVoice === 'marin' ? 'selected' : ''}>Marin</option><option value="cedar" ${S.aiVoice === 'cedar' ? 'selected' : ''}>Cedar</option><option value="coral" ${S.aiVoice === 'coral' ? 'selected' : ''}>Coral</option><option value="nova" ${S.aiVoice === 'nova' ? 'selected' : ''}>Nova</option><option value="sage" ${S.aiVoice === 'sage' ? 'selected' : ''}>Sage</option><option value="shimmer" ${S.aiVoice === 'shimmer' ? 'selected' : ''}>Shimmer</option><option value="onyx" ${S.aiVoice === 'onyx' ? 'selected' : ''}>Onyx</option></select></label></div><label>Device Voice<select id="deviceVoice"><option value="">Best available</option>${voiceOptions}</select></label><div class="grid3"><label><span>AI Announcement Boost <output id="announcementGainOut">${Math.round(Number(S.announcementGain || 1) * 100)}%</output></span><input id="announcementGain" type="range" min="1" max="${MAX_ANNOUNCEMENT_GAIN}" step=".05" value="${esc(S.announcementGain)}"></label><label><span>Speed <output id="rateOut">${esc(S.rate)}</output></span><input id="rate" type="range" min=".75" max="1.15" step=".01" value="${esc(S.rate)}"></label><label><span>Pitch <output id="pitchOut">${esc(S.pitch)}</output></span><input id="pitch" type="range" min=".85" max="1.15" step=".01" value="${esc(S.pitch)}"></label></div><div class="actions"><button id="saveVoice">Save Voice</button><button id="testVoice" class="secondary">Send Voice Test</button><button id="testDevice" class="secondary">Send Device Voice Test</button></div></section>${announcementEditor()}`);
+  return shell(`<section class="panel"><div class="panelHeader"><div><p class="eyebrow">Announcement Audio</p><h1>Voice</h1></div><button id="voiceHealth" class="secondary">Check Voice</button></div><div class="statusBar"><b>Voice health:</b> ${esc(S.voiceHealth)}<br><b>Receiver audio:</b> ${esc(receiverAudio)}<br><b>Voice volume:</b> ${Math.round(Number(S.announcementGain || 1) * 100)}%</div><div class="grid2"><label>Voice Mode<select id="voiceMode"><option value="ai" ${S.voiceMode === 'ai' ? 'selected' : ''}>AI first, device fallback</option><option value="device" ${S.voiceMode === 'device' ? 'selected' : ''}>Device only</option></select></label><label>AI Voice<select id="aiVoice"><option value="marin" ${S.aiVoice === 'marin' ? 'selected' : ''}>Marin</option><option value="cedar" ${S.aiVoice === 'cedar' ? 'selected' : ''}>Cedar</option><option value="coral" ${S.aiVoice === 'coral' ? 'selected' : ''}>Coral</option><option value="nova" ${S.aiVoice === 'nova' ? 'selected' : ''}>Nova</option><option value="sage" ${S.aiVoice === 'sage' ? 'selected' : ''}>Sage</option><option value="shimmer" ${S.aiVoice === 'shimmer' ? 'selected' : ''}>Shimmer</option><option value="onyx" ${S.aiVoice === 'onyx' ? 'selected' : ''}>Onyx</option></select></label></div><label>Device Voice<select id="deviceVoice"><option value="">Best available</option>${voiceOptions}</select></label><div class="grid3"><label><span>AI Voice Volume <output id="announcementGainOut">${Math.round(Number(S.announcementGain || 1) * 100)}%</output></span><input id="announcementGain" type="range" min="1" max="${MAX_ANNOUNCEMENT_GAIN}" step=".05" value="${esc(S.announcementGain)}"></label><label><span>Speed <output id="rateOut">${esc(S.rate)}</output></span><input id="rate" type="range" min=".75" max="1.15" step=".01" value="${esc(S.rate)}"></label><label><span>Pitch <output id="pitchOut">${esc(S.pitch)}</output></span><input id="pitch" type="range" min=".85" max="1.15" step=".01" value="${esc(S.pitch)}"></label></div><div class="actions"><button id="saveVoice">Save Voice</button><button id="testVoice" class="secondary">Send Voice Test</button><button id="testDevice" class="secondary">Send Device Voice Test</button></div></section>${announcementEditor()}`);
 }
 
 function hoursPage() {

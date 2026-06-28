@@ -16,7 +16,7 @@ const VERSIONED_STATE_KEYS = {
 };
 const V18_STALE_SUNO_COMMAND_CUTOFF = 1782483347041;
 const V18_AUDIO_DEFAULTS_ID = '2026-06-26-v18e-spotify2-suno85-duck0-ann500';
-const V20_AUDIO_DEFAULTS_ID = '2026-06-26-v20-2-spotify33-duck0-live-verified';
+const V20_AUDIO_DEFAULTS_ID = '2026-06-28-v20-3-spotify33-voice100-pause-solid';
 const V20_STALE_SPOTIFY_COMMAND_CUTOFF = 1782499126000;
 const V18_STALE_SUNO_TYPES = new Set(['suno-cue', 'suno', 'song']);
 const V20_STALE_SPOTIFY_TYPES = new Set(['spotify-play', 'play']);
@@ -146,14 +146,14 @@ function sanitizeState(state) {
   if (clean[defaultsKey] !== defaultsId) {
     clean.spotifyVolume = version === '20' ? 33 : 2;
     clean.sunoVolume = version === '20' ? 33 : 85;
-    clean.announcementGain = version === '20' ? 6 : 5;
+    clean.announcementGain = version === '20' ? 1 : 5;
     clean.spotifyDuckedVolume = 0;
     clean[defaultsKey] = defaultsId;
   }
   clean.spotifyVolume = clampNumber(clean.spotifyVolume, 0, version === '20' ? 100 : 20, version === '20' ? 33 : 2);
   clean.sunoVolume = clampNumber(clean.sunoVolume, 0, 100, version === '20' ? 33 : 85);
   clean.spotifyDuckedVolume = version === '20' ? clampNumber(clean.spotifyDuckedVolume, 0, 100, 0) : 0;
-  clean.announcementGain = clampNumber(clean.announcementGain, 1, 6, version === '20' ? 6 : 5);
+  clean.announcementGain = clampNumber(clean.announcementGain, 1, version === '20' ? 1 : 6, version === '20' ? 1 : 5);
   return clean;
 }
 

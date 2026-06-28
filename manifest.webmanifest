@@ -1,7 +1,7 @@
 {
-  "name": "Lake123 - Poolside Pulse - Version 20.2",
-  "short_name": "Lake123 V20.2",
-  "start_url": "/?v=20",
+  "name": "Lake123 - Poolside Pulse - Version 20.3",
+  "short_name": "Lake123 V20.3",
+  "start_url": "/?v=20.3",
   "display": "standalone",
   "background_color": "#f6fbfd",
   "theme_color": "#0789a5",
