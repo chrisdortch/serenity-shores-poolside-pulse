@@ -1,5 +1,5 @@
 (() => {
-  const VERSION = '20.3';
+  const VERSION = '20.4';
   let unlocked = false;
   let unlocking = false;
   let unlockPromise = null;
@@ -285,9 +285,18 @@
     const buffer = await decodeAudio(ctx, await blob.arrayBuffer());
     const source = ctx.createBufferSource();
     const gain = ctx.createGain();
+    const limiter = typeof ctx.createDynamicsCompressor === 'function' ? ctx.createDynamicsCompressor() : null;
     gain.gain.value = options.gain;
+    if (limiter) {
+      limiter.threshold.value = -18;
+      limiter.knee.value = 18;
+      limiter.ratio.value = 16;
+      limiter.attack.value = 0.003;
+      limiter.release.value = 0.18;
+    }
     source.buffer = buffer;
-    source.connect(gain).connect(ctx.destination);
+    if (limiter) source.connect(gain).connect(limiter).connect(ctx.destination);
+    else source.connect(gain).connect(ctx.destination);
     return await new Promise((resolve, reject) => {
       let started = false;
       let stopped = false;

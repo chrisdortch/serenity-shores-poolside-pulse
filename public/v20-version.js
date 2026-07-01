@@ -1,7 +1,7 @@
 (() => {
-  const VERSION = '20.3';
-  const TITLE = 'Lake123 - Poolside Pulse - v20.3';
-  const DESCRIPTION = 'Lake123 Poolside Pulse v20.3: command iPhones control the speaker-connected Home iPhone, Spotify bed music defaults to 33%, voice plays at 100%, and announcements pause/restore Spotify for reliable clarity.';
+  const VERSION = '20.4';
+  const TITLE = 'Lake123 - Poolside Pulse - v20.4';
+  const DESCRIPTION = 'Lake123 Poolside Pulse v20.4: command iPhones control the speaker-connected Home iPhone, music is capped low, voice is boosted loudly through receiver Web Audio, and announcements pause/restore Spotify.';
 
   function ensureMeta(name, value) {
     let tag = document.querySelector(`meta[name="${name}"]`);

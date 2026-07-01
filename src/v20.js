@@ -1,5 +1,5 @@
 const VERSION = '20';
-const DISPLAY_VERSION = 'v20.3';
+const DISPLAY_VERSION = 'v20.4';
 const PIN = '7900';
 const KEY = 'poolside-pulse-v20';
 const DEVICE_KEY = 'poolside-pulse-v20-device-id';
@@ -7,7 +7,7 @@ const HANDLED_KEY = 'poolside-pulse-v20-handled-events';
 const LOG_CLEAR_KEY = 'poolside-pulse-v20-log-cleared-at';
 const RECEIVER_SESSION_KEY = 'poolside-pulse-v20-receiver-session-started-at';
 const SPOTIFY_TOKEN_KEY = 'poolside-pulse-v20-spotify-token';
-const APP_QUERY = '?v=20.3';
+const APP_QUERY = '?v=20.4';
 const LEGACY_STATE_KEYS = [
   'poolside-pulse-v18',
   'poolside-pulse-v17',
@@ -58,15 +58,15 @@ const DEFAULT_SUNO_PLAYLIST = '';
 const LEGACY_DELETED_SUNO_PLAYLIST = 'https://suno.com/playlist/cf4b536e-9005-4c98-9ea5-a7f01eca116f';
 const LEGACY_DELETED_SUNO_ID_PATTERN = /cf4b536e-9005/i;
 const DEFAULT_ADDRESS = '615 Serenity Shores Ln, Kimberling City, MO 65686';
-const MUSIC_VOLUME_PERCENT = 33;
+const MUSIC_VOLUME_PERCENT = 15;
 const DEFAULT_SPOTIFY_VOLUME = MUSIC_VOLUME_PERCENT;
 const DEFAULT_SPOTIFY_DUCKED_VOLUME = 0;
 const DEFAULT_SUNO_VOLUME = MUSIC_VOLUME_PERCENT;
-const SPOTIFY_VOLUME_SLIDER_MAX = 100;
-const SUNO_VOLUME_SLIDER_MAX = 100;
-const DEFAULT_ANNOUNCEMENT_GAIN = 1;
-const MAX_ANNOUNCEMENT_GAIN = 1;
-const V20_VOLUME_DEFAULTS_ID = '2026-06-28-v20-3-spotify33-voice100-pause-solid';
+const SPOTIFY_VOLUME_SLIDER_MAX = 33;
+const SUNO_VOLUME_SLIDER_MAX = 33;
+const DEFAULT_ANNOUNCEMENT_GAIN = 10;
+const MAX_ANNOUNCEMENT_GAIN = 12;
+const V20_VOLUME_DEFAULTS_ID = '2026-07-01-v20-4-music15-voice1000-solid';
 const LIVE_SPOTIFY_VOLUME_APPLY_MS = 550;
 const SPOTIFY_VOLUME_VERIFY_TOLERANCE = 2;
 const EVENT_TTL_MS = 90 * 60 * 1000;
@@ -1253,12 +1253,19 @@ async function processEvents() {
 
 function coalesceReceiverEvents(events) {
   let latestSpotifyVolume = '';
+  let latestAudioSettings = '';
   for (const event of events) {
     if (event?.kind === 'command' && event.type === 'spotify-volume') latestSpotifyVolume = event.id;
+    if (event?.kind === 'command' && event.type === 'audio-settings') latestAudioSettings = event.id;
   }
-  if (!latestSpotifyVolume) return events;
+  if (!latestSpotifyVolume && !latestAudioSettings) return events;
   return events.filter(event => {
     if (event?.kind === 'command' && event.type === 'spotify-volume' && event.id !== latestSpotifyVolume) {
+      markHandled(event.id);
+      delete retryAfter[event.id];
+      return false;
+    }
+    if (event?.kind === 'command' && event.type === 'audio-settings' && event.id !== latestAudioSettings) {
       markHandled(event.id);
       delete retryAfter[event.id];
       return false;
@@ -2358,7 +2365,7 @@ function registerSpotifyListeners() {
     spotifyPlayerReady = true;
     spotifyWebDeviceId = device_id;
     S.spotifyDeviceId = device_id;
-    S.spotifyDeviceName = 'Poolside Pulse V20.3 Receiver';
+    S.spotifyDeviceName = 'Poolside Pulse V20.4 Receiver';
     S.spotifyReceiverReadyAt = Date.now();
     S.receiverStatus = 'Spotify receiver ready.';
     S.receiverLastSeen = stamp();
@@ -2403,7 +2410,7 @@ async function primeSpotifyPlayer() {
   spotifyPrimePromise = (async () => {
     const Spotify = await ensureSpotifySdk();
     spotifyPlayer = new Spotify.Player({
-      name: 'Poolside Pulse V20.3 Receiver',
+      name: 'Poolside Pulse V20.4 Receiver',
       getOAuthToken: callback => spotifyAccessToken().then(callback).catch(error => setSpotifyStatus(`Spotify token failed: ${error.message}`, false)),
       volume: clampNumber(S.spotifyVolume, 0, SPOTIFY_VOLUME_SLIDER_MAX, DEFAULT_SPOTIFY_VOLUME) / 100
     });
@@ -2487,7 +2494,7 @@ async function startSpotifyReceiver({ fromTap = false } = {}) {
     throw error;
   }
   S.spotifyDeviceId = deviceId;
-  S.spotifyDeviceName = S.spotifyDeviceName || 'Poolside Pulse V20.3 Receiver';
+  S.spotifyDeviceName = S.spotifyDeviceName || 'Poolside Pulse V20.4 Receiver';
   S.spotifyReceiverReadyAt = Date.now();
   S.receiverStatus = 'Spotify receiver active.';
   S.receiverLastSeen = stamp();
@@ -4255,7 +4262,7 @@ function statusCards() {
   const inbox = S.screen === 'home'
     ? recentEvents(S.events).filter(shouldProcessEvent).length
     : recentEvents(S.events).filter(event => eventTime(event) >= startedAt - RECEIVER_EVENT_GRACE_MS).length;
-  return `<div class="stats"><div class="stat"><b>Spotify Bed</b><strong>${esc(sourceLabel('spotify', activeProviderUrl()))}</strong></div><div class="stat"><b>Receiver</b><strong>${esc(S.screen === 'home' ? receiverReadiness() : (S.receiverStatus || 'No receiver report yet.'))}</strong></div><div class="stat"><b>Remote</b><strong>Event inbox ${inbox}</strong></div><div class="stat"><b>Voice</b><strong>${Math.round(Number(S.announcementGain || 1) * 100)}% / Spotify pauses</strong></div></div>`;
+  return `<div class="stats"><div class="stat"><b>Music</b><strong>${esc(S.spotifyVolume)}% / max ${SPOTIFY_VOLUME_SLIDER_MAX}%</strong></div><div class="stat"><b>Receiver</b><strong>${esc(S.screen === 'home' ? receiverReadiness() : (S.receiverStatus || 'No receiver report yet.'))}</strong></div><div class="stat"><b>Remote</b><strong>Event inbox ${inbox}</strong></div><div class="stat"><b>Voice</b><strong>${Math.round(Number(S.announcementGain || 1) * 100)}% / Spotify pauses</strong></div></div>`;
 }
 
 function readinessSteps() {
@@ -4311,7 +4318,7 @@ function homePage() {
 
 function commandPage() {
   const selected = ann();
-  return shell(`<section class="commandConsole"><div><p class="eyebrow">Live Control</p><h1>Command</h1><p>Command devices send instructions to every active receiver. Speaker phones stay on Home and play all sound.</p></div>${statusCards()}</section><section class="panel controlDeck"><div class="sectionHead"><h2>Receiver Controls</h2><span class="pill ${S.receiverStatus && !receiverActionNeeded(S.receiverStatus) ? 'good' : 'warn'}">${esc(S.receiverStatus || 'No receiver report yet')}</span></div><div class="bigControls"><button id="playCmd">Play / Resume</button><button id="pauseCmd" class="secondary">Pause</button><button id="skipCmd" class="secondary">Skip</button><button id="stopCmd" class="danger">Stop</button><button id="checkWeatherCmd" class="secondary">Check Weather</button></div><div class="volumeStrip"><label><span>Spotify Volume <output id="spotifyVolumeCommandOut">${esc(S.spotifyVolume)}%</output></span><input id="spotifyVolumeCommand" type="range" min="0" max="${SPOTIFY_VOLUME_SLIDER_MAX}" step="1" value="${esc(S.spotifyVolume)}"></label><button id="spotifyVolumeApply" class="secondary">Set Volume on Receivers</button><small>Voice plays at 100%; Spotify pauses and resumes on the Home receiver.</small></div><div class="quickMusic"><label>Play Spotify or Suno Cue URL<input id="quickMusicUrl" value="${esc(S.quickMusicUrl || activeProviderUrl())}" placeholder="Paste Spotify, Suno, or direct audio URL"></label><div class="buttonStack"><button id="playAnyUrl">Play Pasted URL</button><button id="playDefaultSpotify" class="secondary">Default Spotify</button><button id="playDefaultSuno" class="secondary">Saved Suno Cue</button></div></div><div class="splitControls"><label>Announcement<textarea id="quickText">${esc(S.quickText || selected.text)}</textarea></label><div><label>Saved Announcement<select id="quickTemplate">${S.anns.map(item => `<option value="${item.id}" ${item.id === S.selected ? 'selected' : ''}>${esc(item.label)} · ${item.mode === 'suno' ? 'Suno' : 'Voice'}</option>`).join('')}</select></label><div class="buttonStack"><button id="quickPlay">${selected.mode === 'suno' ? 'Play Announcement Track' : 'Speak Now'}</button><button id="quickHold" class="secondary">${selected.mode === 'suno' ? 'Track as Safety Hold' : 'Speak as Safety Hold'}</button><button id="lightningNow" class="secondary">Lightning Hold</button><button id="windNow" class="secondary">Wind Umbrellas</button></div></div></div></section><section class="panel compactLog"><div class="sectionHead"><h2>Receiver Activity</h2><button id="clearLog" class="secondary">Clear Local Log</button></div>${logRows()}</section>`);
+  return shell(`<section class="commandConsole"><div><p class="eyebrow">Live Control</p><h1>Command</h1><p>Command devices send instructions to every active receiver. Speaker phones stay on Home and play all sound.</p></div>${statusCards()}</section><section class="panel controlDeck"><div class="sectionHead"><h2>Receiver Controls</h2><span class="pill ${S.receiverStatus && !receiverActionNeeded(S.receiverStatus) ? 'good' : 'warn'}">${esc(S.receiverStatus || 'No receiver report yet')}</span></div><div class="bigControls"><button id="playCmd">Play / Resume</button><button id="pauseCmd" class="secondary">Pause</button><button id="skipCmd" class="secondary">Skip</button><button id="stopCmd" class="danger">Stop</button><button id="checkWeatherCmd" class="secondary">Check Weather</button></div><div class="volumeStrip"><label><span>Music Volume <output id="spotifyVolumeCommandOut">${esc(S.spotifyVolume)}%</output></span><input id="spotifyVolumeCommand" type="range" min="0" max="${SPOTIFY_VOLUME_SLIDER_MAX}" step="1" value="${esc(S.spotifyVolume)}"></label><label><span>Voice Loudness <output id="announcementGainOut">${Math.round(Number(S.announcementGain || 1) * 100)}%</output></span><input id="announcementGain" type="range" min="1" max="${MAX_ANNOUNCEMENT_GAIN}" step=".25" value="${esc(S.announcementGain)}"></label><button id="spotifyVolumeApply" class="secondary">Set Music + Voice on Receivers</button><small>Music is capped at ${SPOTIFY_VOLUME_SLIDER_MAX}%; voice uses boosted receiver Web Audio and Spotify pauses during announcements.</small></div><div class="quickMusic"><label>Play Spotify or Suno Cue URL<input id="quickMusicUrl" value="${esc(S.quickMusicUrl || activeProviderUrl())}" placeholder="Paste Spotify, Suno, or direct audio URL"></label><div class="buttonStack"><button id="playAnyUrl">Play Pasted URL</button><button id="playDefaultSpotify" class="secondary">Default Spotify</button><button id="playDefaultSuno" class="secondary">Saved Suno Cue</button></div></div><div class="splitControls"><label>Announcement<textarea id="quickText">${esc(S.quickText || selected.text)}</textarea></label><div><label>Saved Announcement<select id="quickTemplate">${S.anns.map(item => `<option value="${item.id}" ${item.id === S.selected ? 'selected' : ''}>${esc(item.label)} · ${item.mode === 'suno' ? 'Suno' : 'Voice'}</option>`).join('')}</select></label><div class="buttonStack"><button id="quickPlay">${selected.mode === 'suno' ? 'Play Announcement Track' : 'Speak Now'}</button><button id="quickHold" class="secondary">${selected.mode === 'suno' ? 'Track as Safety Hold' : 'Speak as Safety Hold'}</button><button id="lightningNow" class="secondary">Lightning Hold</button><button id="windNow" class="secondary">Wind Umbrellas</button></div></div></div></section><section class="panel compactLog"><div class="sectionHead"><h2>Receiver Activity</h2><button id="clearLog" class="secondary">Clear Local Log</button></div>${logRows()}</section>`);
 }
 
 function spotifyDiagnostics() {
@@ -4564,7 +4571,10 @@ function bind() {
   wire('skipCmd', () => skipSelected(true));
   wire('stopCmd', () => stopSelected(true));
   wire('checkWeatherCmd', () => triggerWeatherCheck());
-  wire('spotifyVolumeApply', () => applySpotifyVolume(true));
+  wire('spotifyVolumeApply', async () => {
+    await applySpotifyVolume(true);
+    if ($('announcementGain')) await applyAudioSettings(true);
+  });
   document.querySelectorAll('#spotifyVolumeCommand, #spotifyVolume').forEach(input => {
     const beginRangeEdit = () => markRangeEditing(2500);
     input.onpointerdown = beginRangeEdit;
@@ -4590,6 +4600,7 @@ function bind() {
       markRangeEditing(2500);
       updateRangeDraft(input.id, input.value);
       if (S.screen === 'home') applyReceiverAudioSettings('local slider preview', { log: false });
+      else scheduleAudioSettingsApply();
     };
     input.onchange = () => Promise.resolve((async () => {
       updateRangeDraft(input.id, input.value);
