@@ -16,7 +16,7 @@ const VERSIONED_STATE_KEYS = {
 };
 const V18_STALE_SUNO_COMMAND_CUTOFF = 1782483347041;
 const V18_AUDIO_DEFAULTS_ID = '2026-06-26-v18e-spotify2-suno85-duck0-ann500';
-const V20_AUDIO_DEFAULTS_ID = '2026-07-01-v20-7-ios-shortcut-return-bridge';
+const V20_AUDIO_DEFAULTS_ID = '2026-07-01-v20-8-stale-spotify-device-reset';
 const V20_STALE_SPOTIFY_COMMAND_CUTOFF = 1782499126000;
 const V18_STALE_SUNO_TYPES = new Set(['suno-cue', 'suno', 'song']);
 const V20_STALE_SPOTIFY_TYPES = new Set(['spotify-play', 'play']);
@@ -124,6 +124,10 @@ function staleV18SunoNotice(value) {
   return /Receiver could not start the Suno cue|will retry this music command|not allowed by the user agent/i.test(String(value || ''));
 }
 
+function staleV20SpotifyDeviceNotice(value) {
+  return /device not found|receiver will retry command|receiver will retry event|transfer is not active|not the audible Spotify device/i.test(String(value || ''));
+}
+
 function clampNumber(value, min, max, fallback) {
   const number = Number(value);
   return Math.max(min, Math.min(max, Number.isFinite(number) ? number : fallback));
@@ -141,6 +145,26 @@ function sanitizeState(state) {
   if (staleV18SunoNotice(clean.setupNotice)) clean.setupNotice = '';
   if (staleV18SunoNotice(clean.feedback)) clean.feedback = 'Ready.';
   if (staleV18SunoNotice(clean.lastError)) clean.lastError = '';
+  if (version === '20') {
+    const staleSpotifyDevice = [
+      clean.setupNotice,
+      clean.feedback,
+      clean.lastError,
+      clean.spotifyLastError,
+      clean.spotifyStatus
+    ].some(staleV20SpotifyDeviceNotice);
+    if (staleSpotifyDevice) {
+      clean.setupNotice = '';
+      clean.feedback = 'Ready.';
+      clean.lastError = '';
+      clean.spotifyLastError = '';
+      clean.spotifyStatus = '';
+      clean.spotifyDeviceId = '';
+      clean.spotifyDeviceName = '';
+      clean.spotifyReceiverReadyAt = 0;
+      clean.spotifyNeedsTap = true;
+    }
+  }
   const defaultsKey = version === '20' ? 'v20VolumeDefaultsApplied' : 'v18VolumeDefaultsApplied';
   const defaultsId = version === '20' ? V20_AUDIO_DEFAULTS_ID : V18_AUDIO_DEFAULTS_ID;
   if (clean[defaultsKey] !== defaultsId) {

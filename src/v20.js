@@ -1,5 +1,5 @@
 const VERSION = '20';
-const DISPLAY_VERSION = 'v20.7';
+const DISPLAY_VERSION = 'v20.8';
 const PIN = '7900';
 const KEY = 'poolside-pulse-v20';
 const DEVICE_KEY = 'poolside-pulse-v20-device-id';
@@ -9,7 +9,7 @@ const RECEIVER_SESSION_KEY = 'poolside-pulse-v20-receiver-session-started-at';
 const SPOTIFY_TOKEN_KEY = 'poolside-pulse-v20-spotify-token';
 const IOS_VOLUME_BRIDGE_KEY = 'poolside-pulse-v20-ios-volume-bridge-enabled';
 const IOS_VOLUME_BRIDGE_NAME_KEY = 'poolside-pulse-v20-ios-volume-bridge-name';
-const APP_QUERY = '?v=20.7';
+const APP_QUERY = '?v=20.8';
 const LEGACY_STATE_KEYS = [
   'poolside-pulse-v18',
   'poolside-pulse-v17',
@@ -68,7 +68,7 @@ const SPOTIFY_VOLUME_SLIDER_MAX = 33;
 const SUNO_VOLUME_SLIDER_MAX = 33;
 const DEFAULT_ANNOUNCEMENT_GAIN = 12;
 const MAX_ANNOUNCEMENT_GAIN = 12;
-const V20_VOLUME_DEFAULTS_ID = '2026-07-01-v20-7-ios-shortcut-return-bridge';
+const V20_VOLUME_DEFAULTS_ID = '2026-07-01-v20-8-stale-spotify-device-reset';
 const LIVE_SPOTIFY_VOLUME_APPLY_MS = 550;
 const SPOTIFY_VOLUME_WATCH_MS = 5000;
 const SPOTIFY_VOLUME_WATCH_LOG_MS = 45000;
@@ -82,6 +82,7 @@ const EVENT_RETRY_MS = 9000;
 const RECEIVER_EVENT_GRACE_MS = 3000;
 const SCHEDULE_CATCHUP_MS = 10 * 60 * 1000;
 const RETRYABLE_MUSIC_COMMANDS = new Set(['spotify-play', 'play', 'suno', 'suno-cue', 'song']);
+const SPOTIFY_DEVICE_COMMANDS = new Set(['spotify-play', 'play', 'pause', 'stop', 'skip', 'spotify-volume']);
 const OLD_AUDIO_BLOCK_PATTERN = /play\(\) failed|goo\.gl\/xX8pDD|play method is not allowed|user did(?:n't| not) interact|user agent or the platform/i;
 const STALE_RECEIVER_FAILURE_PATTERN = /restriction violated|player command failed|device not found|HTTP 429|HTTP 404|receiver will retry|Suno page returned HTTP 404|transfer is not active|not the audible Spotify device|Start Speaker Phone/i;
 
@@ -437,8 +438,19 @@ function hasStaleReceiverFailure(value) {
   return STALE_RECEIVER_FAILURE_PATTERN.test(String(value || ''));
 }
 
+function spotifyDeviceNotFound(value) {
+  return /device not found|no active device found|device_id.*not found|device not available/i.test(String(value || ''));
+}
+
 function clearStaleReceiverFailures(state) {
   if (!state || typeof state !== 'object') return state;
+  const hadStaleReceiverFailure = [
+    state.setupNotice,
+    state.lastError,
+    state.spotifyLastError,
+    state.spotifyStatus,
+    state.feedback
+  ].some(hasStaleReceiverFailure);
   if (hasStaleReceiverFailure(state.setupNotice)) state.setupNotice = '';
   if (hasStaleReceiverFailure(state.lastError)) state.lastError = '';
   if (hasStaleReceiverFailure(state.spotifyLastError)) state.spotifyLastError = '';
@@ -448,6 +460,12 @@ function clearStaleReceiverFailures(state) {
       .trim() || BASE.spotifyStatus;
   }
   if (hasStaleReceiverFailure(state.feedback)) state.feedback = 'Ready.';
+  if (hadStaleReceiverFailure) {
+    state.spotifyDeviceId = '';
+    state.spotifyDeviceName = '';
+    state.spotifyReceiverReadyAt = 0;
+    state.spotifyNeedsTap = true;
+  }
   state.activityLog = list(state.activityLog).filter(entry => !hasStaleReceiverFailure(`${entry?.title || ''} ${entry?.detail || ''}`));
   return state;
 }
@@ -1328,6 +1346,13 @@ async function processEvent(event) {
         ? `${message} Receiver needs a fresh command after it is ready.`
         : (/send the command again/i.test(message) ? message : `${message} After this receiver is ready, send the command again.`);
       logEvent('receiver', 'Event needs receiver action', next, { eventId: event.id });
+      setActionNeeded(next);
+    } else if (event?.kind === 'command' && SPOTIFY_DEVICE_COMMANDS.has(event.type) && spotifyDeviceNotFound(message)) {
+      markHandled(event.id);
+      delete retryAfter[event.id];
+      resetSpotifyReceiverDevice(message);
+      const next = staleSpotifyDeviceActionMessage(message);
+      logEvent('receiver', 'Spotify receiver device expired', next, { eventId: event.id, commandType: event.type });
       setActionNeeded(next);
     } else if (isRetryableMusicCommand(event) && (STALE_RECEIVER_FAILURE_PATTERN.test(message) || spotifyRestrictionLike(message))) {
       markHandled(event.id);
@@ -2538,7 +2563,7 @@ function registerSpotifyListeners() {
     spotifyPlayerReady = true;
     spotifyWebDeviceId = device_id;
     S.spotifyDeviceId = device_id;
-    S.spotifyDeviceName = 'Poolside Pulse V20.7 Receiver';
+    S.spotifyDeviceName = 'Poolside Pulse V20.8 Receiver';
     S.spotifyReceiverReadyAt = Date.now();
     S.receiverStatus = 'Spotify receiver ready.';
     S.receiverLastSeen = stamp();
@@ -2585,7 +2610,7 @@ async function primeSpotifyPlayer() {
   spotifyPrimePromise = (async () => {
     const Spotify = await ensureSpotifySdk();
     spotifyPlayer = new Spotify.Player({
-      name: 'Poolside Pulse V20.7 Receiver',
+      name: 'Poolside Pulse V20.8 Receiver',
       getOAuthToken: callback => spotifyAccessToken().then(callback).catch(error => setSpotifyStatus(`Spotify token failed: ${error.message}`, false)),
       volume: clampNumber(S.spotifyVolume, 0, SPOTIFY_VOLUME_SLIDER_MAX, DEFAULT_SPOTIFY_VOLUME) / 100
     });
@@ -2669,7 +2694,7 @@ async function startSpotifyReceiver({ fromTap = false } = {}) {
     throw error;
   }
   S.spotifyDeviceId = deviceId;
-  S.spotifyDeviceName = S.spotifyDeviceName || 'Poolside Pulse V20.7 Receiver';
+  S.spotifyDeviceName = S.spotifyDeviceName || 'Poolside Pulse V20.8 Receiver';
   S.spotifyReceiverReadyAt = Date.now();
   S.receiverStatus = 'Spotify receiver active.';
   S.receiverLastSeen = stamp();
@@ -3154,7 +3179,35 @@ function spotifyErrorMessage(error) {
 }
 
 function spotifyRestrictionLike(message) {
-  return /restriction violated|not allowed|not active|no active device|autoplay|platform|denied|rate|HTTP 429/i.test(String(message || ''));
+  return /restriction violated|not allowed|not active|no active device|device not found|autoplay|platform|denied|rate|HTTP 429/i.test(String(message || ''));
+}
+
+function resetSpotifyReceiverDevice(reason = 'Spotify receiver device reset') {
+  const detail = String(reason || '').trim();
+  stopSpotifyVolumeWatch();
+  stopSpotifyDuckHold();
+  if (spotifyPlayer && typeof spotifyPlayer.disconnect === 'function') {
+    try { spotifyPlayer.disconnect(); } catch {}
+  }
+  spotifyPlayer = null;
+  spotifyPrimePromise = null;
+  spotifyWarmPromise = null;
+  spotifyPlayerReady = false;
+  spotifyWebDeviceId = '';
+  spotifyFreshTapActivatedPlayer = false;
+  S.spotifyDeviceId = '';
+  S.spotifyDeviceName = '';
+  S.spotifyReceiverReadyAt = 0;
+  S.spotifyNeedsTap = true;
+  S.receiverStatus = 'Spotify receiver needs a fresh start.';
+  S.spotifyStatus = 'Spotify receiver device expired. Tap Start Receiver + Play Spotify on this speaker phone.';
+  if (detail) S.spotifyLastError = detail;
+  logEvent('spotify', 'Spotify receiver device reset', detail || 'Cleared stale Spotify device ID.');
+  localSave();
+}
+
+function staleSpotifyDeviceActionMessage(message = '') {
+  return `Spotify lost the speaker-phone receiver device (${message || 'Device not found'}). Tap Start Receiver + Play Spotify once on the speaker-connected Home phone, then send the command again.`;
 }
 
 async function spotifyAttempt(label, fn, errors) {
@@ -3232,6 +3285,9 @@ async function sendSpotifyPlayback(playUrl, deviceId) {
   }
 
   const detail = errors.join(' · ');
+  if (spotifyDeviceNotFound(detail)) {
+    throw Error(detail || 'Device not found');
+  }
   if (spotifyRestrictionLike(detail)) {
     throw actionNeededError('Spotify is ready but still paused because Spotify blocked remote play. On the speaker-connected Home phone, tap Start Receiver + Play Spotify once. After it starts, send Play Spotify again if needed.');
   }
@@ -3281,6 +3337,9 @@ async function playSpotifyUrl(url = S.spotifyUrl, push = true, options = {}) {
       logEvent('spotify', 'Known Spotify device did not become audible', S.spotifyDeviceName || remotePreferredId, { provider: 'spotify', url: playUrl });
     } catch (error) {
       logEvent('spotify', 'Known Spotify device command failed', error.message || String(error), { provider: 'spotify', url: playUrl });
+      if (spotifyDeviceNotFound(error.message || error)) {
+        resetSpotifyReceiverDevice(error.message || String(error));
+      }
     }
   }
   const deviceId = await startSpotifyReceiver({ fromTap: !!options.fromTap });
@@ -3289,15 +3348,28 @@ async function playSpotifyUrl(url = S.spotifyUrl, push = true, options = {}) {
   try {
     audible = await sendSpotifyPlayback(playUrl, deviceId);
   } catch (error) {
-    if (options.fromTap && isIOSLikeBrowser() && !spotifyFreshTapActivatedPlayer && spotifyRestrictionLike(error.message)) {
+    if (spotifyDeviceNotFound(error.message || error)) {
+      resetSpotifyReceiverDevice(error.message || String(error));
+      try {
+        const freshDeviceId = await startSpotifyReceiver({ fromTap: !!options.fromTap });
+        if (options.fromTap) await activateSpotifyElement();
+        audible = await sendSpotifyPlayback(playUrl, freshDeviceId);
+      } catch (retryError) {
+        if (spotifyDeviceNotFound(retryError.message || retryError)) {
+          throw actionNeededError(staleSpotifyDeviceActionMessage(retryError.message || retryError));
+        }
+        throw retryError;
+      }
+    } else if (options.fromTap && isIOSLikeBrowser() && !spotifyFreshTapActivatedPlayer && spotifyRestrictionLike(error.message)) {
       const message = 'Spotify receiver is prepared on this iPhone. Tap Start Receiver + Play Spotify one more time so iOS can activate Spotify playback.';
       S.spotifyNeedsTap = true;
       S.receiverStatus = 'Spotify receiver prepared; needs one more tap.';
       setActionNeeded(message);
       warmSpotifyReceiver();
       throw actionNeededError(message);
+    } else {
+      throw error;
     }
-    throw error;
   }
   if (audible) {
     markSpotifyPlaybackAccepted(playUrl);
@@ -3323,7 +3395,15 @@ async function spotifyPause(push = true) {
   }
   const deviceId = await spotifyTargetDevice({ preferKnown: true, preferPoolside: true, allowStart: false });
   if (!deviceId) throw actionNeededError('Spotify is playing, but this receiver could not identify the speaker-connected Spotify receiver. Tap Start Receiver + Play Spotify once, then press Stop again.');
-  await spotifyApi('PUT', '/me/player/pause', null, { device_id: deviceId });
+  try {
+    await spotifyApi('PUT', '/me/player/pause', null, { device_id: deviceId });
+  } catch (error) {
+    if (spotifyDeviceNotFound(error.message || error)) {
+      resetSpotifyReceiverDevice(error.message || String(error));
+      throw actionNeededError(staleSpotifyDeviceActionMessage(error.message || error));
+    }
+    throw error;
+  }
   S.intent = 'paused';
   stopSpotifyVolumeWatch();
   setManualMusicHold('Spotify paused manually');
@@ -3355,7 +3435,15 @@ async function spotifyNext(push = true) {
   }
   const deviceId = await spotifyTargetDevice({ preferKnown: true, preferPoolside: true, allowStart: false });
   if (!deviceId) throw actionNeededError('Spotify receiver is not ready on this speaker phone. Tap Start Receiver + Play Spotify once, then send Skip again.');
-  await spotifyApi('POST', '/me/player/next', null, { device_id: deviceId });
+  try {
+    await spotifyApi('POST', '/me/player/next', null, { device_id: deviceId });
+  } catch (error) {
+    if (spotifyDeviceNotFound(error.message || error)) {
+      resetSpotifyReceiverDevice(error.message || String(error));
+      throw actionNeededError(staleSpotifyDeviceActionMessage(error.message || error));
+    }
+    throw error;
+  }
   S.intent = 'playing';
   await setReceiverHardwareVolume('music', 'Spotify skip');
   await enforceSpotifyBedVolume('Spotify skip', deviceId, { attempts: 2, preferKnown: true, preferPoolside: true, allowStart: false, requireVerified: false }).catch(error => {
