@@ -975,6 +975,21 @@ button[aria-busy="true"]::after {
   color: var(--amber);
 }
 
+.bridgePanel {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+
+.bridgePanel h3 {
+  margin: 0 0 8px;
+  font-size: .95rem;
+}
+
+.bridgePanel .buttonStack {
+  margin-top: 8px;
+}
+
 .tabs button.on,
 .modeSwitch button.on,
 button[aria-pressed="true"] {
