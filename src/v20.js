@@ -1,5 +1,5 @@
 const VERSION = '20';
-const DISPLAY_VERSION = 'v20.4';
+const DISPLAY_VERSION = 'v20.5';
 const PIN = '7900';
 const KEY = 'poolside-pulse-v20';
 const DEVICE_KEY = 'poolside-pulse-v20-device-id';
@@ -7,7 +7,7 @@ const HANDLED_KEY = 'poolside-pulse-v20-handled-events';
 const LOG_CLEAR_KEY = 'poolside-pulse-v20-log-cleared-at';
 const RECEIVER_SESSION_KEY = 'poolside-pulse-v20-receiver-session-started-at';
 const SPOTIFY_TOKEN_KEY = 'poolside-pulse-v20-spotify-token';
-const APP_QUERY = '?v=20.4';
+const APP_QUERY = '?v=20.5';
 const LEGACY_STATE_KEYS = [
   'poolside-pulse-v18',
   'poolside-pulse-v17',
@@ -64,10 +64,12 @@ const DEFAULT_SPOTIFY_DUCKED_VOLUME = 0;
 const DEFAULT_SUNO_VOLUME = MUSIC_VOLUME_PERCENT;
 const SPOTIFY_VOLUME_SLIDER_MAX = 33;
 const SUNO_VOLUME_SLIDER_MAX = 33;
-const DEFAULT_ANNOUNCEMENT_GAIN = 10;
+const DEFAULT_ANNOUNCEMENT_GAIN = 12;
 const MAX_ANNOUNCEMENT_GAIN = 12;
-const V20_VOLUME_DEFAULTS_ID = '2026-07-01-v20-4-music15-voice1000-solid';
+const V20_VOLUME_DEFAULTS_ID = '2026-07-01-v20-5-ios-volume-truth-watchdog';
 const LIVE_SPOTIFY_VOLUME_APPLY_MS = 550;
+const SPOTIFY_VOLUME_WATCH_MS = 5000;
+const SPOTIFY_VOLUME_WATCH_LOG_MS = 45000;
 const SPOTIFY_VOLUME_VERIFY_TOLERANCE = 2;
 const EVENT_TTL_MS = 90 * 60 * 1000;
 const EVENT_LIMIT = 120;
@@ -222,6 +224,9 @@ let rangeEditingUntil = 0;
 let scheduleBlockedSince = 0;
 let spotifyDuckHoldTimer = null;
 let spotifyVolumeApplyTimer = null;
+let spotifyVolumeWatchTimer = null;
+let spotifyVolumeWatchInFlight = false;
+let spotifyVolumeWatchLastLogAt = 0;
 let audioSettingsApplyTimer = null;
 let weatherRunning = false;
 let announcementTail = Promise.resolve();
@@ -1034,7 +1039,10 @@ async function pullState() {
       restoreLocalAfterMerge(local);
       localSave();
     }
-    if (S.screen === 'home') await processEvents();
+    if (S.screen === 'home') {
+      await processEvents();
+      if (receiverShouldHoldSpotifyVolume()) startSpotifyVolumeWatch('state refresh');
+    }
     renderWhenIdle();
   } catch {
     S.sync = false;
@@ -1355,10 +1363,17 @@ async function runCommand(command) {
   } else if (command.type === 'skip') {
     await skipSelected(false);
   } else if (command.type === 'spotify-volume') {
-    const result = await enforceSpotifyBedVolume('remote volume command', '', { attempts: 2, preferKnown: true, preferPoolside: true, allowStart: false });
+    const result = await enforceSpotifyBedVolume('remote volume command', '', { attempts: 4, delayMs: 350, verifyDelayMs: 500, preferKnown: true, preferPoolside: true, allowStart: false, requireVerified: false });
     S.intent = S.intent || 'playing';
-    setSpotifyStatus(`Spotify volume verified at ${S.spotifyVolume}% on this receiver.`, true);
-    logEvent('spotify', 'Spotify volume verified on receiver', `${S.spotifyVolume}% via ${result.method || 'receiver'}${result.actualVolume !== undefined ? `; Spotify reports ${result.actualVolume}%` : ''}`, { eventId: command.id, commandType: command.type });
+    startSpotifyVolumeWatch('remote volume command');
+    const iosLimited = isIOSLikeBrowser() && !result?.verified;
+    setSpotifyStatus(iosLimited ? spotifyIOSVolumeLimitDetail(S.spotifyVolume) : `Spotify volume verified at ${S.spotifyVolume}% on this receiver.`, !iosLimited);
+    logEvent(
+      'spotify',
+      iosLimited ? 'Spotify volume sent; iPhone output is physical' : 'Spotify volume verified on receiver',
+      `${S.spotifyVolume}% via ${result.method || 'receiver'}${result.actualVolume !== undefined ? `; Spotify reports ${result.actualVolume}%` : ''}${result.detail ? `; ${result.detail}` : ''}`,
+      { eventId: command.id, commandType: command.type }
+    );
     await pushState('Receiver Spotify volume logged.', { render: false });
   } else if (command.type === 'audio-settings') {
     applyReceiverAudioSettings('remote command');
@@ -2078,12 +2093,15 @@ async function applySpotifyVolume(push = true, options = {}) {
     preferKnown: true,
     preferPoolside: true,
     allowStart: false,
+    requireVerified: false,
     log: !options.live
   });
+  startSpotifyVolumeWatch(options.live ? 'live local volume slider' : 'local volume control');
   if (!options.silent) {
-    logEvent('spotify', 'Spotify volume set locally', `${volume}% via ${result.method || 'receiver'}${result.verified ? `; verified ${result.actualVolume}%` : ''}`);
+    const iosLimited = isIOSLikeBrowser() && !result?.verified;
+    logEvent('spotify', iosLimited ? 'Spotify volume sent; iPhone output is physical' : 'Spotify volume set locally', `${volume}% via ${result.method || 'receiver'}${result.verified ? `; verified ${result.actualVolume}%` : ''}${result.detail ? `; ${result.detail}` : ''}`);
     await pushState(`Spotify volume set to ${volume}% on receiver.`, { render: false });
-    setSpotifyStatus(`Spotify volume verified at ${volume}% on this receiver. Announcements stay loud.`, true);
+    setSpotifyStatus(iosLimited ? spotifyIOSVolumeLimitDetail(volume) : `Spotify volume verified at ${volume}% on this receiver. Announcements stay loud.`, !iosLimited);
     renderWhenIdle();
   }
 }
@@ -2292,6 +2310,16 @@ function isIOSLikeBrowser() {
     (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
 }
 
+function spotifyLocalVolumeSettable() {
+  // iOS keeps media output volume under physical device control. Spotify's SDK
+  // can accept the call but cannot make the speaker-connected iPhone quieter.
+  return !isIOSLikeBrowser();
+}
+
+function spotifyIOSVolumeLimitDetail(volume = S.spotifyVolume) {
+  return `iPhone browser Spotify volume cannot be audibly lowered by JavaScript; ${clampNumber(volume, 0, SPOTIFY_VOLUME_SLIDER_MAX, DEFAULT_SPOTIFY_VOLUME)}% is sent through Spotify Connect when possible, and voice pauses Spotify before playing.`;
+}
+
 function isPoolsideReceiverName(name = '') {
   return /poolside pulse|serenity shores/i.test(String(name || ''));
 }
@@ -2365,13 +2393,14 @@ function registerSpotifyListeners() {
     spotifyPlayerReady = true;
     spotifyWebDeviceId = device_id;
     S.spotifyDeviceId = device_id;
-    S.spotifyDeviceName = 'Poolside Pulse V20.4 Receiver';
+    S.spotifyDeviceName = 'Poolside Pulse V20.5 Receiver';
     S.spotifyReceiverReadyAt = Date.now();
     S.receiverStatus = 'Spotify receiver ready.';
     S.receiverLastSeen = stamp();
     setSpotifyStatus('Spotify receiver is ready on this device.', true);
     localSave();
     pushState('Spotify receiver ready.', { render: false }).catch(() => {});
+    startSpotifyVolumeWatch('Spotify receiver ready');
     renderWhenIdle();
   });
   spotifyPlayer.addListener('not_ready', () => {
@@ -2394,6 +2423,7 @@ function registerSpotifyListeners() {
     S.spotifyStatus = state.paused ? 'Spotify receiver is paused.' : 'Spotify receiver is playing.';
     S.receiverLastSeen = stamp();
     localSave();
+    if (!state.paused) startSpotifyVolumeWatch('Spotify playback state');
   });
   spotifyPlayer.addListener('initialization_error', error => setSpotifyStatus(`Spotify player init error: ${error.message}`, false));
   spotifyPlayer.addListener('authentication_error', error => setSpotifyStatus(`Spotify auth error: ${error.message}`, false));
@@ -2410,7 +2440,7 @@ async function primeSpotifyPlayer() {
   spotifyPrimePromise = (async () => {
     const Spotify = await ensureSpotifySdk();
     spotifyPlayer = new Spotify.Player({
-      name: 'Poolside Pulse V20.4 Receiver',
+      name: 'Poolside Pulse V20.5 Receiver',
       getOAuthToken: callback => spotifyAccessToken().then(callback).catch(error => setSpotifyStatus(`Spotify token failed: ${error.message}`, false)),
       volume: clampNumber(S.spotifyVolume, 0, SPOTIFY_VOLUME_SLIDER_MAX, DEFAULT_SPOTIFY_VOLUME) / 100
     });
@@ -2494,7 +2524,7 @@ async function startSpotifyReceiver({ fromTap = false } = {}) {
     throw error;
   }
   S.spotifyDeviceId = deviceId;
-  S.spotifyDeviceName = S.spotifyDeviceName || 'Poolside Pulse V20.4 Receiver';
+  S.spotifyDeviceName = S.spotifyDeviceName || 'Poolside Pulse V20.5 Receiver';
   S.spotifyReceiverReadyAt = Date.now();
   S.receiverStatus = 'Spotify receiver active.';
   S.receiverLastSeen = stamp();
@@ -2505,6 +2535,7 @@ async function startSpotifyReceiver({ fromTap = false } = {}) {
   } catch (error) {
     setSpotifyStatus(`Spotify receiver is ready, but transfer is not active yet: ${error.message}`, false);
   }
+  startSpotifyVolumeWatch('Spotify receiver activation');
   return deviceId;
 }
 
@@ -2607,6 +2638,11 @@ async function spotifyTargetDevice(options = {}) {
 
 async function spotifySetLocalPlayerVolume(percent, label = 'Spotify local volume failed') {
   if (S.screen !== 'home' || !spotifyPlayer || typeof spotifyPlayer.setVolume !== 'function') return false;
+  if (!spotifyLocalVolumeSettable()) {
+    S.spotifyDevicesSummary = spotifyIOSVolumeLimitDetail(percent);
+    localSave();
+    return false;
+  }
   try {
     await spotifyPlayer.setVolume(clampNumber(percent, 0, SPOTIFY_VOLUME_SLIDER_MAX, DEFAULT_SPOTIFY_VOLUME) / 100);
     return true;
@@ -2679,6 +2715,21 @@ async function verifySpotifyVolume(percent, targetDeviceId = '', options = {}) {
   }
   const actualVolume = Math.round(Number(snapshot.volume));
   const delta = Math.abs(actualVolume - expected);
+  const iosLocalReceiver = S.screen === 'home' && isIOSLikeBrowser();
+  if (iosLocalReceiver) {
+    const accepted = delta <= SPOTIFY_VOLUME_VERIFY_TOLERANCE;
+    const report = `${snapshot.name || 'Spotify device'} reports ${actualVolume}% via ${snapshot.source || 'Spotify'}.`;
+    return {
+      verified: false,
+      accepted,
+      expected,
+      actualVolume,
+      deviceId: snapshot.deviceId,
+      name: snapshot.name,
+      source: snapshot.source,
+      detail: `${report} ${spotifyIOSVolumeLimitDetail(expected)}`
+    };
+  }
   const verified = delta <= SPOTIFY_VOLUME_VERIFY_TOLERANCE;
   const detail = verified
     ? `${snapshot.name || 'Spotify device'} reports ${actualVolume}% via ${snapshot.source || 'Spotify'}.`
@@ -2793,9 +2844,24 @@ async function spotifySetVolume(percent, targetDeviceId = '', options = {}) {
       localSave();
       return { localSet, remoteSet, method: `${method || 'Spotify'} + verified`, verified: true, actualVolume: verification.actualVolume, detail: verification.detail };
     }
+    if (verification.accepted && S.screen === 'home' && isIOSLikeBrowser()) {
+      S.spotifyDevicesSummary = spotifyIOSVolumeLimitDetail(volume);
+      localSave();
+      if (options.requireVerified === false) {
+        return {
+          localSet,
+          remoteSet,
+          method: method || 'Spotify API',
+          verified: false,
+          accepted: true,
+          actualVolume: verification.actualVolume,
+          detail: verification.detail
+        };
+      }
+    }
     const localReceiverSet = localSet && S.screen === 'home' && spotifyPlayerReady && spotifyWebDeviceId &&
       (!verifyTarget || String(verifyTarget) === String(spotifyWebDeviceId) || String(verifyTarget) === String(S.spotifyDeviceId || ''));
-    if (localReceiverSet && options.trustLocalSdk !== false) {
+    if (localReceiverSet && spotifyLocalVolumeSettable() && options.trustLocalSdk !== false) {
       S.spotifyDevicesSummary = `Receiver SDK accepted ${volume}% on ${S.spotifyDeviceName || 'Poolside Pulse receiver'}; Spotify did not report device volume.`;
       localSave();
       return {
@@ -2842,6 +2908,63 @@ async function enforceSpotifyBedVolume(reason = 'Spotify bed volume', targetDevi
   return lastResult || { localSet: false, remoteSet: false, method: '' };
 }
 
+function receiverShouldHoldSpotifyVolume() {
+  if (S.screen !== 'home' || S.musicProvider !== 'spotify') return false;
+  if (!receiverAudioReady() || !receiverSessionStartedAt()) return false;
+  if (speaking || manualMusicHoldActive()) return false;
+  return S.intent === 'playing' || spotifyPlayerReady || !!S.spotifyDeviceId;
+}
+
+function stopSpotifyVolumeWatch() {
+  if (!spotifyVolumeWatchTimer) return;
+  clearInterval(spotifyVolumeWatchTimer);
+  spotifyVolumeWatchTimer = null;
+  spotifyVolumeWatchInFlight = false;
+}
+
+async function holdSpotifyBedVolume(reason = 'receiver volume hold') {
+  if (!receiverShouldHoldSpotifyVolume() || spotifyVolumeWatchInFlight) return null;
+  spotifyVolumeWatchInFlight = true;
+  try {
+    const result = await spotifySetVolume(S.spotifyVolume, savedReceiverDeviceId(), {
+      persist: false,
+      preferKnown: true,
+      preferPoolside: true,
+      allowStart: false,
+      allowActiveFallback: false,
+      verify: false,
+      requireVerified: false
+    });
+    const now = Date.now();
+    if (now - spotifyVolumeWatchLastLogAt > SPOTIFY_VOLUME_WATCH_LOG_MS) {
+      spotifyVolumeWatchLastLogAt = now;
+      logEvent('spotify', 'Spotify volume hold active', `${S.spotifyVolume}%${result?.method ? ` via ${result.method}` : ''}${isIOSLikeBrowser() ? '; iPhone output remains physical, voice pauses Spotify' : ''}`);
+      pushState('', { render: false }).catch(() => {});
+    }
+    return result;
+  } catch (error) {
+    const now = Date.now();
+    if (now - spotifyVolumeWatchLastLogAt > SPOTIFY_VOLUME_WATCH_LOG_MS) {
+      spotifyVolumeWatchLastLogAt = now;
+      logEvent('spotify', 'Spotify volume hold waiting', `${reason}: ${error.message || error}`);
+      pushState('', { render: false }).catch(() => {});
+    }
+    return null;
+  } finally {
+    spotifyVolumeWatchInFlight = false;
+  }
+}
+
+function startSpotifyVolumeWatch(reason = 'Spotify volume watch') {
+  if (S.screen !== 'home') return;
+  if (!spotifyVolumeWatchTimer) {
+    spotifyVolumeWatchTimer = setInterval(() => {
+      holdSpotifyBedVolume('watchdog interval').catch(() => {});
+    }, SPOTIFY_VOLUME_WATCH_MS);
+  }
+  holdSpotifyBedVolume(reason).catch(() => {});
+}
+
 function stopSpotifyDuckHold() {
   if (!spotifyDuckHoldTimer) return;
   clearInterval(spotifyDuckHoldTimer);
@@ -2856,7 +2979,9 @@ function startSpotifyDuckHold(deviceId = '', targetVolume = DEFAULT_SPOTIFY_DUCK
       persist: false,
       preferKnown: true,
       preferPoolside: true,
-      allowStart: false
+      allowStart: false,
+      verify: false,
+      requireVerified: false
     }).catch(error => {
       logEvent('spotify', 'Spotify duck hold failed', error.message || String(error));
     });
@@ -2917,13 +3042,16 @@ async function sendSpotifyPlayback(playUrl, deviceId) {
     return null;
   });
 
-  await enforceSpotifyBedVolume('starting Spotify playback', target, { attempts: 1, preferKnown: true, allowStart: false }).catch(error => {
+  await enforceSpotifyBedVolume('starting Spotify playback', target, { attempts: 1, preferKnown: true, allowStart: false, requireVerified: false }).catch(error => {
     errors.push(`set volume before play: ${spotifyErrorMessage(error)}`);
   });
 
   if (before?.isPlaying && before.deviceId && String(before.deviceId) !== target) {
     const moved = await spotifyAttempt('transfer active playback to receiver', () => spotifyApi('PUT', '/me/player', { device_ids: [target], play: true }), errors);
-    if (moved && await spotifyActuallyPlaying(target)) return true;
+    if (moved && await spotifyActuallyPlaying(target)) {
+      startSpotifyVolumeWatch('Spotify transfer playback');
+      return true;
+    }
   }
 
   if (before?.deviceId && String(before.deviceId) === target && !before.isPlaying && before.hasPlayback && spotifyStateMatchesUrl(before, playUrl)) {
@@ -2932,7 +3060,10 @@ async function sendSpotifyPlayback(playUrl, deviceId) {
       if (spotifyFreshTapActivatedPlayer) await activateSpotifyElement();
       resumed = await spotifyAttempt('resume receiver SDK current playback', () => spotifyPlayer.resume(), errors);
     }
-    if (resumed && await spotifyActuallyPlaying(target)) return true;
+    if (resumed && await spotifyActuallyPlaying(target)) {
+      startSpotifyVolumeWatch('Spotify resume playback');
+      return true;
+    }
   }
 
   const transferred = await spotifyAttempt('transfer to receiver', () => spotifyApi('PUT', '/me/player', { device_ids: [target], play: false }), errors);
@@ -2946,10 +3077,13 @@ async function sendSpotifyPlayback(playUrl, deviceId) {
     }
   }
 
-  await enforceSpotifyBedVolume('Spotify playback started', target, { attempts: 2, preferKnown: true, allowStart: false }).catch(error => {
+  await enforceSpotifyBedVolume('Spotify playback started', target, { attempts: 2, preferKnown: true, allowStart: false, requireVerified: false }).catch(error => {
     errors.push(`set volume after play: ${spotifyErrorMessage(error)}`);
   });
-  if (await spotifyActuallyPlaying(target)) return true;
+  if (await spotifyActuallyPlaying(target)) {
+    startSpotifyVolumeWatch('Spotify playback started');
+    return true;
+  }
 
   const detail = errors.join(' · ');
   if (spotifyRestrictionLike(detail)) {
@@ -2968,6 +3102,7 @@ function markSpotifyPlaybackAccepted(playUrl) {
   markMatchingSpotifyPlayEventsHandled(playUrl);
   logEvent('play', 'Spotify playing on receiver', sourceLabel('spotify', playUrl), { provider: 'spotify', url: playUrl });
   setSpotifyStatus(`Spotify is playing on this receiver: ${sourceLabel('spotify', playUrl)}.`, true);
+  startSpotifyVolumeWatch('Spotify playback accepted');
 }
 
 async function playSpotifyUrl(url = S.spotifyUrl, push = true, options = {}) {
@@ -3043,6 +3178,7 @@ async function spotifyPause(push = true) {
   if (!deviceId) throw actionNeededError('Spotify is playing, but this receiver could not identify the speaker-connected Spotify receiver. Tap Start Receiver + Play Spotify once, then press Stop again.');
   await spotifyApi('PUT', '/me/player/pause', null, { device_id: deviceId });
   S.intent = 'paused';
+  stopSpotifyVolumeWatch();
   setManualMusicHold('Spotify paused manually');
   setSpotifyStatus('Spotify paused on receiver.', true);
   logEvent('pause', 'Spotify paused', '');
@@ -3057,6 +3193,7 @@ async function spotifyStop(push = true) {
   }
   await spotifyPause(false);
   S.intent = 'stopped';
+  stopSpotifyVolumeWatch();
   setManualMusicHold('Spotify stopped manually');
   setSpotifyStatus('Spotify stopped on receiver.', true);
   logEvent('stop', 'Spotify stopped', '');
@@ -3073,6 +3210,10 @@ async function spotifyNext(push = true) {
   if (!deviceId) throw actionNeededError('Spotify receiver is not ready on this speaker phone. Tap Start Receiver + Play Spotify once, then send Skip again.');
   await spotifyApi('POST', '/me/player/next', null, { device_id: deviceId });
   S.intent = 'playing';
+  await enforceSpotifyBedVolume('Spotify skip', deviceId, { attempts: 2, preferKnown: true, preferPoolside: true, allowStart: false, requireVerified: false }).catch(error => {
+    logEvent('spotify', 'Spotify post-skip volume hold failed', error.message || String(error));
+  });
+  startSpotifyVolumeWatch('Spotify skip');
   setSpotifyStatus('Spotify skipped to next track.', true);
   logEvent('skip', 'Spotify skipped', '');
   await pushState('Receiver Spotify skip logged.', { render: false });
@@ -3101,6 +3242,7 @@ async function checkSpotifyHealth(renderAfter = true) {
 function releaseCommandReceiver(reason = 'command mode') {
   if (S.screen === 'home') return;
   receiverActive = false;
+  stopSpotifyVolumeWatch();
   storageRemove(RECEIVER_SESSION_KEY);
   if (spotifyPlayer && typeof spotifyPlayer.disconnect === 'function') {
     try { spotifyPlayer.disconnect(); } catch {}
@@ -3155,12 +3297,12 @@ async function duckSpotifyForAnnouncement(options = {}) {
     let remoteError = '';
     let appliedMethod = '';
     try {
-      const result = await spotifySetVolume(targetVolume, deviceId, { persist: false, preferKnown: true, preferPoolside: true, allowStart: false });
+      const result = await spotifySetVolume(targetVolume, deviceId, { persist: false, preferKnown: true, preferPoolside: true, allowStart: false, requireVerified: false });
       localSet = !!result.localSet;
       remoteSet = !!result.remoteSet;
       appliedMethod = result.method || '';
       await wait(250);
-      const repeat = await spotifySetVolume(targetVolume, deviceId, { persist: false, preferKnown: true, preferPoolside: true, allowStart: false }).catch(() => null);
+      const repeat = await spotifySetVolume(targetVolume, deviceId, { persist: false, preferKnown: true, preferPoolside: true, allowStart: false, requireVerified: false }).catch(() => null);
       localSet = localSet || !!repeat?.localSet;
       remoteSet = remoteSet || !!repeat?.remoteSet;
       appliedMethod = repeat?.method || appliedMethod;
@@ -3215,7 +3357,7 @@ async function restoreSpotifyAfterAnnouncement(snapshot) {
     let restoreError = '';
     S.spotifyVolume = restoreVolume;
     try {
-      await enforceSpotifyBedVolume('pre-resume restore', snapshot.deviceId || '', { attempts: 1, preferKnown: true, preferPoolside: true, allowStart: false });
+      await enforceSpotifyBedVolume('pre-resume restore', snapshot.deviceId || '', { attempts: 1, preferKnown: true, preferPoolside: true, allowStart: false, requireVerified: false });
     } catch (error) {
       restoreError = error.message || String(error);
       logEvent('spotify', 'Spotify restore volume failed', restoreError);
@@ -3227,7 +3369,7 @@ async function restoreSpotifyAfterAnnouncement(snapshot) {
           S.intent = 'playing';
           logEvent('spotify', 'Spotify resumed after announcement', resumeMethod);
           try {
-            await enforceSpotifyBedVolume('post-resume restore', snapshot.deviceId || '', { attempts: 2, preferKnown: true, preferPoolside: true, allowStart: false });
+            await enforceSpotifyBedVolume('post-resume restore', snapshot.deviceId || '', { attempts: 2, preferKnown: true, preferPoolside: true, allowStart: false, requireVerified: false });
           } catch (error) {
             restoreError = restoreError || error.message || String(error);
             logEvent('spotify', 'Spotify post-resume volume failed', error.message || String(error));
@@ -3240,7 +3382,7 @@ async function restoreSpotifyAfterAnnouncement(snapshot) {
         } catch {}
         S.intent = 'playing';
         try {
-          await enforceSpotifyBedVolume('active Spotify restore', snapshot.deviceId || '', { attempts: 2, preferKnown: true, preferPoolside: true, allowStart: false });
+          await enforceSpotifyBedVolume('active Spotify restore', snapshot.deviceId || '', { attempts: 2, preferKnown: true, preferPoolside: true, allowStart: false, requireVerified: false });
         } catch (error) {
           restoreError = restoreError || error.message || String(error);
           logEvent('spotify', 'Spotify active restore volume failed', error.message || String(error));

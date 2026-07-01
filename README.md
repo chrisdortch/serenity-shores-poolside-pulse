@@ -35,7 +35,7 @@ npm run build
 
 ## Version Notes
 
-- Version 20.4 keeps the command-phone/Home-receiver model, caps Spotify and Suno music controls at 33%, defaults music to 15%, restores a loud adjustable Web Audio voice gain up to 1200%, and keeps Spotify pause/restore during announcements.
+- Version 20.5 keeps the command-phone/Home-receiver model, caps Spotify and Suno music controls at 33%, defaults music to 15%, runs voice at max adjustable Web Audio gain up to 1200%, keeps Spotify pause/restore during announcements, and stops falsely verifying iPhone-local Spotify volume that iOS keeps under physical control.
 - Version 20.3 keeps the command-phone/Home-receiver model, defaults Spotify bed music to 33%, plays voice at true 100% receiver volume, pauses/restores Spotify for announcements, and refuses to fall back to unrelated active Spotify devices.
 - Version 20.2 keeps Spotify music at 33%, changes Spotify during voice to 0%, sends Spotify volume slider changes live without re-rendering the slider during drag, and verifies the requested Spotify volume against the audible Spotify device before reporting success.
 - Version 20.1 keeps the V20 receiver model and fixes the live audio balance: all music defaults to 33%, voice announcements default to the maximum 600% boost, Spotify ducks to 33% for spoken voice, Spotify pauses during Suno foreground tracks, stale Spotify play retries are stopped, and scheduled Suno cues can be stopped from Command or Home while they are playing.

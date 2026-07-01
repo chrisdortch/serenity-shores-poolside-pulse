@@ -1,5 +1,5 @@
 (() => {
-  const VERSION = '20.4';
+  const VERSION = '20.5';
   let unlocked = false;
   let unlocking = false;
   let unlockPromise = null;
