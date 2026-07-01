@@ -1,5 +1,5 @@
 (() => {
-  const VERSION = '20.12';
+  const VERSION = '20.13';
   let unlocked = false;
   let unlocking = false;
   let unlockPromise = null;
@@ -150,24 +150,60 @@
     return /voice|announcement|spoken|speech/i.test(String(label || ''));
   }
 
-  function bufferPeak(buffer) {
+  function analyzeBuffer(buffer) {
     let peak = 0;
+    let sumSquares = 0;
+    let count = 0;
     const channels = Math.max(1, Number(buffer?.numberOfChannels || 0));
     for (let channelIndex = 0; channelIndex < channels; channelIndex += 1) {
       const channel = buffer.getChannelData(channelIndex);
       const stride = Math.max(1, Math.floor(channel.length / 240000));
       for (let i = 0; i < channel.length; i += stride) {
-        const value = Math.abs(channel[i] || 0);
-        if (value > peak) peak = value;
+        const sample = channel[i] || 0;
+        const absolute = Math.abs(sample);
+        if (absolute > peak) peak = absolute;
+        sumSquares += sample * sample;
+        count += 1;
       }
     }
-    return peak;
+    return {
+      peak,
+      rms: count ? Math.sqrt(sumSquares / count) : 0
+    };
   }
 
-  function voiceNormalizationGain(buffer) {
-    const peak = bufferPeak(buffer);
-    if (!peak) return 1;
-    return Math.max(1, Math.min(6, 0.92 / peak));
+  function voiceLoudnessSettings(buffer, options) {
+    const analysis = analyzeBuffer(buffer);
+    const maxGain = Math.max(1, Number(options.maxGain || 24) || 24);
+    const requested = clampNumber(options.gain, 1, maxGain, maxGain);
+    const strength = Math.max(0, Math.min(1, (requested - 1) / Math.max(1, maxGain - 1)));
+    const targetRms = 0.16 + strength * 0.12;
+    const rmsGain = analysis.rms ? targetRms / analysis.rms : 1;
+    const peakGain = analysis.peak ? 2.25 / analysis.peak : rmsGain;
+    const driveGain = Math.max(1, Math.min(8.5, rmsGain, peakGain));
+    return {
+      driveGain,
+      outputGain: 0.92 + strength * 0.08,
+      threshold: -19 - strength * 5,
+      ratio: 8 + strength * 8,
+      knee: 8,
+      peak: analysis.peak,
+      rms: analysis.rms
+    };
+  }
+
+  function createSoftLimiter(ctx) {
+    if (typeof ctx.createWaveShaper !== 'function') return null;
+    const shaper = ctx.createWaveShaper();
+    const samples = 65536;
+    const curve = new Float32Array(samples);
+    for (let i = 0; i < samples; i += 1) {
+      const x = (i / (samples - 1)) * 4 - 2;
+      curve[i] = Math.tanh(x * 1.25) / Math.tanh(1.25);
+    }
+    shaper.curve = curve;
+    shaper.oversample = '4x';
+    return shaper;
   }
 
   function withTimeout(promise, ms, message) {
@@ -312,19 +348,40 @@
     const makeup = ctx.createGain();
     const limiter = typeof ctx.createDynamicsCompressor === 'function' ? ctx.createDynamicsCompressor() : null;
     const voice = isVoicePlayback(options.label) || Number(options.maxGain || 0) > 1;
-    const normalize = voice ? voiceNormalizationGain(buffer) : 1;
-    drive.gain.value = Math.min(64, options.gain * normalize);
-    makeup.gain.value = voice ? 2.2 : 1.35;
+    const settings = voice ? voiceLoudnessSettings(buffer, options) : null;
+    drive.gain.value = voice ? settings.driveGain : options.gain;
+    makeup.gain.value = voice ? settings.outputGain : 1;
     if (limiter) {
-      limiter.threshold.value = voice ? -30 : -24;
-      limiter.knee.value = voice ? 10 : 14;
-      limiter.ratio.value = 20;
-      limiter.attack.value = 0.002;
-      limiter.release.value = voice ? 0.18 : 0.14;
+      limiter.threshold.value = voice ? settings.threshold : -24;
+      limiter.knee.value = voice ? settings.knee : 14;
+      limiter.ratio.value = voice ? settings.ratio : 20;
+      limiter.attack.value = voice ? 0.004 : 0.002;
+      limiter.release.value = voice ? 0.2 : 0.14;
     }
     source.buffer = buffer;
-    if (limiter) source.connect(drive).connect(limiter).connect(makeup).connect(ctx.destination);
-    else source.connect(drive).connect(ctx.destination);
+    if (voice) {
+      const highpass = ctx.createBiquadFilter();
+      const presence = ctx.createBiquadFilter();
+      const lowpass = ctx.createBiquadFilter();
+      const softLimiter = createSoftLimiter(ctx);
+      highpass.type = 'highpass';
+      highpass.frequency.value = 95;
+      presence.type = 'peaking';
+      presence.frequency.value = 2400;
+      presence.Q.value = 1;
+      presence.gain.value = 1.8;
+      lowpass.type = 'lowpass';
+      lowpass.frequency.value = 10500;
+      source.connect(highpass).connect(presence).connect(lowpass).connect(drive);
+      if (limiter && softLimiter) drive.connect(limiter).connect(softLimiter).connect(makeup).connect(ctx.destination);
+      else if (limiter) drive.connect(limiter).connect(makeup).connect(ctx.destination);
+      else if (softLimiter) drive.connect(softLimiter).connect(makeup).connect(ctx.destination);
+      else drive.connect(makeup).connect(ctx.destination);
+    } else if (limiter) {
+      source.connect(drive).connect(limiter).connect(makeup).connect(ctx.destination);
+    } else {
+      source.connect(drive).connect(ctx.destination);
+    }
     return await new Promise((resolve, reject) => {
       let started = false;
       let stopped = false;
@@ -345,7 +402,9 @@
         source.start(0);
         started = true;
         unlocked = true;
-        lastStatus = `${options.label} started through receiver Web Audio.`;
+        lastStatus = voice
+          ? `${options.label} started through clear PA voice path.`
+          : `${options.label} started through receiver Web Audio.`;
         dispatchStatus();
       } catch (error) {
         clearActivePlayback(playback);

@@ -26,32 +26,43 @@ export default async function handler(req, res) {
   const instructions = String(body.instructions || 'Speak clearly, naturally, warmly, and calmly like a professional resort announcement. For safety messages, sound authoritative without sounding panicked.').slice(0, 700);
 
   try {
-    const r = await fetch('https://api.openai.com/v1/audio/speech', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${key}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        model: 'gpt-4o-mini-tts',
-        voice,
-        input,
-        instructions,
-        response_format: 'mp3'
-      })
-    });
+    let lastError = null;
+    for (const format of ['wav', 'mp3']) {
+      const r = await fetch('https://api.openai.com/v1/audio/speech', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${key}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          model: 'gpt-4o-mini-tts',
+          voice,
+          input,
+          instructions,
+          response_format: format
+        })
+      });
 
-    if (!r.ok) {
+      if (r.ok) {
+        const buffer = Buffer.from(await r.arrayBuffer());
+        res.statusCode = 200;
+        res.setHeader('Content-Type', format === 'wav' ? 'audio/wav' : 'audio/mpeg');
+        res.setHeader('Cache-Control', 'no-store');
+        res.end(buffer);
+        return;
+      }
+
       let detail = '';
       try { detail = await r.text(); } catch {}
-      return json(res, r.status, { ok: false, error: `OpenAI TTS failed: ${r.status}`, detail: detail.slice(0, 600) });
+      lastError = { status: r.status, detail };
+      if (format !== 'wav') break;
     }
 
-    const buffer = Buffer.from(await r.arrayBuffer());
-    res.statusCode = 200;
-    res.setHeader('Content-Type', 'audio/mpeg');
-    res.setHeader('Cache-Control', 'no-store');
-    res.end(buffer);
+    return json(res, lastError?.status || 500, {
+      ok: false,
+      error: `OpenAI TTS failed: ${lastError?.status || 'unknown'}`,
+      detail: String(lastError?.detail || '').slice(0, 600)
+    });
   } catch (error) {
     return json(res, 500, { ok: false, error: error.message || 'TTS request failed.' });
   }

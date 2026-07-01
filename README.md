@@ -35,7 +35,8 @@ npm run build
 
 ## Version Notes
 
-- Version 20.12 makes the iPhone Shortcut optional. The Home receiver has a Loud Voice Setup button, music remains in the 15-33% range, spoken commands pause Spotify/Suno first, the receiver normalizes and boosts AI voice up to 2400%, and music restores after the announcement.
+- Version 20.13 replaces the static-prone raw voice boost with a clear PA voice path: WAV-first TTS, RMS/peak loudness analysis, speech EQ, compression, and soft limiting. Music still pauses for spoken commands, then restores after the announcement.
+- Version 20.12 makes the iPhone Shortcut optional. The Home receiver has a Loud Voice Setup button, music remains in the 15-33% range, spoken commands pause Spotify/Suno first, the receiver normalizes and boosts AI voice, and music restores after the announcement.
 - Version 20.11 matched iOS 26.5 Shortcuts behavior by using fixed If-branch media-volume targets. V20.12 supersedes that path because web apps cannot silently install or configure an iOS Shortcut.
 - Version 20.10 made voice hardware volume always request 100%, raised the voice boost ceiling, and added a louder compressed Web Audio voice path. V20.11 supersedes its Shortcut setup guidance.
 - Version 20.9 forces stale Spotify receiver device IDs out of cloud state during migration, so old V20.5 receiver IDs cannot survive a refresh and cause `Device not found` again.

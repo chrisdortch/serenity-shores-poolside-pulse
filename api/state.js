@@ -16,7 +16,7 @@ const VERSIONED_STATE_KEYS = {
 };
 const V18_STALE_SUNO_COMMAND_CUTOFF = 1782483347041;
 const V18_AUDIO_DEFAULTS_ID = '2026-06-26-v18e-spotify2-suno85-duck0-ann500';
-const V20_AUDIO_DEFAULTS_ID = '2026-07-01-v20-12-loud-voice-takeover';
+const V20_AUDIO_DEFAULTS_ID = '2026-07-01-v20-13-clear-pa-voice';
 const V20_STALE_SPOTIFY_COMMAND_CUTOFF = 1782499126000;
 const V18_STALE_SUNO_TYPES = new Set(['suno-cue', 'suno', 'song']);
 const V20_STALE_SPOTIFY_TYPES = new Set(['spotify-play', 'play']);
@@ -171,7 +171,7 @@ function sanitizeState(state) {
     if (staleV20IOSVolumeNotice(clean.spotifyLastError)) clean.spotifyLastError = '';
     if (staleV20IOSVolumeNotice(clean.spotifyStatus)) clean.spotifyStatus = '';
     if (staleV20IOSVolumeNotice(clean.spotifyDevicesSummary)) {
-      clean.spotifyDevicesSummary = 'V20.12 loud voice mode active: music pauses during spoken commands, voice plays at max receiver boost, then music restores.';
+      clean.spotifyDevicesSummary = 'V20.13 clear PA voice mode active: music pauses during spoken commands, voice plays through the clear voice path, then music restores.';
     }
     if (Array.isArray(clean.activityLog)) {
       clean.activityLog = clean.activityLog.filter(entry => !staleV20IOSVolumeNotice(`${entry?.title || ''} ${entry?.detail || ''}`));
@@ -189,7 +189,7 @@ function sanitizeState(state) {
       clean.spotifyDeviceName = '';
       clean.spotifyReceiverReadyAt = 0;
       clean.spotifyNeedsTap = true;
-      clean.iosVolumeBridgeStatus = 'V20.12 loud voice mode: Shortcut is optional. Loud Voice Setup pauses music during spoken commands, plays voice at max receiver boost, then restores music.';
+      clean.iosVolumeBridgeStatus = 'V20.13 clear PA voice mode: Shortcut is optional. Loud Voice Setup pauses music during spoken commands, plays clean PA-normalized voice, then restores music.';
       clean.iosVolumeBridgeLastTarget = '';
       clean.iosVolumeBridgeLastAt = 0;
     }
