@@ -16,7 +16,7 @@ const VERSIONED_STATE_KEYS = {
 };
 const V18_STALE_SUNO_COMMAND_CUTOFF = 1782483347041;
 const V18_AUDIO_DEFAULTS_ID = '2026-06-26-v18e-spotify2-suno85-duck0-ann500';
-const V20_AUDIO_DEFAULTS_ID = '2026-07-01-v20-8-stale-spotify-device-reset';
+const V20_AUDIO_DEFAULTS_ID = '2026-07-01-v20-9-stale-spotify-device-id-refresh';
 const V20_STALE_SPOTIFY_COMMAND_CUTOFF = 1782499126000;
 const V18_STALE_SUNO_TYPES = new Set(['suno-cue', 'suno', 'song']);
 const V20_STALE_SPOTIFY_TYPES = new Set(['spotify-play', 'play']);
@@ -172,6 +172,12 @@ function sanitizeState(state) {
     clean.sunoVolume = version === '20' ? 15 : 85;
     clean.announcementGain = version === '20' ? 12 : 5;
     clean.spotifyDuckedVolume = 0;
+    if (version === '20') {
+      clean.spotifyDeviceId = '';
+      clean.spotifyDeviceName = '';
+      clean.spotifyReceiverReadyAt = 0;
+      clean.spotifyNeedsTap = true;
+    }
     clean[defaultsKey] = defaultsId;
   }
   clean.spotifyVolume = clampNumber(clean.spotifyVolume, 0, version === '20' ? 33 : 20, version === '20' ? 15 : 2);

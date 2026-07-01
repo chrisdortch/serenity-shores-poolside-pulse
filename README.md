@@ -35,6 +35,7 @@ npm run build
 
 ## Version Notes
 
+- Version 20.9 forces stale Spotify receiver device IDs out of cloud state during migration, so old V20.5 receiver IDs cannot survive a refresh and cause `Device not found` again.
 - Version 20.8 resets stale Spotify receiver device IDs when Spotify returns `Device not found`, reconnects the Home Web Playback receiver once, and stops old failed commands from retrying forever. It keeps the V20.7 iPhone Shortcuts hardware-volume bridge.
 - Version 20.7 adds an optional iPhone hardware volume bridge through a receiver-local Shortcut named `Poolside Pulse Volume`, so the Home iPhone can set true system volume low for Spotify music and high for voice while keeping Suno and voice Web Audio sliders independent. It uses the Shortcuts callback URL form so the speaker iPhone can return to Poolside Pulse after setting volume.
 - Version 20.5 keeps the command-phone/Home-receiver model, caps Spotify and Suno music controls at 33%, defaults music to 15%, runs voice at max adjustable Web Audio gain up to 1200%, keeps Spotify pause/restore during announcements, and stops falsely verifying iPhone-local Spotify volume that iOS keeps under physical control.
