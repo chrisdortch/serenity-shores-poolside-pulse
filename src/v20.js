@@ -1,5 +1,5 @@
 const VERSION = '20';
-const DISPLAY_VERSION = 'v20.13';
+const DISPLAY_VERSION = 'v20.14';
 const PIN = '7900';
 const KEY = 'poolside-pulse-v20';
 const DEVICE_KEY = 'poolside-pulse-v20-device-id';
@@ -10,8 +10,8 @@ const SPOTIFY_TOKEN_KEY = 'poolside-pulse-v20-spotify-token';
 const IOS_VOLUME_BRIDGE_KEY = 'poolside-pulse-v20-ios-volume-bridge-enabled';
 const IOS_VOLUME_BRIDGE_NAME_KEY = 'poolside-pulse-v20-ios-volume-bridge-name';
 const IOS_VOLUME_BRIDGE_MODE_KEY = 'poolside-pulse-v20-ios-volume-bridge-mode-id';
-const IOS_VOLUME_BRIDGE_MODE_ID = '2026-07-01-v20-13-clear-pa-voice';
-const APP_QUERY = '?v=20.13';
+const IOS_VOLUME_BRIDGE_MODE_ID = '2026-07-01-v20-14-clear-pa-state-cleanup';
+const APP_QUERY = '?v=20.14';
 const LEGACY_STATE_KEYS = [
   'poolside-pulse-v18',
   'poolside-pulse-v17',
@@ -73,13 +73,13 @@ const SUNO_VOLUME_SLIDER_MIN = MUSIC_VOLUME_SLIDER_MIN;
 const SUNO_VOLUME_SLIDER_MAX = 33;
 const DEFAULT_ANNOUNCEMENT_GAIN = 24;
 const MAX_ANNOUNCEMENT_GAIN = 24;
-const V20_VOLUME_DEFAULTS_ID = '2026-07-01-v20-13-clear-pa-voice';
+const V20_VOLUME_DEFAULTS_ID = '2026-07-01-v20-14-clear-pa-state-cleanup';
 const LIVE_SPOTIFY_VOLUME_APPLY_MS = 550;
 const SPOTIFY_VOLUME_WATCH_MS = 5000;
 const SPOTIFY_VOLUME_WATCH_LOG_MS = 45000;
 const IOS_VOLUME_BRIDGE_DEFAULT_NAME = 'Poolside Pulse Volume';
 const IOS_VOLUME_BRIDGE_WAIT_MS = 750;
-const IOS_VOLUME_BRIDGE_FIX_TEXT = 'Shortcut is optional in V20.13. Loud Voice Setup pauses music during spoken commands, plays clean PA-normalized voice, then restores music.';
+const IOS_VOLUME_BRIDGE_FIX_TEXT = 'Shortcut is optional in V20.14. Loud Voice Setup pauses music during spoken commands, plays clean PA-normalized voice, then restores music.';
 const SPOTIFY_VOLUME_VERIFY_TOLERANCE = 2;
 const EVENT_TTL_MS = 90 * 60 * 1000;
 const EVENT_LIMIT = 120;
@@ -466,7 +466,7 @@ function hasStaleReceiverFailure(value) {
 }
 
 function hasStaleIOSVolumeNotice(value) {
-  return /iPhone output remains physical|cannot be audibly lowered by JavaScript; .*uses Spotify Connect|Shortcut final action|Shortcut Input bridge|fixed 50%|If branches|fixed Shortcut volume branches/i.test(String(value || ''));
+  return /iPhone output remains physical|cannot be audibly lowered by JavaScript; .*uses Spotify Connect|Shortcut final action|Shortcut Input bridge|fixed 50%|If branches|fixed Shortcut volume branches|V20\.1[0-3].*(?:pauses music|receiver boost|loud voice|max receiver)|voice 2400%|2400% receiver boost|max receiver boost|plays voice at max receiver boost/i.test(String(value || ''));
 }
 
 function spotifyDeviceNotFound(value) {
@@ -545,7 +545,7 @@ function normalize(raw) {
     s.spotifyDeviceName = '';
     s.spotifyReceiverReadyAt = 0;
     s.spotifyNeedsTap = true;
-    s.iosVolumeBridgeStatus = `V20.13 clear PA voice mode: ${IOS_VOLUME_BRIDGE_FIX_TEXT}`;
+    s.iosVolumeBridgeStatus = `V20.14 clear PA voice mode: ${IOS_VOLUME_BRIDGE_FIX_TEXT}`;
     s.iosVolumeBridgeLastTarget = '';
     s.iosVolumeBridgeLastAt = 0;
     s.feedback = 'Ready.';
@@ -2453,7 +2453,7 @@ function applyIOSVolumeBridgeDefault() {
   if (storageGet(IOS_VOLUME_BRIDGE_MODE_KEY) === IOS_VOLUME_BRIDGE_MODE_ID) return;
   setIOSVolumeBridgeEnabled(false);
   storageSet(IOS_VOLUME_BRIDGE_MODE_KEY, IOS_VOLUME_BRIDGE_MODE_ID);
-  S.iosVolumeBridgeStatus = `V20.13 clear PA voice mode: ${IOS_VOLUME_BRIDGE_FIX_TEXT}`;
+  S.iosVolumeBridgeStatus = `V20.14 clear PA voice mode: ${IOS_VOLUME_BRIDGE_FIX_TEXT}`;
   localSave();
 }
 
@@ -2567,7 +2567,7 @@ async function setupLoudVoiceReceiver() {
   S.spotifyDuckedVolume = DEFAULT_SPOTIFY_DUCKED_VOLUME;
   S.announcementGain = MAX_ANNOUNCEMENT_GAIN;
   S.voiceMode = 'ai';
-  S.iosVolumeBridgeStatus = `V20.13 Loud Voice Setup active. ${IOS_VOLUME_BRIDGE_FIX_TEXT}`;
+  S.iosVolumeBridgeStatus = `V20.14 Loud Voice Setup active. ${IOS_VOLUME_BRIDGE_FIX_TEXT}`;
   applyReceiverAudioSettings('Loud Voice Setup', { log: true });
   await ensureReceiverAudio('Loud Voice Setup', {
     required: true,
@@ -2664,7 +2664,7 @@ function registerSpotifyListeners() {
     spotifyPlayerReady = true;
     spotifyWebDeviceId = device_id;
     S.spotifyDeviceId = device_id;
-    S.spotifyDeviceName = 'Poolside Pulse V20.13 Receiver';
+    S.spotifyDeviceName = 'Poolside Pulse V20.14 Receiver';
     S.spotifyReceiverReadyAt = Date.now();
     S.receiverStatus = 'Spotify receiver ready.';
     S.receiverLastSeen = stamp();
@@ -2711,7 +2711,7 @@ async function primeSpotifyPlayer() {
   spotifyPrimePromise = (async () => {
     const Spotify = await ensureSpotifySdk();
     spotifyPlayer = new Spotify.Player({
-      name: 'Poolside Pulse V20.13 Receiver',
+      name: 'Poolside Pulse V20.14 Receiver',
       getOAuthToken: callback => spotifyAccessToken().then(callback).catch(error => setSpotifyStatus(`Spotify token failed: ${error.message}`, false)),
       volume: spotifyVolumePercent(S.spotifyVolume) / 100
     });
@@ -2795,7 +2795,7 @@ async function startSpotifyReceiver({ fromTap = false } = {}) {
     throw error;
   }
   S.spotifyDeviceId = deviceId;
-  S.spotifyDeviceName = S.spotifyDeviceName || 'Poolside Pulse V20.13 Receiver';
+  S.spotifyDeviceName = S.spotifyDeviceName || 'Poolside Pulse V20.14 Receiver';
   S.spotifyReceiverReadyAt = Date.now();
   S.receiverStatus = 'Spotify receiver active.';
   S.receiverLastSeen = stamp();
@@ -3252,7 +3252,7 @@ async function holdSpotifyBedVolume(reason = 'receiver volume hold') {
     const now = Date.now();
     if (now - spotifyVolumeWatchLastLogAt > SPOTIFY_VOLUME_WATCH_LOG_MS) {
       spotifyVolumeWatchLastLogAt = now;
-      logEvent('spotify', 'Spotify volume hold active', `${S.spotifyVolume}%${result?.method ? ` via ${result.method}` : ''}${isIOSLikeBrowser() ? '; V20.13 pauses music during voice and restores it after' : ''}`);
+      logEvent('spotify', 'Spotify volume hold active', `${S.spotifyVolume}%${result?.method ? ` via ${result.method}` : ''}${isIOSLikeBrowser() ? '; V20.14 pauses music during voice and restores it after' : ''}`);
       pushState('', { render: false }).catch(() => {});
     }
     return result;

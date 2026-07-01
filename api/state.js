@@ -16,7 +16,7 @@ const VERSIONED_STATE_KEYS = {
 };
 const V18_STALE_SUNO_COMMAND_CUTOFF = 1782483347041;
 const V18_AUDIO_DEFAULTS_ID = '2026-06-26-v18e-spotify2-suno85-duck0-ann500';
-const V20_AUDIO_DEFAULTS_ID = '2026-07-01-v20-13-clear-pa-voice';
+const V20_AUDIO_DEFAULTS_ID = '2026-07-01-v20-14-clear-pa-state-cleanup';
 const V20_STALE_SPOTIFY_COMMAND_CUTOFF = 1782499126000;
 const V18_STALE_SUNO_TYPES = new Set(['suno-cue', 'suno', 'song']);
 const V20_STALE_SPOTIFY_TYPES = new Set(['spotify-play', 'play']);
@@ -129,7 +129,7 @@ function staleV20SpotifyDeviceNotice(value) {
 }
 
 function staleV20IOSVolumeNotice(value) {
-  return /iPhone output remains physical|cannot be audibly lowered by JavaScript; .*uses Spotify Connect|Shortcut final action|Shortcut Input bridge|fixed 50%|If branches|fixed Shortcut volume branches/i.test(String(value || ''));
+  return /iPhone output remains physical|cannot be audibly lowered by JavaScript; .*uses Spotify Connect|Shortcut final action|Shortcut Input bridge|fixed 50%|If branches|fixed Shortcut volume branches|V20\.1[0-3].*(?:pauses music|receiver boost|loud voice|max receiver)|voice 2400%|2400% receiver boost|max receiver boost|plays voice at max receiver boost/i.test(String(value || ''));
 }
 
 function clampNumber(value, min, max, fallback) {
@@ -146,10 +146,14 @@ function sanitizeState(state) {
   if (version === '18' && staleV18SunoCommand(clean.command)) clean.command = null;
   if (version === '20' && Array.isArray(clean.events)) clean.events = clean.events.filter(event => !staleV20SpotifyCommand(event));
   if (version === '20' && staleV20SpotifyCommand(clean.command)) clean.command = null;
+  if (version === '20' && staleV20IOSVolumeNotice(`${clean.command?.label || ''} ${clean.command?.detail || ''} ${clean.command?.text || ''}`)) clean.command = null;
   if (staleV18SunoNotice(clean.setupNotice)) clean.setupNotice = '';
   if (staleV18SunoNotice(clean.feedback)) clean.feedback = 'Ready.';
   if (staleV18SunoNotice(clean.lastError)) clean.lastError = '';
   if (version === '20') {
+    if (Array.isArray(clean.events)) {
+      clean.events = clean.events.filter(event => !staleV20IOSVolumeNotice(`${event?.label || ''} ${event?.detail || ''} ${event?.text || ''}`));
+    }
     const staleSpotifyDevice = [
       clean.setupNotice,
       clean.feedback,
@@ -171,7 +175,7 @@ function sanitizeState(state) {
     if (staleV20IOSVolumeNotice(clean.spotifyLastError)) clean.spotifyLastError = '';
     if (staleV20IOSVolumeNotice(clean.spotifyStatus)) clean.spotifyStatus = '';
     if (staleV20IOSVolumeNotice(clean.spotifyDevicesSummary)) {
-      clean.spotifyDevicesSummary = 'V20.13 clear PA voice mode active: music pauses during spoken commands, voice plays through the clear voice path, then music restores.';
+      clean.spotifyDevicesSummary = 'V20.14 clear PA voice mode active: music pauses during spoken commands, voice plays through the clear voice path, then music restores.';
     }
     if (Array.isArray(clean.activityLog)) {
       clean.activityLog = clean.activityLog.filter(entry => !staleV20IOSVolumeNotice(`${entry?.title || ''} ${entry?.detail || ''}`));
@@ -189,7 +193,7 @@ function sanitizeState(state) {
       clean.spotifyDeviceName = '';
       clean.spotifyReceiverReadyAt = 0;
       clean.spotifyNeedsTap = true;
-      clean.iosVolumeBridgeStatus = 'V20.13 clear PA voice mode: Shortcut is optional. Loud Voice Setup pauses music during spoken commands, plays clean PA-normalized voice, then restores music.';
+      clean.iosVolumeBridgeStatus = 'V20.14 clear PA voice mode: Shortcut is optional. Loud Voice Setup pauses music during spoken commands, plays clean PA-normalized voice, then restores music.';
       clean.iosVolumeBridgeLastTarget = '';
       clean.iosVolumeBridgeLastAt = 0;
     }
