@@ -128,6 +128,10 @@ function staleV20SpotifyDeviceNotice(value) {
   return /device not found|receiver will retry command|receiver will retry event|transfer is not active|not the audible Spotify device/i.test(String(value || ''));
 }
 
+function staleV20IOSVolumeNotice(value) {
+  return /iPhone output remains physical|cannot be audibly lowered by JavaScript; .*uses Spotify Connect/i.test(String(value || ''));
+}
+
 function clampNumber(value, min, max, fallback) {
   const number = Number(value);
   return Math.max(min, Math.min(max, Number.isFinite(number) ? number : fallback));
@@ -163,6 +167,14 @@ function sanitizeState(state) {
       clean.spotifyDeviceName = '';
       clean.spotifyReceiverReadyAt = 0;
       clean.spotifyNeedsTap = true;
+    }
+    if (staleV20IOSVolumeNotice(clean.spotifyLastError)) clean.spotifyLastError = '';
+    if (staleV20IOSVolumeNotice(clean.spotifyStatus)) clean.spotifyStatus = '';
+    if (staleV20IOSVolumeNotice(clean.spotifyDevicesSummary)) {
+      clean.spotifyDevicesSummary = 'iPhone browser Spotify volume needs the Shortcut Input bridge; music stays low and voice requests 100% hardware volume.';
+    }
+    if (Array.isArray(clean.activityLog)) {
+      clean.activityLog = clean.activityLog.filter(entry => !staleV20IOSVolumeNotice(`${entry?.title || ''} ${entry?.detail || ''}`));
     }
   }
   const defaultsKey = version === '20' ? 'v20VolumeDefaultsApplied' : 'v18VolumeDefaultsApplied';

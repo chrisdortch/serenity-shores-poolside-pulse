@@ -439,6 +439,10 @@ function hasStaleReceiverFailure(value) {
   return STALE_RECEIVER_FAILURE_PATTERN.test(String(value || ''));
 }
 
+function hasStaleIOSVolumeNotice(value) {
+  return /iPhone output remains physical|cannot be audibly lowered by JavaScript; .*uses Spotify Connect/i.test(String(value || ''));
+}
+
 function spotifyDeviceNotFound(value) {
   return /device not found|no active device found|device_id.*not found|device not available/i.test(String(value || ''));
 }
@@ -461,13 +465,19 @@ function clearStaleReceiverFailures(state) {
       .trim() || BASE.spotifyStatus;
   }
   if (hasStaleReceiverFailure(state.feedback)) state.feedback = 'Ready.';
+  if (hasStaleIOSVolumeNotice(state.spotifyLastError)) state.spotifyLastError = '';
+  if (hasStaleIOSVolumeNotice(state.spotifyDevicesSummary)) state.spotifyDevicesSummary = spotifyIOSVolumeLimitDetail(state.spotifyVolume);
+  if (hasStaleIOSVolumeNotice(state.spotifyStatus)) state.spotifyStatus = BASE.spotifyStatus;
   if (hadStaleReceiverFailure) {
     state.spotifyDeviceId = '';
     state.spotifyDeviceName = '';
     state.spotifyReceiverReadyAt = 0;
     state.spotifyNeedsTap = true;
   }
-  state.activityLog = list(state.activityLog).filter(entry => !hasStaleReceiverFailure(`${entry?.title || ''} ${entry?.detail || ''}`));
+  state.activityLog = list(state.activityLog).filter(entry => {
+    const text = `${entry?.title || ''} ${entry?.detail || ''}`;
+    return !hasStaleReceiverFailure(text) && !hasStaleIOSVolumeNotice(text);
+  });
   return state;
 }
 
