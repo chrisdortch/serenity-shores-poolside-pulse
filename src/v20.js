@@ -1,5 +1,5 @@
 const VERSION = '20';
-const DISPLAY_VERSION = 'v20.9';
+const DISPLAY_VERSION = 'v20.10';
 const PIN = '7900';
 const KEY = 'poolside-pulse-v20';
 const DEVICE_KEY = 'poolside-pulse-v20-device-id';
@@ -9,7 +9,7 @@ const RECEIVER_SESSION_KEY = 'poolside-pulse-v20-receiver-session-started-at';
 const SPOTIFY_TOKEN_KEY = 'poolside-pulse-v20-spotify-token';
 const IOS_VOLUME_BRIDGE_KEY = 'poolside-pulse-v20-ios-volume-bridge-enabled';
 const IOS_VOLUME_BRIDGE_NAME_KEY = 'poolside-pulse-v20-ios-volume-bridge-name';
-const APP_QUERY = '?v=20.9';
+const APP_QUERY = '?v=20.10';
 const LEGACY_STATE_KEYS = [
   'poolside-pulse-v18',
   'poolside-pulse-v17',
@@ -66,14 +66,15 @@ const DEFAULT_SPOTIFY_DUCKED_VOLUME = 0;
 const DEFAULT_SUNO_VOLUME = MUSIC_VOLUME_PERCENT;
 const SPOTIFY_VOLUME_SLIDER_MAX = 33;
 const SUNO_VOLUME_SLIDER_MAX = 33;
-const DEFAULT_ANNOUNCEMENT_GAIN = 12;
-const MAX_ANNOUNCEMENT_GAIN = 12;
-const V20_VOLUME_DEFAULTS_ID = '2026-07-01-v20-9-stale-spotify-device-id-refresh';
+const DEFAULT_ANNOUNCEMENT_GAIN = 16;
+const MAX_ANNOUNCEMENT_GAIN = 16;
+const V20_VOLUME_DEFAULTS_ID = '2026-07-01-v20-10-shortcut-input-voice-boost';
 const LIVE_SPOTIFY_VOLUME_APPLY_MS = 550;
 const SPOTIFY_VOLUME_WATCH_MS = 5000;
 const SPOTIFY_VOLUME_WATCH_LOG_MS = 45000;
 const IOS_VOLUME_BRIDGE_DEFAULT_NAME = 'Poolside Pulse Volume';
 const IOS_VOLUME_BRIDGE_WAIT_MS = 750;
+const IOS_VOLUME_BRIDGE_FIX_TEXT = 'Shortcut final action must use the Number from Shortcut Input as the Media volume, not a fixed 50%.';
 const SPOTIFY_VOLUME_VERIFY_TOLERANCE = 2;
 const EVENT_TTL_MS = 90 * 60 * 1000;
 const EVENT_LIMIT = 120;
@@ -508,6 +509,9 @@ function normalize(raw) {
     s.spotifyDeviceName = '';
     s.spotifyReceiverReadyAt = 0;
     s.spotifyNeedsTap = true;
+    s.iosVolumeBridgeStatus = `V20.10 bridge check: ${IOS_VOLUME_BRIDGE_FIX_TEXT}`;
+    s.iosVolumeBridgeLastTarget = '';
+    s.iosVolumeBridgeLastAt = 0;
     s.feedback = 'Ready.';
     s.lastError = '';
     s.setupNotice = '';
@@ -1423,7 +1427,7 @@ async function runCommand(command) {
     setSpotifyStatus(iosLimited ? spotifyIOSVolumeLimitDetail(S.spotifyVolume) : `Spotify volume verified at ${S.spotifyVolume}% on this receiver.`, !iosLimited);
     logEvent(
       'spotify',
-      iosLimited ? 'Spotify volume sent; iPhone output is physical' : 'Spotify volume verified on receiver',
+      iosLimited ? 'Spotify volume sent; Shortcut bridge required' : 'Spotify volume verified on receiver',
       `${S.spotifyVolume}% via ${result.method || 'receiver'}${result.actualVolume !== undefined ? `; Spotify reports ${result.actualVolume}%` : ''}${result.detail ? `; ${result.detail}` : ''}`,
       { eventId: command.id, commandType: command.type }
     );
@@ -2156,7 +2160,7 @@ async function applySpotifyVolume(push = true, options = {}) {
   startSpotifyVolumeWatch(options.live ? 'live local volume slider' : 'local volume control');
   if (!options.silent) {
     const iosLimited = isIOSLikeBrowser() && !result?.verified;
-    logEvent('spotify', iosLimited ? 'Spotify volume sent; iPhone output is physical' : 'Spotify volume set locally', `${volume}% via ${result.method || 'receiver'}${result.verified ? `; verified ${result.actualVolume}%` : ''}${result.detail ? `; ${result.detail}` : ''}`);
+    logEvent('spotify', iosLimited ? 'Spotify volume sent; Shortcut bridge required' : 'Spotify volume set locally', `${volume}% via ${result.method || 'receiver'}${result.verified ? `; verified ${result.actualVolume}%` : ''}${result.detail ? `; ${result.detail}` : ''}`);
     await pushState(`Spotify volume set to ${volume}% on receiver.`, { render: false });
     setSpotifyStatus(iosLimited ? spotifyIOSVolumeLimitDetail(volume) : `Spotify volume verified at ${volume}% on this receiver. Announcements stay loud.`, !iosLimited);
     renderWhenIdle();
@@ -2374,7 +2378,7 @@ function spotifyLocalVolumeSettable() {
 }
 
 function spotifyIOSVolumeLimitDetail(volume = S.spotifyVolume) {
-  return `iPhone browser Spotify volume cannot be audibly lowered by JavaScript; ${clampNumber(volume, 0, SPOTIFY_VOLUME_SLIDER_MAX, DEFAULT_SPOTIFY_VOLUME)}% uses Spotify Connect when possible and the iPhone volume bridge when enabled.`;
+  return `iPhone browser Spotify volume cannot be audibly lowered by JavaScript alone; ${clampNumber(volume, 0, SPOTIFY_VOLUME_SLIDER_MAX, DEFAULT_SPOTIFY_VOLUME)}% needs the iPhone volume bridge, and ${IOS_VOLUME_BRIDGE_FIX_TEXT}`;
 }
 
 function iosVolumeBridgeName() {
@@ -2406,8 +2410,7 @@ function sunoHardwareVolumePercent() {
 }
 
 function voiceHardwareVolumePercent() {
-  const gain = clampNumber(S.announcementGain, 1, MAX_ANNOUNCEMENT_GAIN, DEFAULT_ANNOUNCEMENT_GAIN);
-  return Math.round((gain / MAX_ANNOUNCEMENT_GAIN) * 100);
+  return 100;
 }
 
 function iosVolumeBridgeTarget(kind = 'music') {
@@ -2449,7 +2452,7 @@ async function requestIOSHardwareVolume(kind = 'music', reason = 'receiver volum
   const url = iosVolumeShortcutUrl(percent, target.label);
   S.iosVolumeBridgeLastTarget = last;
   S.iosVolumeBridgeLastAt = now;
-  S.iosVolumeBridgeStatus = `iPhone volume bridge requested ${percent}% for ${target.label}.`;
+  S.iosVolumeBridgeStatus = `iPhone volume bridge requested ${percent}% for ${target.label}. ${IOS_VOLUME_BRIDGE_FIX_TEXT}`;
   localSave();
   try {
     if (options.topLevel) {
@@ -2466,7 +2469,7 @@ async function requestIOSHardwareVolume(kind = 'music', reason = 'receiver volum
       try { frame.remove(); } catch {}
     }, 5000);
     await wait(Number(options.waitMs ?? IOS_VOLUME_BRIDGE_WAIT_MS));
-    if (options.log !== false) logEvent('receiver', 'iPhone volume bridge requested', `${percent}% for ${target.label}; ${reason}`);
+    if (options.log !== false) logEvent('receiver', 'iPhone volume bridge requested', `${percent}% for ${target.label}; ${reason}; ${IOS_VOLUME_BRIDGE_FIX_TEXT}`);
     return true;
   } catch (error) {
     S.iosVolumeBridgeStatus = `iPhone volume bridge failed: ${error.message || error}`;
@@ -2485,11 +2488,11 @@ async function testIOSVolumeBridge(kind = 'music') {
   setIOSVolumeBridgeName(name);
   setIOSVolumeBridgeEnabled(true);
   const target = iosVolumeBridgeTarget(kind);
-  S.iosVolumeBridgeStatus = `Testing iPhone volume bridge: ${target.percent}% for ${target.label}.`;
-  logEvent('receiver', 'iPhone volume bridge test', `${target.percent}% for ${target.label}; shortcut ${name}`);
+  S.iosVolumeBridgeStatus = `Testing iPhone volume bridge: ${target.percent}% for ${target.label}. ${IOS_VOLUME_BRIDGE_FIX_TEXT}`;
+  logEvent('receiver', 'iPhone volume bridge test', `${target.percent}% for ${target.label}; shortcut ${name}; ${IOS_VOLUME_BRIDGE_FIX_TEXT}`);
   localSave();
   renderWhenIdle();
-  await requestIOSHardwareVolume(kind, 'manual test', { force: true, log: true });
+  await requestIOSHardwareVolume(kind, 'manual test', { force: true, log: true, topLevel: true });
   await pushState('iPhone volume bridge test sent.', { render: false });
   renderWhenIdle();
 }
@@ -2567,7 +2570,7 @@ function registerSpotifyListeners() {
     spotifyPlayerReady = true;
     spotifyWebDeviceId = device_id;
     S.spotifyDeviceId = device_id;
-    S.spotifyDeviceName = 'Poolside Pulse V20.9 Receiver';
+    S.spotifyDeviceName = 'Poolside Pulse V20.10 Receiver';
     S.spotifyReceiverReadyAt = Date.now();
     S.receiverStatus = 'Spotify receiver ready.';
     S.receiverLastSeen = stamp();
@@ -2614,7 +2617,7 @@ async function primeSpotifyPlayer() {
   spotifyPrimePromise = (async () => {
     const Spotify = await ensureSpotifySdk();
     spotifyPlayer = new Spotify.Player({
-      name: 'Poolside Pulse V20.9 Receiver',
+      name: 'Poolside Pulse V20.10 Receiver',
       getOAuthToken: callback => spotifyAccessToken().then(callback).catch(error => setSpotifyStatus(`Spotify token failed: ${error.message}`, false)),
       volume: clampNumber(S.spotifyVolume, 0, SPOTIFY_VOLUME_SLIDER_MAX, DEFAULT_SPOTIFY_VOLUME) / 100
     });
@@ -2698,7 +2701,7 @@ async function startSpotifyReceiver({ fromTap = false } = {}) {
     throw error;
   }
   S.spotifyDeviceId = deviceId;
-  S.spotifyDeviceName = S.spotifyDeviceName || 'Poolside Pulse V20.9 Receiver';
+  S.spotifyDeviceName = S.spotifyDeviceName || 'Poolside Pulse V20.10 Receiver';
   S.spotifyReceiverReadyAt = Date.now();
   S.receiverStatus = 'Spotify receiver active.';
   S.receiverLastSeen = stamp();
@@ -3112,7 +3115,7 @@ async function holdSpotifyBedVolume(reason = 'receiver volume hold') {
     const now = Date.now();
     if (now - spotifyVolumeWatchLastLogAt > SPOTIFY_VOLUME_WATCH_LOG_MS) {
       spotifyVolumeWatchLastLogAt = now;
-      logEvent('spotify', 'Spotify volume hold active', `${S.spotifyVolume}%${result?.method ? ` via ${result.method}` : ''}${isIOSLikeBrowser() ? '; iPhone output remains physical, voice pauses Spotify' : ''}`);
+      logEvent('spotify', 'Spotify volume hold active', `${S.spotifyVolume}%${result?.method ? ` via ${result.method}` : ''}${isIOSLikeBrowser() ? '; iPhone output needs Shortcut Input bridge; voice pauses Spotify' : ''}`);
       pushState('', { render: false }).catch(() => {});
     }
     return result;
@@ -4696,7 +4699,7 @@ function iosVolumeBridgeControls() {
   const enabled = iosVolumeBridgeEnabled();
   const name = iosVolumeBridgeName();
   const status = S.iosVolumeBridgeStatus || (enabled ? 'Enabled on this receiver.' : 'Off on this receiver.');
-  return `<div class="bridgePanel"><h3>iPhone Volume Bridge</h3><div class="grid2"><label>Bridge<select id="iosVolumeBridgeEnabled"><option value="false" ${enabled ? '' : 'selected'}>Off</option><option value="true" ${enabled ? 'selected' : ''}>On</option></select></label><label>Shortcut Name<input id="iosVolumeBridgeName" value="${esc(name)}"></label></div><div class="buttonStack"><button id="saveBridgeHome" class="secondary">Save Bridge</button><button id="testMusicBridgeHome" class="secondary">Test Music Level</button><button id="testVoiceBridgeHome" class="secondary">Test Voice Level</button></div><p class="muted">${esc(status)}</p></div>`;
+  return `<div class="bridgePanel"><h3>iPhone Volume Bridge</h3><div class="grid2"><label>Bridge<select id="iosVolumeBridgeEnabled"><option value="false" ${enabled ? '' : 'selected'}>Off</option><option value="true" ${enabled ? 'selected' : ''}>On</option></select></label><label>Shortcut Name<input id="iosVolumeBridgeName" value="${esc(name)}"></label></div><div class="buttonStack"><button id="saveBridgeHome" class="secondary">Save Bridge</button><button id="testMusicBridgeHome" class="secondary">Test Music Level</button><button id="testVoiceBridgeHome" class="secondary">Test Voice Level</button></div><p class="bridgeHint">${esc(IOS_VOLUME_BRIDGE_FIX_TEXT)}</p><p class="muted">${esc(status)}</p></div>`;
 }
 
 function homePage() {
@@ -4955,7 +4958,7 @@ function bind() {
   wire('saveBridgeHome', async () => {
     setIOSVolumeBridgeName(val('iosVolumeBridgeName').trim() || iosVolumeBridgeName());
     setIOSVolumeBridgeEnabled(val('iosVolumeBridgeEnabled') === 'true');
-    S.iosVolumeBridgeStatus = iosVolumeBridgeEnabled() ? `Enabled shortcut: ${iosVolumeBridgeName()}.` : 'iPhone volume bridge off.';
+    S.iosVolumeBridgeStatus = iosVolumeBridgeEnabled() ? `Enabled shortcut: ${iosVolumeBridgeName()}. ${IOS_VOLUME_BRIDGE_FIX_TEXT}` : 'iPhone volume bridge off.';
     logEvent('receiver', 'iPhone volume bridge saved', S.iosVolumeBridgeStatus);
     await pushState('iPhone volume bridge saved on receiver.', { render: false });
     renderWhenIdle();

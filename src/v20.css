@@ -990,6 +990,16 @@ button[aria-busy="true"]::after {
   margin-top: 8px;
 }
 
+.bridgeHint {
+  margin: 10px 0 4px;
+  padding: 10px 12px;
+  border: 1px solid #f0d2a9;
+  border-radius: 10px;
+  background: #fff7ea;
+  color: var(--amber);
+  font-weight: 900;
+}
+
 .tabs button.on,
 .modeSwitch button.on,
 button[aria-pressed="true"] {

@@ -1,5 +1,5 @@
 (() => {
-  const VERSION = '20.9';
+  const VERSION = '20.10';
   let unlocked = false;
   let unlocking = false;
   let unlockPromise = null;
@@ -284,19 +284,21 @@
     if (ctx.state !== 'running') throw Error(`Web Audio is ${ctx.state}; tap Start Speaker Phone on this phone.`);
     const buffer = await decodeAudio(ctx, await blob.arrayBuffer());
     const source = ctx.createBufferSource();
-    const gain = ctx.createGain();
+    const drive = ctx.createGain();
+    const makeup = ctx.createGain();
     const limiter = typeof ctx.createDynamicsCompressor === 'function' ? ctx.createDynamicsCompressor() : null;
-    gain.gain.value = options.gain;
+    drive.gain.value = options.gain;
+    makeup.gain.value = 1.35;
     if (limiter) {
-      limiter.threshold.value = -18;
-      limiter.knee.value = 18;
-      limiter.ratio.value = 16;
-      limiter.attack.value = 0.003;
-      limiter.release.value = 0.18;
+      limiter.threshold.value = -24;
+      limiter.knee.value = 14;
+      limiter.ratio.value = 20;
+      limiter.attack.value = 0.002;
+      limiter.release.value = 0.14;
     }
     source.buffer = buffer;
-    if (limiter) source.connect(gain).connect(limiter).connect(ctx.destination);
-    else source.connect(gain).connect(ctx.destination);
+    if (limiter) source.connect(drive).connect(limiter).connect(makeup).connect(ctx.destination);
+    else source.connect(drive).connect(ctx.destination);
     return await new Promise((resolve, reject) => {
       let started = false;
       let stopped = false;

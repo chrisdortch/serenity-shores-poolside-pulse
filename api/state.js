@@ -16,7 +16,7 @@ const VERSIONED_STATE_KEYS = {
 };
 const V18_STALE_SUNO_COMMAND_CUTOFF = 1782483347041;
 const V18_AUDIO_DEFAULTS_ID = '2026-06-26-v18e-spotify2-suno85-duck0-ann500';
-const V20_AUDIO_DEFAULTS_ID = '2026-07-01-v20-9-stale-spotify-device-id-refresh';
+const V20_AUDIO_DEFAULTS_ID = '2026-07-01-v20-10-shortcut-input-voice-boost';
 const V20_STALE_SPOTIFY_COMMAND_CUTOFF = 1782499126000;
 const V18_STALE_SUNO_TYPES = new Set(['suno-cue', 'suno', 'song']);
 const V20_STALE_SPOTIFY_TYPES = new Set(['spotify-play', 'play']);
@@ -170,20 +170,23 @@ function sanitizeState(state) {
   if (clean[defaultsKey] !== defaultsId) {
     clean.spotifyVolume = version === '20' ? 15 : 2;
     clean.sunoVolume = version === '20' ? 15 : 85;
-    clean.announcementGain = version === '20' ? 12 : 5;
+    clean.announcementGain = version === '20' ? 16 : 5;
     clean.spotifyDuckedVolume = 0;
     if (version === '20') {
       clean.spotifyDeviceId = '';
       clean.spotifyDeviceName = '';
       clean.spotifyReceiverReadyAt = 0;
       clean.spotifyNeedsTap = true;
+      clean.iosVolumeBridgeStatus = 'V20.10 bridge check: Shortcut final action must use the Number from Shortcut Input as the Media volume, not a fixed 50%.';
+      clean.iosVolumeBridgeLastTarget = '';
+      clean.iosVolumeBridgeLastAt = 0;
     }
     clean[defaultsKey] = defaultsId;
   }
   clean.spotifyVolume = clampNumber(clean.spotifyVolume, 0, version === '20' ? 33 : 20, version === '20' ? 15 : 2);
   clean.sunoVolume = clampNumber(clean.sunoVolume, 0, version === '20' ? 33 : 100, version === '20' ? 15 : 85);
   clean.spotifyDuckedVolume = version === '20' ? clampNumber(clean.spotifyDuckedVolume, 0, 100, 0) : 0;
-  clean.announcementGain = clampNumber(clean.announcementGain, 1, version === '20' ? 12 : 6, version === '20' ? 12 : 5);
+  clean.announcementGain = clampNumber(clean.announcementGain, 1, version === '20' ? 16 : 6, version === '20' ? 16 : 5);
   return clean;
 }
 
