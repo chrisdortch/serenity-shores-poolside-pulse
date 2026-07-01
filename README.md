@@ -35,7 +35,8 @@ npm run build
 
 ## Version Notes
 
-- Version 20.10 makes voice hardware volume always request 100%, raises the voice boost ceiling, adds a louder compressed Web Audio voice path, and warns when the iPhone Shortcut bridge is likely hard-coded instead of using Shortcut Input.
+- Version 20.11 matches iOS 26.5 Shortcuts behavior by using fixed If-branch media-volume targets: music/Suno stay between 15% and 33%, voice requests 100%, and the app no longer asks for a variable picker in Apple's fixed Set Media Volume slider.
+- Version 20.10 made voice hardware volume always request 100%, raised the voice boost ceiling, and added a louder compressed Web Audio voice path. V20.11 supersedes its Shortcut setup guidance.
 - Version 20.9 forces stale Spotify receiver device IDs out of cloud state during migration, so old V20.5 receiver IDs cannot survive a refresh and cause `Device not found` again.
 - Version 20.8 resets stale Spotify receiver device IDs when Spotify returns `Device not found`, reconnects the Home Web Playback receiver once, and stops old failed commands from retrying forever. It keeps the V20.7 iPhone Shortcuts hardware-volume bridge.
 - Version 20.7 adds an optional iPhone hardware volume bridge through a receiver-local Shortcut named `Poolside Pulse Volume`, so the Home iPhone can set true system volume low for Spotify music and high for voice while keeping Suno and voice Web Audio sliders independent. It uses the Shortcuts callback URL form so the speaker iPhone can return to Poolside Pulse after setting volume.

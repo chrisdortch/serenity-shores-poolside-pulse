@@ -1,5 +1,5 @@
 const VERSION = '20';
-const DISPLAY_VERSION = 'v20.10';
+const DISPLAY_VERSION = 'v20.11';
 const PIN = '7900';
 const KEY = 'poolside-pulse-v20';
 const DEVICE_KEY = 'poolside-pulse-v20-device-id';
@@ -9,7 +9,7 @@ const RECEIVER_SESSION_KEY = 'poolside-pulse-v20-receiver-session-started-at';
 const SPOTIFY_TOKEN_KEY = 'poolside-pulse-v20-spotify-token';
 const IOS_VOLUME_BRIDGE_KEY = 'poolside-pulse-v20-ios-volume-bridge-enabled';
 const IOS_VOLUME_BRIDGE_NAME_KEY = 'poolside-pulse-v20-ios-volume-bridge-name';
-const APP_QUERY = '?v=20.10';
+const APP_QUERY = '?v=20.11';
 const LEGACY_STATE_KEYS = [
   'poolside-pulse-v18',
   'poolside-pulse-v17',
@@ -60,21 +60,24 @@ const DEFAULT_SUNO_PLAYLIST = '';
 const LEGACY_DELETED_SUNO_PLAYLIST = 'https://suno.com/playlist/cf4b536e-9005-4c98-9ea5-a7f01eca116f';
 const LEGACY_DELETED_SUNO_ID_PATTERN = /cf4b536e-9005/i;
 const DEFAULT_ADDRESS = '615 Serenity Shores Ln, Kimberling City, MO 65686';
-const MUSIC_VOLUME_PERCENT = 15;
+const MUSIC_VOLUME_SLIDER_MIN = 15;
+const MUSIC_VOLUME_PERCENT = MUSIC_VOLUME_SLIDER_MIN;
 const DEFAULT_SPOTIFY_VOLUME = MUSIC_VOLUME_PERCENT;
 const DEFAULT_SPOTIFY_DUCKED_VOLUME = 0;
 const DEFAULT_SUNO_VOLUME = MUSIC_VOLUME_PERCENT;
+const SPOTIFY_VOLUME_SLIDER_MIN = MUSIC_VOLUME_SLIDER_MIN;
 const SPOTIFY_VOLUME_SLIDER_MAX = 33;
+const SUNO_VOLUME_SLIDER_MIN = MUSIC_VOLUME_SLIDER_MIN;
 const SUNO_VOLUME_SLIDER_MAX = 33;
 const DEFAULT_ANNOUNCEMENT_GAIN = 16;
 const MAX_ANNOUNCEMENT_GAIN = 16;
-const V20_VOLUME_DEFAULTS_ID = '2026-07-01-v20-10-shortcut-input-voice-boost';
+const V20_VOLUME_DEFAULTS_ID = '2026-07-01-v20-11-ios-fixed-volume-branches';
 const LIVE_SPOTIFY_VOLUME_APPLY_MS = 550;
 const SPOTIFY_VOLUME_WATCH_MS = 5000;
 const SPOTIFY_VOLUME_WATCH_LOG_MS = 45000;
 const IOS_VOLUME_BRIDGE_DEFAULT_NAME = 'Poolside Pulse Volume';
 const IOS_VOLUME_BRIDGE_WAIT_MS = 750;
-const IOS_VOLUME_BRIDGE_FIX_TEXT = 'Shortcut final action must use the Number from Shortcut Input as the Media volume, not a fixed 50%.';
+const IOS_VOLUME_BRIDGE_FIX_TEXT = 'Poolside Pulse Volume must use If branches: >80 sets 100%, >28 sets 33%, >19 sets 25%, otherwise 15%.';
 const SPOTIFY_VOLUME_VERIFY_TOLERANCE = 2;
 const EVENT_TTL_MS = 90 * 60 * 1000;
 const EVENT_LIMIT = 120;
@@ -353,8 +356,23 @@ function clampNumber(value, min, max, fallback) {
   return Math.max(min, Math.min(max, Number.isFinite(n) ? n : fallback));
 }
 
+function spotifyVolumePercent(value = S?.spotifyVolume, fallback = DEFAULT_SPOTIFY_VOLUME) {
+  return clampNumber(value, SPOTIFY_VOLUME_SLIDER_MIN, SPOTIFY_VOLUME_SLIDER_MAX, fallback);
+}
+
+function sunoVolumePercent(value = S?.sunoVolume, fallback = DEFAULT_SUNO_VOLUME) {
+  return clampNumber(value, SUNO_VOLUME_SLIDER_MIN, SUNO_VOLUME_SLIDER_MAX, fallback);
+}
+
+function iosMusicBranchVolumePercent(value = S?.spotifyVolume, fallback = DEFAULT_SPOTIFY_VOLUME) {
+  const volume = clampNumber(value, MUSIC_VOLUME_SLIDER_MIN, SPOTIFY_VOLUME_SLIDER_MAX, fallback);
+  if (volume > 28) return 33;
+  if (volume > 19) return 25;
+  return 15;
+}
+
 function musicVolumePercent(value = S?.sunoVolume) {
-  return clampNumber(value, 0, SUNO_VOLUME_SLIDER_MAX, DEFAULT_SUNO_VOLUME);
+  return sunoVolumePercent(value);
 }
 
 function musicGain(value = S?.sunoVolume) {
@@ -440,7 +458,7 @@ function hasStaleReceiverFailure(value) {
 }
 
 function hasStaleIOSVolumeNotice(value) {
-  return /iPhone output remains physical|cannot be audibly lowered by JavaScript; .*uses Spotify Connect/i.test(String(value || ''));
+  return /iPhone output remains physical|cannot be audibly lowered by JavaScript; .*uses Spotify Connect|Shortcut final action|Shortcut Input bridge|fixed 50%/i.test(String(value || ''));
 }
 
 function spotifyDeviceNotFound(value) {
@@ -505,10 +523,10 @@ function normalize(raw) {
     : String(s.quickMusicUrl || s.spotifyUrl || DEFAULT_SPOTIFY_PLAYLIST);
   s.spotifyClientId = String(s.spotifyClientId || DEFAULT_SPOTIFY_CLIENT_ID);
   s.spotifyRedirectUri = normalizeRedirectUri(s.spotifyRedirectUri || appRedirectDefault());
-  s.spotifyVolume = clampNumber(s.spotifyVolume, 0, SPOTIFY_VOLUME_SLIDER_MAX, DEFAULT_SPOTIFY_VOLUME);
+  s.spotifyVolume = spotifyVolumePercent(s.spotifyVolume);
   s.spotifyDuckedVolume = clampNumber(s.spotifyDuckedVolume, 0, SPOTIFY_VOLUME_SLIDER_MAX, DEFAULT_SPOTIFY_DUCKED_VOLUME);
   s.announcementGain = clampNumber(s.announcementGain, 1, MAX_ANNOUNCEMENT_GAIN, DEFAULT_ANNOUNCEMENT_GAIN);
-  s.sunoVolume = clampNumber(s.sunoVolume, 0, SUNO_VOLUME_SLIDER_MAX, DEFAULT_SUNO_VOLUME);
+  s.sunoVolume = sunoVolumePercent(s.sunoVolume);
   s.sunoDuckedVolume = clampNumber(s.sunoDuckedVolume, 0, 20, 2);
   if (source.v20VolumeDefaultsApplied !== V20_VOLUME_DEFAULTS_ID) {
     s.spotifyVolume = DEFAULT_SPOTIFY_VOLUME;
@@ -519,7 +537,7 @@ function normalize(raw) {
     s.spotifyDeviceName = '';
     s.spotifyReceiverReadyAt = 0;
     s.spotifyNeedsTap = true;
-    s.iosVolumeBridgeStatus = `V20.10 bridge check: ${IOS_VOLUME_BRIDGE_FIX_TEXT}`;
+    s.iosVolumeBridgeStatus = `V20.11 bridge check: ${IOS_VOLUME_BRIDGE_FIX_TEXT}`;
     s.iosVolumeBridgeLastTarget = '';
     s.iosVolumeBridgeLastAt = 0;
     s.feedback = 'Ready.';
@@ -696,10 +714,10 @@ function uiIsEditing() {
 
 function audioDraftControls() {
   return [
-    ['spotifyVolumeCommand', 'spotifyVolume', 0, SPOTIFY_VOLUME_SLIDER_MAX, DEFAULT_SPOTIFY_VOLUME],
-    ['spotifyVolume', 'spotifyVolume', 0, SPOTIFY_VOLUME_SLIDER_MAX, DEFAULT_SPOTIFY_VOLUME],
+    ['spotifyVolumeCommand', 'spotifyVolume', SPOTIFY_VOLUME_SLIDER_MIN, SPOTIFY_VOLUME_SLIDER_MAX, DEFAULT_SPOTIFY_VOLUME],
+    ['spotifyVolume', 'spotifyVolume', SPOTIFY_VOLUME_SLIDER_MIN, SPOTIFY_VOLUME_SLIDER_MAX, DEFAULT_SPOTIFY_VOLUME],
     ['spotifyDuckedVolume', 'spotifyDuckedVolume', 0, SPOTIFY_VOLUME_SLIDER_MAX, DEFAULT_SPOTIFY_DUCKED_VOLUME],
-    ['sunoVolume', 'sunoVolume', 0, SUNO_VOLUME_SLIDER_MAX, DEFAULT_SUNO_VOLUME],
+    ['sunoVolume', 'sunoVolume', SUNO_VOLUME_SLIDER_MIN, SUNO_VOLUME_SLIDER_MAX, DEFAULT_SUNO_VOLUME],
     ['announcementGain', 'announcementGain', 1, MAX_ANNOUNCEMENT_GAIN, DEFAULT_ANNOUNCEMENT_GAIN],
     ['rate', 'rate', .75, 1.15, .94],
     ['pitch', 'pitch', .85, 1.15, 1]
@@ -1399,12 +1417,12 @@ async function runCommand(command) {
   if (!command?.type) return;
   S.musicProvider = 'spotify';
   if (command.type === 'spotify-volume') {
-    S.spotifyVolume = clampNumber(command.volume, 0, SPOTIFY_VOLUME_SLIDER_MAX, S.spotifyVolume);
+    S.spotifyVolume = spotifyVolumePercent(command.volume, S.spotifyVolume);
   } else if (command.type === 'audio-settings') {
     if (Number.isFinite(Number(command.spotifyDuckedVolume))) {
       S.spotifyDuckedVolume = clampNumber(command.spotifyDuckedVolume, 0, SPOTIFY_VOLUME_SLIDER_MAX, S.spotifyDuckedVolume);
     }
-    if (Number.isFinite(Number(command.sunoVolume))) S.sunoVolume = clampNumber(command.sunoVolume, 0, SUNO_VOLUME_SLIDER_MAX, S.sunoVolume);
+    if (Number.isFinite(Number(command.sunoVolume))) S.sunoVolume = sunoVolumePercent(command.sunoVolume, S.sunoVolume);
     if (Number.isFinite(Number(command.announcementGain))) S.announcementGain = clampNumber(command.announcementGain, 1, MAX_ANNOUNCEMENT_GAIN, S.announcementGain);
     if (Number.isFinite(Number(command.rate))) S.rate = clampNumber(command.rate, .75, 1.15, S.rate);
     if (Number.isFinite(Number(command.pitch))) S.pitch = clampNumber(command.pitch, .85, 1.15, S.pitch);
@@ -1437,7 +1455,7 @@ async function runCommand(command) {
     setSpotifyStatus(iosLimited ? spotifyIOSVolumeLimitDetail(S.spotifyVolume) : `Spotify volume verified at ${S.spotifyVolume}% on this receiver.`, !iosLimited);
     logEvent(
       'spotify',
-      iosLimited ? 'Spotify volume sent; Shortcut bridge required' : 'Spotify volume verified on receiver',
+      iosLimited ? 'Spotify volume sent; fixed volume bridge required' : 'Spotify volume verified on receiver',
       `${S.spotifyVolume}% via ${result.method || 'receiver'}${result.actualVolume !== undefined ? `; Spotify reports ${result.actualVolume}%` : ''}${result.detail ? `; ${result.detail}` : ''}`,
       { eventId: command.id, commandType: command.type }
     );
@@ -1484,10 +1502,10 @@ function readMusicSettings() {
   if ($('spotifyRedirectUri')) S.spotifyRedirectUri = normalizeRedirectUri(val('spotifyRedirectUri').trim() || S.spotifyRedirectUri || appRedirectDefault());
   if ($('iosVolumeBridgeName')) setIOSVolumeBridgeName(val('iosVolumeBridgeName').trim() || iosVolumeBridgeName());
   if ($('iosVolumeBridgeEnabled')) setIOSVolumeBridgeEnabled(val('iosVolumeBridgeEnabled') === 'true');
-  S.spotifyVolume = clampNumber($('spotifyVolume') ? val('spotifyVolume') : S.spotifyVolume, 0, SPOTIFY_VOLUME_SLIDER_MAX, DEFAULT_SPOTIFY_VOLUME);
+  S.spotifyVolume = spotifyVolumePercent($('spotifyVolume') ? val('spotifyVolume') : S.spotifyVolume);
   S.spotifyDuckedVolume = clampNumber($('spotifyDuckedVolume') ? val('spotifyDuckedVolume') : S.spotifyDuckedVolume, 0, SPOTIFY_VOLUME_SLIDER_MAX, DEFAULT_SPOTIFY_DUCKED_VOLUME);
   S.announcementGain = clampNumber($('announcementGain') ? val('announcementGain') : S.announcementGain, 1, MAX_ANNOUNCEMENT_GAIN, DEFAULT_ANNOUNCEMENT_GAIN);
-  S.sunoVolume = clampNumber($('sunoVolume') ? val('sunoVolume') : S.sunoVolume, 0, SUNO_VOLUME_SLIDER_MAX, DEFAULT_SUNO_VOLUME);
+  S.sunoVolume = sunoVolumePercent($('sunoVolume') ? val('sunoVolume') : S.sunoVolume);
   S.sunoDuckedVolume = clampNumber($('sunoDuckedVolume') ? val('sunoDuckedVolume') : S.sunoDuckedVolume, 0, 20, 2);
   S.activeMusicProvider = 'spotify';
   S.activeMusicUrl = S.spotifyUrl || DEFAULT_SPOTIFY_PLAYLIST;
@@ -1993,13 +2011,13 @@ async function playAnyMusicUrl(url = S.quickMusicUrl || activeProviderUrl(), pus
 
 function readSpotifyVolumeControl() {
   const el = $('spotifyVolumeCommand') || $('spotifyVolume');
-  S.spotifyVolume = clampNumber(el ? el.value : S.spotifyVolume, 0, SPOTIFY_VOLUME_SLIDER_MAX, DEFAULT_SPOTIFY_VOLUME);
+  S.spotifyVolume = spotifyVolumePercent(el ? el.value : S.spotifyVolume);
   localSave();
   return S.spotifyVolume;
 }
 
 function updateSpotifyVolumeDraft(value) {
-  S.spotifyVolume = clampNumber(value, 0, SPOTIFY_VOLUME_SLIDER_MAX, DEFAULT_SPOTIFY_VOLUME);
+  S.spotifyVolume = spotifyVolumePercent(value);
   localSave();
   syncVolumeReadouts();
   if (S.screen === 'home') spotifySetLocalPlayerVolume(S.spotifyVolume, 'Spotify slider preview').catch(() => {});
@@ -2007,8 +2025,24 @@ function updateSpotifyVolumeDraft(value) {
   return S.spotifyVolume;
 }
 
+function setRangeLimits(id, min, max) {
+  const input = $(id);
+  if (!input) return;
+  input.min = String(min);
+  input.max = String(max);
+}
+
+function syncVolumeInputLimits() {
+  setRangeLimits('spotifyVolumeCommand', SPOTIFY_VOLUME_SLIDER_MIN, SPOTIFY_VOLUME_SLIDER_MAX);
+  setRangeLimits('spotifyVolume', SPOTIFY_VOLUME_SLIDER_MIN, SPOTIFY_VOLUME_SLIDER_MAX);
+  setRangeLimits('spotifyDuckedVolume', 0, SPOTIFY_VOLUME_SLIDER_MAX);
+  setRangeLimits('sunoVolume', SUNO_VOLUME_SLIDER_MIN, SUNO_VOLUME_SLIDER_MAX);
+  setRangeLimits('announcementGain', 1, MAX_ANNOUNCEMENT_GAIN);
+}
+
 function syncVolumeReadouts() {
-  const volume = String(clampNumber(S.spotifyVolume, 0, SPOTIFY_VOLUME_SLIDER_MAX, DEFAULT_SPOTIFY_VOLUME));
+  syncVolumeInputLimits();
+  const volume = String(spotifyVolumePercent(S.spotifyVolume));
   ['spotifyVolume', 'spotifyVolumeCommand'].forEach(id => {
     const input = $(id);
     if (input && String(input.value) !== volume) input.value = volume;
@@ -2022,7 +2056,7 @@ function syncVolumeReadouts() {
   if (duckedInput && String(duckedInput.value) !== duckedValue) duckedInput.value = duckedValue;
   const ducked = $('spotifyDuckedVolumeOut');
   if (ducked) ducked.textContent = `${duckedValue}%`;
-  const sunoValue = String(clampNumber(S.sunoVolume, 0, SUNO_VOLUME_SLIDER_MAX, DEFAULT_SUNO_VOLUME));
+  const sunoValue = String(sunoVolumePercent(S.sunoVolume));
   const sunoInput = $('sunoVolume');
   if (sunoInput && String(sunoInput.value) !== sunoValue) sunoInput.value = sunoValue;
   const suno = $('sunoVolumeOut');
@@ -2045,9 +2079,9 @@ function syncVolumeReadouts() {
 }
 
 function updateRangeDraft(key, value) {
-  if (key === 'spotifyVolume') S.spotifyVolume = clampNumber(value, 0, SPOTIFY_VOLUME_SLIDER_MAX, DEFAULT_SPOTIFY_VOLUME);
+  if (key === 'spotifyVolume') S.spotifyVolume = spotifyVolumePercent(value);
   else if (key === 'spotifyDuckedVolume') S.spotifyDuckedVolume = clampNumber(value, 0, SPOTIFY_VOLUME_SLIDER_MAX, DEFAULT_SPOTIFY_DUCKED_VOLUME);
-  else if (key === 'sunoVolume') S.sunoVolume = clampNumber(value, 0, SUNO_VOLUME_SLIDER_MAX, DEFAULT_SUNO_VOLUME);
+  else if (key === 'sunoVolume') S.sunoVolume = sunoVolumePercent(value);
   else if (key === 'announcementGain') S.announcementGain = clampNumber(value, 1, MAX_ANNOUNCEMENT_GAIN, DEFAULT_ANNOUNCEMENT_GAIN);
   else if (key === 'rate') S.rate = clampNumber(value, .75, 1.15, .94);
   else if (key === 'pitch') S.pitch = clampNumber(value, .85, 1.15, 1);
@@ -2058,7 +2092,7 @@ function updateRangeDraft(key, value) {
 function audioSettingsPayload() {
   return {
     spotifyDuckedVolume: clampNumber(S.spotifyDuckedVolume, 0, SPOTIFY_VOLUME_SLIDER_MAX, DEFAULT_SPOTIFY_DUCKED_VOLUME),
-    sunoVolume: clampNumber(S.sunoVolume, 0, SUNO_VOLUME_SLIDER_MAX, DEFAULT_SUNO_VOLUME),
+    sunoVolume: sunoVolumePercent(S.sunoVolume),
     announcementGain: clampNumber(S.announcementGain, 1, MAX_ANNOUNCEMENT_GAIN, DEFAULT_ANNOUNCEMENT_GAIN),
     rate: clampNumber(S.rate, .75, 1.15, .94),
     pitch: clampNumber(S.pitch, .85, 1.15, 1)
@@ -2126,7 +2160,7 @@ function scheduleAudioSettingsApply() {
 }
 
 async function sendSpotifyVolumeCommand(volume, options = {}) {
-  const safeVolume = clampNumber(volume, 0, SPOTIFY_VOLUME_SLIDER_MAX, DEFAULT_SPOTIFY_VOLUME);
+  const safeVolume = spotifyVolumePercent(volume);
   const event = appendEvent('command', {
     type: 'spotify-volume',
     volume: safeVolume,
@@ -2170,7 +2204,7 @@ async function applySpotifyVolume(push = true, options = {}) {
   startSpotifyVolumeWatch(options.live ? 'live local volume slider' : 'local volume control');
   if (!options.silent) {
     const iosLimited = isIOSLikeBrowser() && !result?.verified;
-    logEvent('spotify', iosLimited ? 'Spotify volume sent; Shortcut bridge required' : 'Spotify volume set locally', `${volume}% via ${result.method || 'receiver'}${result.verified ? `; verified ${result.actualVolume}%` : ''}${result.detail ? `; ${result.detail}` : ''}`);
+    logEvent('spotify', iosLimited ? 'Spotify volume sent; fixed volume bridge required' : 'Spotify volume set locally', `${volume}% via ${result.method || 'receiver'}${result.verified ? `; verified ${result.actualVolume}%` : ''}${result.detail ? `; ${result.detail}` : ''}`);
     await pushState(`Spotify volume set to ${volume}% on receiver.`, { render: false });
     setSpotifyStatus(iosLimited ? spotifyIOSVolumeLimitDetail(volume) : `Spotify volume verified at ${volume}% on this receiver. Announcements stay loud.`, !iosLimited);
     renderWhenIdle();
@@ -2388,7 +2422,7 @@ function spotifyLocalVolumeSettable() {
 }
 
 function spotifyIOSVolumeLimitDetail(volume = S.spotifyVolume) {
-  return `iPhone browser Spotify volume cannot be audibly lowered by JavaScript alone; ${clampNumber(volume, 0, SPOTIFY_VOLUME_SLIDER_MAX, DEFAULT_SPOTIFY_VOLUME)}% needs the iPhone volume bridge, and ${IOS_VOLUME_BRIDGE_FIX_TEXT}`;
+  return `iPhone browser Spotify volume cannot be audibly lowered by JavaScript alone; ${spotifyVolumePercent(volume)}% uses the iPhone volume bridge branch target ${iosMusicBranchVolumePercent(volume)}%, and ${IOS_VOLUME_BRIDGE_FIX_TEXT}`;
 }
 
 function iosVolumeBridgeName() {
@@ -2412,11 +2446,11 @@ function iosHardwareVolumeAvailable() {
 }
 
 function musicHardwareVolumePercent() {
-  return Math.round(clampNumber(S.spotifyVolume, 0, SPOTIFY_VOLUME_SLIDER_MAX, DEFAULT_SPOTIFY_VOLUME));
+  return iosMusicBranchVolumePercent(S.spotifyVolume);
 }
 
 function sunoHardwareVolumePercent() {
-  return 100;
+  return iosMusicBranchVolumePercent(S.sunoVolume, DEFAULT_SUNO_VOLUME);
 }
 
 function voiceHardwareVolumePercent() {
@@ -2580,7 +2614,7 @@ function registerSpotifyListeners() {
     spotifyPlayerReady = true;
     spotifyWebDeviceId = device_id;
     S.spotifyDeviceId = device_id;
-    S.spotifyDeviceName = 'Poolside Pulse V20.10 Receiver';
+    S.spotifyDeviceName = 'Poolside Pulse V20.11 Receiver';
     S.spotifyReceiverReadyAt = Date.now();
     S.receiverStatus = 'Spotify receiver ready.';
     S.receiverLastSeen = stamp();
@@ -2627,9 +2661,9 @@ async function primeSpotifyPlayer() {
   spotifyPrimePromise = (async () => {
     const Spotify = await ensureSpotifySdk();
     spotifyPlayer = new Spotify.Player({
-      name: 'Poolside Pulse V20.10 Receiver',
+      name: 'Poolside Pulse V20.11 Receiver',
       getOAuthToken: callback => spotifyAccessToken().then(callback).catch(error => setSpotifyStatus(`Spotify token failed: ${error.message}`, false)),
-      volume: clampNumber(S.spotifyVolume, 0, SPOTIFY_VOLUME_SLIDER_MAX, DEFAULT_SPOTIFY_VOLUME) / 100
+      volume: spotifyVolumePercent(S.spotifyVolume) / 100
     });
     registerSpotifyListeners();
     const connected = await spotifyPlayer.connect();
@@ -2711,7 +2745,7 @@ async function startSpotifyReceiver({ fromTap = false } = {}) {
     throw error;
   }
   S.spotifyDeviceId = deviceId;
-  S.spotifyDeviceName = S.spotifyDeviceName || 'Poolside Pulse V20.10 Receiver';
+  S.spotifyDeviceName = S.spotifyDeviceName || 'Poolside Pulse V20.11 Receiver';
   S.spotifyReceiverReadyAt = Date.now();
   S.receiverStatus = 'Spotify receiver active.';
   S.receiverLastSeen = stamp();
@@ -3069,7 +3103,7 @@ async function spotifySetVolume(percent, targetDeviceId = '', options = {}) {
 }
 
 async function enforceSpotifyBedVolume(reason = 'Spotify bed volume', targetDeviceId = '', options = {}) {
-  const volume = clampNumber(S.spotifyVolume, 0, SPOTIFY_VOLUME_SLIDER_MAX, DEFAULT_SPOTIFY_VOLUME);
+  const volume = spotifyVolumePercent(S.spotifyVolume);
   const attempts = Math.max(1, Number(options.attempts || 1) || 1);
   let lastResult = null;
   let lastError = '';
@@ -3125,7 +3159,7 @@ async function holdSpotifyBedVolume(reason = 'receiver volume hold') {
     const now = Date.now();
     if (now - spotifyVolumeWatchLastLogAt > SPOTIFY_VOLUME_WATCH_LOG_MS) {
       spotifyVolumeWatchLastLogAt = now;
-      logEvent('spotify', 'Spotify volume hold active', `${S.spotifyVolume}%${result?.method ? ` via ${result.method}` : ''}${isIOSLikeBrowser() ? '; iPhone output needs Shortcut Input bridge; voice pauses Spotify' : ''}`);
+      logEvent('spotify', 'Spotify volume hold active', `${S.spotifyVolume}%${result?.method ? ` via ${result.method}` : ''}${isIOSLikeBrowser() ? '; iPhone output uses fixed Shortcut volume branches; voice pauses Spotify' : ''}`);
       pushState('', { render: false }).catch(() => {});
     }
     return result;
@@ -3516,7 +3550,7 @@ async function duckSpotifyForAnnouncement(options = {}) {
   const current = await spotifyCurrentPlaybackDevice({ requirePlaying: true });
   const currentIsReceiver = current?.deviceId && isSavedReceiverDevice({ id: current.deviceId, name: current.name });
   const snapshot = {
-    volume: currentIsReceiver && Number.isFinite(Number(current.volume)) ? current.volume : clampNumber(S.spotifyVolume, 0, SPOTIFY_VOLUME_SLIDER_MAX, DEFAULT_SPOTIFY_VOLUME),
+    volume: currentIsReceiver && Number.isFinite(Number(current.volume)) ? current.volume : spotifyVolumePercent(S.spotifyVolume),
     wasPlaying: (!!currentIsReceiver && !!current?.isPlaying) || S.intent === 'playing',
     deviceId: currentIsReceiver ? current.deviceId : savedReceiverDeviceId(),
     targetVolume,
@@ -3606,7 +3640,7 @@ async function restoreSpotifyAfterAnnouncement(snapshot) {
   stopSpotifyDuckHold();
   if (!snapshot) return;
   try {
-    const restoreVolume = clampNumber(S.spotifyVolume, 0, SPOTIFY_VOLUME_SLIDER_MAX, snapshot.volume ?? DEFAULT_SPOTIFY_VOLUME);
+    const restoreVolume = spotifyVolumePercent(S.spotifyVolume, snapshot.volume ?? DEFAULT_SPOTIFY_VOLUME);
     let restoreError = '';
     S.spotifyVolume = restoreVolume;
     try {
@@ -4917,6 +4951,7 @@ function bindDraftControls() {
 }
 
 function bind() {
+  syncVolumeInputLimits();
   wire('home', async () => {
     S.screen = 'home';
     localSave();
