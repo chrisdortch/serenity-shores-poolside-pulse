@@ -35,7 +35,7 @@ npm run build
 
 ## Version Notes
 
-- Version 20.6 adds an optional iPhone hardware volume bridge through a receiver-local Shortcut named `Poolside Pulse Volume`, so the Home iPhone can set true system volume low for Spotify music and high for voice while keeping Suno and voice Web Audio sliders independent.
+- Version 20.7 adds an optional iPhone hardware volume bridge through a receiver-local Shortcut named `Poolside Pulse Volume`, so the Home iPhone can set true system volume low for Spotify music and high for voice while keeping Suno and voice Web Audio sliders independent. It uses the Shortcuts callback URL form so the speaker iPhone can return to Poolside Pulse after setting volume.
 - Version 20.5 keeps the command-phone/Home-receiver model, caps Spotify and Suno music controls at 33%, defaults music to 15%, runs voice at max adjustable Web Audio gain up to 1200%, keeps Spotify pause/restore during announcements, and stops falsely verifying iPhone-local Spotify volume that iOS keeps under physical control.
 - Version 20.3 keeps the command-phone/Home-receiver model, defaults Spotify bed music to 33%, plays voice at true 100% receiver volume, pauses/restores Spotify for announcements, and refuses to fall back to unrelated active Spotify devices.
 - Version 20.2 keeps Spotify music at 33%, changes Spotify during voice to 0%, sends Spotify volume slider changes live without re-rendering the slider during drag, and verifies the requested Spotify volume against the audible Spotify device before reporting success.

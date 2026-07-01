@@ -1,5 +1,5 @@
 const VERSION = '20';
-const DISPLAY_VERSION = 'v20.6';
+const DISPLAY_VERSION = 'v20.7';
 const PIN = '7900';
 const KEY = 'poolside-pulse-v20';
 const DEVICE_KEY = 'poolside-pulse-v20-device-id';
@@ -9,7 +9,7 @@ const RECEIVER_SESSION_KEY = 'poolside-pulse-v20-receiver-session-started-at';
 const SPOTIFY_TOKEN_KEY = 'poolside-pulse-v20-spotify-token';
 const IOS_VOLUME_BRIDGE_KEY = 'poolside-pulse-v20-ios-volume-bridge-enabled';
 const IOS_VOLUME_BRIDGE_NAME_KEY = 'poolside-pulse-v20-ios-volume-bridge-name';
-const APP_QUERY = '?v=20.6';
+const APP_QUERY = '?v=20.7';
 const LEGACY_STATE_KEYS = [
   'poolside-pulse-v18',
   'poolside-pulse-v17',
@@ -68,7 +68,7 @@ const SPOTIFY_VOLUME_SLIDER_MAX = 33;
 const SUNO_VOLUME_SLIDER_MAX = 33;
 const DEFAULT_ANNOUNCEMENT_GAIN = 12;
 const MAX_ANNOUNCEMENT_GAIN = 12;
-const V20_VOLUME_DEFAULTS_ID = '2026-07-01-v20-6-ios-hardware-volume-bridge';
+const V20_VOLUME_DEFAULTS_ID = '2026-07-01-v20-7-ios-shortcut-return-bridge';
 const LIVE_SPOTIFY_VOLUME_APPLY_MS = 550;
 const SPOTIFY_VOLUME_WATCH_MS = 5000;
 const SPOTIFY_VOLUME_WATCH_LOG_MS = 45000;
@@ -2387,11 +2387,25 @@ function iosVolumeBridgeTarget(kind = 'music') {
   return { percent: musicHardwareVolumePercent(), label: 'Spotify music' };
 }
 
+function appReturnUrl() {
+  try {
+    const url = new URL(window.location.href);
+    url.searchParams.set('v', APP_QUERY.replace('?v=', ''));
+    return url.toString();
+  } catch {
+    return `/${APP_QUERY}`;
+  }
+}
+
 function iosVolumeShortcutUrl(percent, label = '') {
-  const url = new URL('shortcuts://run-shortcut');
+  const url = new URL('shortcuts://x-callback-url/run-shortcut');
+  const returnUrl = appReturnUrl();
   url.searchParams.set('name', iosVolumeBridgeName());
   url.searchParams.set('input', 'text');
   url.searchParams.set('text', String(Math.max(0, Math.min(100, Math.round(Number(percent) || 0)))));
+  url.searchParams.set('x-success', returnUrl);
+  url.searchParams.set('x-cancel', returnUrl);
+  url.searchParams.set('x-error', returnUrl);
   if (label) url.searchParams.set('x-source', `Poolside Pulse ${label}`);
   return url.toString();
 }
@@ -2524,7 +2538,7 @@ function registerSpotifyListeners() {
     spotifyPlayerReady = true;
     spotifyWebDeviceId = device_id;
     S.spotifyDeviceId = device_id;
-    S.spotifyDeviceName = 'Poolside Pulse V20.6 Receiver';
+    S.spotifyDeviceName = 'Poolside Pulse V20.7 Receiver';
     S.spotifyReceiverReadyAt = Date.now();
     S.receiverStatus = 'Spotify receiver ready.';
     S.receiverLastSeen = stamp();
@@ -2571,7 +2585,7 @@ async function primeSpotifyPlayer() {
   spotifyPrimePromise = (async () => {
     const Spotify = await ensureSpotifySdk();
     spotifyPlayer = new Spotify.Player({
-      name: 'Poolside Pulse V20.6 Receiver',
+      name: 'Poolside Pulse V20.7 Receiver',
       getOAuthToken: callback => spotifyAccessToken().then(callback).catch(error => setSpotifyStatus(`Spotify token failed: ${error.message}`, false)),
       volume: clampNumber(S.spotifyVolume, 0, SPOTIFY_VOLUME_SLIDER_MAX, DEFAULT_SPOTIFY_VOLUME) / 100
     });
@@ -2655,7 +2669,7 @@ async function startSpotifyReceiver({ fromTap = false } = {}) {
     throw error;
   }
   S.spotifyDeviceId = deviceId;
-  S.spotifyDeviceName = S.spotifyDeviceName || 'Poolside Pulse V20.6 Receiver';
+  S.spotifyDeviceName = S.spotifyDeviceName || 'Poolside Pulse V20.7 Receiver';
   S.spotifyReceiverReadyAt = Date.now();
   S.receiverStatus = 'Spotify receiver active.';
   S.receiverLastSeen = stamp();
