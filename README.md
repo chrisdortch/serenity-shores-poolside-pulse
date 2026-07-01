@@ -35,7 +35,8 @@ npm run build
 
 ## Version Notes
 
-- Version 20.11 matches iOS 26.5 Shortcuts behavior by using fixed If-branch media-volume targets: music/Suno stay between 15% and 33%, voice requests 100%, and the app no longer asks for a variable picker in Apple's fixed Set Media Volume slider.
+- Version 20.12 makes the iPhone Shortcut optional. The Home receiver has a Loud Voice Setup button, music remains in the 15-33% range, spoken commands pause Spotify/Suno first, the receiver normalizes and boosts AI voice up to 2400%, and music restores after the announcement.
+- Version 20.11 matched iOS 26.5 Shortcuts behavior by using fixed If-branch media-volume targets. V20.12 supersedes that path because web apps cannot silently install or configure an iOS Shortcut.
 - Version 20.10 made voice hardware volume always request 100%, raised the voice boost ceiling, and added a louder compressed Web Audio voice path. V20.11 supersedes its Shortcut setup guidance.
 - Version 20.9 forces stale Spotify receiver device IDs out of cloud state during migration, so old V20.5 receiver IDs cannot survive a refresh and cause `Device not found` again.
 - Version 20.8 resets stale Spotify receiver device IDs when Spotify returns `Device not found`, reconnects the Home Web Playback receiver once, and stops old failed commands from retrying forever. It keeps the V20.7 iPhone Shortcuts hardware-volume bridge.

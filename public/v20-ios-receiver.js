@@ -1,5 +1,5 @@
 (() => {
-  const VERSION = '20.11';
+  const VERSION = '20.12';
   let unlocked = false;
   let unlocking = false;
   let unlockPromise = null;
@@ -146,6 +146,30 @@
     };
   }
 
+  function isVoicePlayback(label = '') {
+    return /voice|announcement|spoken|speech/i.test(String(label || ''));
+  }
+
+  function bufferPeak(buffer) {
+    let peak = 0;
+    const channels = Math.max(1, Number(buffer?.numberOfChannels || 0));
+    for (let channelIndex = 0; channelIndex < channels; channelIndex += 1) {
+      const channel = buffer.getChannelData(channelIndex);
+      const stride = Math.max(1, Math.floor(channel.length / 240000));
+      for (let i = 0; i < channel.length; i += stride) {
+        const value = Math.abs(channel[i] || 0);
+        if (value > peak) peak = value;
+      }
+    }
+    return peak;
+  }
+
+  function voiceNormalizationGain(buffer) {
+    const peak = bufferPeak(buffer);
+    if (!peak) return 1;
+    return Math.max(1, Math.min(6, 0.92 / peak));
+  }
+
   function withTimeout(promise, ms, message) {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => reject(Error(message)), ms);
@@ -287,14 +311,16 @@
     const drive = ctx.createGain();
     const makeup = ctx.createGain();
     const limiter = typeof ctx.createDynamicsCompressor === 'function' ? ctx.createDynamicsCompressor() : null;
-    drive.gain.value = options.gain;
-    makeup.gain.value = 1.35;
+    const voice = isVoicePlayback(options.label) || Number(options.maxGain || 0) > 1;
+    const normalize = voice ? voiceNormalizationGain(buffer) : 1;
+    drive.gain.value = Math.min(64, options.gain * normalize);
+    makeup.gain.value = voice ? 2.2 : 1.35;
     if (limiter) {
-      limiter.threshold.value = -24;
-      limiter.knee.value = 14;
+      limiter.threshold.value = voice ? -30 : -24;
+      limiter.knee.value = voice ? 10 : 14;
       limiter.ratio.value = 20;
       limiter.attack.value = 0.002;
-      limiter.release.value = 0.14;
+      limiter.release.value = voice ? 0.18 : 0.14;
     }
     source.buffer = buffer;
     if (limiter) source.connect(drive).connect(limiter).connect(makeup).connect(ctx.destination);
