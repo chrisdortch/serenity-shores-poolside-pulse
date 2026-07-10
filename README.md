@@ -35,6 +35,7 @@ npm run build
 
 ## Version Notes
 
+- Version 21 adds Manager gain controls for the live balance problem: Spotify defaults to gain `-500` mapped to a 1% Spotify bed request, spoken word defaults to gain `+500` mapped to max clear PA voice, and the receiver voice path uses stronger loudness normalization with compression/soft limiting to reduce static.
 - Version 20.14 keeps the clear PA voice path and clears stale V20.12/V20.13 receiver state that still mentioned `2400%`, max receiver boost, or old volume warnings.
 - Version 20.13 replaces the static-prone raw voice boost with a clear PA voice path: WAV-first TTS, RMS/peak loudness analysis, speech EQ, compression, and soft limiting. Music still pauses for spoken commands, then restores after the announcement.
 - Version 20.12 makes the iPhone Shortcut optional. The Home receiver has a Loud Voice Setup button, music remains in the 15-33% range, spoken commands pause Spotify/Suno first, the receiver normalizes and boosts AI voice, and music restores after the announcement.

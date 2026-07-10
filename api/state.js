@@ -7,6 +7,7 @@ function json(res, status, body) {
 
 const DEFAULT_STATE_KEY = 'serenity-shores-poolside-radio-v9';
 const VERSIONED_STATE_KEYS = {
+  '21': 'serenity-shores-poolside-radio-v21',
   '20': 'serenity-shores-poolside-radio-v20',
   '18': 'serenity-shores-poolside-radio-v18',
   '17': 'serenity-shores-poolside-radio-v17',
@@ -17,6 +18,7 @@ const VERSIONED_STATE_KEYS = {
 const V18_STALE_SUNO_COMMAND_CUTOFF = 1782483347041;
 const V18_AUDIO_DEFAULTS_ID = '2026-06-26-v18e-spotify2-suno85-duck0-ann500';
 const V20_AUDIO_DEFAULTS_ID = '2026-07-01-v20-14-clear-pa-state-cleanup';
+const V21_AUDIO_DEFAULTS_ID = '2026-07-10-v21-manager-gain-gap';
 const V20_STALE_SPOTIFY_COMMAND_CUTOFF = 1782499126000;
 const V18_STALE_SUNO_TYPES = new Set(['suno-cue', 'suno', 'song']);
 const V20_STALE_SPOTIFY_TYPES = new Set(['spotify-play', 'play']);
@@ -140,17 +142,18 @@ function clampNumber(value, min, max, fallback) {
 function sanitizeState(state) {
   if (!state || typeof state !== 'object') return state;
   const version = String(state.version || '');
-  if (!['18', '20'].includes(version)) return state;
+  if (!['18', '20', '21'].includes(version)) return state;
+  const modern = version === '20' || version === '21';
   const clean = { ...state };
   if (version === '18' && Array.isArray(clean.events)) clean.events = clean.events.filter(event => !staleV18SunoCommand(event));
   if (version === '18' && staleV18SunoCommand(clean.command)) clean.command = null;
-  if (version === '20' && Array.isArray(clean.events)) clean.events = clean.events.filter(event => !staleV20SpotifyCommand(event));
-  if (version === '20' && staleV20SpotifyCommand(clean.command)) clean.command = null;
-  if (version === '20' && staleV20IOSVolumeNotice(`${clean.command?.label || ''} ${clean.command?.detail || ''} ${clean.command?.text || ''}`)) clean.command = null;
+  if (modern && Array.isArray(clean.events)) clean.events = clean.events.filter(event => !staleV20SpotifyCommand(event));
+  if (modern && staleV20SpotifyCommand(clean.command)) clean.command = null;
+  if (modern && staleV20IOSVolumeNotice(`${clean.command?.label || ''} ${clean.command?.detail || ''} ${clean.command?.text || ''}`)) clean.command = null;
   if (staleV18SunoNotice(clean.setupNotice)) clean.setupNotice = '';
   if (staleV18SunoNotice(clean.feedback)) clean.feedback = 'Ready.';
   if (staleV18SunoNotice(clean.lastError)) clean.lastError = '';
-  if (version === '20') {
+  if (modern) {
     if (Array.isArray(clean.events)) {
       clean.events = clean.events.filter(event => !staleV20IOSVolumeNotice(`${event?.label || ''} ${event?.detail || ''} ${event?.text || ''}`));
     }
@@ -175,34 +178,44 @@ function sanitizeState(state) {
     if (staleV20IOSVolumeNotice(clean.spotifyLastError)) clean.spotifyLastError = '';
     if (staleV20IOSVolumeNotice(clean.spotifyStatus)) clean.spotifyStatus = '';
     if (staleV20IOSVolumeNotice(clean.spotifyDevicesSummary)) {
-      clean.spotifyDevicesSummary = 'V20.14 clear PA voice mode active: music pauses during spoken commands, voice plays through the clear voice path, then music restores.';
+      clean.spotifyDevicesSummary = version === '21'
+        ? 'V21 Manager gain mode active: Spotify defaults to -500/1%, spoken word defaults to +500/max PA, music pauses during voice.'
+        : 'V20.14 clear PA voice mode active: music pauses during spoken commands, voice plays through the clear voice path, then music restores.';
     }
     if (Array.isArray(clean.activityLog)) {
       clean.activityLog = clean.activityLog.filter(entry => !staleV20IOSVolumeNotice(`${entry?.title || ''} ${entry?.detail || ''}`));
     }
   }
-  const defaultsKey = version === '20' ? 'v20VolumeDefaultsApplied' : 'v18VolumeDefaultsApplied';
-  const defaultsId = version === '20' ? V20_AUDIO_DEFAULTS_ID : V18_AUDIO_DEFAULTS_ID;
+  const defaultsKey = version === '21' ? 'v21VolumeDefaultsApplied' : version === '20' ? 'v20VolumeDefaultsApplied' : 'v18VolumeDefaultsApplied';
+  const defaultsId = version === '21' ? V21_AUDIO_DEFAULTS_ID : version === '20' ? V20_AUDIO_DEFAULTS_ID : V18_AUDIO_DEFAULTS_ID;
   if (clean[defaultsKey] !== defaultsId) {
-    clean.spotifyVolume = version === '20' ? 15 : 2;
-    clean.sunoVolume = version === '20' ? 15 : 85;
-    clean.announcementGain = version === '20' ? 24 : 5;
+    clean.spotifyVolume = version === '21' ? 1 : version === '20' ? 15 : 2;
+    clean.spotifyGain = version === '21' ? -500 : clean.spotifyGain;
+    clean.spokenGain = version === '21' ? 500 : clean.spokenGain;
+    clean.sunoVolume = modern ? 15 : 85;
+    clean.announcementGain = version === '21' ? 40 : version === '20' ? 24 : 5;
     clean.spotifyDuckedVolume = 0;
-    if (version === '20') {
+    if (modern) {
       clean.spotifyDeviceId = '';
       clean.spotifyDeviceName = '';
       clean.spotifyReceiverReadyAt = 0;
       clean.spotifyNeedsTap = true;
-      clean.iosVolumeBridgeStatus = 'V20.14 clear PA voice mode: Shortcut is optional. Loud Voice Setup pauses music during spoken commands, plays clean PA-normalized voice, then restores music.';
+      clean.iosVolumeBridgeStatus = version === '21'
+        ? 'V21 Manager gain mode: Spotify defaults to -500/1%; spoken word defaults to +500/max PA; music pauses during announcements, then restores.'
+        : 'V20.14 clear PA voice mode: Shortcut is optional. Loud Voice Setup pauses music during spoken commands, plays clean PA-normalized voice, then restores music.';
       clean.iosVolumeBridgeLastTarget = '';
       clean.iosVolumeBridgeLastAt = 0;
     }
     clean[defaultsKey] = defaultsId;
   }
-  clean.spotifyVolume = clampNumber(clean.spotifyVolume, version === '20' ? 15 : 0, version === '20' ? 33 : 20, version === '20' ? 15 : 2);
-  clean.sunoVolume = clampNumber(clean.sunoVolume, version === '20' ? 15 : 0, version === '20' ? 33 : 100, version === '20' ? 15 : 85);
-  clean.spotifyDuckedVolume = version === '20' ? clampNumber(clean.spotifyDuckedVolume, 0, 33, 0) : 0;
-  clean.announcementGain = clampNumber(clean.announcementGain, 1, version === '20' ? 24 : 6, version === '20' ? 24 : 5);
+  clean.spotifyVolume = clampNumber(clean.spotifyVolume, modern ? 0 : 0, modern ? 33 : 20, version === '21' ? 1 : version === '20' ? 15 : 2);
+  clean.sunoVolume = clampNumber(clean.sunoVolume, modern ? 0 : 0, modern ? 33 : 100, modern ? 15 : 85);
+  clean.spotifyDuckedVolume = modern ? clampNumber(clean.spotifyDuckedVolume, 0, 33, 0) : 0;
+  clean.announcementGain = clampNumber(clean.announcementGain, 1, version === '21' ? 40 : version === '20' ? 24 : 6, version === '21' ? 40 : version === '20' ? 24 : 5);
+  if (version === '21') {
+    clean.spotifyGain = clampNumber(clean.spotifyGain, -500, 0, -500);
+    clean.spokenGain = clampNumber(clean.spokenGain, 0, 500, 500);
+  }
   return clean;
 }
 

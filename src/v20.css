@@ -916,7 +916,7 @@ button[aria-busy="true"]::after {
 
 .volumeStrip {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 10px 14px;
   align-items: end;
   margin: 14px 0;
@@ -948,6 +948,10 @@ button[aria-busy="true"]::after {
   grid-column: 1 / -1;
   color: var(--muted);
   font-weight: 800;
+}
+
+.volumeStrip button {
+  grid-column: 1 / -1;
 }
 
 .announcementEditor {
