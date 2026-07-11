@@ -2894,21 +2894,29 @@ function appReturnUrl(extraParams = {}) {
   }
 }
 
+function shortcutsUrlQuery(params = {}) {
+  return Object.entries(params)
+    .filter(([, value]) => value !== undefined && value !== null && value !== '')
+    .map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(String(value))}`)
+    .join('&');
+}
+
 function iosVolumeShortcutUrl(percent, label = '') {
-  const url = new URL('shortcuts://x-callback-url/run-shortcut');
   const returnUrl = appReturnUrl({
     shortcut: 'returned',
     shortcutKind: label || 'volume',
     shortcutPercent: Math.max(0, Math.min(100, Math.round(Number(percent) || 0)))
   });
-  url.searchParams.set('name', iosVolumeBridgeName());
-  url.searchParams.set('input', 'text');
-  url.searchParams.set('text', String(Math.max(0, Math.min(100, Math.round(Number(percent) || 0)))));
-  url.searchParams.set('x-success', returnUrl);
-  url.searchParams.set('x-cancel', returnUrl);
-  url.searchParams.set('x-error', returnUrl);
-  if (label) url.searchParams.set('x-source', `Poolside Pulse ${label}`);
-  return url.toString();
+  const params = {
+    name: iosVolumeBridgeName(),
+    input: 'text',
+    text: Math.max(0, Math.min(100, Math.round(Number(percent) || 0))),
+    'x-success': returnUrl,
+    'x-cancel': returnUrl,
+    'x-error': returnUrl
+  };
+  if (label) params['x-source'] = `Poolside Pulse ${label}`;
+  return `shortcuts://x-callback-url/run-shortcut?${shortcutsUrlQuery(params)}`;
 }
 
 function iosVolumeShortcutCreateUrl() {
@@ -2916,9 +2924,7 @@ function iosVolumeShortcutCreateUrl() {
 }
 
 function iosVolumeShortcutOpenUrl() {
-  const url = new URL('shortcuts://open-shortcut');
-  url.searchParams.set('name', iosVolumeBridgeName());
-  return url.toString();
+  return `shortcuts://open-shortcut?${shortcutsUrlQuery({ name: iosVolumeBridgeName() })}`;
 }
 
 function shortcutSetupRecipe() {
@@ -2926,7 +2932,7 @@ function shortcutSetupRecipe() {
     `Name the shortcut exactly "${iosVolumeBridgeName()}".`,
     'Add Get Numbers from Shortcut Input.',
     'Add Set Media Volume and tap the blue percentage value; choose the Numbers variable.',
-    'Return here, turn the shortcut On, then run Music 25% and Voice 100% tests.'
+    'Return here, turn the shortcut On, then run Music and Voice tests. If Shortcuts says the file does not exist, the shortcut has not been created with that exact name yet.'
   ];
 }
 
@@ -5347,7 +5353,7 @@ const HELP_NOTES = {
   },
   shortcut: {
     title: 'Optional iPhone Shortcut',
-    body: 'iOS allows websites to open, create, and run Shortcuts by URL, but it does not silently install a finished shortcut. Create the shortcut once with Get Numbers from Shortcut Input, then Set Media Volume to Numbers. The app can then run 25% music and 100% voice volume tests.'
+    body: 'iOS allows websites to open, create, and run Shortcuts by URL, but it does not silently install a finished shortcut. Use Create first, name it exactly Poolside Pulse Volume, add Get Numbers from Shortcut Input, then Set Media Volume to Numbers. After it exists, Open Existing and the tests will find it.'
   },
   balance: {
     title: 'Audio Balance',
@@ -5473,7 +5479,7 @@ function iosVolumeBridgeControls() {
   const name = iosVolumeBridgeName();
   const status = S.iosVolumeBridgeStatus || (enabled ? 'Enabled on this receiver.' : 'Off on this receiver.');
   const recipe = shortcutSetupRecipe().map(step => `<li>${esc(step)}</li>`).join('');
-  return `<div class="bridgePanel"><div class="bridgeHeader"><h3>Optional iPhone Shortcut</h3>${helpButton('shortcut')}</div><p class="muted">Use this only if you want iOS hardware volume to move to low music and full voice automatically on the speaker phone.</p><div class="grid2"><label>Shortcut<select id="iosVolumeBridgeEnabled"><option value="false" ${enabled ? '' : 'selected'}>Off</option><option value="true" ${enabled ? 'selected' : ''}>On</option></select></label><label>Shortcut Name<input id="iosVolumeBridgeName" value="${esc(name)}"></label></div><div class="shortcutRecipe"><b>Shortcut recipe</b><ol>${recipe}</ol></div><div class="buttonStack"><button id="createBridgeHome">Create Shortcut</button><button id="openBridgeHome" class="secondary">Open Shortcut</button><button id="saveBridgeHome" class="secondary">Save On/Off</button><button id="testMusicBridgeHome" class="secondary">Music ${esc(musicHardwareVolumePercent())}% Test</button><button id="testVoiceBridgeHome" class="secondary">Voice 100% Test</button></div><p class="bridgeHint">After the tests, music should be clearly softer and voice should be full iPhone media volume. If the shortcut opens but does not change volume, its Set Media Volume action is still set to a fixed percent instead of the Numbers variable.</p><p class="muted">${esc(status)}</p></div>`;
+  return `<div class="bridgePanel"><div class="bridgeHeader"><h3>Optional iPhone Shortcut</h3>${helpButton('shortcut')}</div><p class="muted">Use this only if you want iOS hardware volume to move to low music and full voice automatically on the speaker phone.</p><div class="grid2"><label>Shortcut<select id="iosVolumeBridgeEnabled"><option value="false" ${enabled ? '' : 'selected'}>Off</option><option value="true" ${enabled ? 'selected' : ''}>On</option></select></label><label>Shortcut Name<input id="iosVolumeBridgeName" value="${esc(name)}"></label></div><div class="shortcutRecipe"><b>Shortcut recipe</b><ol>${recipe}</ol></div><div class="buttonStack"><button id="createBridgeHome">1 Create Shortcut</button><button id="openBridgeHome" class="secondary">2 Open Existing</button><button id="saveBridgeHome" class="secondary">3 Save On/Off</button><button id="testMusicBridgeHome" class="secondary">4 Music ${esc(musicHardwareVolumePercent())}% Test</button><button id="testVoiceBridgeHome" class="secondary">5 Voice 100% Test</button></div><p class="bridgeHint">Do Create first. Open/Test only work after Shortcuts contains a shortcut named exactly ${esc(name)}. After the tests, music should be clearly softer and voice should be full iPhone media volume. If volume does not change, Set Media Volume is still fixed instead of using the Numbers variable.</p><p class="muted">${esc(status)}</p></div>`;
 }
 
 function homePage() {
