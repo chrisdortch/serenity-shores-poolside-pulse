@@ -35,6 +35,7 @@ npm run build
 
 ## Version Notes
 
+- Version 23 stops treating iOS Spotify as a guaranteed quiet source. Spotify remains controllable, but the reliable loud-voice/quiet-music gap now comes from a first-class Suno/direct audio quiet bed at `10%` inside Poolside Pulse's Web Audio path, while spoken word stays at `+800`/max PA+ and any Spotify playback is paused for voice.
 - Version 22 increases the voice/music gap again: Spotify defaults to gain `-800` mapped to a 0% Spotify bed request, spoken word defaults to gain `+800` mapped to max PA+, the receiver silences and pauses Spotify before speech, waits before/after announcements, and uses stronger speech EQ/compression/soft limiting.
 - Version 21 adds Manager gain controls for the live balance problem: Spotify defaults to gain `-500` mapped to a 1% Spotify bed request, spoken word defaults to gain `+500` mapped to max clear PA voice, and the receiver voice path uses stronger loudness normalization with compression/soft limiting to reduce static.
 - Version 20.14 keeps the clear PA voice path and clears stale V20.12/V20.13 receiver state that still mentioned `2400%`, max receiver boost, or old volume warnings.
