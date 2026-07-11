@@ -1,3 +1,5 @@
+import { requireSession } from './_auth.js';
+
 function json(res, status, body) {
   res.statusCode = status;
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
@@ -7,6 +9,7 @@ function json(res, status, body) {
 
 const DEFAULT_STATE_KEY = 'serenity-shores-poolside-radio-v9';
 const VERSIONED_STATE_KEYS = {
+  'final': 'serenity-shores-poolside-radio-vfinal-20260711',
   '23': 'serenity-shores-poolside-radio-v23',
   '22': 'serenity-shores-poolside-radio-v22',
   '21': 'serenity-shores-poolside-radio-v21',
@@ -17,6 +20,26 @@ const VERSIONED_STATE_KEYS = {
   '15': 'serenity-shores-poolside-radio-v15',
   '14': 'serenity-shores-poolside-radio-v14'
 };
+const FINAL_STATE_VERSION = 'final';
+const KV_REQUEST_TIMEOUT_MS = 8_000;
+const FINAL_COMPARE_AND_SET_SCRIPT = `
+local current = redis.call("GET", KEYS[1])
+local currentRevision = 0
+if current then
+  local decodedOk, decoded = pcall(cjson.decode, current)
+  if decodedOk and type(decoded) == "table" then
+    local candidate = tonumber(decoded.revision)
+    if candidate and candidate >= 0 and candidate == math.floor(candidate) then
+      currentRevision = candidate
+    end
+  end
+end
+if currentRevision ~= tonumber(ARGV[1]) then
+  return {0, currentRevision, current or ""}
+end
+redis.call("SET", KEYS[1], ARGV[2])
+return {1, currentRevision + 1}
+`;
 const V18_STALE_SUNO_COMMAND_CUTOFF = 1782483347041;
 const V18_AUDIO_DEFAULTS_ID = '2026-06-26-v18e-spotify2-suno85-duck0-ann500';
 const V20_AUDIO_DEFAULTS_ID = '2026-07-01-v20-14-clear-pa-state-cleanup';
@@ -31,6 +54,7 @@ const V20_STALE_SPOTIFY_TYPES = new Set(['spotify-play', 'play']);
 // Safe fallback: lets preview/admin/Home sync work even before Vercel KV/Upstash is configured.
 // For production/life-safety reliability, add KV_REST_API_URL and KV_REST_API_TOKEN in Vercel.
 globalThis.__POOL_SIDE_MEMORY_STATES__ ||= {};
+globalThis.__POOL_SIDE_MEMORY_STATE_LOCKS__ ||= new Map();
 
 async function readBody(req) {
   if (req.body && typeof req.body === 'object') return req.body;
@@ -50,17 +74,43 @@ function kvReady() {
 }
 
 async function kv(command) {
-  const response = await fetch(process.env.KV_REST_API_URL, {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${process.env.KV_REST_API_TOKEN}`,
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify(command)
-  });
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok || data.error) throw new Error(data.error || `KV returned HTTP ${response.status}`);
-  return data.result;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), KV_REQUEST_TIMEOUT_MS);
+  try {
+    const response = await fetch(process.env.KV_REST_API_URL, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${process.env.KV_REST_API_TOKEN}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(command),
+      signal: controller.signal
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || data.error) throw new Error(data.error || `KV returned HTTP ${response.status}`);
+    return data.result;
+  } catch (error) {
+    if (error?.name === 'AbortError') throw new Error('KV request timed out after 8 seconds.');
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function withMemoryStateLock(stateKey, operation) {
+  const locks = globalThis.__POOL_SIDE_MEMORY_STATE_LOCKS__;
+  const previous = locks.get(stateKey) || Promise.resolve();
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const tail = previous.then(() => gate);
+  locks.set(stateKey, tail);
+  await previous;
+  try {
+    return await operation();
+  } finally {
+    release();
+    if (locks.get(stateKey) === tail) locks.delete(stateKey);
+  }
 }
 
 function parseState(raw) {
@@ -83,11 +133,15 @@ function requestVersion(req, body = {}) {
   const query = queryParams(req);
   const queryVersion = query.v || query.version;
   const bodyVersion = body.version || body.state?.version;
-  return String(queryVersion || bodyVersion || '').trim();
+  return String(queryVersion || bodyVersion || '').trim().toLowerCase();
 }
 
 function stateKeyFor(req, body = {}) {
   return VERSIONED_STATE_KEYS[requestVersion(req, body)] || DEFAULT_STATE_KEY;
+}
+
+function isFinalRequest(req, body = {}) {
+  return requestVersion(req, body) === FINAL_STATE_VERSION;
 }
 
 function mergeById(limit, sortNewestFirst, ...lists) {
@@ -293,56 +347,143 @@ function finalizeState(state, previous = null) {
   });
 }
 
+function stateRevision(state) {
+  const revision = Number(state?.revision);
+  return Number.isSafeInteger(revision) && revision >= 0 ? revision : 0;
+}
+
 export default async function handler(req, res) {
   try {
     const hasKv = kvReady();
 
     if (req.method === 'GET') {
+      if (!isFinalRequest(req)) {
+        return json(res, 410, {
+          ok: false,
+          error: 'Legacy Poolside Pulse state is archived. Use vFinal for active control.',
+          serverTime: Date.now()
+        });
+      }
+      if (!requireSession(req, res)) return;
       const stateKey = stateKeyFor(req);
       if (hasKv) {
         const raw = await kv(['GET', stateKey]);
-        return json(res, 200, { ok: true, cloudSync: true, syncMode: 'kv', state: sanitizeState(raw ? JSON.parse(raw) : null), note: 'KV cloud sync active.' });
+        return json(res, 200, { ok: true, cloudSync: true, syncMode: 'kv', serverTime: Date.now(), state: sanitizeState(parseState(raw)), note: 'KV cloud sync active.' });
       }
       return json(res, 200, {
         ok: true,
-        cloudSync: true,
+        cloudSync: false,
         syncMode: 'memory',
+        serverTime: Date.now(),
         state: sanitizeState(globalThis.__POOL_SIDE_MEMORY_STATES__[stateKey] || null),
-        note: 'Preview sync active using temporary server memory. Add Vercel KV/Upstash for production-grade persistence.'
+        note: 'Temporary server memory is active on this instance only. Add Vercel KV/Upstash for cloud sync.'
       });
     }
 
     if (req.method === 'POST') {
+      if (!isFinalRequest(req)) {
+        return json(res, 410, {
+          ok: false,
+          error: 'Legacy Poolside Pulse state is archived and read-only. Use vFinal for active control.',
+          serverTime: Date.now()
+        });
+      }
+      let session = null;
+      if (isFinalRequest(req)) {
+        session = requireSession(req, res);
+        if (!session) return;
+      }
       const body = await readBody(req);
+      const finalRequest = isFinalRequest(req, body);
       const state = body.state || {};
-      if (!state || typeof state !== 'object') return json(res, 400, { ok: false, error: 'state object required.' });
+      if (!state || typeof state !== 'object') return json(res, 400, { ok: false, error: 'state object required.', serverTime: Date.now() });
+      if (finalRequest && !session && !requireSession(req, res)) return;
+      const expectedRevision = body.expectedRevision;
+      if (finalRequest && (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0)) {
+        return json(res, 400, {
+          ok: false,
+          error: 'expectedRevision must be a non-negative integer.',
+          serverTime: Date.now()
+        });
+      }
       const stateKey = stateKeyFor(req, body);
 
-      let previous = null;
-      if (hasKv) previous = parseState(await kv(['GET', stateKey]));
-      else previous = globalThis.__POOL_SIDE_MEMORY_STATES__[stateKey] || null;
+      const writeState = async () => {
+        let previous = null;
+        if (hasKv) previous = parseState(await kv(['GET', stateKey]));
+        else previous = globalThis.__POOL_SIDE_MEMORY_STATES__[stateKey] || null;
+        const previousRevision = stateRevision(previous);
+        if (finalRequest && expectedRevision !== previousRevision) {
+          return {
+            conflict: true,
+            currentRevision: previousRevision,
+            currentState: sanitizeState(previous)
+          };
+        }
+        const safe = finalizeState(finalRequest ? { ...state, revision: previousRevision } : state, previous);
+        const raw = JSON.stringify(safe);
+        if (raw.length > 200000) return { tooLarge: true, safe: null };
+        if (hasKv && finalRequest) {
+          const cas = await kv([
+            'EVAL',
+            FINAL_COMPARE_AND_SET_SCRIPT,
+            '1',
+            stateKey,
+            String(expectedRevision),
+            raw
+          ]);
+          if (!Array.isArray(cas) || cas.length < 2) throw new Error('KV compare-and-set returned an invalid response.');
+          if (Number(cas[0]) !== 1) {
+            const currentState = sanitizeState(parseState(cas[2]));
+            return {
+              conflict: true,
+              currentRevision: stateRevision(currentState),
+              currentState
+            };
+          }
+        } else if (hasKv) {
+          await kv(['SET', stateKey, raw]);
+        } else {
+          globalThis.__POOL_SIDE_MEMORY_STATES__[stateKey] = safe;
+        }
+        return { tooLarge: false, safe };
+      };
 
-      const safe = finalizeState(state, previous);
-      const raw = JSON.stringify(safe);
-      if (raw.length > 200000) return json(res, 400, { ok: false, error: 'State too large.' });
-
-      if (hasKv) {
-        await kv(['SET', stateKey, raw]);
-        return json(res, 200, { ok: true, cloudSync: true, syncMode: 'kv', state: safe, note: 'KV cloud sync active.' });
+      let result;
+      if (finalRequest && !hasKv) {
+        result = await withMemoryStateLock(stateKey, writeState);
+      } else {
+        result = await writeState();
       }
 
-      globalThis.__POOL_SIDE_MEMORY_STATES__[stateKey] = safe;
+      if (result.conflict) {
+        return json(res, 409, {
+          ok: false,
+          cloudSync: hasKv,
+          syncMode: hasKv ? 'kv' : 'memory',
+          error: 'State revision conflict. Refresh and retry.',
+          state: result.currentState,
+          revision: result.currentRevision,
+          currentRevision: result.currentRevision,
+          serverTime: Date.now()
+        });
+      }
+      if (result.tooLarge) return json(res, 400, { ok: false, error: 'State too large.', serverTime: Date.now() });
+      if (hasKv) {
+        return json(res, 200, { ok: true, cloudSync: true, syncMode: 'kv', serverTime: Date.now(), state: result.safe, note: 'KV cloud sync active.' });
+      }
       return json(res, 200, {
         ok: true,
-        cloudSync: true,
+        cloudSync: false,
         syncMode: 'memory',
-        state: safe,
-        note: 'Preview sync active using temporary server memory. Add Vercel KV/Upstash for production-grade persistence.'
+        serverTime: Date.now(),
+        state: result.safe,
+        note: 'Temporary server memory is active on this instance only. Add Vercel KV/Upstash for cloud sync.'
       });
     }
 
-    return json(res, 405, { ok: false, error: 'GET or POST required.' });
+    return json(res, 405, { ok: false, error: 'GET or POST required.', serverTime: Date.now() });
   } catch (error) {
-    return json(res, 500, { ok: false, cloudSync: false, error: error.message || 'State sync failed.' });
+    return json(res, 500, { ok: false, cloudSync: false, error: error.message || 'State sync failed.', serverTime: Date.now() });
   }
 }

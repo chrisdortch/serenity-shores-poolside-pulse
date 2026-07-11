@@ -1,39 +1,52 @@
+import { requireSession } from './_auth.js';
+
 function json(res, status, body) {
   res.statusCode = status;
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
   res.end(JSON.stringify(body));
 }
 
-function extractPlaylistId(input) {
-  const raw = String(input || '').trim();
-  const patterns = [
-    /suno\.com\/(?:playlist|playlists)\/([a-zA-Z0-9-]+)/i,
-    /(?:^|[?&])id=([a-zA-Z0-9-]+)/i,
-    /^([a-zA-Z0-9-]{20,80})$/
-  ];
-  for (const pattern of patterns) {
-    const match = raw.match(pattern);
-    if (match?.[1]) return match[1];
+async function fetchWithTimeout(url, options = {}, timeoutMs = 10_000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } catch (error) {
+    if (error.name === 'AbortError') throw new Error('Suno did not respond before the request timeout.');
+    throw error;
+  } finally {
+    clearTimeout(timer);
   }
+}
+
+function httpsUrl(input) {
+  const raw = String(input || '').trim();
+  if (!raw || raw.length > 2_048) return null;
   try {
     const url = new URL(raw);
-    const parts = url.pathname.split('/').filter(Boolean);
-    const i = parts.findIndex(p => p === 'playlist' || p === 'playlists');
-    if (i >= 0 && parts[i + 1]) return parts[i + 1];
+    if (url.protocol !== 'https:' || url.username || url.password || !url.hostname) return null;
+    return url;
   } catch {}
-  return '';
+  return null;
 }
 
 function directAudioUrl(input) {
-  return /^https?:\/\//i.test(String(input || '')) && /\.(mp3|m4a|aac|wav|ogg|oga|webm)(\?|#|$)/i.test(String(input || ''));
+  const url = httpsUrl(input);
+  return Boolean(url && /\.(mp3|m4a|aac|wav|ogg|oga|webm)$/i.test(url.pathname));
 }
 
-function sunoSongUrl(input) {
-  return /^https?:\/\//i.test(String(input || '')) && /suno\.com\/(?:song|songs)\//i.test(String(input || ''));
-}
-
-function sunoShareUrl(input) {
-  return /^https?:\/\//i.test(String(input || '')) && /suno\.com\/s\/[a-zA-Z0-9-]+/i.test(String(input || ''));
+function sunoResource(input) {
+  const url = httpsUrl(input);
+  if (!url || url.port) return null;
+  const hostname = url.hostname.toLowerCase().replace(/\.$/, '');
+  if (hostname !== 'suno.com' && hostname !== 'www.suno.com') return null;
+  const match = url.pathname.match(/^\/(playlist|playlists|song|songs|s)\/([a-zA-Z0-9-]+)\/?$/i);
+  if (!match) return null;
+  const type = /^playlist/i.test(match[1]) ? 'playlist' : match[1].toLowerCase() === 's' ? 'share' : 'song';
+  url.hash = '';
+  return { url: url.toString(), type, id: match[2] };
 }
 
 function trackFromDirectAudio(input) {
@@ -110,7 +123,7 @@ function uniqueTracks(tracks) {
 }
 
 async function fetchJson(url, playlistUrl) {
-  const response = await fetch(url, {
+  const response = await fetchWithTimeout(url, {
     headers: {
       'Accept': 'application/json, text/plain, */*',
       'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36',
@@ -174,7 +187,7 @@ function collectObjects(value, out = []) {
   const duration = value.duration || value.duration_seconds || value.durationSeconds || value.metadata?.duration;
   const artist = value.artist || value.user?.display_name || value.user?.username || value.creator || value.handle || 'Suno';
   if (title && (audioUrl || sourceUrl || value.id || value.clip_id || value.entity_type === 'song_schema' || value.entity_type === 'song')) {
-    out.push({ title: String(title), artist: String(artist || 'Suno'), duration: typeof duration === 'string' ? duration : durationFromSeconds(duration), audioUrl: String(audioUrl || ''), sourceUrl: String(sourceUrl || '') });
+    out.push({ id: String(value.id || value.clip_id || ''), title: String(title), artist: String(artist || 'Suno'), duration: typeof duration === 'string' ? duration : durationFromSeconds(duration), audioUrl: String(audioUrl || ''), sourceUrl: String(sourceUrl || '') });
   }
   Object.values(value).forEach(item => collectObjects(item, out));
   return out;
@@ -307,20 +320,83 @@ function parseLoosePatterns(html) {
   return tracks;
 }
 
-async function fetchFromHtml(playlistUrl) {
-  const response = await fetch(playlistUrl, {
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36',
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+async function limitedText(response, maxBytes = 5_000_000) {
+  const declaredLength = Number(response.headers.get('content-length') || 0);
+  if (declaredLength > maxBytes) throw new Error('Suno page response was too large.');
+  if (!response.body?.getReader) {
+    const text = await response.text();
+    if (Buffer.byteLength(text) > maxBytes) throw new Error('Suno page response was too large.');
+    return text;
+  }
+  const reader = response.body.getReader();
+  const chunks = [];
+  let total = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > maxBytes) {
+      await reader.cancel().catch(() => {});
+      throw new Error('Suno page response was too large.');
     }
-  });
-  const html = await response.text();
+    chunks.push(Buffer.from(value));
+  }
+  return Buffer.concat(chunks).toString('utf8');
+}
+
+async function fetchValidatedSunoPage(input) {
+  let resource = sunoResource(input);
+  if (!resource) throw new Error('Only HTTPS Suno share, playlist, and song pages can be fetched.');
+  for (let redirects = 0; redirects <= 3; redirects += 1) {
+    const response = await fetchWithTimeout(resource.url, {
+      redirect: 'manual',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+      }
+    });
+    if (response.status < 300 || response.status >= 400) return response;
+    const location = response.headers.get('location');
+    if (!location || redirects === 3) throw new Error('Suno page redirect could not be followed safely.');
+    let next;
+    try { next = new URL(location, resource.url).toString(); }
+    catch { throw new Error('Suno page returned an invalid redirect.'); }
+    resource = sunoResource(next);
+    if (!resource) throw new Error('Suno page redirected outside an allowed Suno resource.');
+  }
+  throw new Error('Suno page redirect could not be followed safely.');
+}
+
+async function fetchFromHtml(playlistUrl) {
+  const response = await fetchValidatedSunoPage(playlistUrl);
+  const html = await limitedText(response);
   if (!response.ok) throw new Error(`Suno page returned HTTP ${response.status}`);
-  return uniqueTracks([...parseJsonScripts(html), ...parseEmbeddedAudioPatterns(html), ...parseLoosePatterns(html)]);
+  const canonicalResource = sunoResource(canonicalUrl(html));
+  const tracks = uniqueTracks([...parseJsonScripts(html), ...parseEmbeddedAudioPatterns(html), ...parseLoosePatterns(html)]);
+  return { tracks, canonicalResource };
+}
+
+function exactSongTracks(tracks, resource) {
+  if (!resource || resource.type === 'playlist') return tracks;
+  const id = String(resource.id || '').toLowerCase();
+  const exact = tracks.filter(track => {
+    const trackId = String(track.id || '').toLowerCase();
+    const audioUrl = String(track.audioUrl || '').toLowerCase();
+    return trackId === id || audioUrl.includes(`/${id}.`);
+  });
+  return exact;
 }
 
 export default async function handler(req, res) {
-  const playlistUrl = String(queryParams(req).url || '');
+  if (!requireSession(req, res)) return;
+  if (req.method !== 'GET') {
+    res.setHeader('Allow', 'GET');
+    return json(res, 405, { ok: false, error: 'GET required.' });
+  }
+  const playlistUrl = String(queryParams(req).url || '').trim();
+  if (!playlistUrl || playlistUrl.length > 2_048) {
+    return json(res, 400, { ok: false, error: 'Provide an HTTPS Suno share, playlist, or song URL, or an HTTPS direct audio URL.' });
+  }
   if (directAudioUrl(playlistUrl)) {
     const track = trackFromDirectAudio(playlistUrl);
     return json(res, 200, {
@@ -333,9 +409,31 @@ export default async function handler(req, res) {
       audioWarning: ''
     });
   }
-  if (sunoSongUrl(playlistUrl) || sunoShareUrl(playlistUrl)) {
+  const resource = sunoResource(playlistUrl);
+  if (!resource) {
+    return json(res, 400, { ok: false, error: 'Provide an HTTPS Suno share, playlist, or song URL, or an HTTPS direct audio URL.' });
+  }
+  if (resource.type === 'song' || resource.type === 'share') {
     try {
-      const tracks = await fetchFromHtml(playlistUrl);
+      const htmlResult = await fetchFromHtml(resource.url);
+      if (resource.type === 'share' && htmlResult.canonicalResource?.type === 'playlist') {
+        const apiResult = await fetchFromSunoPlaylistApi(htmlResult.canonicalResource.id, htmlResult.canonicalResource.url);
+        return json(res, 200, {
+          ok: true,
+          tracks: apiResult.tracks,
+          count: apiResult.tracks.length,
+          playlistName: apiResult.playlistName,
+          playlistImage: apiResult.playlistImage,
+          source: 'canonical-suno-playlist-api',
+          audioWarning: ''
+        });
+      }
+      if (resource.type === 'song' && htmlResult.canonicalResource &&
+          (htmlResult.canonicalResource.type !== 'song' || htmlResult.canonicalResource.id !== resource.id)) {
+        throw new Error('Suno redirected that song URL to a different resource, so Poolside Pulse refused to guess which audio to play.');
+      }
+      const exactResource = htmlResult.canonicalResource?.type === 'song' ? htmlResult.canonicalResource : resource;
+      const tracks = exactSongTracks(htmlResult.tracks, exactResource);
       if (!tracks.length) throw new Error('Suno song page returned no playable track data.');
       return json(res, 200, {
         ok: true,
@@ -350,11 +448,9 @@ export default async function handler(req, res) {
       return json(res, sunoStatus(error), { ok: false, error: error.message });
     }
   }
-  const playlistId = extractPlaylistId(playlistUrl);
-  if (!playlistId) return json(res, 400, { ok: false, error: 'Provide a valid Suno playlist URL, Suno song URL, direct audio URL, or playlist ID.' });
 
   try {
-    const apiResult = await fetchFromSunoPlaylistApi(playlistId, playlistUrl);
+    const apiResult = await fetchFromSunoPlaylistApi(resource.id, resource.url);
     return json(res, 200, {
       ok: true,
       tracks: apiResult.tracks,
@@ -365,15 +461,9 @@ export default async function handler(req, res) {
       audioWarning: apiResult.tracks.some(t => t.audioUrl) ? '' : 'titles only; no public playable audio URLs found'
     });
   } catch (apiError) {
-    try {
-      const htmlTracks = await fetchFromHtml(playlistUrl.startsWith('http') ? playlistUrl : `https://suno.com/playlist/${playlistId}`);
-      if (!htmlTracks.length) throw new Error('HTML fallback found no tracks.');
-      return json(res, 200, { ok: true, tracks: htmlTracks, count: htmlTracks.length, source: 'html-fallback', warning: apiError.message, audioWarning: htmlTracks.some(t => t.audioUrl) ? '' : 'titles only; no public playable audio URLs found' });
-    } catch (htmlError) {
-      const apiStatus = sunoStatus(apiError);
-      const htmlStatus = sunoStatus(htmlError);
-      const status = apiStatus === 410 || htmlStatus === 410 ? 410 : 500;
-      return json(res, status, { ok: false, error: `${apiError.message}; fallback: ${htmlError.message}` });
-    }
+    return json(res, sunoStatus(apiError), {
+      ok: false,
+      error: `${apiError.message} Poolside Pulse did not use playlist-page recommendations as a fallback because their membership cannot be verified.`
+    });
   }
 }

@@ -1,4 +1,5 @@
 import * as hdf5 from 'jsfive';
+import { consumeRateLimit, requireSession } from './_auth.js';
 
 const THUNDERSTORM_CODES = new Set([95, 96, 99]);
 const TORNADO_EVENTS = ['Tornado Warning', 'Tornado Emergency'];
@@ -8,12 +9,14 @@ const NOAA_GLM_BUCKET = 'noaa-goes19';
 const NOAA_GLM_PRODUCT = 'GLM-L2-LCFA';
 const NOAA_GLM_HOST = `https://${NOAA_GLM_BUCKET}.s3.amazonaws.com`;
 const NOAA_GLM_DEFAULT_LOOKBACK_MINUTES = 6;
-const NOAA_GLM_MAX_FILES = 12;
+const NOAA_GLM_MAX_FILES = 30;
+const NOAA_GLM_FILE_DURATION_MS = 20_000;
+const NOAA_GLM_BATCH_SIZE = 6;
 const NWS_FETCH_TIMEOUT_MS = 2200;
 const OPEN_METEO_FETCH_TIMEOUT_MS = 2200;
 const NOAA_GLM_LIST_TIMEOUT_MS = 1800;
 const NOAA_GLM_FILE_TIMEOUT_MS = 1800;
-const NOAA_GLM_BUDGET_MS = 6200;
+const NOAA_GLM_BUDGET_MS = 8500;
 
 globalThis.__POOL_SIDE_GLM_CACHE__ ||= new Map();
 
@@ -194,27 +197,42 @@ async function getNoaaGlmLightning(lat, lon, radiusMiles, query = {}) {
   const lookbackMinutes = Math.max(2, Math.min(15, Number(query.lightningLookbackMinutes) || NOAA_GLM_DEFAULT_LOOKBACK_MINUTES));
   const budgetMs = Math.max(1200, Math.min(9000, Number(query.lightningBudgetMs) || NOAA_GLM_BUDGET_MS));
   const deadline = Date.now() + budgetMs;
-  if (lat < -52 || lat > 52) return { lightningHits, errors: ['NOAA GLM coverage is limited outside roughly 52°S to 52°N.'], provider: 'noaa-goes-glm', filesChecked: 0 };
+  if (lat < -52 || lat > 52) return { lightningHits, errors: ['NOAA GLM coverage is limited outside roughly 52°S to 52°N.'], provider: 'noaa-goes-glm', filesChecked: 0, coverageKnown: false };
   try {
     const { keys, errors: listErrors } = await recentGlmKeys(lookbackMinutes);
     errors.push(...listErrors);
     const latPad = (radiusMiles / 69) + 0.08;
     const lonPad = (radiusMiles / Math.max(10, 69 * Math.cos(lat * Math.PI / 180))) + 0.08;
     let filesChecked = 0;
-    for (const key of keys) {
+    const checkedStarts = [];
+    for (let offset = 0; offset < keys.length; offset += NOAA_GLM_BATCH_SIZE) {
       if (Date.now() > deadline) {
         errors.push(`NOAA GLM check reached its ${Math.round(budgetMs / 1000)}s response budget.`);
         break;
       }
-      try {
+      const batch = keys.slice(offset, offset + NOAA_GLM_BATCH_SIZE);
+      const results = await Promise.all(batch.map(async key => {
+        try {
+          return { key, flashes: await readGlmFlashes(key), error: '' };
+        } catch (error) {
+          return { key, flashes: [], error: error.message };
+        }
+      }));
+      for (const result of results) {
+        if (result.error) {
+          errors.push(result.error);
+          continue;
+        }
         filesChecked += 1;
-        const flashes = await readGlmFlashes(key);
+        const startMs = glmStartMs(result.key);
+        if (startMs) checkedStarts.push(startMs);
+        const flashes = result.flashes;
         for (const flash of flashes) {
           if (flash.lat < lat - latPad || flash.lat > lat + latPad || flash.lon < lon - lonPad || flash.lon > lon + lonPad) continue;
           const distanceMI = haversineMiles(lat, lon, flash.lat, flash.lon);
           if (distanceMI <= radiusMiles) {
             lightningHits.push({
-              id: `glm-${key.split('/').pop()?.replace(/\.nc$/, '')}-${flash.index}`,
+              id: `glm-${result.key.split('/').pop()?.replace(/\.nc$/, '')}-${flash.index}`,
               distanceMI,
               lat: flash.lat,
               lon: flash.lon,
@@ -223,15 +241,22 @@ async function getNoaaGlmLightning(lat, lon, radiusMiles, query = {}) {
             });
           }
         }
-      } catch (error) {
-        errors.push(error.message);
       }
       if (lightningHits.length) break;
     }
-    return { lightningHits, errors, provider: 'noaa-goes-glm', filesChecked, lookbackMinutes };
+    const sortedStarts = [...new Set(checkedStarts)].sort((a, b) => a - b);
+    const requiredStart = Date.now() - lookbackMinutes * 60_000;
+    const oldest = sortedStarts[0] || 0;
+    const newest = sortedStarts.at(-1) || 0;
+    const contiguous = sortedStarts.length >= Math.ceil((lookbackMinutes * 60_000) / NOAA_GLM_FILE_DURATION_MS) &&
+      sortedStarts.every((start, index) => index === 0 || start - sortedStarts[index - 1] <= NOAA_GLM_FILE_DURATION_MS + 5_000);
+    const coverageKnown = contiguous &&
+      oldest <= requiredStart + NOAA_GLM_FILE_DURATION_MS &&
+      newest + NOAA_GLM_FILE_DURATION_MS >= Date.now() - 45_000;
+    return { lightningHits, errors, provider: 'noaa-goes-glm', filesChecked, lookbackMinutes, coverageKnown };
   } catch (error) {
     errors.push(`NOAA GLM lightning: ${error.message}`);
-    return { lightningHits, errors, provider: 'noaa-goes-glm', filesChecked: 0, lookbackMinutes };
+    return { lightningHits, errors, provider: 'noaa-goes-glm', filesChecked: 0, lookbackMinutes, coverageKnown: false };
   }
 }
 
@@ -339,20 +364,20 @@ function normalizeLightningHit(raw, radiusMiles) {
 async function getXweatherLightning(lat, lon, radiusMiles) {
   const lightningHits = [];
   const errors = [];
-  if (!xweatherReady()) return { lightningHits, errors, provider: 'not-configured' };
+  if (!xweatherReady()) return { lightningHits, errors, provider: 'not-configured', coverageKnown: false };
   try {
     const url = new URL(`${XWEATHER_HOST}/lightning/closest`);
     url.searchParams.set('p', `${lat.toFixed(5)},${lon.toFixed(5)}`);
     url.searchParams.set('radius', `${radiusMiles}mi`);
     url.searchParams.set('limit', '1');
-    url.searchParams.set('from', '-6minutes');
+    url.searchParams.set('from', '-5minutes');
     url.searchParams.set('client_id', process.env.XWEATHER_CLIENT_ID);
     url.searchParams.set('client_secret', process.env.XWEATHER_CLIENT_SECRET);
-    const response = await fetch(url.toString(), { headers: { Accept: 'application/json' } });
+    const response = await fetchWithTimeout(url.toString(), { headers: { Accept: 'application/json' } }, 2_500);
     const data = await response.json().catch(() => ({}));
     if (!response.ok || data.success === false) {
       errors.push(`Xweather lightning: ${data.error?.description || data.error?.message || `HTTP ${response.status}`}`);
-      return { lightningHits, errors, provider: 'xweather' };
+      return { lightningHits, errors, provider: 'xweather', coverageKnown: false };
     }
     for (const item of data.response || []) {
       const hit = normalizeLightningHit(item, radiusMiles);
@@ -361,7 +386,7 @@ async function getXweatherLightning(lat, lon, radiusMiles) {
   } catch (error) {
     errors.push(`Xweather lightning: ${error.message}`);
   }
-  return { lightningHits, errors, provider: 'xweather' };
+  return { lightningHits, errors, provider: 'xweather', coverageKnown: errors.length === 0 };
 }
 
 function mockSignals(query, lightningRadiusMiles, windGustMph) {
@@ -410,6 +435,17 @@ function classify(alerts, lightningHits, thunderHits, windHits, providerErrors, 
 }
 
 export default async function handler(req, res) {
+  if (req.method !== 'GET') {
+    res.setHeader('Allow', 'GET');
+    return json(res, 405, { ok: false, error: 'GET required.' });
+  }
+  const session = requireSession(req, res);
+  if (!session) return;
+  const rate = consumeRateLimit(`weather:${session.sid}`, { limit: 12, windowMs: 60_000 });
+  if (!rate.allowed) {
+    res.setHeader('Retry-After', String(rate.retryAfterSeconds));
+    return json(res, 429, { ok: false, error: 'Weather checks are temporarily rate limited. Try again shortly.' });
+  }
   const query = queryParams(req);
   const lat = coord(query.lat);
   const lon = coord(query.lon);
@@ -427,11 +463,14 @@ export default async function handler(req, res) {
     const providerErrors = [...nws.errors, ...meteo.errors, ...noaaGlm.errors, ...xweather.errors];
     const summaryErrors = providerErrors.filter(error => !/NOAA GLM check reached/i.test(error));
     const result = classify(nws.alerts, lightningHits, meteo.thunderHits, windHits, summaryErrors, { thunderstormCodesClose });
+    const lightningCoverageKnown = noaaGlm.coverageKnown === true || xweather.coverageKnown === true;
+    const tornadoCoverageKnown = nws.errors.length === 0;
+    const windCoverageKnown = meteo.errors.length === 0;
     if (!result.threat && !summaryErrors.length && noaaGlm.filesChecked) {
       result.summary = `No closure trigger detected. Free NWS, Open-Meteo, and NOAA GLM checks completed; NOAA scanned ${noaaGlm.filesChecked} recent lightning file(s).`;
     }
-    return json(res, 200, { ok: true, radiusMiles, lightningRadiusMiles, windGustMph, thunderstormCodesClose, lightningProvider: noaaGlm.provider, lightningLookbackMinutes: noaaGlm.lookbackMinutes, lightningFilesChecked: noaaGlm.filesChecked, paidLightningProvider: xweather.provider, checkedPoints: points.length, alerts: nws.alerts, lightningHits, thunderHits: meteo.thunderHits, windHits, providerErrors, ...result });
+    return json(res, 200, { ok: true, radiusMiles, lightningRadiusMiles, windGustMph, thunderstormCodesClose, lightningProvider: noaaGlm.provider, lightningLookbackMinutes: noaaGlm.lookbackMinutes, lightningFilesChecked: noaaGlm.filesChecked, lightningCoverageKnown, tornadoCoverageKnown, windCoverageKnown, paidLightningProvider: xweather.provider, checkedPoints: points.length, alerts: nws.alerts, lightningHits, thunderHits: meteo.thunderHits, windHits, providerErrors, ...result });
   } catch (error) {
-    return json(res, 200, { ok: true, threat: false, threatType: '', radiusMiles, lightningRadiusMiles, windGustMph, checkedPoints: 0, alerts: [], lightningHits: [], thunderHits: [], windHits: [], providerErrors: [error.message], summary: `Weather check did not complete, but the app stayed online. Error: ${error.message || 'Unknown weather error.'}` });
+    return json(res, 200, { ok: true, threat: false, threatType: '', radiusMiles, lightningRadiusMiles, windGustMph, checkedPoints: 0, lightningFilesChecked: 0, lightningCoverageKnown: false, tornadoCoverageKnown: false, windCoverageKnown: false, alerts: [], lightningHits: [], thunderHits: [], windHits: [], providerErrors: [error.message], summary: `Weather check did not complete, but the app stayed online. Error: ${error.message || 'Unknown weather error.'}` });
   }
 }

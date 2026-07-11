@@ -1,67 +1,49 @@
-# Serenity Shores Poolside Pulse
+# Serenity Shores Poolside Pulse vFinal
 
-A standalone Vite web app for Serenity Shores poolside music, weather safety automation, spoken announcements, and playlist administration.
+Poolside Pulse coordinates scheduled announcements, weather safety messages, Suno/direct music, and Spotify from one dedicated speaker receiver.
 
-## Isolation guarantee
+Automatic weather checks run every two minutes. Each request overlaps at least six minutes of NOAA GLM lightning data, and the lookback expands after an incomplete check so a single provider failure does not create a blind gap.
 
-This project is intentionally standalone. It does not import from, depend on, or modify:
+## Operating contract
 
-- `serenity-stores`
-- `Lifeguards`
-- `first`
-- `lakesideessentials.com`
-- `serenityshores.com`
+- Exactly one speaker receiver owns audio. Phones and laptops in Remote Control mode only send commands to that receiver.
+- Suno/direct audio runs through one Web Audio graph with music fixed at 30%, voice fixed at 100%, and music ducked to 6% while speech plays.
+- Spotify is always confirmed paused before voice. A supported desktop receiver may report Spotify at 30% only after the local SDK verifies that value; iPhone/iPad Spotify volume is never presented as software-controlled.
+- Receiver leases, expiring commands, revision-checked writes, and server-adjusted time prevent stale playback and split ownership.
+- Scheduled items are recorded only after successful playback. Weather failures persist an explicit unknown state and never manufacture an all-clear.
+- The receiver stops audio if durable cloud heartbeats are unavailable for a full lease.
 
-Deploy it as its own Vercel project.
+For unattended scheduling, use an always-on desktop-class receiver connected to the speakers, keep the page visible, and keep the device plugged in.
 
-## Admin playlist section
+## Start-up
 
-Open Admin with passcode `2468`, then use **Playlist → Add / Update Playlist** to:
+1. Open vFinal on the device connected to the pool speakers.
+2. Choose **Speaker Receiver**, then **Start Receiver**.
+3. Use other devices in **Remote Control** mode.
+4. Prefer **Suno / Direct** when exact 30% music and 100% announcements are required.
 
-- update playlist name
-- store the Suno playlist URL
-- add individual tracks
-- bulk import tracks
-- add direct audio URLs where available
-- reorder or delete tracks
+## Required production configuration
+
+- `KV_REST_API_URL` and `KV_REST_API_TOKEN`: mandatory durable state, receiver ownership, conflict control, and distributed login throttling.
+- `POOL_SIDE_PIN`: mandatory 8–64 character production access code.
+- `POOL_SIDE_SESSION_SECRET`: recommended dedicated signing secret; a configured server-side integration secret is used only as a fallback.
+- `OPENAI_API_KEY`: optional natural announcement voice; device speech is the bounded fallback.
+- Existing weather-provider variables remain server-side and optional; failures are shown as unknown rather than clear.
+
+The receiver refuses to start unless live state reports durable KV sync. Do not use temporary server-memory mode for operations.
 
 ## Commands
 
 ```bash
 npm install
 npm run dev
-npm run build
+npm run verify
 ```
 
-## Version Notes
+Vercel settings: Vite framework, `npm install`, `npm run build`, output directory `dist`.
 
-- Version 23 stops treating iOS Spotify as a guaranteed quiet source. Spotify remains controllable, but the reliable loud-voice/quiet-music gap now comes from a first-class Suno/direct audio quiet bed at `10%` inside Poolside Pulse's Web Audio path, while spoken word stays at `+800`/max PA+ and any Spotify playback is paused for voice.
-- Version 22 increases the voice/music gap again: Spotify defaults to gain `-800` mapped to a 0% Spotify bed request, spoken word defaults to gain `+800` mapped to max PA+, the receiver silences and pauses Spotify before speech, waits before/after announcements, and uses stronger speech EQ/compression/soft limiting.
-- Version 21 adds Manager gain controls for the live balance problem: Spotify defaults to gain `-500` mapped to a 1% Spotify bed request, spoken word defaults to gain `+500` mapped to max clear PA voice, and the receiver voice path uses stronger loudness normalization with compression/soft limiting to reduce static.
-- Version 20.14 keeps the clear PA voice path and clears stale V20.12/V20.13 receiver state that still mentioned `2400%`, max receiver boost, or old volume warnings.
-- Version 20.13 replaces the static-prone raw voice boost with a clear PA voice path: WAV-first TTS, RMS/peak loudness analysis, speech EQ, compression, and soft limiting. Music still pauses for spoken commands, then restores after the announcement.
-- Version 20.12 makes the iPhone Shortcut optional. The Home receiver has a Loud Voice Setup button, music remains in the 15-33% range, spoken commands pause Spotify/Suno first, the receiver normalizes and boosts AI voice, and music restores after the announcement.
-- Version 20.11 matched iOS 26.5 Shortcuts behavior by using fixed If-branch media-volume targets. V20.12 supersedes that path because web apps cannot silently install or configure an iOS Shortcut.
-- Version 20.10 made voice hardware volume always request 100%, raised the voice boost ceiling, and added a louder compressed Web Audio voice path. V20.11 supersedes its Shortcut setup guidance.
-- Version 20.9 forces stale Spotify receiver device IDs out of cloud state during migration, so old V20.5 receiver IDs cannot survive a refresh and cause `Device not found` again.
-- Version 20.8 resets stale Spotify receiver device IDs when Spotify returns `Device not found`, reconnects the Home Web Playback receiver once, and stops old failed commands from retrying forever. It keeps the V20.7 iPhone Shortcuts hardware-volume bridge.
-- Version 20.7 adds an optional iPhone hardware volume bridge through a receiver-local Shortcut named `Poolside Pulse Volume`, so the Home iPhone can set true system volume low for Spotify music and high for voice while keeping Suno and voice Web Audio sliders independent. It uses the Shortcuts callback URL form so the speaker iPhone can return to Poolside Pulse after setting volume.
-- Version 20.5 keeps the command-phone/Home-receiver model, caps Spotify and Suno music controls at 33%, defaults music to 15%, runs voice at max adjustable Web Audio gain up to 1200%, keeps Spotify pause/restore during announcements, and stops falsely verifying iPhone-local Spotify volume that iOS keeps under physical control.
-- Version 20.3 keeps the command-phone/Home-receiver model, defaults Spotify bed music to 33%, plays voice at true 100% receiver volume, pauses/restores Spotify for announcements, and refuses to fall back to unrelated active Spotify devices.
-- Version 20.2 keeps Spotify music at 33%, changes Spotify during voice to 0%, sends Spotify volume slider changes live without re-rendering the slider during drag, and verifies the requested Spotify volume against the audible Spotify device before reporting success.
-- Version 20.1 keeps the V20 receiver model and fixes the live audio balance: all music defaults to 33%, voice announcements default to the maximum 600% boost, Spotify ducks to 33% for spoken voice, Spotify pauses during Suno foreground tracks, stale Spotify play retries are stopped, and scheduled Suno cues can be stopped from Command or Home while they are playing.
-- Version 17 rolls forward from the V9 receiver model: one speaker phone stays on Home, Command devices only send controls, music starts at 45%, the deleted default Suno playlist is removed, and weather closure triggers require verified lightning/NWS closure alerts instead of Open-Meteo thunderstorm-code-only hits.
-- Version 13 unifies Spotify and Suno music volume into one receiver-wide Music Volume command, lowers inherited loud music defaults, primes iPhone receiver audio for seamless Suno switching, simplifies the schedule item editor, and improves iPhone/laptop layout behavior.
-- Version 12 adds Lake123 branding, a receiver on/off switch independent of Home/Command view, clickable receiver repair notices, stronger button pressed states, receiver-wide volume commands, and denser collapsible party cue cards.
-- Version 11 adds the Weekly Poolside Party Command Page, editable party cues, Gabe/Callie/manager/safety voice profiles, manual checkpoints, Spotify/Suno/custom-audio cue support, import/export JSON, and a mode switch that suspends normal pool automation only while the party schedule is active. Weather monitoring and safety announcements remain active.
+## Backup and isolation
 
-## Vercel settings
+The pre-vFinal V23 source is preserved at commit `e8b59e119398d180e2540791f54e09d63cdef9bb` and branch `codex/backup-v23-20260711`. The in-app archive page is informational and does not activate the old receiver.
 
-- Framework: Vite
-- Install command: `npm install`
-- Build command: `npm run build`
-- Output directory: `dist`
-
-## Prototype warning
-
-This version uses browser localStorage and a front-end-only admin passcode. Before using it for public safety-critical operations, replace the prototype passcode with real authentication and connect a dedicated weather/lightning provider.
+This repository is standalone and must remain isolated from Lakeside Essentials, RollinD, Lifeguard Scheduler, Boat Rental, and every other Serenity Shores project.
