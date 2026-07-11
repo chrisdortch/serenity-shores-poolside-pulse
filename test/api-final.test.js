@@ -11,6 +11,7 @@ import stateHandler from '../api/state.js';
 import sunoHandler from '../api/suno-playlist.js';
 import ttsHandler from '../api/tts.js';
 import voiceHealthHandler from '../api/voice-health.js';
+import weatherHandler from '../api/weather.js';
 
 const SECRET = 'vfinal-test-session-secret-with-sufficient-length';
 
@@ -148,6 +149,34 @@ describe('vFinal signed session', () => {
     const logout = await invoke(sessionHandler, request('DELETE', '/api/session', { cookie }));
     assert.equal(logout.statusCode, 200);
     assert.match(logout.getHeader('set-cookie'), /Max-Age=0/);
+  });
+});
+
+describe('vFinal weather input validation', () => {
+  test('rejects missing, blank, or out-of-range coordinates without contacting providers', async () => {
+    const previousFetch = globalThis.fetch;
+    let providerFetches = 0;
+    globalThis.fetch = async () => {
+      providerFetches += 1;
+      throw new Error('Weather providers must not run for invalid coordinates.');
+    };
+
+    try {
+      const cookie = sessionCookie();
+      const responses = await Promise.all([
+        invoke(weatherHandler, request('GET', '/api/weather', { cookie })),
+        invoke(weatherHandler, request('GET', '/api/weather?lat=&lon=%20', { cookie })),
+        invoke(weatherHandler, request('GET', '/api/weather?lat=91&lon=-181', { cookie }))
+      ]);
+
+      for (const result of responses) {
+        assert.equal(result.statusCode, 400);
+        assert.match(result.json().error, /valid latitude and longitude/i);
+      }
+      assert.equal(providerFetches, 0);
+    } finally {
+      globalThis.fetch = previousFetch;
+    }
   });
 });
 

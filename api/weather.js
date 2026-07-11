@@ -40,9 +40,11 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 2500) {
   }
 }
 
-function coord(value) {
-  const n = Number(String(value ?? '').trim().replace(/[−–—]/g, '-'));
-  return Number.isFinite(n) ? n : null;
+function coord(value, min, max) {
+  const raw = String(value ?? '').trim().replace(/[−–—]/g, '-');
+  if (!raw) return null;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= min && n <= max ? n : null;
 }
 
 function queryParams(req) {
@@ -447,8 +449,8 @@ export default async function handler(req, res) {
     return json(res, 429, { ok: false, error: 'Weather checks are temporarily rate limited. Try again shortly.' });
   }
   const query = queryParams(req);
-  const lat = coord(query.lat);
-  const lon = coord(query.lon);
+  const lat = coord(query.lat, -90, 90);
+  const lon = coord(query.lon, -180, 180);
   const radiusMiles = Math.max(1, Math.min(25, Number(query.radiusMiles) || 10));
   const lightningRadiusMiles = Math.max(1, Math.min(25, Number(query.lightningRadiusMiles) || radiusMiles || 10));
   const windGustMph = Math.max(15, Math.min(80, Number(query.windGustMph) || 35));
