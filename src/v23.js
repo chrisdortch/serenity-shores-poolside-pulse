@@ -10,7 +10,7 @@ const SPOTIFY_TOKEN_KEY = 'poolside-pulse-v23-spotify-token';
 const IOS_VOLUME_BRIDGE_KEY = 'poolside-pulse-v23-ios-volume-bridge-enabled';
 const IOS_VOLUME_BRIDGE_NAME_KEY = 'poolside-pulse-v23-ios-volume-bridge-name';
 const IOS_VOLUME_BRIDGE_MODE_KEY = 'poolside-pulse-v23-ios-volume-bridge-mode-id';
-const IOS_VOLUME_BRIDGE_MODE_ID = '2026-07-11-v23-guaranteed-gap';
+const IOS_VOLUME_BRIDGE_MODE_ID = '2026-07-11-v23-audible-bed';
 const APP_QUERY = '?v=23';
 const LEGACY_STATE_KEYS = [
   'poolside-pulse-v21',
@@ -69,9 +69,9 @@ const LEGACY_DELETED_SUNO_ID_PATTERN = /cf4b536e-9005/i;
 const DEFAULT_ADDRESS = '615 Serenity Shores Ln, Kimberling City, MO 65686';
 const MUSIC_VOLUME_SLIDER_MIN = 0;
 const MUSIC_VOLUME_PERCENT = MUSIC_VOLUME_SLIDER_MIN;
-const DEFAULT_SPOTIFY_VOLUME = 0;
+const DEFAULT_SPOTIFY_VOLUME = 25;
 const DEFAULT_SPOTIFY_DUCKED_VOLUME = 0;
-const DEFAULT_SUNO_VOLUME = 10;
+const DEFAULT_SUNO_VOLUME = 25;
 const SPOTIFY_VOLUME_SLIDER_MIN = MUSIC_VOLUME_SLIDER_MIN;
 const SPOTIFY_VOLUME_SLIDER_MAX = 33;
 const SUNO_VOLUME_SLIDER_MIN = 0;
@@ -84,13 +84,13 @@ const MIN_SPOKEN_GAIN = 0;
 const MAX_SPOKEN_GAIN = 800;
 const DEFAULT_ANNOUNCEMENT_GAIN = 64;
 const MAX_ANNOUNCEMENT_GAIN = 64;
-const V23_VOLUME_DEFAULTS_ID = '2026-07-11-v23-guaranteed-gap';
+const V23_VOLUME_DEFAULTS_ID = '2026-07-11-v23-audible-bed';
 const LIVE_SPOTIFY_VOLUME_APPLY_MS = 550;
 const SPOTIFY_VOLUME_WATCH_MS = 5000;
 const SPOTIFY_VOLUME_WATCH_LOG_MS = 45000;
 const IOS_VOLUME_BRIDGE_DEFAULT_NAME = 'Poolside Pulse Volume';
 const IOS_VOLUME_BRIDGE_WAIT_MS = 750;
-const IOS_VOLUME_BRIDGE_FIX_TEXT = 'V23 Guaranteed Gap: Spotify on iOS cannot be made quietly controllable by browser volume, so the guaranteed quiet bed uses Suno/direct audio inside Poolside Pulse at 10%; spoken word uses +800/max PA+ and any Spotify playback is paused for voice.';
+const IOS_VOLUME_BRIDGE_FIX_TEXT = 'V23 Audible Gap: Spotify on iOS cannot be made quietly controllable by browser volume, so the guaranteed quiet bed uses receiver-owned Web Audio/Suno at 25% by default; spoken word uses +800/max PA+ and any Spotify playback is paused for voice.';
 const SPOTIFY_VOLUME_VERIFY_TOLERANCE = 1;
 const VOICE_TAKEOVER_PRE_ROLL_MS = 850;
 const VOICE_TAKEOVER_POST_ROLL_MS = 1100;
@@ -593,6 +593,7 @@ function clearStaleReceiverFailures(state) {
   if (hasStaleReceiverFailure(state.setupNotice)) state.setupNotice = '';
   if (hasStaleReceiverFailure(state.lastError)) state.lastError = '';
   if (hasStaleReceiverFailure(state.spotifyLastError)) state.spotifyLastError = '';
+  if (/(autoplay.*blocked|blocked.*autoplay)/i.test(String(state.spotifyLastError || '')) && /ready|playing|paused while quiet bed/i.test(String(state.spotifyStatus || ''))) state.spotifyLastError = '';
   if (hasStaleReceiverFailure(state.spotifyStatus)) {
     state.spotifyStatus = String(state.spotifyStatus || '')
       .replace(/\n?Last Spotify issue:.*$/s, '')
@@ -664,8 +665,8 @@ function normalize(raw) {
     s.spotifyNeedsTap = true;
     s.activeMusicProvider = 'suno';
     s.activeMusicUrl = quietBedSourceUrl(s.playlistUrl, s.quickMusicUrl);
-    s.activeMusicLabel = 'V23 Guaranteed Gap ready: the built-in ambient quiet bed can play now; save a Suno/direct audio URL for custom music.';
-    s.iosVolumeBridgeStatus = `V23 guaranteed gap mode: ${IOS_VOLUME_BRIDGE_FIX_TEXT}`;
+    s.activeMusicLabel = 'V23 Audible Gap ready: the built-in ambient quiet bed can play now at an audible default; save a Suno/direct audio URL for custom music.';
+    s.iosVolumeBridgeStatus = `V23 audible gap mode: ${IOS_VOLUME_BRIDGE_FIX_TEXT}`;
     s.iosVolumeBridgeLastTarget = '';
     s.iosVolumeBridgeLastAt = 0;
     s.feedback = 'Ready.';
@@ -2836,7 +2837,7 @@ function applyIOSVolumeBridgeDefault() {
   if (storageGet(IOS_VOLUME_BRIDGE_MODE_KEY) === IOS_VOLUME_BRIDGE_MODE_ID) return;
   setIOSVolumeBridgeEnabled(false);
   storageSet(IOS_VOLUME_BRIDGE_MODE_KEY, IOS_VOLUME_BRIDGE_MODE_ID);
-  S.iosVolumeBridgeStatus = `V23 guaranteed gap mode: ${IOS_VOLUME_BRIDGE_FIX_TEXT}`;
+  S.iosVolumeBridgeStatus = `V23 audible gap mode: ${IOS_VOLUME_BRIDGE_FIX_TEXT}`;
   localSave();
 }
 
@@ -3032,6 +3033,7 @@ function setSpotifyStatus(message, ok = true) {
     S.spotifyLastError = message;
     S.spotifyNeedsTap = /tap|activate|autoplay|iOS|receiver/i.test(message);
   } else {
+    S.spotifyLastError = '';
     S.spotifyNeedsTap = false;
   }
   setFeedback(message, ok);
@@ -3068,8 +3070,18 @@ function registerSpotifyListeners() {
       const current = state.track_window.current_track;
       S.spotifyNowPlaying = `${current.name || 'Spotify'}${current.artists?.length ? ` - ${current.artists.map(artist => artist.name).join(', ')}` : ''}`;
     }
-    S.intent = state.paused ? 'paused' : 'playing';
-    S.spotifyStatus = state.paused ? 'Spotify receiver is paused.' : 'Spotify receiver is playing.';
+    const quietBedOwnsPlayback = activeForegroundPlayback?.kind === 'quiet-bed' || S.activeMusicProvider === 'suno';
+    if (state.paused && quietBedOwnsPlayback) {
+      S.intent = 'playing';
+      S.spotifyStatus = 'Spotify paused while quiet bed plays.';
+    } else {
+      S.intent = state.paused ? 'paused' : 'playing';
+      S.spotifyStatus = state.paused ? 'Spotify receiver is paused.' : 'Spotify receiver is playing.';
+      if (!state.paused && S.musicProvider === 'spotify') {
+        S.activeMusicProvider = 'spotify';
+        S.activeMusicUrl = S.spotifyUrl || DEFAULT_SPOTIFY_PLAYLIST;
+      }
+    }
     S.receiverLastSeen = stamp();
     localSave();
     if (!state.paused) startSpotifyVolumeWatch('Spotify playback state');
@@ -4619,7 +4631,7 @@ async function performAnnouncement(text, options = {}) {
   const quietBedSnapshot = await duckQuietBedForAnnouncement();
   try {
     if (spotifySnapshot?.duckMethod || spotifySnapshot?.pausedForDuck || sunoSnapshot?.wasPlaying || quietBedSnapshot?.wasPlaying) {
-      S.audioStatus = 'V23 Guaranteed Gap voice takeover: quiet bed or Spotify is stopped before speech starts.';
+      S.audioStatus = 'V23 Audible Gap voice takeover: quiet bed or Spotify is stopped before speech starts.';
       await wait(VOICE_TAKEOVER_PRE_ROLL_MS);
       await reinforceSpotifySilenceForVoice(spotifySnapshot);
     }
@@ -5341,7 +5353,7 @@ function commandPage() {
         <label><span>Spoken Gain <output id="spokenGainOut">${esc(spokenGainLabel())}</output></span><input id="spokenGain" type="range" min="${MIN_SPOKEN_GAIN}" max="${MAX_SPOKEN_GAIN}" step="25" value="${esc(S.spokenGain)}"></label>
         <label><span>Voice Loudness <output id="announcementGainOut">${esc(voiceLoudnessLabel())}</output></span><input id="announcementGain" type="range" min="1" max="${MAX_ANNOUNCEMENT_GAIN}" step=".25" value="${esc(S.announcementGain)}"></label>
         <button id="spotifyVolumeApply" class="secondary">Send Audio Settings</button>
-        <small>V23 Guaranteed Gap uses Suno/direct audio for the quiet bed because that path can actually be attenuated by Poolside Pulse. Spotify is still controllable, but iOS does not allow browser JavaScript to make local Spotify quiet; voice stops music first and plays at +800/max PA+.</small>
+        <small>V23 Audible Gap uses receiver-owned Web Audio/Suno for the quiet bed because that path can actually be attenuated by Poolside Pulse. Spotify is still controllable, but iOS does not allow browser JavaScript to make local Spotify quiet; voice stops music first and plays at +800/max PA+.</small>
       </div>
       <div class="quickMusic"><label>Quiet Bed or Spotify URL<input id="quickMusicUrl" value="${esc(quietInputValue)}" placeholder="Paste Suno, direct audio, or Spotify URL"></label><div class="buttonStack"><button id="playAnyUrl">Play Pasted URL</button><button id="playDefaultSuno" class="secondary">Play Quiet Bed</button><button id="playDefaultSpotify" class="secondary">Play Spotify</button></div></div>
       <div class="splitControls"><label>Announcement<textarea id="quickText">${esc(S.quickText || selected.text)}</textarea></label><div><label>Saved Announcement<select id="quickTemplate">${S.anns.map(item => `<option value="${item.id}" ${item.id === S.selected ? 'selected' : ''}>${esc(item.label)} · ${item.mode === 'suno' ? 'Suno' : 'Voice'}</option>`).join('')}</select></label><div class="buttonStack"><button id="quickPlay">${selected.mode === 'suno' ? 'Play Announcement Track' : 'Speak Now'}</button><button id="quickHold" class="secondary">${selected.mode === 'suno' ? 'Track as Safety Hold' : 'Speak as Safety Hold'}</button><button id="lightningNow" class="secondary">Lightning Hold</button><button id="windNow" class="secondary">Wind Umbrellas</button></div></div></div>

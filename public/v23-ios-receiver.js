@@ -171,16 +171,17 @@
     const lfoGain = ctx.createGain();
     const nodes = [];
 
+    const outputLevel = quietBedOutputLevel(options.volume);
     master.gain.setValueAtTime(0.0001, start);
-    master.gain.linearRampToValueAtTime(options.volume, start + 1.2);
-    pad.gain.value = 0.18;
-    shimmer.gain.value = 0.045;
+    master.gain.linearRampToValueAtTime(outputLevel, start + 1.2);
+    pad.gain.value = 0.28;
+    shimmer.gain.value = 0.07;
     filter.type = 'lowpass';
     filter.frequency.value = 1150;
     filter.Q.value = 0.65;
     lfo.type = 'sine';
     lfo.frequency.value = 0.035;
-    lfoGain.gain.value = Math.min(0.008, Math.max(0.002, options.volume * 0.08));
+    lfoGain.gain.value = Math.min(0.014, Math.max(0.003, outputLevel * 0.035));
     lfo.connect(lfoGain).connect(master.gain);
     lfo.start(start);
     nodes.push(lfo);
@@ -197,10 +198,10 @@
       nodes.push(osc, gain);
     };
 
-    makeOscillator(196, 'sine', pad, 0.44, -4);
-    makeOscillator(246.94, 'sine', pad, 0.32, 3);
-    makeOscillator(329.63, 'triangle', shimmer, 0.12, -7);
-    makeOscillator(392, 'sine', shimmer, 0.08, 5);
+    makeOscillator(196, 'sine', pad, 0.58, -4);
+    makeOscillator(246.94, 'sine', pad, 0.42, 3);
+    makeOscillator(329.63, 'triangle', shimmer, 0.18, -7);
+    makeOscillator(392, 'sine', shimmer, 0.12, 5);
 
     const noiseBuffer = ctx.createBuffer(1, Math.max(1, Math.floor(ctx.sampleRate * 2)), ctx.sampleRate);
     const noise = noiseBuffer.getChannelData(0);
@@ -213,7 +214,7 @@
     const noiseGain = ctx.createGain();
     noiseSource.buffer = noiseBuffer;
     noiseSource.loop = true;
-    noiseGain.gain.value = 0.012;
+    noiseGain.gain.value = 0.024;
     noiseSource.connect(noiseGain).connect(filter);
     noiseSource.start(start);
     nodes.push(noiseSource, noiseGain);
@@ -228,7 +229,7 @@
       const playback = {
         id: ++playbackSeq,
         setVolume(value) {
-          const level = clampNumber(value, 0, 1, options.volume);
+          const level = quietBedOutputLevel(value);
           try { master.gain.setTargetAtTime(level, ctx.currentTime || 0, 0.05); } catch { master.gain.value = level; }
         },
         stop() {
@@ -257,7 +258,7 @@
       activePlayback = playback;
       unlocked = true;
       webAudioPrimed = true;
-      lastStatus = `${options.label} started through receiver Web Audio.`;
+      lastStatus = `${options.label} started through receiver Web Audio at ${Math.round(options.volume * 100)}% requested / ${Math.round(outputLevel * 100)}% audible bed output.`;
       dispatchStatus();
     });
   }
@@ -269,6 +270,12 @@
   function clampNumber(value, min, max, fallback) {
     const n = Number(value);
     return Math.max(min, Math.min(max, Number.isFinite(n) ? n : fallback));
+  }
+
+  function quietBedOutputLevel(value) {
+    const requested = clampNumber(value, 0, 1, 0.25);
+    if (requested <= 0) return 0;
+    return clampNumber(0.08 + requested * 1.45, 0, 0.58, 0.25);
   }
 
   function playbackOptions(options = {}) {
