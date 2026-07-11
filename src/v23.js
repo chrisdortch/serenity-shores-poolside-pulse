@@ -63,6 +63,7 @@ const DEFAULT_PUBLIC_APP_URL = 'https://serenity-shores-poolside-pulse.vercel.ap
 const DEFAULT_SPOTIFY_CLIENT_ID = '7e086716aaea4ce98051287b552a676c';
 const DEFAULT_SPOTIFY_PLAYLIST = 'https://open.spotify.com/playlist/0WPOOzy3puLNwxukYt9pTw';
 const DEFAULT_SUNO_PLAYLIST = '';
+const BUILT_IN_QUIET_BED_URL = 'poolside://quiet-bed/ambient';
 const LEGACY_DELETED_SUNO_PLAYLIST = 'https://suno.com/playlist/cf4b536e-9005-4c98-9ea5-a7f01eca116f';
 const LEGACY_DELETED_SUNO_ID_PATTERN = /cf4b536e-9005/i;
 const DEFAULT_ADDRESS = '615 Serenity Shores Ln, Kimberling City, MO 65686';
@@ -167,9 +168,9 @@ const BASE = {
   tracks: [{ title: 'Import the Serenity Shores playlist', artist: 'Poolside Pulse', duration: '3:00', audioUrl: '' }],
   current: 0,
   intent: 'stopped',
-  activeMusicLabel: 'Nothing has been sent to receivers yet. V23 quiet bed needs a Suno or direct audio URL.',
+  activeMusicLabel: 'Nothing has been sent to receivers yet. V23 quiet bed can use the built-in ambient bed or a saved Suno/direct audio URL.',
   activeMusicProvider: 'suno',
-  activeMusicUrl: DEFAULT_SUNO_PLAYLIST,
+  activeMusicUrl: BUILT_IN_QUIET_BED_URL,
   manualMusicHoldUntil: 0,
   manualMusicHoldReason: '',
   manualMusicStartUntil: 0,
@@ -532,6 +533,50 @@ function hasStaleIOSVolumeNotice(value) {
   return /iPhone output remains physical|cannot be audibly lowered by JavaScript; .*uses Spotify Connect|Shortcut final action|Shortcut Input bridge|fixed 50%|If branches|fixed Shortcut volume branches|V20\.1[0-3].*(?:pauses music|receiver boost|loud voice|max receiver)|voice 2400%|2400% receiver boost|max receiver boost|plays voice at max receiver boost/i.test(String(value || ''));
 }
 
+function isSpotifyUrl(value) {
+  return /spotify:|open\.spotify\.com\//i.test(String(value || ''));
+}
+
+function isSunoOrDirectAudioUrl(value) {
+  const raw = String(value || '').trim();
+  return /suno\.com\/(?:playlist|playlists|song|songs|s)\//i.test(raw) ||
+    /\.(mp3|m4a|aac|wav|ogg|oga|webm)(\?|#|$)/i.test(raw);
+}
+
+function isBuiltInQuietBedUrl(value) {
+  return /^poolside:\/\/quiet-bed\//i.test(String(value || '').trim());
+}
+
+function quietBedSourceUrl(...candidates) {
+  for (const candidate of candidates) {
+    const raw = String(candidate || '').trim();
+    if (!raw) continue;
+    if (isBuiltInQuietBedUrl(raw) || isSunoOrDirectAudioUrl(raw)) return raw;
+  }
+  return BUILT_IN_QUIET_BED_URL;
+}
+
+function savedQuietBedUrl(...candidates) {
+  for (const candidate of candidates) {
+    const raw = String(candidate || '').trim();
+    if (isSunoOrDirectAudioUrl(raw)) return raw;
+  }
+  return '';
+}
+
+function sanitizeQuietBedState(state) {
+  if (!state || typeof state !== 'object') return state;
+  if (isSpotifyUrl(state.playlistUrl)) state.playlistUrl = '';
+  if ((state.musicProvider === 'suno' || state.activeMusicProvider === 'suno') && isSpotifyUrl(state.quickMusicUrl)) state.quickMusicUrl = '';
+  if (state.activeMusicProvider === 'suno' && isSpotifyUrl(state.activeMusicUrl)) {
+    state.activeMusicUrl = quietBedSourceUrl(state.playlistUrl, state.quickMusicUrl);
+    state.activeMusicLabel = 'Built-in ambient quiet bed ready. Save a Suno/direct audio URL when you want custom music.';
+  }
+  if (state.command?.type === 'quiet-bed-play' && isSpotifyUrl(state.command.url)) state.command = null;
+  state.events = list(state.events).filter(event => !(event?.kind === 'command' && event.type === 'quiet-bed-play' && isSpotifyUrl(event.url)));
+  return state;
+}
+
 function spotifyDeviceNotFound(value) {
   return /device not found|no active device found|device_id.*not found|device not available/i.test(String(value || ''));
 }
@@ -593,6 +638,7 @@ function normalize(raw) {
   s.quickMusicUrl = hasDeletedSunoReference(s.quickMusicUrl)
     ? ''
     : String(s.quickMusicUrl || s.playlistUrl || DEFAULT_SUNO_PLAYLIST || '');
+  sanitizeQuietBedState(s);
   s.spotifyClientId = String(s.spotifyClientId || DEFAULT_SPOTIFY_CLIENT_ID);
   s.spotifyRedirectUri = normalizeRedirectUri(s.spotifyRedirectUri || appRedirectDefault());
   const hasStoredSpotifyGain = Number.isFinite(Number(source.spotifyGain));
@@ -617,8 +663,8 @@ function normalize(raw) {
     s.spotifyReceiverReadyAt = 0;
     s.spotifyNeedsTap = true;
     s.activeMusicProvider = 'suno';
-    s.activeMusicUrl = s.playlistUrl || DEFAULT_SUNO_PLAYLIST;
-    s.activeMusicLabel = 'V23 Guaranteed Gap ready: paste a Suno/direct audio URL for a truly quiet controllable music bed.';
+    s.activeMusicUrl = quietBedSourceUrl(s.playlistUrl, s.quickMusicUrl);
+    s.activeMusicLabel = 'V23 Guaranteed Gap ready: the built-in ambient quiet bed can play now; save a Suno/direct audio URL for custom music.';
     s.iosVolumeBridgeStatus = `V23 guaranteed gap mode: ${IOS_VOLUME_BRIDGE_FIX_TEXT}`;
     s.iosVolumeBridgeLastTarget = '';
     s.iosVolumeBridgeLastAt = 0;
@@ -666,7 +712,7 @@ function normalize(raw) {
     s.lastError = '';
     s.activeMusicLabel = BASE.activeMusicLabel;
     s.activeMusicProvider = 'suno';
-    s.activeMusicUrl = s.playlistUrl || DEFAULT_SUNO_PLAYLIST;
+    s.activeMusicUrl = quietBedSourceUrl(s.playlistUrl, s.quickMusicUrl);
     s.spotifyNowPlaying = '';
     s.musicProvider = 'suno';
   }
@@ -687,6 +733,7 @@ function normalize(raw) {
   if (OLD_AUDIO_BLOCK_PATTERN.test(String(s.audioStatus || ''))) s.audioStatus = BASE.audioStatus;
   if (OLD_AUDIO_BLOCK_PATTERN.test(String(s.setupNotice || ''))) s.setupNotice = '';
   clearStaleReceiverFailures(s);
+  sanitizeQuietBedState(s);
   if (source.rev && !source.revision) s.revision = Number(source.rev) || 0;
   if (source.cmd && !source.command) s.command = source.cmd;
   if (source.announce && !source.announcement) s.announcement = source.announce;
@@ -1538,6 +1585,7 @@ async function runCommand(command) {
   }
   if (command.url) {
     if (command.type === 'spotify-play') S.spotifyUrl = command.url;
+    else if (command.type === 'quiet-bed-play') S.playlistUrl = savedQuietBedUrl(command.url, S.playlistUrl);
     else S.playlistUrl = command.url;
   }
   if (Number.isFinite(Number(command.trackIndex))) S.current = Math.max(0, Math.min(Number(command.trackIndex) || 0, Math.max(0, S.tracks.length - 1)));
@@ -1558,9 +1606,9 @@ async function runCommand(command) {
       S.announcementGain = clampNumber(command.announcementGain, 1, MAX_ANNOUNCEMENT_GAIN, S.announcementGain);
       S.spokenGain = spokenGainFromAnnouncementGain(S.announcementGain);
     }
-    await playQuietBedUrl(command.url || S.playlistUrl || S.quickMusicUrl, false);
+    await playQuietBedUrl(quietBedSourceUrl(command.url, S.playlistUrl, S.quickMusicUrl), false);
   } else if (command.type === 'play') {
-    if (S.musicProvider === 'suno' && String(S.playlistUrl || '').trim()) await playQuietBedUrl(S.playlistUrl, false);
+    if (S.musicProvider === 'suno') await playQuietBedUrl(quietBedSourceUrl(S.playlistUrl, S.quickMusicUrl), false);
     else await playSpotifyUrl(S.spotifyUrl, false, { fromRemote: true });
   } else if (command.type === 'pause') {
     await pauseSelected(false);
@@ -1643,8 +1691,9 @@ function readMusicSettings() {
   }
   S.sunoVolume = sunoVolumePercent($('sunoVolume') ? val('sunoVolume') : S.sunoVolume);
   S.sunoDuckedVolume = clampNumber($('sunoDuckedVolume') ? val('sunoDuckedVolume') : S.sunoDuckedVolume, 0, 20, 2);
+  sanitizeQuietBedState(S);
   S.activeMusicProvider = S.musicProvider;
-  S.activeMusicUrl = S.musicProvider === 'suno' ? (S.playlistUrl || DEFAULT_SUNO_PLAYLIST) : (S.spotifyUrl || DEFAULT_SPOTIFY_PLAYLIST);
+  S.activeMusicUrl = S.musicProvider === 'suno' ? quietBedSourceUrl(S.playlistUrl, S.quickMusicUrl) : (S.spotifyUrl || DEFAULT_SPOTIFY_PLAYLIST);
   localSave();
 }
 
@@ -1697,7 +1746,7 @@ async function loadSunoTracksFromUrl(url, message = 'Suno URL loaded.') {
 async function importSuno(message = 'Suno playlist imported.') {
   readMusicSettings();
   if (!String(S.playlistUrl || '').trim()) throw Error('Paste a Suno song, playlist, or direct audio URL first.');
-  S.musicProvider = 'spotify';
+  S.musicProvider = 'suno';
   setFeedback('Loading Suno URL...', true);
   renderWhenIdle();
   await loadSunoTracksFromUrl(S.playlistUrl, message);
@@ -1917,7 +1966,7 @@ async function playSunoUrl(url, push = true) {
   if (!raw) throw Error('Paste a Suno song, playlist, or direct audio URL first.');
   S.quickMusicUrl = raw;
   S.playlistUrl = raw;
-  S.musicProvider = 'spotify';
+  S.musicProvider = 'suno';
   if (S.screen !== 'home' && push) {
     await issueCommand('suno-cue', {
       label: 'Play Suno Cue',
@@ -1939,11 +1988,16 @@ async function playSuno(push = true) {
 
 async function playQuietBedUrl(url = S.playlistUrl || S.quickMusicUrl, push = true, options = {}) {
   readMusicSettings();
-  const raw = String(url || S.playlistUrl || S.quickMusicUrl || '').trim();
-  if (!raw) throw Error('Paste a Suno song, Suno playlist, or direct audio URL first. V23 can only guarantee quiet music when the bed audio is played inside Poolside Pulse.');
+  let raw = quietBedSourceUrl(url, S.playlistUrl, S.quickMusicUrl);
+  let builtIn = isBuiltInQuietBedUrl(raw);
   S.musicProvider = 'suno';
-  S.quickMusicUrl = raw;
-  S.playlistUrl = raw;
+  if (builtIn) {
+    if (isSpotifyUrl(S.playlistUrl)) S.playlistUrl = '';
+    if (isSpotifyUrl(S.quickMusicUrl)) S.quickMusicUrl = '';
+  } else {
+    S.quickMusicUrl = raw;
+    S.playlistUrl = raw;
+  }
   if (S.screen !== 'home' && push) {
     await issueCommand('quiet-bed-play', {
       label: 'Play Quiet Bed',
@@ -1960,16 +2014,26 @@ async function playQuietBedUrl(url = S.playlistUrl || S.quickMusicUrl, push = tr
   await pauseSpotifyForSunoPlayback();
   const stoppedExisting = activeForegroundPlayback?.kind === 'quiet-bed';
   if (stoppedExisting) await stopReceiverForegroundAudio('Quiet bed restart');
-  const { tracks } = await fetchSunoTracksForUrl(raw);
-  const chosen = tracks.find(item => item.audioUrl) || null;
-  if (!chosen?.audioUrl) throw Error('That Suno/direct URL did not expose playable audio. Paste a direct audio URL or a public Suno URL with playable audio.');
-  const title = chosen.title || sourceLabel('suno', raw);
+  let chosen = null;
+  if (!builtIn) {
+    try {
+      const { tracks } = await fetchSunoTracksForUrl(raw);
+      chosen = tracks.find(item => item.audioUrl) || null;
+      if (!chosen?.audioUrl) throw Error('That Suno/direct URL did not expose playable audio.');
+    } catch (error) {
+      logEvent('receiver', 'Quiet bed URL fallback', `${error.message || error}; using built-in ambient quiet bed.`, { url: raw });
+      raw = BUILT_IN_QUIET_BED_URL;
+      builtIn = true;
+      chosen = null;
+    }
+  }
+  const title = builtIn ? 'Built-in ambient quiet bed' : (chosen.title || sourceLabel('suno', raw));
   const playback = {
     id: ++foregroundPlaybackSeq,
     kind: 'quiet-bed',
     title,
     url: raw,
-    audioUrl: chosen.audioUrl,
+    audioUrl: chosen?.audioUrl || '',
     stopped: false
   };
   activeForegroundPlayback = playback;
@@ -1980,11 +2044,17 @@ async function playQuietBedUrl(url = S.playlistUrl || S.quickMusicUrl, push = tr
   setFeedback(`Quiet bed started at ${sunoVolumePercent(S.sunoVolume)}%. Voice will stop it, play loud, then restart it.`, true);
   logEvent('play', options.restore ? 'Quiet bed restored' : 'Quiet bed started', `${title} · ${compactUrl(raw)} · ${sunoVolumePercent(S.sunoVolume)}%`, { url: raw });
   await setReceiverHardwareVolume('suno', 'quiet bed');
-  const playbackPromise = playReceiverAudioUrl(chosen.audioUrl, {
-    label: 'Quiet music bed',
-    volume: musicGain(S.sunoVolume),
-    loop: true
-  }).catch(error => {
+  const playbackStarter = builtIn
+    ? playReceiverBuiltInQuietBed({
+        label: 'Built-in quiet music bed',
+        volume: musicGain(S.sunoVolume)
+      })
+    : playReceiverAudioUrl(chosen.audioUrl, {
+        label: 'Quiet music bed',
+        volume: musicGain(S.sunoVolume),
+        loop: true
+      });
+  const playbackPromise = playbackStarter.catch(error => {
     if (!playback.stopped) {
       logEvent('receiver', 'Quiet bed playback failed', error.message || String(error), { url: raw });
       setFeedback(`Quiet bed playback failed: ${error.message || error}`, false);
@@ -2084,7 +2154,7 @@ async function stopReceiverForegroundAudio(reason = 'stop command') {
     if (playback.kind === 'quiet-bed') {
       S.intent = 'stopped';
       S.activeMusicProvider = 'suno';
-      S.activeMusicUrl = playback.url || S.playlistUrl || DEFAULT_SUNO_PLAYLIST;
+      S.activeMusicUrl = playback.url || quietBedSourceUrl(S.playlistUrl, S.quickMusicUrl);
       S.activeMusicLabel = `Quiet bed stopped: ${playback.title || 'music bed'}`;
       setFeedback(`${playback.title || 'Quiet bed'} stopped.`, true);
       localSave();
@@ -2158,9 +2228,9 @@ async function nextSuno(push = true, message = 'Skipped to next Suno track.') {
 
 async function playSelected(push = true) {
   readMusicSettings();
-  if (S.musicProvider === 'suno' || String(S.playlistUrl || '').trim()) {
+  if (S.musicProvider === 'suno') {
     S.musicProvider = 'suno';
-    await playQuietBedUrl(S.playlistUrl || S.quickMusicUrl, push);
+    await playQuietBedUrl(quietBedSourceUrl(S.playlistUrl, S.quickMusicUrl), push);
     return;
   }
   S.musicProvider = 'spotify';
@@ -2196,7 +2266,7 @@ async function stopSelected(push = true) {
 
 async function skipSelected(push = true) {
   if (S.musicProvider === 'suno' || S.activeMusicProvider === 'suno') {
-    await playQuietBedUrl(S.playlistUrl || S.quickMusicUrl, push);
+    await playQuietBedUrl(quietBedSourceUrl(S.playlistUrl, S.quickMusicUrl), push);
     return;
   }
   S.musicProvider = 'spotify';
@@ -2204,12 +2274,13 @@ async function skipSelected(push = true) {
 }
 
 function activeProviderUrl() {
-  if (S.musicProvider === 'suno') return S.playlistUrl || S.quickMusicUrl || DEFAULT_SUNO_PLAYLIST || '';
+  if (S.musicProvider === 'suno') return quietBedSourceUrl(S.playlistUrl, S.quickMusicUrl);
   return S.spotifyUrl || DEFAULT_SPOTIFY_PLAYLIST;
 }
 
 function providerFromUrl(url) {
   const raw = String(url || '').trim();
+  if (isBuiltInQuietBedUrl(raw)) return 'suno';
   if (/suno\.com\/(?:playlist|playlists|song|songs|s)\//i.test(raw)) return 'suno';
   if (/\.(mp3|m4a|aac|wav|ogg|oga|webm)(\?|#|$)/i.test(raw)) return 'suno';
   if (/spotify:|open\.spotify\.com\//i.test(raw)) return 'spotify';
@@ -2218,6 +2289,7 @@ function providerFromUrl(url) {
 
 function sourceKind(url) {
   const raw = String(url || '');
+  if (isBuiltInQuietBedUrl(raw)) return 'Built-in quiet bed';
   if (/spotify:track:|open\.spotify\.com\/track\//i.test(raw)) return 'Spotify song';
   if (/spotify:album:|open\.spotify\.com\/album\//i.test(raw)) return 'Spotify album';
   if (/spotify:artist:|open\.spotify\.com\/artist\//i.test(raw)) return 'Spotify artist';
@@ -2242,6 +2314,7 @@ function sourceId(url) {
 }
 
 function compactUrl(url) {
+  if (isBuiltInQuietBedUrl(url)) return 'Built-in ambient quiet bed';
   try {
     const parsed = new URL(url);
     return `${parsed.hostname}${parsed.pathname}`;
@@ -2251,6 +2324,7 @@ function compactUrl(url) {
 }
 
 function sourceLabel(provider = S.musicProvider, url = activeProviderUrl()) {
+  if (isBuiltInQuietBedUrl(url)) return 'Built-in ambient quiet bed';
   const id = sourceId(url);
   if (provider === 'spotify') return `${sourceKind(url)}${id ? ` ${id.slice(0, 14)}` : ''}`;
   if (provider === 'suno') return `${sourceKind(url)}${id ? ` ${id.slice(0, 14)}` : ''}`;
@@ -2886,9 +2960,9 @@ async function setupLoudVoiceReceiver() {
     userGesture: true,
     testTone: true
   });
-  const quietMessage = String(S.playlistUrl || S.quickMusicUrl || DEFAULT_SUNO_PLAYLIST || '').trim()
+  const quietMessage = savedQuietBedUrl(S.playlistUrl, S.quickMusicUrl)
     ? 'Quiet bed is ready to play from the saved Suno/direct URL.'
-    : 'Paste a Suno/direct URL from Command or Music to start the guaranteed quiet bed.';
+    : 'Built-in ambient quiet bed is ready now. Save a Suno/direct URL when you want custom music.';
   logEvent('receiver', 'Loud Voice Setup active', `${quietMessage} Spoken commands stop music, play through the clear PA voice path, then restore the quiet bed.`);
   setFeedback(`Loud Voice Setup active. ${quietMessage}`, true);
   await pushState('Loud Voice Setup saved on receiver.', { render: false });
@@ -4252,6 +4326,22 @@ async function playReceiverAudioUrl(url, options = {}) {
   return await playAudioElementToEnd(announcementMusic);
 }
 
+async function playReceiverBuiltInQuietBed(options = {}) {
+  const volume = clampNumber(options.volume, 0, 1, musicGain(S.sunoVolume));
+  const label = options.label || 'Built-in quiet music bed';
+  if (typeof window.__poolsideV23PlayQuietBed === 'function') {
+    return await window.__poolsideV23PlayQuietBed({
+      label,
+      volume,
+      gain: volume,
+      minGain: 0,
+      maxGain: 1,
+      loop: true
+    });
+  }
+  throw Error('Built-in quiet bed is unavailable in this browser. Tap Start Receiver again, or paste a direct audio URL.');
+}
+
 async function announceSunoTrack(trackIndex, options = {}) {
   const job = announcementTail.then(() => performSunoAnnouncement(trackIndex, options));
   announcementTail = job.catch(() => {});
@@ -5128,7 +5218,6 @@ function receiverReadiness() {
   if (S.screen !== 'home') return 'Command only; receiver screens play sound.';
   if (!receiverSessionStartedAt()) return 'Tap Start Receiver.';
   if (!receiverAudioReady()) return 'Tap Start Receiver on this speaker phone.';
-  if (!String(S.playlistUrl || S.quickMusicUrl || DEFAULT_SUNO_PLAYLIST || '').trim()) return 'Quiet bed URL needed.';
   if (S.activeMusicProvider === 'suno' && S.intent === 'playing') return 'Ready: quiet bed playing.';
   return 'Ready for quiet bed.';
 }
@@ -5186,12 +5275,11 @@ function readinessSteps() {
   const audioOk = receiverAudioReady();
   const sessionOk = receiverSessionStartedAt() > 0;
   const receiverOk = audioOk && sessionOk;
-  const quietUrl = String(S.playlistUrl || S.quickMusicUrl || DEFAULT_SUNO_PLAYLIST || '').trim();
-  const quietReady = !!quietUrl;
+  const quietReady = true;
   const musicOk = S.activeMusicProvider === 'suno' && S.intent === 'playing';
   const steps = [
     { label: 'Activate Receiver', ok: receiverOk, action: 'audio', help: 'Tap once on the speaker phone to unlock iPhone audio.' },
-    { label: 'Save Quiet Bed', ok: quietReady, action: '', help: 'Paste a Suno song, Suno playlist, or direct audio URL from Command or Music.' },
+    { label: 'Quiet Bed Source', ok: quietReady, action: '', help: 'Built-in ambient is ready; save a Suno/direct URL for custom music.' },
     { label: 'Play Quiet Bed', ok: musicOk, action: 'quiet-bed', help: 'Tap to start the controllable quiet music bed.' }
   ];
   return `<div class="steps numbered">${steps.map((step, index) => {
@@ -5204,8 +5292,7 @@ function readinessSteps() {
 
 function receiverActionButtons() {
   const audioOk = receiverAudioReady();
-  const quietReady = !!String(S.playlistUrl || S.quickMusicUrl || DEFAULT_SUNO_PLAYLIST || '').trim();
-  const label = !audioOk || !receiverSessionStartedAt() ? 'Start Receiver' : quietReady ? 'Play Quiet Bed' : 'Unlock Receiver Audio';
+  const label = !audioOk || !receiverSessionStartedAt() ? 'Start Receiver' : 'Play Quiet Bed';
   const primary = `<button id="playHome" class="primaryWide">${esc(label)}</button>`;
   return `<div class="receiverActions">${primary}<button id="spotifyReceiver" class="secondary">Play Spotify</button><button id="spotifyLoginHome" class="secondary">Login Spotify</button><button id="loudVoiceSetupHome" class="secondary">Loud Voice Setup</button><button id="testVoiceHome" class="secondary">Test Voice</button><button id="testToneHome" class="secondary">Test Tone</button><button id="checkWeatherHome" class="secondary">Check Weather</button><button id="skipHome" class="secondary">Skip</button><button id="stopHome" class="secondary">Stop</button></div>`;
 }
@@ -5213,7 +5300,6 @@ function receiverActionButtons() {
 function receiverNotice() {
   let message = '';
   if (!receiverSessionStartedAt() || !receiverAudioReady()) message = 'Tap Start Receiver once on the speaker phone to unlock iPhone audio.';
-  else if (!String(S.playlistUrl || S.quickMusicUrl || DEFAULT_SUNO_PLAYLIST || '').trim()) message = 'Paste a Suno song, Suno playlist, or direct audio URL from Command or Music to use the guaranteed quiet bed.';
   else if (S.activeMusicProvider !== 'suno' || S.intent !== 'playing') message = 'Tap Play Quiet Bed. Spotify is still available, but it is not the guaranteed low-volume source on iOS.';
   else if (manualMusicHoldActive()) message = `${S.manualMusicHoldReason || 'Music stopped manually'}. Auto-start will stay off until the next Play command or pool opening cycle.`;
   else message = S.setupNotice || '';
@@ -5232,7 +5318,7 @@ function homePage() {
   const activeMode = scheduleMode(S.activeSchedule);
   const next = scheduleItems(activeMode).filter(item => item.enabled).sort((a, b) => mins(schedTime(a)) - mins(schedTime(b))).slice(0, 5)
     .map(item => `<p class="line"><b>${pretty(schedTime(item))}</b><span>${esc(item.label)}</span></p>`).join('');
-  const label = S.playlistUrl ? sourceLabel('suno', S.playlistUrl) : 'No quiet bed URL saved';
+  const label = S.playlistUrl ? sourceLabel('suno', S.playlistUrl) : 'Built-in ambient quiet bed';
   const error = visibleLastError();
   const live = receiverCanPause();
   return `${header()}<main class="home console"><section class="receiverConsole"><div class="receiverLead"><p class="eyebrow">Home Receiver · ${esc(DISPLAY_VERSION)}</p><h1>Sound Station</h1><p>This phone stays on Home and plays the controllable quiet bed, loud voice announcements, Suno cues, scheduled audio, and weather safety messages through the speakers.</p>${receiverActionButtons()}${receiverNotice()}${error ? `<div class="alert warn">${esc(error)}</div>` : ''}</div><aside class="setupPanel"><h2>Receiver Readiness</h2>${readinessSteps()}<div class="miniFacts"><b>Quiet Bed:</b> ${esc(label)}<br><b>Balance:</b> ${esc(S.sunoVolume)}% / ${esc(spokenGainLabel())}<br><b>Spotify:</b> ${esc(spotifyGainLabel())} request only on iOS<br><b>Schedule:</b> ${esc(scheduleTitle(activeMode))}<br><b>Status:</b> ${esc(receiverReadiness())}<br><b>Audio:</b> ${esc(S.audioStatus)}<br><b>Loud Voice:</b> ${esc(S.iosVolumeBridgeStatus || IOS_VOLUME_BRIDGE_FIX_TEXT)}</div>${iosVolumeBridgeControls()}</aside></section><section class="nowCompact"><div><p class="eyebrow">${live ? 'Now Playing' : S.intent === 'paused' ? 'Paused' : 'Ready'}</p><h2>${esc(S.activeMusicProvider === 'suno' ? 'Quiet Bed Receiver' : (S.spotifyNowPlaying || 'Spotify Receiver'))}</h2><p>${esc(compactUrl(S.activeMusicProvider === 'suno' ? S.activeMusicUrl : S.spotifyUrl))}</p><p class="muted">${esc(S.activeMusicLabel || label)}</p></div><div class="signal ${live ? 'live' : ''}"><span></span><span></span><span></span></div></section><section class="cards"><div class="card"><h3>Next Scheduled · ${esc(scheduleTitle(activeMode))}</h3>${next || '<p class="muted">No enabled schedule items.</p>'}</div><div class="card"><h3>Recent Receiver Log</h3>${logRows(5)}</div></section></main>`;
@@ -5240,6 +5326,7 @@ function homePage() {
 
 function commandPage() {
   const selected = ann();
+  const quietInputValue = savedQuietBedUrl(S.quickMusicUrl, S.playlistUrl);
   return shell(`
     <section class="commandConsole">
       <div><p class="eyebrow">Live Control</p><h1>Command</h1><p>Command devices send instructions to every active receiver. Speaker phones stay on Home and play all sound.</p></div>
@@ -5256,7 +5343,7 @@ function commandPage() {
         <button id="spotifyVolumeApply" class="secondary">Send Audio Settings</button>
         <small>V23 Guaranteed Gap uses Suno/direct audio for the quiet bed because that path can actually be attenuated by Poolside Pulse. Spotify is still controllable, but iOS does not allow browser JavaScript to make local Spotify quiet; voice stops music first and plays at +800/max PA+.</small>
       </div>
-      <div class="quickMusic"><label>Quiet Bed or Spotify URL<input id="quickMusicUrl" value="${esc(S.quickMusicUrl || activeProviderUrl())}" placeholder="Paste Suno, direct audio, or Spotify URL"></label><div class="buttonStack"><button id="playAnyUrl">Play Pasted URL</button><button id="playDefaultSuno" class="secondary">Play Saved Quiet Bed</button><button id="playDefaultSpotify" class="secondary">Play Spotify</button></div></div>
+      <div class="quickMusic"><label>Quiet Bed or Spotify URL<input id="quickMusicUrl" value="${esc(quietInputValue)}" placeholder="Paste Suno, direct audio, or Spotify URL"></label><div class="buttonStack"><button id="playAnyUrl">Play Pasted URL</button><button id="playDefaultSuno" class="secondary">Play Quiet Bed</button><button id="playDefaultSpotify" class="secondary">Play Spotify</button></div></div>
       <div class="splitControls"><label>Announcement<textarea id="quickText">${esc(S.quickText || selected.text)}</textarea></label><div><label>Saved Announcement<select id="quickTemplate">${S.anns.map(item => `<option value="${item.id}" ${item.id === S.selected ? 'selected' : ''}>${esc(item.label)} · ${item.mode === 'suno' ? 'Suno' : 'Voice'}</option>`).join('')}</select></label><div class="buttonStack"><button id="quickPlay">${selected.mode === 'suno' ? 'Play Announcement Track' : 'Speak Now'}</button><button id="quickHold" class="secondary">${selected.mode === 'suno' ? 'Track as Safety Hold' : 'Speak as Safety Hold'}</button><button id="lightningNow" class="secondary">Lightning Hold</button><button id="windNow" class="secondary">Wind Umbrellas</button></div></div></div>
     </section>
     <section class="panel compactLog"><div class="sectionHead"><h2>Receiver Activity</h2><button id="clearLog" class="secondary">Clear Local Log</button></div>${logRows()}</section>`);
@@ -5275,17 +5362,20 @@ function musicPage() {
 }
 
 function musicPageV23() {
-  const sunoReady = String(S.playlistUrl || '').trim();
+  const sunoReady = savedQuietBedUrl(S.playlistUrl);
+  const quietBedLabel = sunoReady ? sourceLabel('suno', sunoReady) : 'Built-in ambient quiet bed';
+  const quietBedDetail = sunoReady ? sunoReady : 'Ready now. Save a Suno song, playlist, or direct audio URL for custom music.';
+  const quietInputValue = savedQuietBedUrl(S.quickMusicUrl, S.playlistUrl);
   return shell(`
     <section class="panel">
       <div class="panelHeader"><div><p class="eyebrow">Music Control</p><h1>Music</h1></div><button id="saveMusic">Save</button></div>
       <div class="sourceBoard">
-        <div class="sourceTile"><b>Guaranteed Quiet Bed</b><strong>${esc(sunoReady ? sourceLabel('suno', S.playlistUrl) : 'No saved quiet bed')}</strong><span>${esc(sunoReady ? S.playlistUrl : 'Paste a Suno song, playlist, or direct audio URL below.')}</span></div>
+        <div class="sourceTile"><b>Guaranteed Quiet Bed</b><strong>${esc(quietBedLabel)}</strong><span>${esc(quietBedDetail)}</span></div>
         <div class="sourceTile"><b>Spotify Control</b><strong>${esc(sourceLabel('spotify', S.spotifyUrl || DEFAULT_SPOTIFY_PLAYLIST))}</strong><span>Spotify is not quiet-safe on iOS web; voice pauses it before announcements.</span></div>
         <div class="sourceTile"><b>Gap</b><strong>${esc(S.sunoVolume)}% / ${esc(spokenGainLabel())}</strong><span>Quiet bed uses controllable Web Audio; voice uses max PA+.</span></div>
       </div>
       <div class="buttonStack"><button id="sunoPlayNow">Play Quiet Bed on Receivers</button><button id="spotifyPlayNow" class="secondary">Play Spotify on Receivers</button></div>
-      <div class="quickMusic"><label>Quiet Bed or Spotify URL<input id="quickMusicUrl" value="${esc(S.quickMusicUrl || S.playlistUrl || '')}" placeholder="Paste Suno, direct audio, or Spotify URL"></label><div class="buttonStack"><button id="playAnyUrl">Play Pasted URL</button><button id="savePastedUrl" class="secondary">Save URL</button></div></div>
+      <div class="quickMusic"><label>Quiet Bed or Spotify URL<input id="quickMusicUrl" value="${esc(quietInputValue)}" placeholder="Paste Suno, direct audio, or Spotify URL"></label><div class="buttonStack"><button id="playAnyUrl">Play Pasted URL</button><button id="savePastedUrl" class="secondary">Save URL</button></div></div>
       <div class="grid2"><label>Station Name<input id="playlistName" value="${esc(S.playlistName)}"></label><label>Spotify Playlist or Track URL<input id="spotifyUrl" value="${esc(S.spotifyUrl)}" placeholder="https://open.spotify.com/playlist/..."></label></div>
       <label>Saved Quiet Bed URL<input id="playlistUrl" value="${esc(S.playlistUrl)}" placeholder="Paste a Suno song, playlist, or direct audio URL"></label>
       <div class="grid2"><label>Spotify Client ID<input id="spotifyClientId" value="${esc(S.spotifyClientId)}"></label><label>Spotify Redirect URI<input id="spotifyRedirectUri" value="${esc(spotifyRedirectUri())}"></label></div>
@@ -5462,7 +5552,7 @@ async function handleReadinessAction(action) {
   }
   if (action === 'quiet-bed') {
     await ensureReceiverAudio('quiet bed readiness', { required: true, startSession: true, userGesture: true });
-    await playQuietBedUrl(S.playlistUrl || S.quickMusicUrl, false);
+    await playQuietBedUrl(quietBedSourceUrl(S.playlistUrl, S.quickMusicUrl), false);
   }
 }
 
@@ -5518,13 +5608,7 @@ function bind() {
     const needsAudioUnlock = !receiverSessionStartedAt() || !receiverAudioReady();
     await ensureReceiverAudio('Home play button', { startSession: true, userGesture: true, testTone: needsAudioUnlock });
     S.musicProvider = 'suno';
-    const quietUrl = String(S.playlistUrl || S.quickMusicUrl || DEFAULT_SUNO_PLAYLIST || '').trim();
-    if (!quietUrl) {
-      setActionNeeded('Receiver audio is unlocked. Paste a Suno song, Suno playlist, or direct audio URL from Command or Music, then tap Play Quiet Bed.');
-      renderWhenIdle();
-      return;
-    }
-    await playQuietBedUrl(quietUrl, false);
+    await playQuietBedUrl(quietBedSourceUrl(S.playlistUrl, S.quickMusicUrl), false);
   });
   wire('testToneHome', () => testReceiverTone('Home test tone button'));
   wire('loudVoiceSetupHome', setupLoudVoiceReceiver);
@@ -5604,9 +5688,7 @@ function bind() {
     await playAnyMusicUrl(S.quickMusicUrl, true);
   });
   wire('playDefaultSuno', async () => {
-    if (!String(S.playlistUrl || DEFAULT_SUNO_PLAYLIST || '').trim()) throw Error('Paste and save a Suno/direct URL before using the saved quiet bed.');
-    S.quickMusicUrl = S.playlistUrl || DEFAULT_SUNO_PLAYLIST;
-    await playAnyMusicUrl(S.quickMusicUrl, true);
+    await playQuietBedUrl(quietBedSourceUrl(S.playlistUrl, S.quickMusicUrl), true);
   });
   wire('savePastedUrl', async () => {
     const raw = val('quickMusicUrl').trim();
@@ -5671,8 +5753,8 @@ function bind() {
   wire('useSuno', async () => {
     readMusicSettings();
     S.musicProvider = 'suno';
-    rememberActiveSource('suno', S.playlistUrl || S.quickMusicUrl || '', 'selected quiet bed');
-    await save('Quiet bed selected. Paste or save a Suno/direct URL, then Play Quiet Bed.');
+    rememberActiveSource('suno', quietBedSourceUrl(S.playlistUrl, S.quickMusicUrl), 'selected quiet bed');
+    await save('Quiet bed selected. Built-in ambient can play now; save a Suno/direct URL for custom music.');
   });
   wire('spotifyPlayNow', async () => {
     readMusicSettings();
@@ -5682,7 +5764,7 @@ function bind() {
   wire('sunoPlayNow', async () => {
     readMusicSettings();
     S.musicProvider = 'suno';
-    await playQuietBedUrl(S.playlistUrl || S.quickMusicUrl, true);
+    await playQuietBedUrl(quietBedSourceUrl(S.playlistUrl, S.quickMusicUrl), true);
   });
   wire('spotifyLogin', spotifyLogin);
   wire('spotifyCheck', () => checkSpotifyHealth(true));
@@ -5706,7 +5788,7 @@ function bind() {
     button.onclick = () => Promise.resolve((async () => {
       S.current = Number(button.dataset.song) || 0;
       S.musicProvider = 'suno';
-      await playQuietBedUrl(S.playlistUrl || S.quickMusicUrl, true);
+      await playQuietBedUrl(quietBedSourceUrl(S.playlistUrl, S.quickMusicUrl), true);
     })()).catch(error => isActionNeeded(error) ? setActionNeeded(error.message) : setFeedback(error.message, false));
   });
   document.querySelectorAll('[data-schedule-song]').forEach(button => {

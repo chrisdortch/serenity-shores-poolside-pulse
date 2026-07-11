@@ -145,6 +145,123 @@
     return changed;
   }
 
+  async function playBuiltInQuietBed(rawOptions = {}) {
+    const options = playbackOptions({
+      label: 'Built-in quiet music bed',
+      volume: 0.1,
+      gain: 0.1,
+      minGain: 0,
+      maxGain: 1,
+      loop: true,
+      ...rawOptions
+    });
+    const ctx = getAudioContext();
+    if (!ctx) throw Error('Web Audio is unavailable for the built-in quiet bed.');
+    if (ctx.state !== 'running') await ctx.resume();
+    if (ctx.state !== 'running') throw Error(`Web Audio is ${ctx.state}; tap Start Receiver on this speaker phone.`);
+
+    stopActiveAudio('built-in quiet bed restart');
+
+    const start = (ctx.currentTime || 0) + 0.03;
+    const master = ctx.createGain();
+    const pad = ctx.createGain();
+    const shimmer = ctx.createGain();
+    const filter = ctx.createBiquadFilter();
+    const lfo = ctx.createOscillator();
+    const lfoGain = ctx.createGain();
+    const nodes = [];
+
+    master.gain.setValueAtTime(0.0001, start);
+    master.gain.linearRampToValueAtTime(options.volume, start + 1.2);
+    pad.gain.value = 0.18;
+    shimmer.gain.value = 0.045;
+    filter.type = 'lowpass';
+    filter.frequency.value = 1150;
+    filter.Q.value = 0.65;
+    lfo.type = 'sine';
+    lfo.frequency.value = 0.035;
+    lfoGain.gain.value = Math.min(0.008, Math.max(0.002, options.volume * 0.08));
+    lfo.connect(lfoGain).connect(master.gain);
+    lfo.start(start);
+    nodes.push(lfo);
+
+    const makeOscillator = (frequency, type, target, gainValue, detune = 0) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = type;
+      osc.frequency.value = frequency;
+      osc.detune.value = detune;
+      gain.gain.value = gainValue;
+      osc.connect(gain).connect(target);
+      osc.start(start);
+      nodes.push(osc, gain);
+    };
+
+    makeOscillator(196, 'sine', pad, 0.44, -4);
+    makeOscillator(246.94, 'sine', pad, 0.32, 3);
+    makeOscillator(329.63, 'triangle', shimmer, 0.12, -7);
+    makeOscillator(392, 'sine', shimmer, 0.08, 5);
+
+    const noiseBuffer = ctx.createBuffer(1, Math.max(1, Math.floor(ctx.sampleRate * 2)), ctx.sampleRate);
+    const noise = noiseBuffer.getChannelData(0);
+    let brown = 0;
+    for (let i = 0; i < noise.length; i += 1) {
+      brown = (brown + 0.018 * (Math.random() * 2 - 1)) / 1.018;
+      noise[i] = brown * 3.2;
+    }
+    const noiseSource = ctx.createBufferSource();
+    const noiseGain = ctx.createGain();
+    noiseSource.buffer = noiseBuffer;
+    noiseSource.loop = true;
+    noiseGain.gain.value = 0.012;
+    noiseSource.connect(noiseGain).connect(filter);
+    noiseSource.start(start);
+    nodes.push(noiseSource, noiseGain);
+
+    pad.connect(filter);
+    shimmer.connect(filter);
+    filter.connect(master).connect(ctx.destination);
+
+    return await new Promise(resolve => {
+      let stopped = false;
+      let cleaned = false;
+      const playback = {
+        id: ++playbackSeq,
+        setVolume(value) {
+          const level = clampNumber(value, 0, 1, options.volume);
+          try { master.gain.setTargetAtTime(level, ctx.currentTime || 0, 0.05); } catch { master.gain.value = level; }
+        },
+        stop() {
+          if (stopped) return true;
+          stopped = true;
+          const now = ctx.currentTime || 0;
+          try { master.gain.cancelScheduledValues(now); } catch {}
+          try { master.gain.setTargetAtTime(0.0001, now, 0.08); } catch { master.gain.value = 0.0001; }
+          setTimeout(() => {
+            if (cleaned) return;
+            cleaned = true;
+            nodes.forEach(node => {
+              try {
+                if (typeof node.stop === 'function') node.stop(0);
+                if (typeof node.disconnect === 'function') node.disconnect();
+              } catch {}
+            });
+            try { master.disconnect(); } catch {}
+            try { filter.disconnect(); } catch {}
+            clearActivePlayback(playback);
+            resolve(false);
+          }, 180);
+          return true;
+        }
+      };
+      activePlayback = playback;
+      unlocked = true;
+      webAudioPrimed = true;
+      lastStatus = `${options.label} started through receiver Web Audio.`;
+      dispatchStatus();
+    });
+  }
+
   function wait(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
   }
@@ -556,6 +673,7 @@
   window.__poolsideV23AudioStatus = status;
   window.__poolsideV23PlayAnnouncementBlob = playBlob;
   window.__poolsideV23PlayAudioUrl = playAudioUrl;
+  window.__poolsideV23PlayQuietBed = playBuiltInQuietBed;
   window.__poolsideV23PlayTestTone = playTestTone;
   window.__poolsideV23StopAudio = stopActiveAudio;
   window.__poolsideV23SetActiveVolume = setActiveVolume;

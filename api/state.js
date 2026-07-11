@@ -23,6 +23,7 @@ const V20_AUDIO_DEFAULTS_ID = '2026-07-01-v20-14-clear-pa-state-cleanup';
 const V21_AUDIO_DEFAULTS_ID = '2026-07-10-v21-manager-gain-gap';
 const V22_AUDIO_DEFAULTS_ID = '2026-07-10-v22-max-gap-takeover';
 const V23_AUDIO_DEFAULTS_ID = '2026-07-11-v23-guaranteed-gap';
+const BUILT_IN_QUIET_BED_URL = 'poolside://quiet-bed/ambient';
 const V20_STALE_SPOTIFY_COMMAND_CUTOFF = 1782499126000;
 const V18_STALE_SUNO_TYPES = new Set(['suno-cue', 'suno', 'song']);
 const V20_STALE_SPOTIFY_TYPES = new Set(['spotify-play', 'play']);
@@ -143,6 +144,46 @@ function clampNumber(value, min, max, fallback) {
   return Math.max(min, Math.min(max, Number.isFinite(number) ? number : fallback));
 }
 
+function isSpotifyUrl(value) {
+  return /spotify:|open\.spotify\.com\//i.test(String(value || ''));
+}
+
+function isSunoOrDirectAudioUrl(value) {
+  const raw = String(value || '').trim();
+  return /suno\.com\/(?:playlist|playlists|song|songs|s)\//i.test(raw) ||
+    /\.(mp3|m4a|aac|wav|ogg|oga|webm)(\?|#|$)/i.test(raw);
+}
+
+function quietBedSourceUrl(...candidates) {
+  for (const candidate of candidates) {
+    const raw = String(candidate || '').trim();
+    if (!raw) continue;
+    if (/^poolside:\/\/quiet-bed\//i.test(raw) || isSunoOrDirectAudioUrl(raw)) return raw;
+  }
+  return BUILT_IN_QUIET_BED_URL;
+}
+
+function sanitizeV23QuietBed(clean) {
+  if (!clean || typeof clean !== 'object') return clean;
+  if (isSpotifyUrl(clean.playlistUrl)) {
+    clean.spotifyUrl = clean.spotifyUrl || clean.playlistUrl;
+    clean.playlistUrl = '';
+  }
+  if ((clean.musicProvider === 'suno' || clean.activeMusicProvider === 'suno') && isSpotifyUrl(clean.quickMusicUrl)) {
+    clean.spotifyUrl = clean.spotifyUrl || clean.quickMusicUrl;
+    clean.quickMusicUrl = '';
+  }
+  if (clean.activeMusicProvider === 'suno' && (isSpotifyUrl(clean.activeMusicUrl) || !String(clean.activeMusicUrl || '').trim())) {
+    clean.activeMusicUrl = quietBedSourceUrl(clean.playlistUrl, clean.quickMusicUrl);
+    clean.activeMusicLabel = 'Built-in ambient quiet bed ready. Save a Suno/direct audio URL when you want custom music.';
+  }
+  if (clean.command?.type === 'quiet-bed-play' && isSpotifyUrl(clean.command.url)) clean.command = null;
+  if (Array.isArray(clean.events)) {
+    clean.events = clean.events.filter(event => !(event?.kind === 'command' && event.type === 'quiet-bed-play' && isSpotifyUrl(event.url)));
+  }
+  return clean;
+}
+
 function sanitizeState(state) {
   if (!state || typeof state !== 'object') return state;
   const version = String(state.version || '');
@@ -194,6 +235,7 @@ function sanitizeState(state) {
       clean.activityLog = clean.activityLog.filter(entry => !staleV20IOSVolumeNotice(`${entry?.title || ''} ${entry?.detail || ''}`));
     }
   }
+  if (version === '23') sanitizeV23QuietBed(clean);
   const defaultsKey = version === '23' ? 'v23VolumeDefaultsApplied' : version === '22' ? 'v22VolumeDefaultsApplied' : version === '21' ? 'v21VolumeDefaultsApplied' : version === '20' ? 'v20VolumeDefaultsApplied' : 'v18VolumeDefaultsApplied';
   const defaultsId = version === '23' ? V23_AUDIO_DEFAULTS_ID : version === '22' ? V22_AUDIO_DEFAULTS_ID : version === '21' ? V21_AUDIO_DEFAULTS_ID : version === '20' ? V20_AUDIO_DEFAULTS_ID : V18_AUDIO_DEFAULTS_ID;
   if (clean[defaultsKey] !== defaultsId) {
@@ -221,6 +263,7 @@ function sanitizeState(state) {
     }
     clean[defaultsKey] = defaultsId;
   }
+  if (version === '23') sanitizeV23QuietBed(clean);
   clean.spotifyVolume = clampNumber(clean.spotifyVolume, modern ? 0 : 0, modern ? 33 : 20, (version === '23' || version === '22') ? 0 : version === '21' ? 1 : version === '20' ? 15 : 2);
   clean.sunoVolume = clampNumber(clean.sunoVolume, modern ? 0 : 0, modern ? 33 : 100, (version === '23' || version === '22') ? 10 : modern ? 15 : 85);
   clean.spotifyDuckedVolume = modern ? clampNumber(clean.spotifyDuckedVolume, 0, 33, 0) : 0;
@@ -232,6 +275,7 @@ function sanitizeState(state) {
     clean.spotifyGain = clampNumber(clean.spotifyGain, -500, 0, -500);
     clean.spokenGain = clampNumber(clean.spokenGain, 0, 500, 500);
   }
+  if (version === '23') sanitizeV23QuietBed(clean);
   return clean;
 }
 
