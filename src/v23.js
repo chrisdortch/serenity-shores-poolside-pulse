@@ -90,6 +90,7 @@ const SPOTIFY_VOLUME_WATCH_MS = 5000;
 const SPOTIFY_VOLUME_WATCH_LOG_MS = 45000;
 const IOS_VOLUME_BRIDGE_DEFAULT_NAME = 'Poolside Pulse Volume';
 const IOS_VOLUME_BRIDGE_WAIT_MS = 750;
+const IOS_VOLUME_BRIDGE_TOPLEVEL_REPEAT_MS = 60000;
 const IOS_VOLUME_BRIDGE_FIX_TEXT = 'V23 Audible Gap: Spotify on iOS cannot be made quietly controllable by browser volume, so the guaranteed quiet bed uses receiver-owned Web Audio/Suno at 25% by default; spoken word uses +800/max PA+ and any Spotify playback is paused for voice.';
 const SPOTIFY_VOLUME_VERIFY_TOLERANCE = 1;
 const VOICE_TAKEOVER_PRE_ROLL_MS = 850;
@@ -269,6 +270,7 @@ let fallbackUnlockAudio = null;
 let fallbackUnlockToneUrl = '';
 let activeForegroundPlayback = null;
 let foregroundPlaybackSeq = 0;
+let activeHelpKey = '';
 const retryAfter = {};
 const inFlightEvents = new Set();
 
@@ -2012,9 +2014,10 @@ async function playQuietBedUrl(url = S.playlistUrl || S.quickMusicUrl, push = tr
     return;
   }
   await ensureReceiverAudio('quiet bed', { required: true });
+  if (activeForegroundPlayback) {
+    await stopReceiverForegroundAudio('Quiet bed source switch', { restoreSpotify: false, stopSpeech: false });
+  }
   await pauseSpotifyForSunoPlayback();
-  const stoppedExisting = activeForegroundPlayback?.kind === 'quiet-bed';
-  if (stoppedExisting) await stopReceiverForegroundAudio('Quiet bed restart');
   let chosen = null;
   if (!builtIn) {
     try {
@@ -2121,13 +2124,20 @@ async function pauseSpotifyForSunoPlayback() {
 }
 
 async function pauseSunoForSpotifyPlayback() {
-  if (music.paused) return;
+  let stopped = false;
+  if (activeForegroundPlayback) {
+    stopped = await stopReceiverForegroundAudio('Spotify playback start', { restoreSpotify: false, stopSpeech: false }) || stopped;
+  }
+  if (music.paused) return stopped;
   await fade(music, 0, 220).catch(() => {});
   music.pause();
   logEvent('music', 'Suno paused for Spotify playback', track().title || 'Suno track');
+  return true;
 }
 
-async function stopReceiverForegroundAudio(reason = 'stop command') {
+async function stopReceiverForegroundAudio(reason = 'stop command', options = {}) {
+  const restoreSpotify = options.restoreSpotify !== false;
+  const stopSpeech = options.stopSpeech !== false;
   let stopped = false;
   const playback = activeForegroundPlayback;
   if (playback) playback.stopped = true;
@@ -2146,7 +2156,7 @@ async function stopReceiverForegroundAudio(reason = 'stop command') {
     music.volume = musicGain();
     stopped = true;
   }
-  if ('speechSynthesis' in window && speechSynthesis.speaking) {
+  if (stopSpeech && 'speechSynthesis' in window && speechSynthesis.speaking) {
     speechSynthesis.cancel();
     stopped = true;
   }
@@ -2158,6 +2168,13 @@ async function stopReceiverForegroundAudio(reason = 'stop command') {
       S.activeMusicUrl = playback.url || quietBedSourceUrl(S.playlistUrl, S.quickMusicUrl);
       S.activeMusicLabel = `Quiet bed stopped: ${playback.title || 'music bed'}`;
       setFeedback(`${playback.title || 'Quiet bed'} stopped.`, true);
+      localSave();
+      return true;
+    }
+    if (!restoreSpotify) {
+      S.intent = 'stopped';
+      S.activeMusicLabel = `${playback.title || 'Foreground audio'} stopped.`;
+      setFeedback(`${playback.title || 'Foreground audio'} stopped.`, true);
       localSave();
       return true;
     }
@@ -2863,10 +2880,14 @@ function iosVolumeBridgeTarget(kind = 'music') {
   return { percent: musicHardwareVolumePercent(), label: 'Spotify music' };
 }
 
-function appReturnUrl() {
+function appReturnUrl(extraParams = {}) {
   try {
     const url = new URL(window.location.href);
+    url.search = '';
     url.searchParams.set('v', APP_QUERY.replace('?v=', ''));
+    Object.entries(extraParams).forEach(([key, value]) => {
+      if (value !== undefined && value !== null && value !== '') url.searchParams.set(key, String(value));
+    });
     return url.toString();
   } catch {
     return `/${APP_QUERY}`;
@@ -2875,7 +2896,11 @@ function appReturnUrl() {
 
 function iosVolumeShortcutUrl(percent, label = '') {
   const url = new URL('shortcuts://x-callback-url/run-shortcut');
-  const returnUrl = appReturnUrl();
+  const returnUrl = appReturnUrl({
+    shortcut: 'returned',
+    shortcutKind: label || 'volume',
+    shortcutPercent: Math.max(0, Math.min(100, Math.round(Number(percent) || 0)))
+  });
   url.searchParams.set('name', iosVolumeBridgeName());
   url.searchParams.set('input', 'text');
   url.searchParams.set('text', String(Math.max(0, Math.min(100, Math.round(Number(percent) || 0)))));
@@ -2886,17 +2911,37 @@ function iosVolumeShortcutUrl(percent, label = '') {
   return url.toString();
 }
 
+function iosVolumeShortcutCreateUrl() {
+  return 'shortcuts://create-shortcut';
+}
+
+function iosVolumeShortcutOpenUrl() {
+  const url = new URL('shortcuts://open-shortcut');
+  url.searchParams.set('name', iosVolumeBridgeName());
+  return url.toString();
+}
+
+function shortcutSetupRecipe() {
+  return [
+    `Name the shortcut exactly "${iosVolumeBridgeName()}".`,
+    'Add Get Numbers from Shortcut Input.',
+    'Add Set Media Volume and tap the blue percentage value; choose the Numbers variable.',
+    'Return here, turn the shortcut On, then run Music 25% and Voice 100% tests.'
+  ];
+}
+
 async function requestIOSHardwareVolume(kind = 'music', reason = 'optional receiver volume shortcut', options = {}) {
   if (!iosHardwareVolumeAvailable() || !iosVolumeBridgeEnabled()) return false;
   const target = iosVolumeBridgeTarget(kind);
   const percent = Math.max(0, Math.min(100, Math.round(Number(target.percent) || 0)));
   const last = `${kind}:${percent}`;
   const now = Date.now();
-  if (!options.force && S.iosVolumeBridgeLastTarget === last && now - Number(S.iosVolumeBridgeLastAt || 0) < 3500) return true;
+  const repeatWindow = options.topLevel ? IOS_VOLUME_BRIDGE_TOPLEVEL_REPEAT_MS : 3500;
+  if (!options.force && S.iosVolumeBridgeLastTarget === last && now - Number(S.iosVolumeBridgeLastAt || 0) < repeatWindow) return true;
   const url = iosVolumeShortcutUrl(percent, target.label);
   S.iosVolumeBridgeLastTarget = last;
   S.iosVolumeBridgeLastAt = now;
-  S.iosVolumeBridgeStatus = `Optional iPhone shortcut requested ${percent}% for ${target.label}. ${IOS_VOLUME_BRIDGE_FIX_TEXT}`;
+  S.iosVolumeBridgeStatus = `Optional iPhone shortcut requested ${percent}% for ${target.label}. If iOS opens Shortcuts, let it run and return.`;
   localSave();
   try {
     if (options.topLevel) {
@@ -2924,7 +2969,8 @@ async function requestIOSHardwareVolume(kind = 'music', reason = 'optional recei
 }
 
 async function setReceiverHardwareVolume(kind = 'music', reason = 'receiver volume') {
-  return await requestIOSHardwareVolume(kind, reason, { log: false });
+  const topLevel = !/preview|slider|live local/i.test(String(reason || ''));
+  return await requestIOSHardwareVolume(kind, reason, { log: false, topLevel });
 }
 
 async function testIOSVolumeBridge(kind = 'music') {
@@ -2939,6 +2985,32 @@ async function testIOSVolumeBridge(kind = 'music') {
   await requestIOSHardwareVolume(kind, 'manual test', { force: true, log: true, topLevel: true });
   await pushState('Optional iPhone shortcut test sent.', { render: false });
   renderWhenIdle();
+}
+
+async function saveIOSVolumeBridgeSettings(message = 'Optional iPhone shortcut saved on receiver.') {
+  setIOSVolumeBridgeName(val('iosVolumeBridgeName').trim() || iosVolumeBridgeName());
+  setIOSVolumeBridgeEnabled(val('iosVolumeBridgeEnabled') === 'true');
+  storageSet(IOS_VOLUME_BRIDGE_MODE_KEY, IOS_VOLUME_BRIDGE_MODE_ID);
+  S.iosVolumeBridgeStatus = iosVolumeBridgeEnabled()
+    ? `Shortcut On: ${iosVolumeBridgeName()}. Run Music 25% and Voice 100% tests to verify.`
+    : `Shortcut Off. ${IOS_VOLUME_BRIDGE_FIX_TEXT}`;
+  logEvent('receiver', 'Optional iPhone shortcut saved', S.iosVolumeBridgeStatus);
+  await pushState(message, { render: false });
+  renderWhenIdle();
+}
+
+async function openIOSVolumeShortcutSetup(mode = 'create') {
+  setIOSVolumeBridgeName(val('iosVolumeBridgeName').trim() || iosVolumeBridgeName());
+  setIOSVolumeBridgeEnabled(true);
+  storageSet(IOS_VOLUME_BRIDGE_MODE_KEY, IOS_VOLUME_BRIDGE_MODE_ID);
+  S.iosVolumeBridgeStatus = mode === 'open'
+    ? `Opening ${iosVolumeBridgeName()} in Shortcuts. Confirm it uses Get Numbers from Shortcut Input, then Set Media Volume to Numbers.`
+    : `Creating ${iosVolumeBridgeName()} in Shortcuts. ${shortcutSetupRecipe().join(' ')}`;
+  logEvent('receiver', mode === 'open' ? 'Open iPhone shortcut setup' : 'Create iPhone shortcut setup', S.iosVolumeBridgeStatus);
+  localSave();
+  renderWhenIdle();
+  await pushState('Optional iPhone shortcut setup opened.', { render: false });
+  location.href = mode === 'open' ? iosVolumeShortcutOpenUrl() : iosVolumeShortcutCreateUrl();
 }
 
 async function setupLoudVoiceReceiver() {
@@ -4377,10 +4449,14 @@ async function performSunoUrlCue(url, options = {}) {
   const raw = String(url || '').trim();
   if (!raw) throw Error('Paste a Suno song, playlist, or direct audio URL first.');
   speaking = true;
+  const providerBeforeCue = S.activeMusicProvider || S.musicProvider;
   let title = sourceLabel('suno', raw);
   try {
-    S.musicProvider = 'spotify';
+    S.musicProvider = 'suno';
     await ensureReceiverAudio('Suno cue', { required: true });
+    if (activeForegroundPlayback) {
+      await stopReceiverForegroundAudio('Suno cue source switch', { restoreSpotify: false, stopSpeech: false });
+    }
     const { tracks } = await fetchSunoTracksForUrl(raw);
     const chosen = tracks.find(item => item.audioUrl) || null;
     if (!chosen?.audioUrl) throw Error('That Suno URL did not expose playable audio. Paste a direct audio URL or a public Suno URL that includes playable audio.');
@@ -4388,6 +4464,7 @@ async function performSunoUrlCue(url, options = {}) {
     const spotifySnapshot = await duckSpotifyForAnnouncement({ pauseSpotify: true });
     const playback = {
       id: ++foregroundPlaybackSeq,
+      kind: 'suno-cue',
       title,
       url: raw,
       spotifySnapshot,
@@ -4422,12 +4499,20 @@ async function performSunoUrlCue(url, options = {}) {
           announcementMusic.pause();
           try { announcementMusic.currentTime = 0; } catch {}
           announcementMusic.volume = 1;
-          S.musicProvider = 'spotify';
-          S.intent = 'playing';
-          setManualMusicStart('Suno cue restored Spotify');
-          S.activeMusicProvider = 'spotify';
-          S.activeMusicUrl = S.spotifyUrl || DEFAULT_SPOTIFY_PLAYLIST;
-          S.activeMusicLabel = `Spotify bed restored after Suno cue: ${title}`;
+          if (spotifySnapshot?.wasPlaying) {
+            S.musicProvider = 'spotify';
+            S.intent = 'playing';
+            setManualMusicStart('Suno cue restored Spotify');
+            S.activeMusicProvider = 'spotify';
+            S.activeMusicUrl = S.spotifyUrl || DEFAULT_SPOTIFY_PLAYLIST;
+            S.activeMusicLabel = `Spotify bed restored after Suno cue: ${title}`;
+          } else {
+            S.musicProvider = providerBeforeCue === 'spotify' ? 'spotify' : 'suno';
+            S.intent = 'stopped';
+            S.activeMusicProvider = 'suno';
+            S.activeMusicUrl = raw;
+            S.activeMusicLabel = `Suno cue finished: ${title}`;
+          }
           await pushState('Receiver Suno cue completed.', { render: false });
           renderWhenIdle();
         }
@@ -5247,6 +5332,71 @@ function receiverCanPause() {
   return S.activeMusicProvider === 'suno' || spotifyDeviceReady();
 }
 
+const HELP_NOTES = {
+  receiver: {
+    title: 'Receiver Setup',
+    body: 'Use the iPhone connected to the speakers as Home. Tap Start Receiver once, leave this screen open, then control it from the other iPhone in Command.'
+  },
+  quietBed: {
+    title: 'Quiet Bed',
+    body: 'The built-in hum proves the receiver audio path is working. For real music, paste a Suno or direct audio URL and tap Play Quiet Bed. Starting quiet bed now stops Spotify and any older bed first.'
+  },
+  spotify: {
+    title: 'Spotify',
+    body: 'Spotify plays through Spotify Connect and is controlled separately from browser audio. Poolside Pulse now stops Suno/direct beds before Spotify starts, and voice announcements pause Spotify before speaking.'
+  },
+  shortcut: {
+    title: 'Optional iPhone Shortcut',
+    body: 'iOS allows websites to open, create, and run Shortcuts by URL, but it does not silently install a finished shortcut. Create the shortcut once with Get Numbers from Shortcut Input, then Set Media Volume to Numbers. The app can then run 25% music and 100% voice volume tests.'
+  },
+  balance: {
+    title: 'Audio Balance',
+    body: 'Start with Quiet Bed 15-25%, Spotify Gain -800, Spoken Gain +800, and Clear PA Voice max. The dependable gap is the receiver-owned quiet bed plus loud voice takeover.'
+  },
+  command: {
+    title: 'Command Phone',
+    body: 'Command sends events to every active Home receiver. It can play/pause/stop, change settings, trigger Speak Now, run weather holds, and switch music sources on the speaker iPhone.'
+  },
+  schedule: {
+    title: 'Schedules',
+    body: 'Scheduled items run on the Home receiver. Spoken announcements pause music, play loudly, then restore the quiet bed unless you manually stopped music.'
+  },
+  weather: {
+    title: 'Weather Holds',
+    body: 'Weather checks can trigger lightning, wind, and all-clear announcements. Keep the receiver open during pool hours so safety messages can play through the speakers.'
+  },
+  voice: {
+    title: 'Voice',
+    body: 'Voice announcements use the loudest available PA path. If the optional shortcut is enabled, the receiver asks iOS for 100% media volume before speaking.'
+  }
+};
+
+function helpButton(key) {
+  return `<button type="button" class="helpDot" data-help-key="${esc(key)}" aria-label="Help for ${esc(key)}">?</button>`;
+}
+
+function guideCard(key, title, body) {
+  return `<div class="guideCard"><div class="guideTitle"><b>${esc(title)}</b>${helpButton(key)}</div><p>${esc(body)}</p></div>`;
+}
+
+function receiverCoach() {
+  return `<div class="coachPanel">${guideCard('receiver', 'Speaker iPhone', 'Leave this device on Home. It is the receiver that plays sound through the speakers.')}${guideCard('quietBed', 'Soft Bed', 'Tap Play Quiet Bed for the built-in hum or paste a Suno/direct URL for music.')}${guideCard('voice', 'Loud Voice', 'Speak Now and scheduled announcements stop/duck music first, then use the loud voice path.')}</div>`;
+}
+
+function commandCoach() {
+  return `<div class="coachPanel">${guideCard('command', 'Run The Receiver', 'Use this phone for play/pause/skip, Speak Now, schedule tests, weather holds, and source changes.')}${guideCard('balance', 'Volume Gap', 'Send Audio Settings after slider changes. Quiet bed stays low; voice is maxed.')}${guideCard('spotify', 'Spotify Or Bed', 'Play Spotify replaces the quiet bed. Play Quiet Bed replaces Spotify.')}</div>`;
+}
+
+function musicCoach() {
+  return `<div class="coachPanel">${guideCard('quietBed', 'Recommended Today', 'Start with built-in quiet bed. Save a Suno/direct URL when you want real bed music.')}${guideCard('spotify', 'Spotify Source', 'Use Spotify when you want Spotify Connect; voice pauses it before announcements.')}${guideCard('shortcut', 'iPhone Volume Bridge', 'Optional shortcut can ask iOS for 25% music and 100% voice media volume.')}</div>`;
+}
+
+function helpOverlay() {
+  const note = HELP_NOTES[activeHelpKey];
+  if (!note) return '';
+  return `<div class="helpOverlay" role="dialog" aria-modal="true" aria-labelledby="helpTitle"><div class="helpDialog"><button id="closeHelp" class="helpClose" aria-label="Close help">Close</button><p class="eyebrow">Poolside Pulse Help</p><h2 id="helpTitle">${esc(note.title)}</h2><p>${esc(note.body)}</p></div></div>`;
+}
+
 function header() {
   return `<header class="top"><div class="brand"><div class="brandMark">L123</div><div class="brandText"><b>Lake123</b><small>Poolside Pulse · ${esc(DISPLAY_VERSION)}</small></div></div><nav class="modeSwitch"><button id="home" class="${S.screen === 'home' ? 'on' : ''}" aria-pressed="${S.screen === 'home'}">Home</button><button id="cmd" class="${S.screen !== 'home' ? 'on' : ''}" aria-pressed="${S.screen !== 'home'}">Command</button></nav></header>`;
 }
@@ -5268,11 +5418,11 @@ function shell(body) {
   const error = visibleLastError();
   const syncClass = S.sync ? 'good' : 'warn';
   const notice = S.setupNotice ? `<div class="actionNotice"><b>Receiver action:</b> ${esc(S.setupNotice)}</div>` : '';
-  return `${header()}<main class="wrap commandWrap"><div class="topStatus">Command Center · ${esc(DISPLAY_VERSION)} · <span class="pill ${syncClass}">${esc(S.sync ? 'Sync active' : 'Preview sync')}</span> · ${esc(S.syncMode || '')} · ${esc(deviceLabel())}</div>${nav()}<div id="feedbackBox" class="statusBar"><b>Status:</b> ${esc(S.feedback || 'Ready.')}</div>${notice}${error ? `<div class="alert warn"><b>Last Error:</b> ${esc(error)}</div>` : ''}${body}</main>`;
+  return `${header()}<main class="wrap commandWrap"><div class="topStatus">Command Center · ${esc(DISPLAY_VERSION)} · <span class="pill ${syncClass}">${esc(S.sync ? 'Sync active' : 'Preview sync')}</span> · ${esc(S.syncMode || '')} · ${esc(deviceLabel())}</div>${nav()}<div id="feedbackBox" class="statusBar"><b>Status:</b> ${esc(S.feedback || 'Ready.')}</div>${notice}${error ? `<div class="alert warn"><b>Last Error:</b> ${esc(error)}</div>` : ''}${body}</main>${helpOverlay()}`;
 }
 
 function login() {
-  return `${header()}<main class="wrap"><section class="login"><p class="eyebrow">Command Login</p><h1>Command</h1><p>Enter the shared command PIN to control active receivers.</p><label>PIN<input id="pin" inputmode="numeric" type="password" autocomplete="one-time-code"></label><button id="login">Unlock Command</button><p class="muted">${esc(S.feedback || '')}</p></section></main>`;
+  return `${header()}<main class="wrap"><section class="login"><p class="eyebrow">Command Login</p><h1>Command</h1><p>Enter the shared command PIN to control active receivers.</p><label>PIN<input id="pin" inputmode="numeric" type="password" autocomplete="one-time-code"></label><button id="login">Unlock Command</button><p class="muted">${esc(S.feedback || '')}</p></section></main>${helpOverlay()}`;
 }
 
 function statusCards() {
@@ -5322,7 +5472,8 @@ function iosVolumeBridgeControls() {
   const enabled = iosVolumeBridgeEnabled();
   const name = iosVolumeBridgeName();
   const status = S.iosVolumeBridgeStatus || (enabled ? 'Enabled on this receiver.' : 'Off on this receiver.');
-  return `<div class="bridgePanel"><h3>Optional iPhone Shortcut</h3><div class="grid2"><label>Shortcut<select id="iosVolumeBridgeEnabled"><option value="false" ${enabled ? '' : 'selected'}>Off</option><option value="true" ${enabled ? 'selected' : ''}>On</option></select></label><label>Shortcut Name<input id="iosVolumeBridgeName" value="${esc(name)}"></label></div><div class="buttonStack"><button id="saveBridgeHome" class="secondary">Save Optional Shortcut</button><button id="testMusicBridgeHome" class="secondary">Test Music Shortcut</button><button id="testVoiceBridgeHome" class="secondary">Test Voice Shortcut</button></div><p class="bridgeHint">${esc(IOS_VOLUME_BRIDGE_FIX_TEXT)}</p><p class="muted">${esc(status)}</p></div>`;
+  const recipe = shortcutSetupRecipe().map(step => `<li>${esc(step)}</li>`).join('');
+  return `<div class="bridgePanel"><div class="bridgeHeader"><h3>Optional iPhone Shortcut</h3>${helpButton('shortcut')}</div><p class="muted">Use this only if you want iOS hardware volume to move to low music and full voice automatically on the speaker phone.</p><div class="grid2"><label>Shortcut<select id="iosVolumeBridgeEnabled"><option value="false" ${enabled ? '' : 'selected'}>Off</option><option value="true" ${enabled ? 'selected' : ''}>On</option></select></label><label>Shortcut Name<input id="iosVolumeBridgeName" value="${esc(name)}"></label></div><div class="shortcutRecipe"><b>Shortcut recipe</b><ol>${recipe}</ol></div><div class="buttonStack"><button id="createBridgeHome">Create Shortcut</button><button id="openBridgeHome" class="secondary">Open Shortcut</button><button id="saveBridgeHome" class="secondary">Save On/Off</button><button id="testMusicBridgeHome" class="secondary">Music ${esc(musicHardwareVolumePercent())}% Test</button><button id="testVoiceBridgeHome" class="secondary">Voice 100% Test</button></div><p class="bridgeHint">After the tests, music should be clearly softer and voice should be full iPhone media volume. If the shortcut opens but does not change volume, its Set Media Volume action is still set to a fixed percent instead of the Numbers variable.</p><p class="muted">${esc(status)}</p></div>`;
 }
 
 function homePage() {
@@ -5333,7 +5484,7 @@ function homePage() {
   const label = S.playlistUrl ? sourceLabel('suno', S.playlistUrl) : 'Built-in ambient quiet bed';
   const error = visibleLastError();
   const live = receiverCanPause();
-  return `${header()}<main class="home console"><section class="receiverConsole"><div class="receiverLead"><p class="eyebrow">Home Receiver · ${esc(DISPLAY_VERSION)}</p><h1>Sound Station</h1><p>This phone stays on Home and plays the controllable quiet bed, loud voice announcements, Suno cues, scheduled audio, and weather safety messages through the speakers.</p>${receiverActionButtons()}${receiverNotice()}${error ? `<div class="alert warn">${esc(error)}</div>` : ''}</div><aside class="setupPanel"><h2>Receiver Readiness</h2>${readinessSteps()}<div class="miniFacts"><b>Quiet Bed:</b> ${esc(label)}<br><b>Balance:</b> ${esc(S.sunoVolume)}% / ${esc(spokenGainLabel())}<br><b>Spotify:</b> ${esc(spotifyGainLabel())} request only on iOS<br><b>Schedule:</b> ${esc(scheduleTitle(activeMode))}<br><b>Status:</b> ${esc(receiverReadiness())}<br><b>Audio:</b> ${esc(S.audioStatus)}<br><b>Loud Voice:</b> ${esc(S.iosVolumeBridgeStatus || IOS_VOLUME_BRIDGE_FIX_TEXT)}</div>${iosVolumeBridgeControls()}</aside></section><section class="nowCompact"><div><p class="eyebrow">${live ? 'Now Playing' : S.intent === 'paused' ? 'Paused' : 'Ready'}</p><h2>${esc(S.activeMusicProvider === 'suno' ? 'Quiet Bed Receiver' : (S.spotifyNowPlaying || 'Spotify Receiver'))}</h2><p>${esc(compactUrl(S.activeMusicProvider === 'suno' ? S.activeMusicUrl : S.spotifyUrl))}</p><p class="muted">${esc(S.activeMusicLabel || label)}</p></div><div class="signal ${live ? 'live' : ''}"><span></span><span></span><span></span></div></section><section class="cards"><div class="card"><h3>Next Scheduled · ${esc(scheduleTitle(activeMode))}</h3>${next || '<p class="muted">No enabled schedule items.</p>'}</div><div class="card"><h3>Recent Receiver Log</h3>${logRows(5)}</div></section></main>`;
+  return `${header()}<main class="home console"><section class="receiverConsole"><div class="receiverLead"><p class="eyebrow">Home Receiver · ${esc(DISPLAY_VERSION)}</p><h1>Sound Station</h1><p>This phone stays on Home and plays the controllable quiet bed, loud voice announcements, Suno cues, scheduled audio, and weather safety messages through the speakers.</p>${receiverCoach()}${receiverActionButtons()}${receiverNotice()}${error ? `<div class="alert warn">${esc(error)}</div>` : ''}</div><aside class="setupPanel"><h2>Receiver Readiness</h2>${readinessSteps()}<div class="miniFacts"><b>Quiet Bed:</b> ${esc(label)}<br><b>Balance:</b> ${esc(S.sunoVolume)}% / ${esc(spokenGainLabel())}<br><b>Spotify:</b> ${esc(spotifyGainLabel())} request only on iOS<br><b>Schedule:</b> ${esc(scheduleTitle(activeMode))}<br><b>Status:</b> ${esc(receiverReadiness())}<br><b>Audio:</b> ${esc(S.audioStatus)}<br><b>Loud Voice:</b> ${esc(S.iosVolumeBridgeStatus || IOS_VOLUME_BRIDGE_FIX_TEXT)}</div>${iosVolumeBridgeControls()}</aside></section><section class="nowCompact"><div><p class="eyebrow">${live ? 'Now Playing' : S.intent === 'paused' ? 'Paused' : 'Ready'}</p><h2>${esc(S.activeMusicProvider === 'suno' ? 'Quiet Bed Receiver' : (S.spotifyNowPlaying || 'Spotify Receiver'))}</h2><p>${esc(compactUrl(S.activeMusicProvider === 'suno' ? S.activeMusicUrl : S.spotifyUrl))}</p><p class="muted">${esc(S.activeMusicLabel || label)}</p></div><div class="signal ${live ? 'live' : ''}"><span></span><span></span><span></span></div></section><section class="cards"><div class="card"><h3>Next Scheduled · ${esc(scheduleTitle(activeMode))}</h3>${next || '<p class="muted">No enabled schedule items.</p>'}</div><div class="card"><h3>Recent Receiver Log</h3>${logRows(5)}</div></section></main>${helpOverlay()}`;
 }
 
 function commandPage() {
@@ -5343,6 +5494,7 @@ function commandPage() {
     <section class="commandConsole">
       <div><p class="eyebrow">Live Control</p><h1>Command</h1><p>Command devices send instructions to every active receiver. Speaker phones stay on Home and play all sound.</p></div>
       ${statusCards()}
+      ${commandCoach()}
     </section>
     <section class="panel controlDeck">
       <div class="sectionHead"><h2>Receiver Controls</h2><span class="pill ${S.receiverStatus && !receiverActionNeeded(S.receiverStatus) ? 'good' : 'warn'}">${esc(S.receiverStatus || 'No receiver report yet')}</span></div>
@@ -5386,6 +5538,7 @@ function musicPageV23() {
         <div class="sourceTile"><b>Spotify Control</b><strong>${esc(sourceLabel('spotify', S.spotifyUrl || DEFAULT_SPOTIFY_PLAYLIST))}</strong><span>Spotify is not quiet-safe on iOS web; voice pauses it before announcements.</span></div>
         <div class="sourceTile"><b>Gap</b><strong>${esc(S.sunoVolume)}% / ${esc(spokenGainLabel())}</strong><span>Quiet bed uses controllable Web Audio; voice uses max PA+.</span></div>
       </div>
+      ${musicCoach()}
       <div class="buttonStack"><button id="sunoPlayNow">Play Quiet Bed on Receivers</button><button id="spotifyPlayNow" class="secondary">Play Spotify on Receivers</button></div>
       <div class="quickMusic"><label>Quiet Bed or Spotify URL<input id="quickMusicUrl" value="${esc(quietInputValue)}" placeholder="Paste Suno, direct audio, or Spotify URL"></label><div class="buttonStack"><button id="playAnyUrl">Play Pasted URL</button><button id="savePastedUrl" class="secondary">Save URL</button></div></div>
       <div class="grid2"><label>Station Name<input id="playlistName" value="${esc(S.playlistName)}"></label><label>Spotify Playlist or Track URL<input id="spotifyUrl" value="${esc(S.spotifyUrl)}" placeholder="https://open.spotify.com/playlist/..."></label></div>
@@ -5472,11 +5625,11 @@ function schedulePage(mode = 'daily') {
   const copy = activeMode === 'party'
     ? 'Party schedule uses the same controls as the daily schedule. Turn it on when you want party cues to replace the normal pool schedule.'
     : 'Daily schedule runs by default during pool hours unless the party schedule is active.';
-  return shell(`<section class="panel"><div class="panelHeader"><div><p class="eyebrow">${eyebrow}</p><h1>${scheduleTitle(activeMode)}</h1></div><div class="actions tight"><button data-activate-schedule="${activeMode}" class="${active ? '' : 'secondary'}">${active ? 'Using This Schedule' : 'Use This Schedule'}</button><button data-add-sched="${activeMode}" class="secondary">Add Item</button></div></div><p>${copy}</p><div class="statusBar"><b>Active schedule:</b> ${esc(scheduleTitle(S.activeSchedule))}</div>${rows || '<p class="muted">No enabled schedule items.</p>'}</section>`);
+  return shell(`<section class="panel"><div class="panelHeader"><div><p class="eyebrow">${eyebrow}</p><h1>${scheduleTitle(activeMode)}</h1></div><div class="actions tight"><button data-activate-schedule="${activeMode}" class="${active ? '' : 'secondary'}">${active ? 'Using This Schedule' : 'Use This Schedule'}</button><button data-add-sched="${activeMode}" class="secondary">Add Item</button></div></div><p>${copy}</p><div class="coachPanel">${guideCard('schedule', 'Receiver Runs These', 'Keep Home open on the speaker iPhone. Spoken schedule items pause music, speak loudly, then restore the quiet bed.')}${guideCard('quietBed', 'Music Items', 'Use Suno/direct audio for quiet bed items when you need controllable low volume.')}${guideCard('spotify', 'Spotify Items', 'Spotify items start Spotify Connect and replace the quiet bed.')}</div><div class="statusBar"><b>Active schedule:</b> ${esc(scheduleTitle(S.activeSchedule))}</div>${rows || '<p class="muted">No enabled schedule items.</p>'}</section>`);
 }
 
 function weatherPage() {
-  return shell(`<section class="panel"><div class="panelHeader"><div><p class="eyebrow">Safety Automation</p><h1>Weather</h1></div><button id="checkWeather">Check Weather</button></div><label>Address<input id="address" value="${esc(S.address)}"></label><div class="actions"><button id="verify" class="secondary">Verify Address</button><button id="gps" class="secondary">Use Device GPS</button></div><div class="grid3"><label>Latitude<input id="lat" value="${esc(S.lat)}"></label><label>Longitude<input id="lon" value="${esc(S.lon)}"></label><label>Weather Radius Miles<input id="radius" value="${esc(S.radius)}"></label></div><div class="grid3"><label>Lightning Radius Miles<input id="lightningRadiusMiles" value="${esc(S.lightningRadiusMiles)}"></label><label>Lightning Hold Minutes<input id="lightningHoldMinutes" value="${esc(S.lightningHoldMinutes)}"></label><label>Strong Wind Alert MPH<input id="windGustMph" inputmode="numeric" value="${esc(S.windGustMph)}"></label></div><label>Auto Scan<select id="weatherAuto"><option value="true" ${S.weatherAuto ? 'selected' : ''}>Every 5 minutes on active receivers</option><option value="false" ${!S.weatherAuto ? 'selected' : ''}>Manual only</option></select></label><label>Lightning Announcement<textarea id="lightningText">${esc(S.lightningText)}</textarea></label><label>Strong Wind Announcement<textarea id="windText">${esc(S.windText)}</textarea></label><label>Lightning All Clear Announcement<textarea id="lightningClearText">${esc(S.lightningClearText)}</textarea></label><div class="actions"><button id="saveLoc">Save Weather Settings</button></div><div class="statusBar"><b>Weather:</b> ${esc(S.weather)}<br><b>${esc(S.weatherCheckedAt ? `Last checked ${S.weatherCheckedAt}` : 'Not checked yet')}</b><br><b>Lightning:</b> ${esc(lightningRemainingText())}</div></section>`);
+  return shell(`<section class="panel"><div class="panelHeader"><div><p class="eyebrow">Safety Automation</p><h1>Weather</h1></div><button id="checkWeather">Check Weather</button></div><div class="coachPanel">${guideCard('weather', 'Safety Holds', 'Manual or automatic checks can speak lightning, wind, and all-clear messages on the receiver.')}${guideCard('voice', 'Announcement Volume', 'Weather messages use the same loud voice path as Speak Now.')}${guideCard('receiver', 'Receiver Needed', 'Keep the speaker iPhone on Home during pool hours for automatic weather audio.')}</div><label>Address<input id="address" value="${esc(S.address)}"></label><div class="actions"><button id="verify" class="secondary">Verify Address</button><button id="gps" class="secondary">Use Device GPS</button></div><div class="grid3"><label>Latitude<input id="lat" value="${esc(S.lat)}"></label><label>Longitude<input id="lon" value="${esc(S.lon)}"></label><label>Weather Radius Miles<input id="radius" value="${esc(S.radius)}"></label></div><div class="grid3"><label>Lightning Radius Miles<input id="lightningRadiusMiles" value="${esc(S.lightningRadiusMiles)}"></label><label>Lightning Hold Minutes<input id="lightningHoldMinutes" value="${esc(S.lightningHoldMinutes)}"></label><label>Strong Wind Alert MPH<input id="windGustMph" inputmode="numeric" value="${esc(S.windGustMph)}"></label></div><label>Auto Scan<select id="weatherAuto"><option value="true" ${S.weatherAuto ? 'selected' : ''}>Every 5 minutes on active receivers</option><option value="false" ${!S.weatherAuto ? 'selected' : ''}>Manual only</option></select></label><label>Lightning Announcement<textarea id="lightningText">${esc(S.lightningText)}</textarea></label><label>Strong Wind Announcement<textarea id="windText">${esc(S.windText)}</textarea></label><label>Lightning All Clear Announcement<textarea id="lightningClearText">${esc(S.lightningClearText)}</textarea></label><div class="actions"><button id="saveLoc">Save Weather Settings</button></div><div class="statusBar"><b>Weather:</b> ${esc(S.weather)}<br><b>${esc(S.weatherCheckedAt ? `Last checked ${S.weatherCheckedAt}` : 'Not checked yet')}</b><br><b>Lightning:</b> ${esc(lightningRemainingText())}</div></section>`);
 }
 
 function announcementEditor() {
@@ -5489,11 +5642,11 @@ function voicePage() {
   const receiverAudio = S.screen === 'home'
     ? S.audioStatus
     : (S.receiverStatus || 'Command devices send voice events; the Home receiver plays them.');
-  return shell(`<section class="panel"><div class="panelHeader"><div><p class="eyebrow">Announcement Audio</p><h1>Voice</h1></div><button id="voiceHealth" class="secondary">Check Voice</button></div><div class="statusBar"><b>Voice health:</b> ${esc(S.voiceHealth)}<br><b>Receiver audio:</b> ${esc(receiverAudio)}<br><b>Voice path:</b> ${esc(spokenGainLabel())}</div><div class="grid2"><label>Voice Mode<select id="voiceMode"><option value="ai" ${S.voiceMode === 'ai' ? 'selected' : ''}>AI first, device fallback</option><option value="device" ${S.voiceMode === 'device' ? 'selected' : ''}>Device only</option></select></label><label>AI Voice<select id="aiVoice"><option value="marin" ${S.aiVoice === 'marin' ? 'selected' : ''}>Marin</option><option value="cedar" ${S.aiVoice === 'cedar' ? 'selected' : ''}>Cedar</option><option value="coral" ${S.aiVoice === 'coral' ? 'selected' : ''}>Coral</option><option value="nova" ${S.aiVoice === 'nova' ? 'selected' : ''}>Nova</option><option value="sage" ${S.aiVoice === 'sage' ? 'selected' : ''}>Sage</option><option value="shimmer" ${S.aiVoice === 'shimmer' ? 'selected' : ''}>Shimmer</option><option value="onyx" ${S.aiVoice === 'onyx' ? 'selected' : ''}>Onyx</option></select></label></div><label>Device Voice<select id="deviceVoice"><option value="">Best available</option>${voiceOptions}</select></label><div class="grid4"><label><span>Spoken Gain <output id="spokenGainOut">${esc(spokenGainLabel())}</output></span><input id="spokenGain" type="range" min="${MIN_SPOKEN_GAIN}" max="${MAX_SPOKEN_GAIN}" step="25" value="${esc(S.spokenGain)}"></label><label><span>Clear PA Voice <output id="announcementGainOut">${esc(voiceLoudnessLabel())}</output></span><input id="announcementGain" type="range" min="1" max="${MAX_ANNOUNCEMENT_GAIN}" step=".05" value="${esc(S.announcementGain)}"></label><label><span>Speed <output id="rateOut">${esc(S.rate)}</output></span><input id="rate" type="range" min=".75" max="1.15" step=".01" value="${esc(S.rate)}"></label><label><span>Pitch <output id="pitchOut">${esc(S.pitch)}</output></span><input id="pitch" type="range" min=".85" max="1.15" step=".01" value="${esc(S.pitch)}"></label></div><div class="actions"><button id="saveVoice">Save Voice</button><button id="testVoice" class="secondary">Send Voice Test</button><button id="testDevice" class="secondary">Send Device Voice Test</button></div></section>${announcementEditor()}`);
+  return shell(`<section class="panel"><div class="panelHeader"><div><p class="eyebrow">Announcement Audio</p><h1>Voice</h1></div><button id="voiceHealth" class="secondary">Check Voice</button></div><div class="statusBar"><b>Voice health:</b> ${esc(S.voiceHealth)}<br><b>Receiver audio:</b> ${esc(receiverAudio)}<br><b>Voice path:</b> ${esc(spokenGainLabel())}</div><div class="coachPanel">${guideCard('voice', 'Loud Path', 'AI voice is preferred, device voice is fallback. Both stop/duck music before speaking.')}${guideCard('balance', 'Voice Gap', 'Use Spoken Gain +800 and Clear PA Voice max for the largest possible gap.')}${guideCard('shortcut', 'Optional iOS Volume', 'The shortcut bridge can request 100% iPhone media volume before voice playback.')}</div><div class="grid2"><label>Voice Mode<select id="voiceMode"><option value="ai" ${S.voiceMode === 'ai' ? 'selected' : ''}>AI first, device fallback</option><option value="device" ${S.voiceMode === 'device' ? 'selected' : ''}>Device only</option></select></label><label>AI Voice<select id="aiVoice"><option value="marin" ${S.aiVoice === 'marin' ? 'selected' : ''}>Marin</option><option value="cedar" ${S.aiVoice === 'cedar' ? 'selected' : ''}>Cedar</option><option value="coral" ${S.aiVoice === 'coral' ? 'selected' : ''}>Coral</option><option value="nova" ${S.aiVoice === 'nova' ? 'selected' : ''}>Nova</option><option value="sage" ${S.aiVoice === 'sage' ? 'selected' : ''}>Sage</option><option value="shimmer" ${S.aiVoice === 'shimmer' ? 'selected' : ''}>Shimmer</option><option value="onyx" ${S.aiVoice === 'onyx' ? 'selected' : ''}>Onyx</option></select></label></div><label>Device Voice<select id="deviceVoice"><option value="">Best available</option>${voiceOptions}</select></label><div class="grid4"><label><span>Spoken Gain <output id="spokenGainOut">${esc(spokenGainLabel())}</output></span><input id="spokenGain" type="range" min="${MIN_SPOKEN_GAIN}" max="${MAX_SPOKEN_GAIN}" step="25" value="${esc(S.spokenGain)}"></label><label><span>Clear PA Voice <output id="announcementGainOut">${esc(voiceLoudnessLabel())}</output></span><input id="announcementGain" type="range" min="1" max="${MAX_ANNOUNCEMENT_GAIN}" step=".05" value="${esc(S.announcementGain)}"></label><label><span>Speed <output id="rateOut">${esc(S.rate)}</output></span><input id="rate" type="range" min=".75" max="1.15" step=".01" value="${esc(S.rate)}"></label><label><span>Pitch <output id="pitchOut">${esc(S.pitch)}</output></span><input id="pitch" type="range" min=".85" max="1.15" step=".01" value="${esc(S.pitch)}"></label></div><div class="actions"><button id="saveVoice">Save Voice</button><button id="testVoice" class="secondary">Send Voice Test</button><button id="testDevice" class="secondary">Send Device Voice Test</button></div></section>${announcementEditor()}`);
 }
 
 function hoursPage() {
-  return shell(`<section class="panel"><div class="panelHeader"><div><p class="eyebrow">Station Rules</p><h1>Hours</h1></div><button id="saveHours">Save</button></div><div class="grid2"><label>Music Mode<select id="playbackMode"><option value="always" ${S.playbackMode === 'always' ? 'selected' : ''}>Always play unless paused</option><option value="hours" ${S.playbackMode === 'hours' ? 'selected' : ''}>Follow pool hours</option></select></label><label>Auto Start<select id="autoStart"><option value="true" ${S.autoStart ? 'selected' : ''}>Yes</option><option value="false" ${!S.autoStart ? 'selected' : ''}>No</option></select></label></div><div class="grid2"><label>Pool Opens<input id="poolOpen" type="time" value="${esc(S.poolOpen)}"></label><label>Pool Closes<input id="poolClose" type="time" value="${esc(S.poolClose)}"></label></div><label>Auto Stop<select id="autoStop"><option value="true" ${S.autoStop ? 'selected' : ''}>Yes, stop at closing when following pool hours</option><option value="false" ${!S.autoStop ? 'selected' : ''}>No</option></select></label></section>`);
+  return shell(`<section class="panel"><div class="panelHeader"><div><p class="eyebrow">Station Rules</p><h1>Hours</h1></div><button id="saveHours">Save</button></div><div class="coachPanel">${guideCard('receiver', 'Open Hours', 'Auto-start and auto-stop only matter while the speaker iPhone receiver is open.')}${guideCard('quietBed', 'Default Bed', 'For today, use quiet bed as the reliable ambient source during pool hours.')}${guideCard('schedule', 'Closing Cues', 'Closing announcements use the same schedule and loud voice path.')}</div><div class="grid2"><label>Music Mode<select id="playbackMode"><option value="always" ${S.playbackMode === 'always' ? 'selected' : ''}>Always play unless paused</option><option value="hours" ${S.playbackMode === 'hours' ? 'selected' : ''}>Follow pool hours</option></select></label><label>Auto Start<select id="autoStart"><option value="true" ${S.autoStart ? 'selected' : ''}>Yes</option><option value="false" ${!S.autoStart ? 'selected' : ''}>No</option></select></label></div><div class="grid2"><label>Pool Opens<input id="poolOpen" type="time" value="${esc(S.poolOpen)}"></label><label>Pool Closes<input id="poolClose" type="time" value="${esc(S.poolClose)}"></label></div><label>Auto Stop<select id="autoStop"><option value="true" ${S.autoStop ? 'selected' : ''}>Yes, stop at closing when following pool hours</option><option value="false" ${!S.autoStop ? 'selected' : ''}>No</option></select></label></section>`);
 }
 
 function render() {
@@ -5585,6 +5738,18 @@ function bindDraftControls() {
 
 function bind() {
   syncVolumeInputLimits();
+  document.querySelectorAll('[data-help-key]').forEach(button => {
+    button.onclick = event => {
+      event.preventDefault();
+      event.stopPropagation();
+      activeHelpKey = button.dataset.helpKey || '';
+      render();
+    };
+  });
+  wire('closeHelp', () => {
+    activeHelpKey = '';
+    render();
+  });
   wire('home', async () => {
     S.screen = 'home';
     localSave();
@@ -5629,14 +5794,9 @@ function bind() {
   wire('stopHome', () => stopSelected(false));
   wire('checkWeatherHome', () => triggerWeatherCheck());
   wire('spotifyLoginHome', spotifyLogin);
-  wire('saveBridgeHome', async () => {
-    setIOSVolumeBridgeName(val('iosVolumeBridgeName').trim() || iosVolumeBridgeName());
-    setIOSVolumeBridgeEnabled(val('iosVolumeBridgeEnabled') === 'true');
-    S.iosVolumeBridgeStatus = iosVolumeBridgeEnabled() ? `Optional shortcut enabled: ${iosVolumeBridgeName()}. ${IOS_VOLUME_BRIDGE_FIX_TEXT}` : `Optional shortcut off. ${IOS_VOLUME_BRIDGE_FIX_TEXT}`;
-    logEvent('receiver', 'Optional iPhone shortcut saved', S.iosVolumeBridgeStatus);
-    await pushState('Optional iPhone shortcut saved on receiver.', { render: false });
-    renderWhenIdle();
-  });
+  wire('createBridgeHome', () => openIOSVolumeShortcutSetup('create'));
+  wire('openBridgeHome', () => openIOSVolumeShortcutSetup('open'));
+  wire('saveBridgeHome', () => saveIOSVolumeBridgeSettings());
   wire('testMusicBridgeHome', () => testIOSVolumeBridge('music'));
   wire('testVoiceBridgeHome', () => testIOSVolumeBridge('voice'));
   document.querySelectorAll('[data-ready-action]').forEach(button => {
@@ -5965,7 +6125,22 @@ function normalizeCurrentUrl() {
   } catch {}
 }
 
+function handleIOSVolumeShortcutReturn() {
+  try {
+    const params = new URLSearchParams(location.search);
+    if (params.get('shortcut') !== 'returned') return;
+    const percent = params.get('shortcutPercent') || '';
+    const kind = params.get('shortcutKind') || 'volume';
+    setIOSVolumeBridgeEnabled(true);
+    storageSet(IOS_VOLUME_BRIDGE_MODE_KEY, IOS_VOLUME_BRIDGE_MODE_ID);
+    S.iosVolumeBridgeStatus = `Shortcut returned after ${percent}% ${kind} test. If the iPhone media volume changed, the receiver bridge is working.`;
+    logEvent('receiver', 'Optional iPhone shortcut returned', S.iosVolumeBridgeStatus);
+    localSave();
+  } catch {}
+}
+
 completeSpotifyLogin().finally(() => {
+  handleIOSVolumeShortcutReturn();
   normalizeCurrentUrl();
   applyIOSVolumeBridgeDefault();
   if (S.screen !== 'home') releaseCommandReceiver('startup');
