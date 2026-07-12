@@ -273,6 +273,10 @@ a {
   outline-offset: 2px;
 }
 
+.content h1[tabindex="-1"]:focus {
+  outline: 0;
+}
+
 input:focus-visible,
 textarea:focus-visible,
 select:focus-visible {
