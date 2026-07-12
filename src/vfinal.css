@@ -781,6 +781,13 @@ select:focus-visible {
   pointer-events: none;
 }
 
+.appShell.busy .content .alwaysAvailable {
+  position: relative;
+  z-index: 3;
+  opacity: 1;
+  pointer-events: auto;
+}
+
 @keyframes busy-spin {
   to { transform: rotate(360deg); }
 }
@@ -1127,6 +1134,30 @@ select:focus-visible {
   min-width: 0;
 }
 
+.nowMeta {
+  min-height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.nowMeta .kicker {
+  margin-bottom: 0;
+}
+
+.nowBack {
+  min-height: 34px;
+  padding: 6px 11px;
+  font-size: 0.74rem;
+}
+
+.nowPlaying.calibrating {
+  border-color: #d9ba7a;
+  border-left-color: var(--amber-800);
+  background: #fffaf1;
+}
+
 .nowText h2 {
   margin-bottom: 5px;
   overflow-wrap: anywhere;
@@ -1317,12 +1348,20 @@ select:focus-visible {
 }
 
 .volumeScale {
+  position: relative;
   display: flex;
   justify-content: space-between;
+  min-height: 16px;
   margin-top: -2px;
   color: var(--muted);
   font-size: 0.68rem;
   font-weight: 700;
+}
+
+.volumeScale span:nth-child(2) {
+  position: absolute;
+  left: 30%;
+  transform: translateX(-50%);
 }
 
 .volumeControl > p {
@@ -1607,10 +1646,111 @@ select:focus-visible {
   justify-content: end;
 }
 
-/* Daily schedule */
+/* Saved schedules */
+.scheduleWorkspace {
+  display: grid;
+  gap: 16px;
+}
+
+.schedulePickerBar,
+.scheduleSettings,
+.orderRunner,
+.timeRunner {
+  border: 1px solid var(--line);
+  border-radius: var(--panel-radius);
+  background: var(--paper);
+  box-shadow: var(--shadow-small);
+}
+
+.schedulePickerBar {
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) auto;
+  align-items: end;
+  gap: 14px;
+  padding: 18px;
+}
+
+.addScheduleButton {
+  min-width: 164px;
+}
+
+.scheduleSettings {
+  display: grid;
+  grid-template-columns: minmax(220px, 1.7fr) minmax(150px, 0.7fr) auto;
+  align-items: end;
+  gap: 14px;
+  padding: 18px;
+}
+
+.scheduleSettingsActions {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+  border-top: 1px solid var(--line);
+  padding-top: 14px;
+}
+
+.liveScheduleBadge {
+  align-self: center;
+  border: 1px solid var(--teal-700);
+  border-radius: 999px;
+  padding: 8px 12px;
+  background: var(--teal-50);
+  color: var(--teal-700);
+  font-size: 0.76rem;
+  font-weight: 850;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.orderRunner,
+.timeRunner {
+  min-height: 86px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  border-left: 5px solid var(--teal-700);
+  padding: 16px 18px;
+}
+
+.orderRunner.inactive,
+.timeRunner.inactive {
+  border-left-color: var(--line-strong);
+  background: var(--canvas);
+}
+
+.orderRunner > div:first-child,
+.timeRunner {
+  color: var(--muted-strong);
+}
+
+.orderRunner span,
+.orderRunner small,
+.timeRunner span {
+  display: block;
+}
+
+.orderRunner strong,
+.timeRunner strong {
+  color: var(--navy-950);
+}
+
+.orderRunner small {
+  margin-top: 3px;
+}
+
+.orderRunnerActions {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 8px;
+}
+
 .scheduleList {
   display: grid;
-  gap: 14px;
+  gap: 10px;
 }
 
 .scheduleList:empty {
@@ -1625,37 +1765,287 @@ select:focus-visible {
 .scheduleList:empty::before {
   color: var(--muted);
   font-size: 0.9rem;
-  content: "No scheduled items yet. Add one below.";
+  content: "No items yet. Use + Add Schedule Item below.";
 }
 
-.scheduleRow {
+.scheduleItemShell {
   display: grid;
-  grid-template-columns: minmax(165px, 1.25fr) minmax(180px, 1.5fr) minmax(150px, 1fr) minmax(175px, 1.25fr) minmax(210px, 1.6fr);
-  gap: 15px;
+  grid-template-columns: 48px minmax(0, 1fr);
+  align-items: stretch;
+  gap: 8px;
+  transition: transform 140ms ease, opacity 140ms ease;
+}
+
+.scheduleItemShell.dragging {
+  opacity: 0.5;
+}
+
+.scheduleItemShell.dragTarget {
+  transform: translateY(4px);
+}
+
+.scheduleItemShell.dragTarget .scheduleItemCard {
+  border-color: var(--teal-700);
+  box-shadow: 0 0 0 3px rgba(8, 104, 108, 0.16);
+}
+
+.dragHandle {
+  width: 48px;
+  min-width: 48px;
+  height: 58px;
+  align-self: start;
+  padding: 0;
+  color: var(--teal-700);
+  font-size: 1.25rem;
+  letter-spacing: -0.2em;
+  cursor: grab;
+  touch-action: none;
+}
+
+.dragHandle:active {
+  cursor: grabbing;
+}
+
+.scheduleItemCard {
+  overflow: hidden;
   border: 1px solid var(--line);
   border-left: 4px solid var(--teal-700);
   border-radius: var(--panel-radius);
-  padding: 18px;
   background: var(--paper);
   box-shadow: var(--shadow-small);
 }
 
-.scheduleTime {
+.scheduleItemCard > summary {
+  min-height: 58px;
   display: grid;
-  grid-template-columns: minmax(100px, 1fr) auto;
-  align-items: end;
+  grid-template-columns: minmax(78px, auto) minmax(180px, 1fr) auto auto 28px;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
+  cursor: pointer;
+  list-style: none;
+  touch-action: manipulation;
+}
+
+.scheduleItemCard > summary::-webkit-details-marker {
+  display: none;
+}
+
+.scheduleItemCard > summary::after {
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--line-strong);
+  border-radius: 7px;
+  background: var(--canvas);
+  color: var(--navy-900);
+  content: "+";
+}
+
+.scheduleItemCard[open] > summary::after {
+  content: "−";
+}
+
+.schedulePosition {
+  min-width: 70px;
+  border-radius: 8px;
+  padding: 6px 9px;
+  background: var(--navy-950);
+  color: #fff;
+  font-size: 0.8rem;
+  font-weight: 850;
+  text-align: center;
+}
+
+.schedulePosition.order {
+  min-width: 44px;
+  color: #d8f4ef;
+  font-size: 1rem;
+}
+
+.scheduleSummaryCopy {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.scheduleSummaryCopy strong {
+  overflow: hidden;
+  color: var(--navy-950);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.scheduleSummaryCopy small {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 0.72rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.scheduleVolumeBadge,
+.scheduleEnabled {
+  border-radius: 999px;
+  padding: 5px 9px;
+  font-size: 0.7rem;
+  font-weight: 820;
+  white-space: nowrap;
+}
+
+.scheduleVolumeBadge {
+  background: var(--teal-50);
+  color: var(--teal-700);
+}
+
+.scheduleEnabled {
+  background: var(--green-100);
+  color: var(--green-700);
+}
+
+.scheduleEnabled.off {
+  background: var(--canvas-deep);
+  color: var(--muted);
+}
+
+.scheduleItemForm {
+  border-top: 1px solid var(--line);
+  padding: 18px;
+  background: #fbfcfb;
+}
+
+.scheduleFormGrid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: start;
+  gap: 14px;
+}
+
+.conditionalFields,
+.weekdayField {
+  grid-column: 1 / -1;
+}
+
+.conditionalFields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  padding: 14px;
+  background: var(--paper);
+}
+
+.conditionalFields[hidden],
+.conditionalFields [hidden] {
+  display: none !important;
+}
+
+.weekdayField {
+  min-width: 0;
+  margin: 0;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  padding: 10px 12px 12px;
+}
+
+.weekdayField legend {
+  padding-inline: 5px;
+  color: var(--navy-900);
+  font-size: 0.78rem;
+  font-weight: 780;
+}
+
+.weekdayGrid {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.dayChoice {
+  display: block;
+  cursor: pointer;
+}
+
+.dayChoice input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.dayChoice span {
+  min-height: 38px;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--line-strong);
+  border-radius: 7px;
+  background: var(--paper);
+  color: var(--muted-strong);
+  font-size: 0.72rem;
+}
+
+.dayChoice input:checked + span {
+  border-color: var(--teal-700);
+  background: var(--teal-50);
+  color: var(--teal-700);
+  font-weight: 820;
+}
+
+.dayChoice input:focus-visible + span {
+  outline: 3px solid rgba(160, 93, 0, 0.34);
+  outline-offset: 2px;
+}
+
+.fixedVoiceNote {
+  min-height: 72px;
+  display: grid;
+  align-content: center;
+  gap: 3px;
+  border-left: 4px solid var(--teal-700);
+  border-radius: 8px;
+  padding: 11px 13px;
+  background: var(--teal-50);
+}
+
+.fixedVoiceNote strong {
+  color: var(--teal-700);
+}
+
+.fixedVoiceNote span {
+  color: var(--muted-strong);
+  font-size: 0.78rem;
+}
+
+.itemVolumeControl {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 62px;
+  align-items: center;
   gap: 10px;
 }
 
-.scheduleTime .checkLabel {
-  min-width: 74px;
-  padding-bottom: 2px;
+.itemVolumeSlider {
+  min-height: 44px;
+  padding-inline: 0;
+  accent-color: var(--teal-700);
 }
 
-.rowActions {
-  grid-column: 1 / -1;
+.itemVolumeControl output {
+  border: 1px solid var(--line-strong);
+  border-radius: 7px;
+  padding: 6px;
+  background: var(--paper);
+  color: var(--teal-700);
+  font-weight: 850;
+  text-align: center;
+}
+
+.scheduleRowActions {
+  display: flex;
+  flex-wrap: wrap;
   justify-content: end;
   border-top: 1px solid var(--line);
+  margin-top: 16px;
   padding-top: 14px;
 }
 
@@ -2553,5 +2943,111 @@ select:focus-visible {
   .scheduleRow,
   .activityList {
     box-shadow: none;
+  }
+}
+
+@media (max-width: 900px) {
+  .scheduleSettings {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .scheduleSettings .checkLabel {
+    grid-column: 1 / -1;
+  }
+
+  .scheduleItemCard > summary {
+    grid-template-columns: minmax(76px, auto) minmax(150px, 1fr) auto auto 28px;
+  }
+
+}
+
+@media (max-width: 600px) {
+  .schedulePickerBar,
+  .scheduleSettings,
+  .scheduleFormGrid,
+  .conditionalFields {
+    grid-template-columns: 1fr;
+  }
+
+  .schedulePickerBar button,
+  .scheduleSettingsActions button,
+  .orderRunnerActions button {
+    width: 100%;
+  }
+
+  .scheduleSettingsActions,
+  .orderRunnerActions {
+    display: grid;
+    grid-template-columns: 1fr;
+  }
+
+  .orderRunner,
+  .timeRunner {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .scheduleItemShell {
+    grid-template-columns: 42px minmax(0, 1fr);
+    gap: 6px;
+  }
+
+  .dragHandle {
+    width: 42px;
+    min-width: 42px;
+  }
+
+  .scheduleItemCard > summary {
+    grid-template-columns: auto minmax(0, 1fr) 28px;
+    gap: 8px;
+    padding: 10px;
+  }
+
+  .schedulePosition {
+    min-width: 58px;
+    grid-row: 1;
+  }
+
+  .scheduleSummaryCopy {
+    grid-row: 1;
+  }
+
+  .scheduleItemCard > summary::after {
+    grid-column: 3;
+    grid-row: 1;
+  }
+
+  .scheduleVolumeBadge {
+    width: max-content;
+    grid-column: 1 / 2;
+    grid-row: 2;
+  }
+
+  .scheduleEnabled {
+    grid-column: 2 / 4;
+    grid-row: 2;
+    justify-self: end;
+  }
+
+  .scheduleItemForm {
+    padding: 14px;
+  }
+
+  .weekdayGrid {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+
+  .scheduleRowActions {
+    display: grid;
+    grid-template-columns: 1fr;
+  }
+
+  .scheduleRowActions button {
+    width: 100%;
+  }
+
+  .nowMeta {
+    align-items: flex-start;
+    flex-direction: column-reverse;
   }
 }

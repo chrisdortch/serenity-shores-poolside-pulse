@@ -224,7 +224,7 @@ describe('adjustable levels and exclusive source handoffs', { concurrency: false
     assert.deepEqual(targets, [42]);
     assert.equal(store.state.config.musicLevel, 42);
     assert.equal(store.state.config.voiceLevel, 100);
-    assert.equal(store.state.config.duckLevel, 6);
+    assert.equal(store.state.config.duckLevel, 0);
     assert.equal(store.state.playback.provider, 'controlled');
     assert.equal(store.state.playback.intent, 'playing');
     assert.deepEqual(mutations.map(entry => entry.reason), ['Music level applied', 'Receiver capability']);

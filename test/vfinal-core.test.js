@@ -2,33 +2,51 @@ import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
 
 import {
+  DEFAULT_SCHEDULE_ID,
   DUCK_LEVEL_PERCENT,
   EVENT_TTL_MS,
   LIGHTNING_ANNOUNCEMENT_REPEAT_MS,
+  MAX_SCHEDULE_ITEMS,
   MUSIC_LEVEL_PERCENT,
   RECEIVER_LEASE_MS,
   SAFETY_EVENT_TTL_MS,
   SCHEDULE_CATCHUP_MS,
   SCHEDULE_CLAIM_MS,
+  SCHEDULE_DURATION_DEFAULT_SECONDS,
+  SCHEDULE_DURATION_MAX_SECONDS,
+  SCHEDULE_DURATION_MIN_SECONDS,
   VOICE_LEVEL_PERCENT,
   WEATHER_INTERVAL_MS,
   audioPolicy,
+  cancelSequenceRun,
   clamp,
   completeEvent,
   createDefaultState,
   createTargetedEvent,
   dueScheduleItems,
+  dueTimeScheduleItems,
+  effectiveScheduleItemVolume,
   evaluateWeather,
   eventBelongsToReceiver,
+  getActiveSchedule,
+  inlineAnnouncementText,
   isDirectAudioUrl,
   isSpotifyUrl,
   isSunoUrl,
   makeId,
   makeLog,
   makeReceiverLease,
+  normalizeNamedSchedule,
+  normalizeScheduleItem,
+  normalizeSequenceRun,
+  normalizeSequenceRuns,
   normalizeState,
+  nextOrderScheduleItem,
+  orderedEnabledScheduleItems,
   pendingEventsForReceiver,
   receiverOnline,
+  reorderScheduleItems,
+  resolveScheduleAnnouncementText,
   renewReceiverLease,
   weatherRequestUrl
 } from '../src/vfinal/core.js';
@@ -36,10 +54,10 @@ import {
 const T0 = 1_800_000_000_000;
 
 describe('adjustable mix state and foundational helpers', () => {
-  test('publishes a 30% music default with fixed 100% voice and 6% maximum duck', () => {
+  test('publishes a 30% music default with fixed 100% voice and a full music mute during speech', () => {
     assert.equal(MUSIC_LEVEL_PERCENT, 30);
     assert.equal(VOICE_LEVEL_PERCENT, 100);
-    assert.equal(DUCK_LEVEL_PERCENT, 6);
+    assert.equal(DUCK_LEVEL_PERCENT, 0);
   });
 
   test('normalization preserves adjustable music while overriding hostile voice and duck values', () => {
@@ -58,13 +76,13 @@ describe('adjustable mix state and foundational helpers', () => {
     assert.equal(normalized.config.musicProvider, 'spotify');
     assert.equal(normalized.config.musicLevel, 99);
     assert.equal(normalized.config.voiceLevel, 100);
-    assert.equal(normalized.config.duckLevel, 6);
+    assert.equal(normalized.config.duckLevel, 0);
     assert.equal(normalized.config.weatherIntervalMinutes, 2);
 
     const renormalized = normalizeState(normalized, T0 + 1);
     assert.equal(renormalized.config.musicLevel, 99);
     assert.equal(renormalized.config.voiceLevel, 100);
-    assert.equal(renormalized.config.duckLevel, 6);
+    assert.equal(renormalized.config.duckLevel, 0);
   });
 
   test('normalization clamps music to 0-100 and falls back to the 30% default', () => {
@@ -83,7 +101,7 @@ describe('adjustable mix state and foundational helpers', () => {
       }, T0);
       assert.equal(normalized.config.musicLevel, expected);
       assert.equal(normalized.config.voiceLevel, 100);
-      assert.equal(normalized.config.duckLevel, 6);
+      assert.equal(normalized.config.duckLevel, 0);
     }
   });
 
@@ -115,9 +133,12 @@ describe('adjustable mix state and foundational helpers', () => {
 
     first.announcements[0].label = 'mutated';
     first.schedule[0].days.pop();
+    first.schedules[0].items[0].label = 'named mutation';
 
     assert.notEqual(second.announcements[0].label, 'mutated');
     assert.equal(second.schedule[0].days.length, 7);
+    assert.notEqual(second.schedules[0].items[0].label, 'named mutation');
+    assert.notStrictEqual(first.schedule, first.schedules[0].items);
     assert.equal(first.savedAt, T0);
     assert.equal(second.savedAt, T0 + 1);
   });
@@ -127,6 +148,470 @@ describe('adjustable mix state and foundational helpers', () => {
     assert.equal(clamp(99, 1, 20, 4), 20);
     assert.equal(clamp('bad', 1, 20, 4), 4);
     assert.equal(makeId('event', 36, 0), 'event-10-000000');
+  });
+});
+
+describe('named schedule model and migration', () => {
+  const allDays = [0, 1, 2, 3, 4, 5, 6];
+
+  test('default state exposes one active named time schedule and a separate legacy projection', () => {
+    const state = createDefaultState(T0);
+    const active = getActiveSchedule(state);
+
+    assert.equal(state.activeScheduleId, DEFAULT_SCHEDULE_ID);
+    assert.equal(active.id, DEFAULT_SCHEDULE_ID);
+    assert.equal(active.name, 'Daily Schedule');
+    assert.equal(active.mode, 'time');
+    assert.deepEqual(state.schedule.map(item => item.id), active.items.map(item => item.id));
+    assert.notStrictEqual(state.schedule, active.items);
+    assert.deepEqual(active.items.map(item => item.position.order), [1, 2, 3, 4, 5, 6]);
+  });
+
+  test('migrates a legacy schedule once without changing item IDs or run receipts', () => {
+    const receipts = {
+      'legacy-welcome': '2027-01-14',
+      'legacy-song': { dateKey: '2027-01-14', status: 'completed', completedAt: T0 - 1 }
+    };
+    const migrated = normalizeState({
+      schedule: [
+        { id: 'legacy-welcome', label: 'Welcome', type: 'announcement', time: '09:00', announcementId: 'welcome', enabled: true, days: allDays },
+        { id: 'legacy-song', label: 'Song', type: 'controlled', time: '09:10', url: 'https://cdn.example.test/song.mp3', enabled: true, days: [1] }
+      ],
+      scheduleRuns: receipts
+    }, T0);
+
+    assert.equal(migrated.activeScheduleId, 'legacy-schedule');
+    assert.equal(migrated.schedules.length, 1);
+    assert.equal(migrated.schedules[0].id, 'legacy-schedule');
+    assert.deepEqual(migrated.schedules[0].items.map(item => item.id), ['legacy-welcome', 'legacy-song']);
+    assert.deepEqual(migrated.schedule.map(item => item.id), ['legacy-welcome', 'legacy-song']);
+    assert.deepEqual(migrated.scheduleRuns, receipts);
+    assert.deepEqual(normalizeState(migrated, T0), migrated, 'normalizing the migrated state again must not drift');
+  });
+
+  test('selects the requested named schedule and keeps the legacy timer inert for Order mode', () => {
+    const state = normalizeState({
+      activeScheduleId: 'playlist',
+      schedules: [
+        { id: 'clock', name: 'Clock day', mode: 'time', items: [{ id: 'clock-item', time: '12:30', enabled: true }] },
+        { id: 'playlist', name: 'Pool rotation', mode: 'order', items: [{ id: 'order-item', order: 1, enabled: true }] }
+      ]
+    }, T0);
+
+    assert.equal(getActiveSchedule(state).id, 'playlist');
+    assert.equal(getActiveSchedule(state).mode, 'order');
+    assert.deepEqual(state.schedule, []);
+
+    const switched = normalizeState({ ...state, activeScheduleId: 'clock' }, T0);
+    assert.equal(getActiveSchedule(switched).id, 'clock');
+    assert.deepEqual(switched.schedule.map(item => item.id), ['clock-item']);
+  });
+
+  test('reconciles edits from a legacy time-schedule client without overriding newer named edits', () => {
+    const initial = normalizeState(createDefaultState(T0), T0);
+    initial.schedule[0].time = '08:15';
+    initial.schedule[0].label = 'Legacy edit';
+    const legacyEdited = normalizeState(initial, T0);
+
+    assert.equal(legacyEdited.schedules[0].items[0].position.time, '08:15');
+    assert.equal(legacyEdited.schedules[0].items[0].label, 'Legacy edit');
+
+    legacyEdited.schedules[0].items[0].position.time = '08:45';
+    legacyEdited.schedules[0].items[0].label = 'Named edit';
+    const namedEdited = normalizeState(legacyEdited, T0);
+    assert.equal(namedEdited.schedule[0].time, '08:45');
+    assert.equal(namedEdited.schedule[0].label, 'Named edit');
+  });
+
+  test('preserves rich schedule fields through a legacy-client round trip while normalizing the speech gate', () => {
+    const rich = normalizeState({
+      activeScheduleId: 'rich-time',
+      schedules: [{
+        id: 'rich-time',
+        name: 'Rich Time',
+        mode: 'time',
+        items: [{
+          id: 'inline-rich',
+          label: 'Inline rich announcement',
+          time: '10:15',
+          action: { kind: 'announcement', announcementSource: 'inline', text: 'Do not lose me.' },
+          volume: { mode: 'custom', percent: 77 },
+          advance: { mode: 'duration', durationSeconds: 42 }
+        }]
+      }]
+    }, T0);
+    const legacyProjection = rich.schedule.map(item => ({
+      id: item.id,
+      label: item.label,
+      type: item.type,
+      time: item.time,
+      announcementId: item.announcementId,
+      url: item.url,
+      enabled: item.enabled,
+      days: item.days
+    }));
+    const roundTripped = normalizeState({ ...rich, schedule: legacyProjection }, T0 + 1);
+    const item = getActiveSchedule(roundTripped).items[0];
+
+    assert.equal(item.action.announcementSource, 'inline');
+    assert.equal(item.action.text, 'Do not lose me.');
+    assert.deepEqual(item.volume, { mode: 'custom', percent: 77 });
+    assert.deepEqual(item.advance, { mode: 'complete', durationSeconds: 42 });
+    assert.deepEqual(normalizeState(roundTripped, T0 + 2), roundTripped);
+  });
+
+  test('merges legacy edits, deletion, reorder, and addition without erasing rich-only fields', () => {
+    const initial = normalizeState({
+      activeScheduleId: 'legacy-editable',
+      schedules: [{
+        id: 'legacy-editable',
+        name: 'Legacy Editable',
+        mode: 'time',
+        items: [
+          { id: 'a', label: 'A', type: 'announcement', time: '09:00', action: { announcementSource: 'inline', text: 'Keep A text' }, volume: { mode: 'custom', percent: 61 }, advance: { mode: 'duration', durationSeconds: 11 } },
+          { id: 'b', label: 'B', type: 'controlled', time: '09:10', url: 'https://audio.test/b.mp3', volume: { mode: 'custom', percent: 22 } },
+          { id: 'c', label: 'C', type: 'controlled', time: '09:20', url: 'https://audio.test/c.mp3', action: { text: 'Keep C metadata' }, volume: { mode: 'custom', percent: 44 }, advance: { mode: 'duration', durationSeconds: 33 } }
+        ]
+      }]
+    }, T0);
+    const originalA = structuredClone(getActiveSchedule(initial).items.find(item => item.id === 'a'));
+    const originalC = structuredClone(getActiveSchedule(initial).items.find(item => item.id === 'c'));
+    const legacyEditedProjection = [
+      { id: 'c', label: 'C edited', type: 'spotify', time: '08:45', announcementId: '', url: 'https://open.spotify.com/track/c', enabled: true, days: [1, 3] },
+      { id: 'a', label: 'A', type: 'announcement', time: '09:00', announcementId: '', url: '', enabled: false, days: [2] },
+      { id: 'd', label: 'D added', type: 'controlled', time: '09:30', announcementId: '', url: 'https://audio.test/d.mp3', enabled: true, days: allDays }
+    ];
+    const reconciled = normalizeState({ ...initial, schedule: legacyEditedProjection }, T0 + 1);
+    const items = getActiveSchedule(reconciled).items;
+
+    assert.deepEqual(items.map(item => item.id), ['c', 'a', 'd']);
+    assert.deepEqual(items.map(item => item.position.order), [1, 2, 3]);
+    assert.equal(items[0].label, 'C edited');
+    assert.equal(items[0].action.kind, 'spotify');
+    assert.equal(items[0].action.url, 'https://open.spotify.com/track/c');
+    assert.equal(items[0].position.time, '08:45');
+    assert.deepEqual(items[0].days, [1, 3]);
+    assert.equal(items[0].action.text, originalC.action.text);
+    assert.deepEqual(items[0].volume, originalC.volume);
+    assert.deepEqual(items[0].advance, originalC.advance);
+    assert.equal(items[1].enabled, false);
+    assert.deepEqual(items[1].days, [2]);
+    assert.equal(items[1].action.text, originalA.action.text);
+    assert.deepEqual(items[1].volume, originalA.volume);
+    assert.deepEqual(items[1].advance, originalA.advance);
+    assert.equal(items[2].action.kind, 'controlled');
+    assert.deepEqual(items[2].volume, { mode: 'global', percent: 30 });
+    assert.equal(items[2].advance.mode, 'manual');
+  });
+
+  test('normalizes bounded item fields, aliases, days, volume, and duration', () => {
+    const url = `https://cdn.example.test/${'u'.repeat(2200)}.mp3`;
+    const item = normalizeScheduleItem({
+      id: `  ${'i'.repeat(140)}  `,
+      label: `  ${'L'.repeat(130)}  `,
+      days: [6, '1', 6, -1, 2.5, 9],
+      position: { time: '9:07', order: 999 },
+      action: {
+        kind: 'suno',
+        announcementSource: 'inline',
+        announcementId: 'a'.repeat(140),
+        text: `  ${'T'.repeat(1_000)}  `,
+        url: `  ${url}  `
+      },
+      volume: { mode: 'custom', percent: 500 },
+      advance: { mode: 'duration', durationSeconds: 0 }
+    }, 3);
+
+    assert.equal(item.id.length, 120);
+    assert.equal(item.label.length, 100);
+    assert.deepEqual(item.days, [1, 6]);
+    assert.deepEqual(item.position, { time: '09:07', order: 100 });
+    assert.equal(item.action.kind, 'controlled');
+    assert.equal(item.action.announcementSource, 'inline');
+    assert.equal(item.action.announcementId.length, 120);
+    assert.equal(item.action.text.length, 900);
+    assert.equal(item.action.url.length, 2000);
+    assert.deepEqual(item.volume, { mode: 'custom', percent: 100 });
+    assert.deepEqual(item.advance, { mode: 'duration', durationSeconds: SCHEDULE_DURATION_MIN_SECONDS });
+    assert.equal(item.type, item.action.kind);
+    assert.equal(item.time, item.position.time);
+    assert.equal(item.order, item.position.order);
+    assert.equal(item.announcementId, item.action.announcementId);
+    assert.equal(item.url, item.action.url);
+  });
+
+  test('bounds duration at one day and chooses practical action defaults', () => {
+    const announcement = normalizeScheduleItem({ id: 'announcement' });
+    const track = normalizeScheduleItem({ id: 'track', type: 'spotify' });
+    const tooLong = normalizeScheduleItem({
+      id: 'duration',
+      type: 'controlled',
+      advance: { mode: 'duration', durationSeconds: SCHEDULE_DURATION_MAX_SECONDS + 10 }
+    });
+
+    assert.equal(SCHEDULE_DURATION_DEFAULT_SECONDS, 300);
+    assert.equal(announcement.advance.mode, 'complete');
+    assert.equal(announcement.advance.durationSeconds, SCHEDULE_DURATION_DEFAULT_SECONDS);
+    assert.equal(track.advance.mode, 'manual');
+    assert.equal(tooLong.advance.durationSeconds, SCHEDULE_DURATION_MAX_SECONDS);
+    for (const mode of ['complete', 'track-end', 'duration', 'manual']) {
+      assert.equal(normalizeScheduleItem({ id: mode, type: 'controlled', advance: { mode } }).advance.mode, mode);
+    }
+  });
+
+  test('forces announcements to complete and defaults all music to a manual gate', () => {
+    for (const mode of ['manual', 'duration', 'track-end', 'complete', 'malformed']) {
+      assert.equal(
+        normalizeScheduleItem({ id: `voice-${mode}`, type: 'announcement', advance: { mode } }).advance.mode,
+        'complete'
+      );
+    }
+    assert.equal(normalizeScheduleItem({ id: 'direct', type: 'controlled' }).advance.mode, 'manual');
+    assert.equal(normalizeScheduleItem({ id: 'spotify', type: 'spotify' }).advance.mode, 'manual');
+  });
+
+  test('caps each schedule at 100 items and produces stable contiguous order values', () => {
+    const capped = normalizeNamedSchedule({
+      id: 'large',
+      name: 'Large schedule',
+      mode: 'order',
+      items: Array.from({ length: MAX_SCHEDULE_ITEMS + 5 }, (_, index) => ({ id: `item-${index}` }))
+    });
+    const sorted = normalizeNamedSchedule({
+      id: 'sorted',
+      items: [
+        { id: 'third', order: 3 },
+        { id: 'first-a', order: 1 },
+        { id: 'first-b', order: 1 }
+      ]
+    });
+
+    assert.equal(capped.items.length, MAX_SCHEDULE_ITEMS);
+    assert.deepEqual(capped.items.map(item => item.order), Array.from({ length: MAX_SCHEDULE_ITEMS }, (_, index) => index + 1));
+    assert.deepEqual(sorted.items.map(item => item.id), ['first-a', 'first-b', 'third']);
+    assert.deepEqual(sorted.items.map(item => item.position.order), [1, 2, 3]);
+  });
+
+  test('keeps a valid 100-item inline schedule below the persisted state limit', () => {
+    const state = normalizeState({
+      activeScheduleId: 'capacity',
+      schedules: [{
+        id: 'capacity',
+        name: 'Capacity schedule',
+        mode: 'time',
+        items: Array.from({ length: MAX_SCHEDULE_ITEMS }, (_, index) => ({
+          id: `capacity-${index}`,
+          label: `Item ${index} ${'L'.repeat(90)}`,
+          time: `${String(Math.floor(index / 5) % 24).padStart(2, '0')}:${String((index % 5) * 10).padStart(2, '0')}`,
+          action: { kind: 'announcement', announcementSource: 'inline', text: `Message ${index} ${'T'.repeat(880)}` }
+        }))
+      }]
+    }, T0);
+
+    assert.equal(getActiveSchedule(state).items.length, MAX_SCHEDULE_ITEMS);
+    assert.ok(JSON.stringify(state).length < 200_000, 'maximum valid schedule must fit the API persistence limit');
+    assert.equal(Object.hasOwn(state.schedule[0], 'action'), false, 'legacy projection must not duplicate rich fields');
+  });
+
+  test('reorders immutably and keeps nested and legacy order fields synchronized', () => {
+    const original = normalizeNamedSchedule({
+      id: 'rotation',
+      mode: 'order',
+      items: [{ id: 'one' }, { id: 'two' }, { id: 'three' }]
+    }).items;
+    const reordered = reorderScheduleItems(original, 'three', 1);
+
+    assert.deepEqual(original.map(item => item.id), ['one', 'two', 'three']);
+    assert.deepEqual(reordered.map(item => item.id), ['three', 'one', 'two']);
+    assert.deepEqual(reordered.map(item => item.order), [1, 2, 3]);
+    assert.deepEqual(reordered.map(item => item.position.order), [1, 2, 3]);
+    assert.deepEqual(reorderScheduleItems(reordered, 'missing', 2), reordered);
+  });
+
+  test('resolves global and custom item volumes by action kind', () => {
+    const announcement = normalizeScheduleItem({ id: 'voice', type: 'announcement' });
+    const music = normalizeScheduleItem({ id: 'music', type: 'controlled' });
+    const custom = normalizeScheduleItem({ id: 'custom', type: 'spotify', volume: { mode: 'custom', percent: 47 } });
+
+    assert.equal(effectiveScheduleItemVolume(announcement, { voiceLevel: 100, musicLevel: 22 }), 100);
+    assert.equal(effectiveScheduleItemVolume(music, { voiceLevel: 100, musicLevel: 22 }), 22);
+    assert.equal(effectiveScheduleItemVolume(custom, { musicLevel: 22 }), 47);
+    assert.equal(effectiveScheduleItemVolume(music, 19), 19);
+  });
+
+  test('keeps custom inline speech separate from saved announcements', () => {
+    const saved = normalizeScheduleItem({
+      id: 'saved',
+      action: { kind: 'announcement', announcementSource: 'saved', announcementId: 'welcome' }
+    });
+    const inline = normalizeScheduleItem({
+      id: 'inline',
+      action: { kind: 'announcement', announcementSource: 'inline', announcementId: 'welcome', text: '  Custom pool message  ' }
+    });
+    const emptyInline = normalizeScheduleItem({
+      id: 'empty-inline',
+      action: { kind: 'announcement', announcementSource: 'inline', announcementId: 'welcome', text: '' }
+    });
+    const announcements = [{ id: 'welcome', text: 'Saved welcome' }];
+
+    assert.equal(inlineAnnouncementText(saved), '');
+    assert.equal(inlineAnnouncementText(inline), 'Custom pool message');
+    assert.equal(resolveScheduleAnnouncementText(saved, announcements), 'Saved welcome');
+    assert.equal(resolveScheduleAnnouncementText(inline, announcements), 'Custom pool message');
+    assert.equal(resolveScheduleAnnouncementText(emptyInline, announcements), '');
+  });
+
+  test('migrates the legacy order cursor into a stable durable run record', () => {
+    const legacy = { order: 2, itemId: 'second', updatedAt: T0 };
+    const normalized = normalizeSequenceRun(legacy);
+
+    assert.deepEqual(normalized, {
+      version: 1,
+      order: 2,
+      itemId: 'second',
+      status: 'idle',
+      active: null,
+      lastTriggerId: '',
+      lastOutcome: '',
+      lastError: '',
+      updatedAt: T0
+    });
+    assert.deepEqual(normalizeSequenceRun(normalized), normalized);
+  });
+
+  test('bounds rich run fields and drops unsafe or unknown persisted values', () => {
+    const schedules = [{ id: 'known-order', mode: 'order', items: [] }];
+    const runs = normalizeSequenceRuns({
+      'known-order': {
+        version: 999,
+        order: 500,
+        itemId: ` ${'i'.repeat(150)} `,
+        status: 'waiting-duration',
+        active: {
+          token: ` ${'t'.repeat(200)} `,
+          triggerId: ` ${'g'.repeat(200)} `,
+          itemId: 'active-item',
+          order: 999,
+          kind: 'spotify',
+          advanceMode: 'duration',
+          receiverId: ` ${'r'.repeat(200)} `,
+          sessionId: ` ${'s'.repeat(200)} `,
+          claimedAt: -1,
+          startedAt: T0 + 1,
+          dueAt: Number.POSITIVE_INFINITY,
+          expectedProvider: 'SPOTIFY',
+          expectedUrl: ` https://example.test/${'u'.repeat(2200)} `
+        },
+        lastTriggerId: 'x'.repeat(300),
+        lastOutcome: 'armed',
+        lastError: ` ${'e'.repeat(400)} `,
+        updatedAt: Number.MAX_SAFE_INTEGER + 1_000
+      },
+      unknown: { order: 1, itemId: 'never-keep-me' }
+    }, schedules);
+
+    assert.deepEqual(Object.keys(runs), ['known-order']);
+    const run = runs['known-order'];
+    assert.equal(run.version, 1);
+    assert.equal(run.order, MAX_SCHEDULE_ITEMS);
+    assert.equal(run.itemId.length, 120);
+    assert.equal(run.active.token.length, 160);
+    assert.equal(run.active.triggerId.length, 160);
+    assert.equal(run.active.order, MAX_SCHEDULE_ITEMS);
+    assert.equal(run.active.kind, 'spotify');
+    assert.equal(run.active.advanceMode, 'duration');
+    assert.equal(run.active.receiverId.length, 160);
+    assert.equal(run.active.sessionId.length, 160);
+    assert.equal(run.active.claimedAt, 0);
+    assert.equal(run.active.startedAt, T0 + 1);
+    assert.equal(run.active.dueAt, 0);
+    assert.equal(run.active.expectedProvider, 'spotify');
+    assert.equal(run.active.expectedUrl.length, 2000);
+    assert.equal(run.lastTriggerId.length, 160);
+    assert.equal(run.lastOutcome, 'armed');
+    assert.equal(run.lastError.length, 300);
+    assert.equal(run.updatedAt, Number.MAX_SAFE_INTEGER);
+
+    const invalid = normalizeSequenceRun({
+      status: 'hostile',
+      active: { token: '', itemId: 'item', order: 1 },
+      lastOutcome: 'invented'
+    });
+    assert.equal(invalid.status, 'idle');
+    assert.equal(invalid.active, null);
+    assert.equal(invalid.lastOutcome, '');
+  });
+
+  test('normalizes sequence runs in state and keeps only known schedule IDs', () => {
+    const state = normalizeState({
+      activeScheduleId: 'rotation',
+      schedules: [{
+        id: 'rotation',
+        name: 'Rotation',
+        mode: 'order',
+        items: [{ id: 'one', type: 'controlled' }]
+      }],
+      sequenceRuns: {
+        rotation: { order: 1, itemId: 'one', updatedAt: T0 },
+        removed: { order: 99, itemId: 'old' }
+      }
+    }, T0);
+
+    assert.equal(createDefaultState(T0).sequenceRuns && Object.keys(createDefaultState(T0).sequenceRuns).length, 0);
+    assert.deepEqual(Object.keys(state.sequenceRuns), ['rotation']);
+    assert.equal(state.sequenceRuns.rotation.order, 1);
+    assert.equal(state.sequenceRuns.rotation.itemId, 'one');
+    assert.equal(state.sequenceRuns.rotation.status, 'idle');
+    assert.deepEqual(normalizeState(state, T0), state);
+  });
+
+  test('skips disabled Order items and never wraps after the final committed order', () => {
+    const schedule = normalizeNamedSchedule({
+      id: 'rotation',
+      mode: 'order',
+      items: [
+        { id: 'one', order: 1, enabled: true },
+        { id: 'two-disabled', order: 2, enabled: false },
+        { id: 'three', order: 3, enabled: true }
+      ]
+    });
+
+    assert.deepEqual(orderedEnabledScheduleItems(schedule).map(item => item.id), ['one', 'three']);
+    assert.equal(nextOrderScheduleItem(schedule, 0)?.id, 'one');
+    assert.equal(nextOrderScheduleItem(schedule, 1)?.id, 'three');
+    assert.equal(nextOrderScheduleItem(schedule, 2)?.id, 'three');
+    assert.equal(nextOrderScheduleItem(schedule, 3), null);
+    assert.equal(nextOrderScheduleItem(schedule, 100), null);
+    assert.deepEqual(orderedEnabledScheduleItems({ ...schedule, mode: 'time' }), []);
+    assert.equal(nextOrderScheduleItem({ ...schedule, enabled: false }, 0), null);
+  });
+
+  test('cancellation preserves the committed cursor and active trigger replay guard', () => {
+    const cancelled = cancelSequenceRun({
+      order: 2,
+      itemId: 'two',
+      status: 'waiting-duration',
+      active: {
+        token: 'step-token',
+        triggerId: 'event-123',
+        itemId: 'three',
+        order: 3,
+        kind: 'controlled',
+        advanceMode: 'duration'
+      },
+      lastTriggerId: 'event-old',
+      lastOutcome: 'armed',
+      updatedAt: T0 - 1
+    }, T0, ` Reset requested ${'x'.repeat(400)} `);
+
+    assert.equal(cancelled.order, 2);
+    assert.equal(cancelled.itemId, 'two');
+    assert.equal(cancelled.status, 'cancelled');
+    assert.equal(cancelled.active, null);
+    assert.equal(cancelled.lastTriggerId, 'event-123');
+    assert.equal(cancelled.lastOutcome, 'cancelled');
+    assert.equal(cancelled.lastError.length, 300);
+    assert.equal(cancelled.updatedAt, T0);
   });
 });
 
@@ -306,6 +791,22 @@ describe('schedule due-time policy', () => {
     assert.deepEqual(due.map(item => item.id), ['due', 'empty-days-means-every-day']);
   });
 
+  test('accepts a named Time schedule with nested positions and rejects Order schedules', () => {
+    const timeSchedule = normalizeNamedSchedule({
+      id: 'clock',
+      mode: 'time',
+      items: [{ id: 'nested-time', enabled: true, days: [1], position: { time: '12:30', order: 1 } }]
+    });
+    const orderSchedule = { ...timeSchedule, mode: 'order' };
+
+    assert.deepEqual(
+      dueTimeScheduleItems(timeSchedule, {}, mondayAt123045Chicago, 'America/Chicago').map(item => item.id),
+      ['nested-time']
+    );
+    assert.deepEqual(dueTimeScheduleItems(orderSchedule, {}, mondayAt123045Chicago, 'America/Chicago'), []);
+    assert.deepEqual(dueTimeScheduleItems({ ...timeSchedule, enabled: false }, {}, mondayAt123045Chicago, 'America/Chicago'), []);
+  });
+
   test('includes the exact catch-up boundary and excludes the next second', () => {
     const schedule = [{ id: 'boundary', enabled: true, time: '12:30', days: allDays }];
     const exactBoundary = Date.UTC(2026, 6, 6, 17, 31, 30);
@@ -387,12 +888,12 @@ describe('audio policy', () => {
       exact: true,
       musicPercent: 42,
       voicePercent: 100,
-      duringVoicePercent: 6,
+      duringVoicePercent: 0,
       action: 'duck'
     });
 
     const quietTarget = audioPolicy({ provider: 'controlled', musicPercent: 4 });
-    assert.equal(quietTarget.duringVoicePercent, 4, 'duck must never raise music above its selected target');
+    assert.equal(quietTarget.duringVoicePercent, 0, 'every controlled music target must mute fully during speech');
   });
 
   test('desktop Spotify with verified volume support uses 30% and pauses for voice', () => {

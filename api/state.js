@@ -22,6 +22,8 @@ const VERSIONED_STATE_KEYS = {
 };
 const FINAL_STATE_VERSION = 'final';
 const KV_REQUEST_TIMEOUT_MS = 8_000;
+const FINAL_MAX_REQUEST_BYTES = 1_100_000;
+const FINAL_MAX_STATE_BYTES = 1_000_000;
 const FINAL_COMPARE_AND_SET_SCRIPT = `
 local current = redis.call("GET", KEYS[1])
 local currentRevision = 0
@@ -57,15 +59,62 @@ globalThis.__POOL_SIDE_MEMORY_STATES__ ||= {};
 globalThis.__POOL_SIDE_MEMORY_STATE_LOCKS__ ||= new Map();
 
 async function readBody(req) {
-  if (req.body && typeof req.body === 'object') return req.body;
-  if (typeof req.body === 'string') return JSON.parse(req.body || '{}');
+  if (req.body && typeof req.body === 'object') {
+    if (Buffer.byteLength(JSON.stringify(req.body), 'utf8') > FINAL_MAX_REQUEST_BYTES) {
+      const error = new Error('Request exceeds the 1.1 MB limit.');
+      error.statusCode = 413;
+      throw error;
+    }
+    return req.body;
+  }
+  if (typeof req.body === 'string') {
+    if (Buffer.byteLength(req.body, 'utf8') > FINAL_MAX_REQUEST_BYTES) {
+      const error = new Error('Request exceeds the 1.1 MB limit.');
+      error.statusCode = 413;
+      throw error;
+    }
+    try {
+      return JSON.parse(req.body || '{}');
+    } catch {
+      const error = new Error('Invalid JSON body.');
+      error.statusCode = 400;
+      throw error;
+    }
+  }
   return await new Promise((resolve, reject) => {
-    let raw = '';
-    req.on('data', chunk => { raw += chunk; if (raw.length > 250000) reject(new Error('Request too large.')); });
-    req.on('end', () => {
-      try { resolve(raw ? JSON.parse(raw) : {}); } catch (error) { reject(error); }
+    const chunks = [];
+    let receivedBytes = 0;
+    let settled = false;
+    req.on('data', chunk => {
+      if (settled) return;
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk), 'utf8');
+      receivedBytes += buffer.byteLength;
+      if (receivedBytes > FINAL_MAX_REQUEST_BYTES) {
+        settled = true;
+        const error = new Error('Request exceeds the 1.1 MB limit.');
+        error.statusCode = 413;
+        reject(error);
+        return;
+      }
+      chunks.push(buffer);
     });
-    req.on('error', reject);
+    req.on('end', () => {
+      if (settled) return;
+      settled = true;
+      try {
+        const raw = chunks.length ? Buffer.concat(chunks, receivedBytes).toString('utf8') : '';
+        resolve(raw ? JSON.parse(raw) : {});
+      } catch (error) {
+        const invalid = new Error('Invalid JSON body.');
+        invalid.statusCode = 400;
+        reject(invalid);
+      }
+    });
+    req.on('error', error => {
+      if (settled) return;
+      settled = true;
+      reject(error);
+    });
   });
 }
 
@@ -239,7 +288,7 @@ function sanitizeV23QuietBed(clean) {
 }
 
 function sanitizeFinalState(state) {
-  const clean = { ...state };
+  const clean = { ...state, version: FINAL_STATE_VERSION };
   const sourceConfig = state.config && typeof state.config === 'object' && !Array.isArray(state.config)
     ? state.config
     : {};
@@ -247,9 +296,14 @@ function sanitizeFinalState(state) {
     ...sourceConfig,
     musicLevel: clampNumber(sourceConfig.musicLevel, 0, 100, 30),
     voiceLevel: 100,
-    duckLevel: 6
+    duckLevel: 0
   };
   return clean;
+}
+
+function sanitizeFinalNamespaceState(state) {
+  if (!state || typeof state !== 'object' || Array.isArray(state)) return null;
+  return sanitizeFinalState({ ...state, version: FINAL_STATE_VERSION });
 }
 
 function sanitizeState(state) {
@@ -350,15 +404,27 @@ function sanitizeState(state) {
 }
 
 function finalizeState(state, previous = null) {
-  const previousSafe = sanitizeState(previous);
-  const stateSafe = sanitizeState(state);
-  const merged = { ...(previousSafe || {}), ...stateSafe };
-  merged.events = mergeById(80, false, recentEvents(previousSafe?.events), recentEvents(stateSafe.events));
-  merged.activityLog = mergeById(160, true, previousSafe?.activityLog, stateSafe.activityLog);
-  return sanitizeState({
+  const previousRevision = stateRevision(previous);
+  if (previousRevision >= Number.MAX_SAFE_INTEGER) throw new Error('State revision limit reached; the state store must be repaired before another write.');
+  const previousSafe = sanitizeFinalNamespaceState(previous);
+  const incomingConfig = state?.config && typeof state.config === 'object' && !Array.isArray(state.config)
+    ? state.config
+    : {};
+  const merged = {
+    ...(previousSafe || {}),
+    ...(state || {}),
+    version: FINAL_STATE_VERSION,
+    config: {
+      ...(previousSafe?.config || {}),
+      ...incomingConfig
+    }
+  };
+  merged.events = mergeById(80, false, recentEvents(previousSafe?.events), recentEvents(state?.events));
+  merged.activityLog = mergeById(160, true, previousSafe?.activityLog, state?.activityLog);
+  return sanitizeFinalNamespaceState({
     ...merged,
     savedAt: Date.now(),
-    revision: Math.max(Number(previous?.revision || 0), Number(state.revision || 0)) + 1
+    revision: Math.max(previousRevision, stateRevision(state)) + 1
   });
 }
 
@@ -383,14 +449,14 @@ export default async function handler(req, res) {
       const stateKey = stateKeyFor(req);
       if (hasKv) {
         const raw = await kv(['GET', stateKey]);
-        return json(res, 200, { ok: true, cloudSync: true, syncMode: 'kv', serverTime: Date.now(), state: sanitizeState(parseState(raw)), note: 'KV cloud sync active.' });
+        return json(res, 200, { ok: true, cloudSync: true, syncMode: 'kv', serverTime: Date.now(), state: sanitizeFinalNamespaceState(parseState(raw)), note: 'KV cloud sync active.' });
       }
       return json(res, 200, {
         ok: true,
         cloudSync: false,
         syncMode: 'memory',
         serverTime: Date.now(),
-        state: sanitizeState(globalThis.__POOL_SIDE_MEMORY_STATES__[stateKey] || null),
+        state: sanitizeFinalNamespaceState(globalThis.__POOL_SIDE_MEMORY_STATES__[stateKey] || null),
         note: 'Temporary server memory is active on this instance only. Add Vercel KV/Upstash for cloud sync.'
       });
     }
@@ -410,8 +476,8 @@ export default async function handler(req, res) {
       }
       const body = await readBody(req);
       const finalRequest = isFinalRequest(req, body);
-      const state = body.state || {};
-      if (!state || typeof state !== 'object') return json(res, 400, { ok: false, error: 'state object required.', serverTime: Date.now() });
+      const state = body.state;
+      if (!state || typeof state !== 'object' || Array.isArray(state)) return json(res, 400, { ok: false, error: 'state object required.', serverTime: Date.now() });
       if (finalRequest && !session && !requireSession(req, res)) return;
       const expectedRevision = body.expectedRevision;
       if (finalRequest && (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0)) {
@@ -432,12 +498,12 @@ export default async function handler(req, res) {
           return {
             conflict: true,
             currentRevision: previousRevision,
-            currentState: sanitizeState(previous)
+            currentState: sanitizeFinalNamespaceState(previous)
           };
         }
-        const safe = finalizeState(finalRequest ? { ...state, revision: previousRevision } : state, previous);
+        const safe = finalizeState({ ...state, version: FINAL_STATE_VERSION, revision: previousRevision }, previous);
         const raw = JSON.stringify(safe);
-        if (raw.length > 200000) return { tooLarge: true, safe: null };
+        if (Buffer.byteLength(raw, 'utf8') > FINAL_MAX_STATE_BYTES) return { tooLarge: true, safe: null };
         if (hasKv && finalRequest) {
           const cas = await kv([
             'EVAL',
@@ -449,7 +515,7 @@ export default async function handler(req, res) {
           ]);
           if (!Array.isArray(cas) || cas.length < 2) throw new Error('KV compare-and-set returned an invalid response.');
           if (Number(cas[0]) !== 1) {
-            const currentState = sanitizeState(parseState(cas[2]));
+            const currentState = sanitizeFinalNamespaceState(parseState(cas[2]));
             return {
               conflict: true,
               currentRevision: stateRevision(currentState),
@@ -483,7 +549,7 @@ export default async function handler(req, res) {
           serverTime: Date.now()
         });
       }
-      if (result.tooLarge) return json(res, 400, { ok: false, error: 'State too large.', serverTime: Date.now() });
+      if (result.tooLarge) return json(res, 400, { ok: false, error: 'Saved schedules exceed the 1 MB state limit. Shorten large custom announcements or remove unused schedules.', serverTime: Date.now() });
       if (hasKv) {
         return json(res, 200, { ok: true, cloudSync: true, syncMode: 'kv', serverTime: Date.now(), state: result.safe, note: 'KV cloud sync active.' });
       }
@@ -499,6 +565,7 @@ export default async function handler(req, res) {
 
     return json(res, 405, { ok: false, error: 'GET or POST required.', serverTime: Date.now() });
   } catch (error) {
-    return json(res, 500, { ok: false, cloudSync: false, error: error.message || 'State sync failed.', serverTime: Date.now() });
+    const status = [400, 413].includes(Number(error?.statusCode)) ? Number(error.statusCode) : 500;
+    return json(res, status, { ok: false, cloudSync: false, error: error.message || 'State sync failed.', serverTime: Date.now() });
   }
 }

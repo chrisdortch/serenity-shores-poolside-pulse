@@ -9,6 +9,60 @@ function wait(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+const CALIBRATION_TIMEOUT_MS = 30_000;
+
+function calibrationAbortError(reason = 'Sound check stopped.') {
+  if (reason instanceof Error) return reason;
+  const error = new Error(String(reason || 'Sound check stopped.'));
+  error.name = 'AbortError';
+  return error;
+}
+
+function throwIfAborted(signal) {
+  if (signal?.aborted) throw calibrationAbortError(signal.reason);
+}
+
+function abortable(promise, signal) {
+  if (!signal) return Promise.resolve(promise);
+  if (signal.aborted) return Promise.reject(calibrationAbortError(signal.reason));
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const cleanup = () => signal.removeEventListener('abort', onAbort);
+    const finish = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      fn(value);
+    };
+    const onAbort = () => finish(reject, calibrationAbortError(signal.reason));
+    signal.addEventListener('abort', onAbort, { once: true });
+    Promise.resolve(promise).then(
+      value => finish(resolve, value),
+      error => finish(reject, error)
+    );
+  });
+}
+
+function abortableWait(ms, signal) {
+  if (!signal) return wait(ms);
+  if (signal.aborted) return Promise.reject(calibrationAbortError(signal.reason));
+  return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      clearTimeout(timer);
+      signal.removeEventListener('abort', onAbort);
+    };
+    const onAbort = () => {
+      cleanup();
+      reject(calibrationAbortError(signal.reason));
+    };
+    const timer = setTimeout(() => {
+      cleanup();
+      resolve(true);
+    }, ms);
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
 function withTimeout(promise, timeoutMs, message) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error(message)), timeoutMs);
@@ -137,12 +191,17 @@ export class AudioEngine {
     this.unlocked = false;
     this.currentLabel = '';
     this.currentUrl = '';
+    this.currentRunToken = '';
     this.currentTrackIndex = 0;
     this.builtInBed = null;
     this.voiceSource = null;
     this.voiceCancel = null;
     this.speechCancel = null;
     this.announcementDepth = 0;
+    this.musicRamp = null;
+    this.calibrationActive = false;
+    this.calibrationController = null;
+    this.calibrationPromise = null;
   }
 
   status() {
@@ -154,8 +213,10 @@ export class AudioEngine {
       voiceLevelPercent: VOICE_LEVEL_PERCENT,
       duckLevelPercent: Math.round(this.duckLevel * 100),
       musicPlaying: this.musicPlaying(),
+      calibrationActive: this.calibrationActive,
       label: this.currentLabel,
-      url: this.currentUrl
+      url: this.currentUrl,
+      scheduledRunToken: this.currentRunToken
     };
   }
 
@@ -179,7 +240,10 @@ export class AudioEngine {
     musicLimiter.attack.value = 0.003;
     musicLimiter.release.value = 0.18;
     musicBus.gain.value = this.musicLevel;
-    musicBus.connect(musicAnalyser).connect(musicLimiter).connect(context.destination);
+    // Keep the signal verifier ahead of the adjustable music gain. At a valid
+    // 0% target the destination must be silent, but source PCM still needs to
+    // be distinguishable from a stalled, silent, or CORS-blocked media source.
+    musicBus.connect(musicLimiter).connect(context.destination);
 
     const voiceInput = context.createGain();
     const highPass = context.createBiquadFilter();
@@ -209,6 +273,7 @@ export class AudioEngine {
 
     this.context = context;
     this.musicBus = musicBus;
+    this.musicRamp = null;
     this.musicAnalyser = musicAnalyser;
     this.voiceInput = voiceInput;
     this.voiceBus = voiceBus;
@@ -266,15 +331,15 @@ export class AudioEngine {
     this.musicElement = audio;
     const context = this.ensureGraph();
     this.musicElementSource = context.createMediaElementSource(audio);
-    this.musicElementSource.connect(this.musicBus);
+    this.musicElementSource.connect(this.musicAnalyser).connect(this.musicBus);
     audio.addEventListener('playing', () => {
-      if (!this.primingMusic) this.onPlayback({ type: 'playing', label: this.currentLabel, url: this.currentUrl });
+      if (!this.primingMusic) this.onPlayback({ type: 'playing', label: this.currentLabel, url: this.currentUrl, scheduledRunToken: this.currentRunToken });
     });
     audio.addEventListener('pause', () => {
-      if (!this.primingMusic) this.onPlayback({ type: 'paused', label: this.currentLabel, url: this.currentUrl });
+      if (!this.primingMusic) this.onPlayback({ type: 'paused', label: this.currentLabel, url: this.currentUrl, scheduledRunToken: this.currentRunToken });
     });
-    audio.addEventListener('ended', () => this.onPlayback({ type: 'ended', label: this.currentLabel, url: this.currentUrl }));
-    audio.addEventListener('error', () => this.onPlayback({ type: 'error', label: this.currentLabel, url: this.currentUrl, error: audio.error?.message || 'Audio media error' }));
+    audio.addEventListener('ended', () => this.onPlayback({ type: 'ended', label: this.currentLabel, url: this.currentUrl, scheduledRunToken: this.currentRunToken }));
+    audio.addEventListener('error', () => this.onPlayback({ type: 'error', label: this.currentLabel, url: this.currentUrl, scheduledRunToken: this.currentRunToken, error: audio.error?.message || 'Audio media error' }));
     return audio;
   }
 
@@ -326,9 +391,36 @@ export class AudioEngine {
     const context = this.ensureGraph();
     const target = clamp(level, 0, 1, this.musicLevel);
     const now = context.currentTime;
-    this.musicBus.gain.cancelScheduledValues(now);
-    this.musicBus.gain.setValueAtTime(this.musicBus.gain.value, now);
-    this.musicBus.gain.linearRampToValueAtTime(target, now + Math.max(0.01, rampMs / 1000));
+    const gain = this.musicBus.gain;
+    const previousRamp = this.musicRamp;
+    let heldValue = Number(gain.value);
+    if (previousRamp) {
+      if (now <= previousRamp.startTime) {
+        heldValue = previousRamp.startValue;
+      } else if (now >= previousRamp.endTime) {
+        heldValue = previousRamp.targetValue;
+      } else {
+        const progress = (now - previousRamp.startTime) / (previousRamp.endTime - previousRamp.startTime);
+        heldValue = previousRamp.startValue + (previousRamp.targetValue - previousRamp.startValue) * progress;
+      }
+    }
+    heldValue = clamp(heldValue, 0, 1, target);
+
+    let heldNatively = false;
+    if (typeof gain.cancelAndHoldAtTime === 'function') {
+      try {
+        gain.cancelAndHoldAtTime(now);
+        heldNatively = true;
+      } catch {}
+    }
+    if (!heldNatively) {
+      gain.cancelScheduledValues(now);
+      gain.setValueAtTime(heldValue, now);
+    }
+
+    const endTime = now + Math.max(0.01, rampMs / 1000);
+    gain.linearRampToValueAtTime(target, endTime);
+    this.musicRamp = { startValue: heldValue, targetValue: target, startTime: now, endTime };
   }
 
   setMusicLevelPercent(percent, { rampMs = 140, report = true } = {}) {
@@ -357,7 +449,7 @@ export class AudioEngine {
     return false;
   }
 
-  async playMusicUrl(url, { label = 'Suno / direct audio', loop = false, startAt = 0 } = {}) {
+  async playMusicUrl(url, { label = 'Suno / direct audio', loop = false, startAt = 0, scheduledRunToken = '' } = {}) {
     if (!this.unlocked) throw new Error('Start Receiver before playing music.');
     const raw = String(url || '').trim();
     if (!/^https:\/\//i.test(raw)) throw new Error('Music needs a secure HTTPS Suno or direct audio URL.');
@@ -375,7 +467,8 @@ export class AudioEngine {
     audio.volume = 1;
     this.currentUrl = raw;
     this.currentLabel = String(label || 'Suno / direct audio');
-    this.setMusicBus(this.musicLevel, 80);
+    this.currentRunToken = String(scheduledRunToken || '');
+    this.setMusicBus(this.announcementDepth > 0 ? this.duckLevel : this.musicLevel, 80);
     if (!changed && !audio.paused && !audio.ended) {
       this.report(`${this.currentLabel} is already playing through the exact ${Math.round(this.musicLevel * 100)}% music bus.`, true);
       return true;
@@ -425,7 +518,7 @@ export class AudioEngine {
       await withTimeout(context.resume(), 5_000, 'The receiver mixer did not resume. Keep this page visible and tap Start Receiver again.');
     }
     if (context.state !== 'running') throw new Error(`Receiver audio is ${context.state}; music stayed paused.`);
-    this.setMusicBus(this.musicLevel, 120);
+    this.setMusicBus(this.announcementDepth > 0 ? this.duckLevel : this.musicLevel, 120);
     await withTimeout(Promise.resolve(this.musicElement.play()), 12_000, 'The paused track could not resume through the calibrated mixer.');
     if (!await this.verifyMusicSignal()) {
       this.musicElement.pause();
@@ -442,6 +535,7 @@ export class AudioEngine {
     }
     this.currentLabel = '';
     this.currentUrl = '';
+    this.currentRunToken = '';
     this.report('Music stopped.', true);
     return changed;
   }
@@ -464,42 +558,55 @@ export class AudioEngine {
       oscillator.start();
       return { oscillator, gain };
     });
+    let stopped = false;
     const playback = {
       stop: () => {
+        if (stopped) return false;
+        stopped = true;
         oscillators.forEach(({ oscillator, gain }) => {
           try { oscillator.stop(); } catch {}
           try { oscillator.disconnect(); gain.disconnect(); } catch {}
         });
         try { master.disconnect(); } catch {}
+        return true;
       }
     };
     this.builtInBed = playback;
     this.currentLabel = label;
     this.currentUrl = 'poolside://calibration-bed';
-    this.setMusicBus(this.musicLevel, 120);
+    this.currentRunToken = '';
+    this.setMusicBus(this.announcementDepth > 0 ? this.duckLevel : this.musicLevel, 120);
     this.report(`${label} is playing through the exact ${Math.round(this.musicLevel * 100)}% music bus.`, true);
     return true;
   }
 
   stopBuiltInBed() {
     if (!this.builtInBed) return false;
-    try { this.builtInBed.stop(); } catch {}
+    const playback = this.builtInBed;
     this.builtInBed = null;
+    try { playback.stop(); } catch {}
+    if (this.currentUrl === 'poolside://calibration-bed') {
+      this.currentLabel = '';
+      this.currentUrl = '';
+    }
     return true;
   }
 
-  async beginAnnouncement() {
+  async beginAnnouncement({ signal = null } = {}) {
+    throwIfAborted(signal);
     this.announcementDepth += 1;
     if (this.announcementDepth > 1) return;
     this.setMusicBus(this.duckLevel, 320);
-    await wait(380);
+    await abortableWait(380, signal);
   }
 
-  async endAnnouncement({ restore = true } = {}) {
+  async endAnnouncement({ restore = true, signal = null } = {}) {
     this.announcementDepth = Math.max(0, this.announcementDepth - 1);
     if (this.announcementDepth > 0) return;
     if (!restore) return;
-    await wait(220);
+    await abortableWait(220, signal);
+    throwIfAborted(signal);
+    if (this.announcementDepth > 0) return;
     this.setMusicBus(this.musicLevel, 450);
   }
 
@@ -618,27 +725,85 @@ export class AudioEngine {
     }
   }
 
-  async runCalibration({ speak = null } = {}) {
-    await this.unlock({ audibleTest: true });
-    const targetPercent = Math.round(this.musicLevel * 100);
-    this.playBuiltInBed({ label: `${targetPercent}% calibration bed` });
-    try {
-      await wait(1_100);
-      await this.beginAnnouncement();
-      try {
-        const message = `Poolside Pulse sound check. Music is at ${targetPercent} percent. This announcement is at one hundred percent.`;
-        if (typeof speak === 'function') await speak(message);
-        else await this.playDeviceSpeech(message);
-      } finally {
-        await this.endAnnouncement();
-      }
-    } finally {
-      this.stopBuiltInBed();
+  stopCalibration(reason = 'Sound check stopped.', options = {}) {
+    if (reason && typeof reason === 'object' && !(reason instanceof Error)) {
+      options = reason;
+      reason = options.reason || 'Sound check stopped.';
     }
+    const { ok = true, report = true } = options || {};
+    const controller = this.calibrationController;
+    if (!this.calibrationActive && !controller && !this.builtInBed) return false;
+    const error = calibrationAbortError(reason);
+    if (controller && !controller.signal.aborted) controller.abort(error);
+    this.stopVoice(error.message);
+    this.stopBuiltInBed();
+    this.announcementDepth = 0;
+    if (this.musicBus) this.setMusicBus(this.musicLevel, 60);
+    this.calibrationActive = false;
+    if (this.calibrationController === controller) this.calibrationController = null;
+    if (report) this.report(error.message, ok);
     return true;
   }
 
+  runCalibration({ speak = null } = {}) {
+    if (this.calibrationPromise) return this.calibrationPromise;
+
+    const controller = new AbortController();
+    const { signal } = controller;
+    this.calibrationController = controller;
+    this.calibrationActive = true;
+    this.report('Sound check starting. Use Stop Sound Check at any time.', true);
+
+    const timeout = setTimeout(() => {
+      if (this.calibrationController !== controller || signal.aborted) return;
+      this.stopCalibration('Sound check reached its 30-second safety limit and was stopped.', { ok: false });
+    }, CALIBRATION_TIMEOUT_MS);
+
+    const task = (async () => {
+      let completed = false;
+      try {
+        // The calibration bed itself is the audible test. Avoid starting a
+        // second unlock oscillator that could outlive a cancelled sound check.
+        await abortable(this.unlock({ audibleTest: false }), signal);
+        throwIfAborted(signal);
+        const targetPercent = Math.round(this.musicLevel * 100);
+        this.playBuiltInBed({ label: `${targetPercent}% calibration bed` });
+        await abortableWait(1_100, signal);
+        await this.beginAnnouncement({ signal });
+        try {
+          const message = `Poolside Pulse sound check. Music is at ${targetPercent} percent. This announcement is at one hundred percent.`;
+          const speech = typeof speak === 'function' ? speak(message, { signal }) : this.playDeviceSpeech(message);
+          await abortable(speech, signal);
+        } finally {
+          if (!signal.aborted) await this.endAnnouncement({ signal });
+        }
+        completed = true;
+        return true;
+      } finally {
+        clearTimeout(timeout);
+        this.stopBuiltInBed();
+        if (this.announcementDepth > 0) {
+          this.announcementDepth = 0;
+          if (this.musicBus) this.setMusicBus(this.musicLevel, 80);
+        }
+        if (this.calibrationController === controller) {
+          this.calibrationController = null;
+          this.calibrationActive = false;
+          if (completed) this.report('Sound check completed and its calibration tone is off.', true);
+          else if (!signal.aborted) this.report('Sound check ended early and its calibration tone is off.', false);
+        }
+      }
+    })();
+
+    const wrappedTask = task.finally(() => {
+      if (this.calibrationPromise === wrappedTask) this.calibrationPromise = null;
+    });
+    this.calibrationPromise = wrappedTask;
+    return wrappedTask;
+  }
+
   destroy() {
+    this.stopCalibration('Sound check stopped because the receiver closed.', { ok: true });
     this.stopVoice();
     this.stopMusic();
     if (this.musicElement) {
@@ -650,6 +815,7 @@ export class AudioEngine {
       try { this.context.close(); } catch {}
       this.context = null;
     }
+    this.musicRamp = null;
     this.unlocked = false;
   }
 }

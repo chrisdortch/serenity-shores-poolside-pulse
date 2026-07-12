@@ -10,7 +10,7 @@ const SESSION_TTL_SECONDS = 24 * 60 * 60;
 const SESSION_RENEW_AFTER_SECONDS = 12 * 60 * 60;
 const SESSION_CLOCK_SKEW_SECONDS = 5 * 60;
 const PRODUCTION_PASSPHRASE_MIN_LENGTH = 8;
-const SECRET_CONTEXT = 'serenity-shores-poolside-pulse:vfinal:session:v1';
+const SECRET_CONTEXT = 'serenity-shores-poolside-pulse:vfinal:session:v2:pin-bound';
 
 globalThis.__POOL_SIDE_API_RATE_LIMITS__ ||= new Map();
 
@@ -45,7 +45,8 @@ function sessionSecretSource() {
 function sessionSigningKey() {
   const source = sessionSecretSource();
   if (!source) return null;
-  return createHash('sha256').update(`${SECRET_CONTEXT}\0${source}`).digest();
+  const pinBinding = createHash('sha256').update(expectedPin()).digest('hex');
+  return createHash('sha256').update(`${SECRET_CONTEXT}\0${source}\0${pinBinding}`).digest();
 }
 
 function sign(encodedPayload, key) {
@@ -251,7 +252,10 @@ export function consumeRateLimit(key, { limit, windowMs }) {
 }
 
 export async function readJsonBody(req, maxBytes = 16_000) {
-  if (req.body && typeof req.body === 'object') return req.body;
+  if (req.body && typeof req.body === 'object') {
+    if (Buffer.byteLength(JSON.stringify(req.body), 'utf8') > maxBytes) throw new Error('Request too large.');
+    return req.body;
+  }
   if (typeof req.body === 'string') {
     if (Buffer.byteLength(req.body) > maxBytes) throw new Error('Request too large.');
     return JSON.parse(req.body || '{}');

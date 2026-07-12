@@ -4,7 +4,138 @@ import { describe, test } from 'node:test';
 import { createSessionToken } from '../api/_auth.js';
 import ttsHandler from '../api/tts.js';
 import { AudioEngine, estimateDeviceSpeechTimeoutMs } from '../src/vfinal/audio-engine.js';
+import { DUCK_LEVEL_PERCENT } from '../src/vfinal/core.js';
 import { SpotifyReceiver } from '../src/vfinal/spotify-receiver.js';
+
+function installControlledAudioHarness({ signal = 0.24 } = {}) {
+  const originalDocument = globalThis.document;
+  const originalAudioContext = globalThis.AudioContext;
+  const originalWebkitAudioContext = globalThis.webkitAudioContext;
+  const state = { signal, playCalls: 0 };
+
+  const amplitudeAt = (node, visited = new Set()) => {
+    if (!node || visited.has(node)) return 0;
+    visited.add(node);
+    if (node.kind === 'media-source') return state.signal;
+    const upstream = amplitudeAt(node.upstream, visited);
+    return node.kind === 'gain' ? upstream * Number(node.gain.value || 0) : upstream;
+  };
+  const connectable = (kind, properties = {}) => ({
+    kind,
+    connections: [],
+    ...properties,
+    connect(target) {
+      this.connections.push(target);
+      target.upstream = this;
+      return target;
+    },
+    disconnect() {}
+  });
+  const audio = {
+    src: '',
+    paused: true,
+    ended: false,
+    currentTime: 0,
+    duration: 180,
+    readyState: 4,
+    style: {},
+    listeners: new Map(),
+    setAttribute() {},
+    addEventListener(type, listener) {
+      const listeners = this.listeners.get(type) || [];
+      listeners.push(listener);
+      this.listeners.set(type, listeners);
+    },
+    removeEventListener() {},
+    dispatch(type) {
+      for (const listener of this.listeners.get(type) || []) listener({ type });
+    },
+    load() { this.ended = false; },
+    play() {
+      state.playCalls += 1;
+      this.paused = false;
+      this.ended = false;
+      this.dispatch('playing');
+      return Promise.resolve();
+    },
+    pause() {
+      if (this.paused) return;
+      this.paused = true;
+      this.dispatch('pause');
+    }
+  };
+
+  class FakeAudioContext {
+    constructor() {
+      this.state = 'running';
+      this.currentTime = 0;
+      this.destination = connectable('destination');
+    }
+
+    createGain() {
+      return connectable('gain', {
+        gain: {
+          value: 1,
+          cancelScheduledValues() {},
+          setValueAtTime(value) { this.value = value; },
+          linearRampToValueAtTime(value) { this.value = value; }
+        }
+      });
+    }
+
+    createAnalyser() {
+      const analyser = connectable('analyser', {
+        fftSize: 0,
+        smoothingTimeConstant: 0,
+        getFloatTimeDomainData(samples) {
+          samples.fill(amplitudeAt(analyser));
+        }
+      });
+      return analyser;
+    }
+
+    createDynamicsCompressor() {
+      return connectable('compressor', {
+        threshold: { value: 0 },
+        knee: { value: 0 },
+        ratio: { value: 0 },
+        attack: { value: 0 },
+        release: { value: 0 }
+      });
+    }
+
+    createBiquadFilter() {
+      return connectable('filter', { type: '', frequency: { value: 0 }, Q: { value: 0 }, gain: { value: 0 } });
+    }
+
+    createMediaElementSource() { return connectable('media-source'); }
+    resume() { this.state = 'running'; return Promise.resolve(); }
+  }
+
+  globalThis.document = {
+    createElement(tag) {
+      assert.equal(tag, 'audio');
+      return audio;
+    },
+    body: { appendChild() {} }
+  };
+  globalThis.AudioContext = FakeAudioContext;
+  delete globalThis.webkitAudioContext;
+
+  return {
+    audio,
+    state,
+    setSignal(value) { state.signal = value; },
+    restore() {
+      if (originalDocument === undefined) delete globalThis.document;
+      else globalThis.document = originalDocument;
+      if (originalAudioContext === undefined) delete globalThis.AudioContext;
+      else globalThis.AudioContext = originalAudioContext;
+      if (originalWebkitAudioContext === undefined) delete globalThis.webkitAudioContext;
+      else globalThis.webkitAudioContext = originalWebkitAudioContext;
+    }
+  };
+}
 
 describe('Spotify volume truthfulness', () => {
   test('keeps device capability separate from exact verification at a non-30 target', async () => {
@@ -315,26 +446,271 @@ describe('receiver media-element priming', { concurrency: false }, () => {
   });
 });
 
+describe('controlled music source-signal verification', { concurrency: false }, () => {
+  test('plays and resumes at a 0% target when nonzero PCM is present before the music gain', async () => {
+    const harness = installControlledAudioHarness({ signal: 0.24 });
+    try {
+      const engine = new AudioEngine();
+      engine.unlocked = true;
+      engine.setMusicLevelPercent(0, { report: false });
+      const verifyMusicSignal = engine.verifyMusicSignal.bind(engine);
+      engine.verifyMusicSignal = () => verifyMusicSignal(10);
+
+      assert.equal(await engine.playMusicUrl('https://audio.example/zero-target.mp3', { label: 'Zero target' }), true);
+      assert.equal(engine.musicBus.gain.value, 0, 'the destination-facing music gain remains fully silent');
+      assert.equal(engine.musicElementSource.connections[0], engine.musicAnalyser, 'source PCM reaches the verifier before volume is applied');
+      assert.equal(engine.musicAnalyser.connections[0], engine.musicBus);
+
+      engine.pauseMusic();
+      assert.equal(await engine.resumeMusic(), true, 'a valid zero-volume track can resume without a false no-signal failure');
+      assert.equal(harness.state.playCalls, 2);
+      assert.equal(engine.musicBus.gain.value, 0);
+    } finally {
+      harness.restore();
+    }
+  });
+
+  test('still rejects a truly silent source at a 0% target', async () => {
+    const harness = installControlledAudioHarness({ signal: 0 });
+    try {
+      const engine = new AudioEngine();
+      engine.unlocked = true;
+      engine.setMusicLevelPercent(0, { report: false });
+      const verifyMusicSignal = engine.verifyMusicSignal.bind(engine);
+      engine.verifyMusicSignal = () => verifyMusicSignal(10);
+
+      await assert.rejects(
+        engine.playMusicUrl('https://audio.example/silent.mp3', { label: 'Silent source' }),
+        /no audio entered the calibrated mixer/i
+      );
+      assert.equal(harness.audio.paused, true, 'failed verification pauses the silent source');
+      assert.equal(engine.musicBus.gain.value, 0);
+    } finally {
+      harness.restore();
+    }
+  });
+
+  test('keeps ordinary 30% controlled playback on the same gain and limiter path', async () => {
+    const harness = installControlledAudioHarness({ signal: 0.24 });
+    try {
+      const engine = new AudioEngine();
+      engine.unlocked = true;
+      const verifyMusicSignal = engine.verifyMusicSignal.bind(engine);
+      engine.verifyMusicSignal = () => verifyMusicSignal(10);
+
+      assert.equal(await engine.playMusicUrl('https://audio.example/thirty.mp3', { label: 'Thirty percent' }), true);
+      assert.equal(engine.status().musicLevelPercent, 30);
+      assert.equal(engine.musicBus.gain.value, 0.3);
+      assert.equal(engine.musicElementSource.connections[0], engine.musicAnalyser);
+      assert.equal(engine.musicAnalyser.connections[0], engine.musicBus);
+      assert.equal(engine.musicBus.connections[0].kind, 'compressor', 'the audible output remains limited after its 30% gain');
+    } finally {
+      harness.restore();
+    }
+  });
+});
+
 describe('adjustable controlled-audio mixer', () => {
-  test('applies a live non-30 target and never raises quiet music while an announcement is active', () => {
+  test('applies a live non-30 target and follows the zero-duck core policy while an announcement is active', () => {
     const engine = new AudioEngine();
     const ramps = [];
     engine.musicBus = {};
     engine.setMusicBus = (level, rampMs) => ramps.push({ level, rampMs });
 
+    assert.equal(DUCK_LEVEL_PERCENT, 0, 'the shared mixer policy must fully silence music under speech');
     assert.equal(engine.setMusicLevelPercent(42, { report: false }), 42);
     assert.equal(engine.status().musicLevelPercent, 42);
-    assert.equal(engine.status().duckLevelPercent, 6);
+    assert.equal(engine.status().duckLevelPercent, DUCK_LEVEL_PERCENT);
     assert.deepEqual(ramps.at(-1), { level: 0.42, rampMs: 140 });
 
     engine.announcementDepth = 1;
     assert.equal(engine.setMusicLevelPercent(4, { rampMs: 25, report: false }), 4);
-    assert.equal(engine.status().duckLevelPercent, 4);
-    assert.deepEqual(ramps.at(-1), { level: 0.04, rampMs: 25 });
+    assert.equal(engine.status().duckLevelPercent, DUCK_LEVEL_PERCENT);
+    assert.deepEqual(ramps.at(-1), { level: DUCK_LEVEL_PERCENT / 100, rampMs: 25 });
 
     assert.equal(engine.setMusicLevelPercent(140, { report: false }), 100);
     assert.equal(engine.status().musicLevelPercent, 100);
-    assert.deepEqual(ramps.at(-1), { level: 0.06, rampMs: 140 }, 'an active announcement keeps the bus ducked even when the target rises');
+    assert.deepEqual(ramps.at(-1), { level: DUCK_LEVEL_PERCENT / 100, rampMs: 140 }, 'an active announcement keeps the bus silent even when the target rises');
+  });
+
+  test('ramps the controlled music bus all the way to the shared duck target before speech', async () => {
+    const engine = new AudioEngine();
+    const ramps = [];
+    engine.musicBus = {};
+    engine.setMusicBus = (level, rampMs) => ramps.push({ level, rampMs });
+
+    await engine.beginAnnouncement();
+
+    assert.deepEqual(ramps, [{ level: DUCK_LEVEL_PERCENT / 100, rampMs: 320 }]);
+    assert.equal(engine.announcementDepth, 1);
+    await engine.endAnnouncement({ restore: false });
+  });
+
+  test('holds an interrupted gain ramp at its instantaneous value before scheduling the new target', () => {
+    const calls = [];
+    const gain = {
+      value: 0.8,
+      cancelScheduledValues(time) { calls.push(['cancel', time]); },
+      setValueAtTime(value, time) { calls.push(['set', value, time]); },
+      linearRampToValueAtTime(value, time) { calls.push(['ramp', value, time]); }
+    };
+    const engine = new AudioEngine();
+    engine.context = { currentTime: 5 };
+    engine.musicBus = { gain };
+    engine.musicRamp = { startValue: 0.2, targetValue: 0.8, startTime: 0, endTime: 10 };
+
+    engine.setMusicBus(0.1, 200);
+
+    assert.deepEqual(calls, [
+      ['cancel', 5],
+      ['set', 0.5, 5],
+      ['ramp', 0.1, 5.2]
+    ]);
+  });
+
+  test('uses native cancel-and-hold when the browser provides it', () => {
+    const calls = [];
+    const gain = {
+      value: 0.8,
+      cancelAndHoldAtTime(time) { calls.push(['hold', time]); },
+      cancelScheduledValues(time) { calls.push(['cancel', time]); },
+      setValueAtTime(value, time) { calls.push(['set', value, time]); },
+      linearRampToValueAtTime(value, time) { calls.push(['ramp', value, time]); }
+    };
+    const engine = new AudioEngine();
+    engine.context = { currentTime: 5 };
+    engine.musicBus = { gain };
+    engine.musicRamp = { startValue: 0.2, targetValue: 0.8, startTime: 0, endTime: 10 };
+
+    engine.setMusicBus(0.1, 200);
+
+    assert.deepEqual(calls, [
+      ['hold', 5],
+      ['ramp', 0.1, 5.2]
+    ]);
+  });
+});
+
+describe('abortable calibration lifecycle', { concurrency: false }, () => {
+  test('reports active state truthfully and stops the calibration bed immediately and idempotently', async () => {
+    const engine = new AudioEngine();
+    let bedStops = 0;
+    engine.unlock = async () => true;
+    engine.playBuiltInBed = () => {
+      engine.builtInBed = {
+        stop() {
+          bedStops += 1;
+          return bedStops === 1;
+        }
+      };
+      engine.currentLabel = '30% calibration bed';
+      engine.currentUrl = 'poolside://calibration-bed';
+      return true;
+    };
+
+    const pending = engine.runCalibration({ speak: async () => true });
+    for (let turn = 0; turn < 5 && !engine.builtInBed; turn += 1) await Promise.resolve();
+
+    assert.equal(engine.status().calibrationActive, true);
+    assert.ok(engine.builtInBed, 'calibration bed should be running before it is stopped');
+    assert.equal(engine.stopCalibration(), true);
+    assert.equal(engine.status().calibrationActive, false, 'status must turn off synchronously');
+    assert.equal(engine.builtInBed, null, 'oscillators must be detached synchronously');
+    assert.equal(engine.currentUrl, '', 'stopped calibration must not remain in Now Playing');
+    assert.equal(engine.stopCalibration(), false, 'repeated stops are harmless no-ops');
+    await assert.rejects(pending, /sound check stopped/i);
+    assert.equal(bedStops, 1);
+  });
+
+  test('makes the calibration oscillator teardown repeat-safe', () => {
+    let oscillatorStops = 0;
+    const gainParam = {
+      value: 0.3,
+      cancelScheduledValues() {},
+      setValueAtTime(value) { this.value = value; },
+      linearRampToValueAtTime(value) { this.value = value; }
+    };
+    const connectable = extra => ({
+      ...extra,
+      connect(target) { return target; },
+      disconnect() {}
+    });
+    const context = {
+      currentTime: 0,
+      createGain() { return connectable({ gain: { ...gainParam } }); },
+      createOscillator() {
+        return connectable({
+          type: 'sine',
+          frequency: { value: 0 },
+          start() {},
+          stop() { oscillatorStops += 1; }
+        });
+      }
+    };
+    const engine = new AudioEngine();
+    engine.unlocked = true;
+    engine.context = context;
+    engine.musicBus = connectable({ gain: gainParam });
+
+    engine.playBuiltInBed();
+    const playback = engine.builtInBed;
+    assert.equal(engine.stopBuiltInBed(), true);
+    assert.equal(engine.stopBuiltInBed(), false);
+    assert.equal(playback.stop(), false);
+    assert.equal(oscillatorStops, 4, 'each oscillator is stopped exactly once');
+  });
+
+  test('hard-stops a sound check whose speech promise never settles', async () => {
+    const originalSetTimeout = globalThis.setTimeout;
+    const originalClearTimeout = globalThis.clearTimeout;
+    const timers = [];
+    globalThis.setTimeout = (callback, delay) => {
+      const timer = { callback, delay, cleared: false };
+      timers.push(timer);
+      return timer;
+    };
+    globalThis.clearTimeout = timer => { if (timer) timer.cleared = true; };
+
+    try {
+      const engine = new AudioEngine();
+      let bedStops = 0;
+      let speechStarted = false;
+      let speechSignal = null;
+      engine.unlock = async () => true;
+      engine.playBuiltInBed = () => {
+        engine.builtInBed = { stop() { bedStops += 1; return true; } };
+        return true;
+      };
+      engine.beginAnnouncement = async () => { engine.announcementDepth = 1; };
+      const pending = engine.runCalibration({
+        speak: (_message, { signal }) => {
+          speechStarted = true;
+          speechSignal = signal;
+          return new Promise(() => {});
+        }
+      });
+
+      for (let turn = 0; turn < 5; turn += 1) await Promise.resolve();
+      const leadIn = timers.find(timer => timer.delay === 1_100 && !timer.cleared);
+      assert.ok(leadIn);
+      leadIn.callback();
+      for (let turn = 0; turn < 5 && !speechStarted; turn += 1) await Promise.resolve();
+      assert.equal(speechStarted, true);
+
+      const watchdog = timers.find(timer => timer.delay === 30_000 && !timer.cleared);
+      assert.ok(watchdog, 'calibration must always have a hard watchdog');
+      watchdog.callback();
+
+      await assert.rejects(pending, /30-second safety limit/i);
+      assert.equal(speechSignal?.aborted, true, 'the TTS callback receives the same cancellation signal');
+      assert.equal(engine.status().calibrationActive, false);
+      assert.equal(engine.announcementDepth, 0);
+      assert.equal(engine.builtInBed, null);
+      assert.equal(bedStops, 1);
+    } finally {
+      globalThis.setTimeout = originalSetTimeout;
+      globalThis.clearTimeout = originalClearTimeout;
+    }
   });
 });
 

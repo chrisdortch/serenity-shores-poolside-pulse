@@ -1,4 +1,5 @@
 import {
+  DUCK_LEVEL_PERCENT,
   RECEIVER_LEASE_MS,
   SAFETY_EVENT_TTL_MS,
   WEATHER_INTERVAL_MS,
@@ -6,14 +7,19 @@ import {
   clamp,
   completeEvent,
   createTargetedEvent,
-  dueScheduleItems,
+  dueTimeScheduleItems,
+  effectiveScheduleItemVolume,
   evaluateWeather,
+  getActiveSchedule,
   isDirectAudioUrl,
   makeId,
   makeLog,
   makeReceiverLease,
+  nextOrderScheduleItem,
+  normalizeSequenceRun,
   pendingEventsForReceiver,
   receiverOnline,
+  resolveScheduleAnnouncementText,
   renewReceiverLease,
   safetyAnnouncementText,
   weatherRequestUrl
@@ -26,6 +32,17 @@ const SESSION_KEY = 'poolside-pulse-vfinal-receiver-session';
 const HEARTBEAT_MS = 10_000;
 const EVENT_POLL_MS = 1_250;
 const SCHEDULE_TICK_MS = 15_000;
+const EXTERNAL_AUDIO_INTENT_TYPES = new Map([
+  ['play-controlled', 'play'],
+  ['play-spotify', 'play'],
+  ['pause-music', 'terminal'],
+  ['resume-music', 'play'],
+  ['stop-music', 'terminal'],
+  ['next-music', 'play'],
+  ['calibration', 'play'],
+  ['order-next', 'schedule'],
+  ['order-reset', 'terminal']
+]);
 
 function wait(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -202,13 +219,22 @@ export class ReceiverRuntime {
     this.weatherTail = Promise.resolve();
     this.audioTail = Promise.resolve();
     this.volumeTail = Promise.resolve();
+    this.orderTail = Promise.resolve();
+    this.orderWakeTimers = new Map();
+    this.deferredAutomaticNext = null;
+    this.deferredControlledTrackEnd = null;
     this.audioEpoch = 0;
     this.audioRequestId = 0;
     this.audioRequestKind = 'none';
+    this.externalAudioIntentGeneration = 0;
+    this.externalAudioIntentKind = 'none';
+    this.orderIntentGenerations = new Map();
+    this.orderCancellationQueued = false;
     this.physicalRequestId = 0;
     this.physicalCommittedRequestId = 0;
     this.committedPlaybackSnapshot = null;
     this.committedSourceConfig = null;
+    this.physicalMusicTarget = null;
     this.safetyPendingCount = 0;
     this.physicalProvider = '';
     this.temporarySpotifyPauseDepth = 0;
@@ -227,6 +253,7 @@ export class ReceiverRuntime {
     this.lastDurableHeartbeatAt = 0;
     this.leaseGuardTimer = null;
     this.scheduleCompletedLocal = new Set();
+    this.scheduleCancellationInFlight = null;
     this.wakeLock = null;
     this.visibilityHandler = () => this.onVisibilityChange();
   }
@@ -240,9 +267,81 @@ export class ReceiverRuntime {
   }
 
   nextAudioRequest(kind = 'normal') {
+    if (this.audio.status?.()?.calibrationActive) {
+      this.audio.stopCalibration?.('Sound check stopped because a newer audio action arrived.', { ok: true, report: false });
+    }
     this.audioRequestId += 1;
     this.audioRequestKind = kind;
     return this.audioRequestId;
+  }
+
+  beginExternalAudioIntent(kind = 'normal') {
+    this.externalAudioIntentGeneration += 1;
+    this.externalAudioIntentKind = String(kind || 'normal');
+    this.queueSupersededOrderCancellation();
+    return this.externalAudioIntentGeneration;
+  }
+
+  queueSupersededOrderCancellation() {
+    if (this.orderCancellationQueued) return;
+    this.orderCancellationQueued = true;
+    queueMicrotask(() => {
+      this.orderCancellationQueued = false;
+      if (!this.active || !this.isOwner()) return;
+      const schedule = getActiveSchedule(this.state);
+      const run = schedule?.mode === 'order' ? normalizeSequenceRun(this.state.sequenceRuns?.[schedule.id]) : null;
+      const token = String(run?.active?.token || '');
+      if (!token && run?.status === 'auto-pending' && this.externalAudioIntentKind !== 'safety') {
+        this.serializeOrder(() => this.cancelAutoPendingOrder(schedule.id, 'A newer audio command cancelled the pending Order continuation.'))
+          .catch(error => this.status(`Pending Order cancellation failed: ${error.message}`, false));
+        return;
+      }
+      if (!token || this.orderIntentGenerations.get(token) === this.externalAudioIntentGeneration) return;
+      this.serializeOrder(async () => {
+        const latestSchedule = getActiveSchedule(this.state);
+        const latest = latestSchedule?.id === schedule.id ? normalizeSequenceRun(this.state.sequenceRuns?.[schedule.id]) : null;
+        if (!latest?.active?.token || latest.active.token !== token || this.orderIntentGenerations.get(token) === this.externalAudioIntentGeneration) return false;
+        return await this.failOrderStep(schedule.id, token, new Error('A newer audio command cancelled the pending Order advance.'));
+      }).catch(error => this.status(`Pending Order cancellation failed: ${error.message}`, false));
+    });
+  }
+
+  assertExternalAudioIntent(generation, message = 'A newer audio command replaced this scheduled action before it could start.') {
+    if (generation === null || generation === undefined) return true;
+    if (Number(generation) !== this.externalAudioIntentGeneration) {
+      const error = new Error(message);
+      error.code = 'AUDIO_INTENT_SUPERSEDED';
+      throw error;
+    }
+    if (!this.isOwner()) throw new Error('Receiver ownership changed before the scheduled audio action could start.');
+    return true;
+  }
+
+  assertScheduledRunAuthorization(state, scheduledRunToken, scheduledItemId) {
+    const token = String(scheduledRunToken || '');
+    if (!token) return true;
+    const schedule = getActiveSchedule(state);
+    const run = schedule?.mode === 'order' ? normalizeSequenceRun(state.sequenceRuns?.[schedule.id]) : null;
+    if (schedule?.enabled !== false && run?.active?.token === token && run.active.itemId === String(scheduledItemId || '') && run.active.sessionId === this.sessionId) return true;
+    if (schedule?.enabled !== false && ['waiting-manual', 'complete'].includes(run?.status) && run?.itemId === String(scheduledItemId || '') && (schedule.items || []).some(item => item.id === run.itemId && item.enabled !== false)) return true;
+    const error = new Error('The scheduled playback claim was cancelled before its cloud receipt could commit.');
+    error.code = 'SCHEDULE_RUN_CANCELLED';
+    throw error;
+  }
+
+  scheduledRunAuthorized(state, scheduledRunToken, scheduledItemId) {
+    try {
+      this.assertScheduledRunAuthorization(state, scheduledRunToken, scheduledItemId);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  currentPhysicalCustomTarget() {
+    const target = this.physicalMusicTarget;
+    if (!target || target.mode !== 'custom' || target.requestId !== this.audioRequestId) return null;
+    return clamp(target.percent, 0, 100, this.state.config.musicLevel);
   }
 
   invalidateAudioRestores({ preservePreempted = false, preserveSafetyRestore = false } = {}) {
@@ -347,6 +446,12 @@ export class ReceiverRuntime {
     return job;
   }
 
+  serializeOrder(work) {
+    const job = this.orderTail.then(work, work);
+    this.orderTail = job.catch(() => {});
+    return job;
+  }
+
   async settleAudioOperations() {
     await withTimeout(
       this.audioTail,
@@ -364,8 +469,10 @@ export class ReceiverRuntime {
     return this.active && receiverOnline(receiver, now) && receiver.id === this.deviceId && receiver.sessionId === this.sessionId;
   }
 
-  currentPolicy(provider = this.state.config.musicProvider) {
-    const musicPercent = clamp(this.state.config.musicLevel, 0, 100, 30);
+  currentPolicy(provider = this.state.config.musicProvider, requestedPercent = null) {
+    const musicPercent = requestedPercent === null || requestedPercent === undefined
+      ? this.currentMusicTarget()
+      : clamp(requestedPercent, 0, 100, this.state.config.musicLevel);
     return audioPolicy({
       provider,
       isIOS: isIOSLike(),
@@ -376,8 +483,18 @@ export class ReceiverRuntime {
     });
   }
 
-  applyConfiguredMusicTarget({ report = false } = {}) {
-    const target = clamp(this.state.config.musicLevel, 0, 100, 30);
+  currentMusicTarget(playback = this.state.playback) {
+    const physicalTarget = this.currentPhysicalCustomTarget();
+    if (physicalTarget !== null) return physicalTarget;
+    const playbackTarget = Number(playback?.musicLevelPercent);
+    const hasPlaybackTarget = playback?.intent !== 'stopped' && playback?.volumeMode === 'custom' && Number.isFinite(playbackTarget);
+    return clamp(hasPlaybackTarget ? playbackTarget : this.state.config.musicLevel, 0, 100, 30);
+  }
+
+  applyConfiguredMusicTarget({ report = false, percent = null } = {}) {
+    const target = percent === null || percent === undefined
+      ? this.currentMusicTarget()
+      : clamp(percent, 0, 100, this.state.config.musicLevel);
     this.audio.setMusicLevelPercent?.(target, { report });
     this.spotify.setTargetVolumePercent?.(target);
     return target;
@@ -388,22 +505,34 @@ export class ReceiverRuntime {
     const work = async () => {
       if (!this.isOwner()) throw new Error('This device is not the active speaker receiver.');
       const target = requested;
-      this.audio.setMusicLevelPercent?.(target, { report: false });
-      this.spotify.setTargetVolumePercent?.(target);
+      const pendingPhysicalTarget = this.currentPhysicalCustomTarget();
+      const customPlaybackTarget = pendingPhysicalTarget !== null
+        ? pendingPhysicalTarget
+        : this.state.playback?.intent === 'playing' &&
+        this.state.playback?.volumeMode === 'custom' &&
+        Number.isFinite(Number(this.state.playback?.musicLevelPercent))
+          ? clamp(this.state.playback.musicLevelPercent, 0, 100, target)
+          : null;
+      const audibleTarget = customPlaybackTarget === null ? target : customPlaybackTarget;
+      this.audio.setMusicLevelPercent?.(audibleTarget, { report: false });
+      this.spotify.setTargetVolumePercent?.(audibleTarget);
       let verification = null;
       const spotifyActive = this.physicalProvider === 'spotify' ||
         (this.state.playback.provider === 'spotify' && this.state.playback.intent === 'playing');
-      if (spotifyActive && this.spotify.ready) verification = await this.spotify.enforceVolume(target);
+      if (spotifyActive && this.spotify.ready) verification = await this.spotify.enforceVolume(audibleTarget);
       await this.store.mutate(draft => {
         if (draft.receiver?.id !== this.deviceId || draft.receiver?.sessionId !== this.sessionId) {
           throw new Error('Receiver ownership changed before the music level could be recorded.');
         }
         draft.config.musicLevel = target;
+        if (draft.playback?.intent !== 'stopped' && draft.playback?.volumeMode !== 'custom') {
+          draft.playback.musicLevelPercent = target;
+        }
         if (draft.playback?.provider === 'spotify') {
           draft.playback = {
             ...draft.playback,
             volumeVerified: verification?.verified === true,
-            volumeVerifiedPercent: verification?.verified === true ? target : null,
+            volumeVerifiedPercent: verification?.verified === true ? audibleTarget : null,
             volumeVerifiedAt: verification?.verified === true ? this.now() : 0,
             updatedAt: this.now()
           };
@@ -414,9 +543,11 @@ export class ReceiverRuntime {
       const policy = this.currentPolicy(this.physicalProvider || this.state.playback.provider || this.state.config.musicProvider);
       await this.updateReceiverDetail(policy.detail, policy.id);
       this.status(
-        spotifyActive && verification?.verified !== true
-          ? `Music target is ${target}%. Spotify could not verify that level on this receiver; announcements will still pause Spotify.`
-          : `Music level is ${target}%. Announcements remain fixed at 100%.`,
+        customPlaybackTarget !== null
+          ? `Global music target saved at ${target}%. The current scheduled item remains at its custom ${customPlaybackTarget}% level.`
+          : spotifyActive && verification?.verified !== true
+            ? `Music target is ${target}%. Spotify could not verify that level on this receiver; announcements will still pause Spotify.`
+            : `Music level is ${target}%. Announcements remain fixed at 100%.`,
         !spotifyActive || verification?.verified === true,
         { policy, verification }
       );
@@ -428,6 +559,7 @@ export class ReceiverRuntime {
   }
 
   async start({ takeover = false, takeoverTarget = null } = {}) {
+    this.beginExternalAudioIntent('receiver-start');
     this.nextAudioRequest();
     this.invalidateAudioRestores();
     if (typeof this.store.durableReady === 'function' && !this.store.durableReady()) {
@@ -452,18 +584,9 @@ export class ReceiverRuntime {
     }
     this.applyConfiguredMusicTarget({ report: false });
     await this.audio.unlock({ audibleTest: false });
-    let spotifyCapability = null;
     const startupProvider = this.state.playback.intent === 'stopped'
       ? this.state.config.musicProvider
       : (this.state.playback.provider || this.state.config.musicProvider);
-    if (startupProvider === 'spotify' && this.spotify.loggedIn()) {
-      try {
-        await this.spotify.connectFromUserGesture();
-        spotifyCapability = await this.spotify.refreshCapabilities();
-      } catch (error) {
-        this.status(`Receiver audio is ready; Spotify still needs attention: ${error.message}`, false);
-      }
-    }
     const sessionId = makeId('session', this.now());
     const policy = this.currentPolicy(startupProvider);
     let lease = null;
@@ -547,10 +670,6 @@ export class ReceiverRuntime {
             return draft;
           }, 'Playback restore failed safely', { requireDurable: true });
         }
-      }
-      if (spotifyCapability) {
-        const spotifyPolicy = this.currentPolicy('spotify');
-        await this.updateReceiverDetail(spotifyPolicy.detail, spotifyPolicy.id);
       }
     } finally {
       clearInterval(startupRenewTimer);
@@ -643,18 +762,23 @@ export class ReceiverRuntime {
     for (const timer of this.timers) clearInterval(timer);
     this.timers.clear();
     this.loopInFlight.clear();
+    for (const timer of this.orderWakeTimers.values()) clearTimeout(timer);
+    this.orderWakeTimers.clear();
     if (this.leaseGuardTimer) clearTimeout(this.leaseGuardTimer);
     this.leaseGuardTimer = null;
     document.removeEventListener('visibilitychange', this.visibilityHandler);
   }
 
   async stop({ release = true } = {}) {
+    this.beginExternalAudioIntent('terminal');
     this.nextAudioRequest();
     this.invalidateAudioRestores();
     const stoppingProvider = this.physicalProvider;
     this.cancelPendingAnnouncements('Receiver stop requested.');
+    this.audio.stopCalibration?.('Sound check stopped because the receiver is stopping.', { ok: true, report: false });
     this.audio.stopVoice();
     this.audio.stopMusic();
+    this.physicalMusicTarget = null;
     this.physicalProvider = '';
     this.physicalRequestId = 0;
     try {
@@ -682,6 +806,7 @@ export class ReceiverRuntime {
     this.cancelPendingAnnouncements('Receiver stopped before the announcement could play.');
     this.audio.stopVoice();
     this.audio.stopMusic();
+    this.physicalMusicTarget = null;
     this.physicalProvider = '';
     this.physicalRequestId = 0;
     this.spotify.disconnect();
@@ -872,13 +997,16 @@ export class ReceiverRuntime {
   }
 
   async failSafeStop(message) {
+    this.beginExternalAudioIntent('terminal');
     this.nextAudioRequest();
     this.invalidateAudioRestores();
     this.active = false;
     this.stopLoops();
     this.cancelPendingAnnouncements(message);
+    this.audio.stopCalibration?.('Sound check stopped because the receiver session ended.', { ok: true, report: false });
     this.audio.stopVoice();
     this.audio.stopMusic();
+    this.physicalMusicTarget = null;
     let settleError = '';
     await this.settleAudioOperations().catch(error => { settleError = error.message || String(error); });
     let spotifyPauseError = '';
@@ -939,10 +1067,20 @@ export class ReceiverRuntime {
   async processEvent(event) {
     if (!event?.id || this.inFlightEventIds.has(event.id) || handledIds().has(event.id)) return false;
     this.inFlightEventIds.add(event.id);
+    const intentKind = EXTERNAL_AUDIO_INTENT_TYPES.get(event.type) || '';
+    const externalIntentGeneration = intentKind ? this.beginExternalAudioIntent(intentKind) : null;
     let error = '';
     try {
       try {
-        await this.handleEvent(event);
+        if (externalIntentGeneration !== null) {
+          const schedule = getActiveSchedule(this.state);
+          const run = schedule?.mode === 'order' ? normalizeSequenceRun(this.state.sequenceRuns?.[schedule.id]) : null;
+          if (run?.status === 'auto-pending' && !run.active) {
+            await this.cancelAutoPendingOrder(schedule.id, 'A newer audio command cancelled the pending Order continuation.');
+          }
+          this.assertExternalAudioIntent(externalIntentGeneration, 'A newer receiver command replaced this pending audio event.');
+        }
+        await this.handleEvent(event, { externalIntentGeneration });
       } catch (caught) {
         error = caught.message || String(caught);
         this.status(`Command failed: ${error}`, false, { event });
@@ -967,13 +1105,26 @@ export class ReceiverRuntime {
     }
   }
 
-  async handleEvent(event) {
+  async handleEvent(event, { externalIntentGeneration = null } = {}) {
     const payload = event.payload || {};
     switch (event.type) {
       case 'play-controlled':
-        return await this.playControlled(payload.url, { label: payload.label, index: payload.index });
+        return await this.playControlled(payload.url, {
+          label: payload.label,
+          index: payload.index,
+          volumePercent: payload.volumePercent,
+          volumeMode: payload.volumeMode,
+          scheduledItemId: payload.scheduledItemId,
+          scheduledRunToken: payload.scheduledRunToken,
+          loop: payload.loop
+        });
       case 'play-spotify':
-        return await this.playSpotify(payload.url);
+        return await this.playSpotify(payload.url, {
+          volumePercent: payload.volumePercent,
+          volumeMode: payload.volumeMode,
+          scheduledItemId: payload.scheduledItemId,
+          scheduledRunToken: payload.scheduledRunToken
+        });
       case 'pause-music':
         return await this.pauseMusic();
       case 'resume-music':
@@ -990,7 +1141,11 @@ export class ReceiverRuntime {
       case 'weather-check':
         return await this.checkWeather({ announce: payload.announce !== false, reason: 'remote command' });
       case 'calibration':
-        return await this.runCalibration();
+        return await this.runCalibration(externalIntentGeneration);
+      case 'order-next':
+        return await this.requestOrderNext(event, externalIntentGeneration);
+      case 'order-reset':
+        return await this.resetOrderSchedule(event, externalIntentGeneration);
       default:
         throw new Error(`Unknown receiver command: ${event.type}`);
     }
@@ -1005,12 +1160,20 @@ export class ReceiverRuntime {
     return { tracks, playlistName: data.playlistName || tracks[0].title, source: data.source || '' };
   }
 
-  async playControlled(url, { label = '', index = 0 } = {}) {
+  async playControlled(url, { label = '', index = 0, volumePercent = null, volumeMode = 'global', scheduledItemId = '', scheduledRunToken = '', loop = null } = {}) {
     if (!this.isOwner()) throw new Error('This device is not the active speaker receiver.');
     this.assertNoSafetyPending();
-    this.applyConfiguredMusicTarget({ report: false });
-    const requestId = this.nextAudioRequest();
+    const targetPercent = clamp(
+      volumePercent === null || volumePercent === undefined ? this.state.config.musicLevel : volumePercent,
+      0,
+      100,
+      this.state.config.musicLevel
+    );
+    const targetMode = volumeMode === 'custom' ? 'custom' : 'global';
     const previousPlayback = structuredClone(this.state.playback || {});
+    const previousTarget = this.currentMusicTarget(previousPlayback);
+    const previousPhysicalTarget = this.physicalMusicTarget ? { ...this.physicalMusicTarget } : null;
+    const requestId = this.nextAudioRequest();
     const previousSourceConfig = Object.fromEntries(['musicProvider', 'musicUrl', 'musicLabel', 'spotifyUrl'].map(key => [key, this.state.config[key]]));
     const resolved = await this.resolveControlledTracks(url);
     if (requestId !== this.audioRequestId) throw new Error('A newer audio command replaced this music request while its source was loading.');
@@ -1018,6 +1181,19 @@ export class ReceiverRuntime {
     const epoch = this.invalidateAudioRestores();
     const physical = await this.serializeAudio(async () => {
       this.assertAudioRequest(requestId, epoch);
+      const controlledAudible = this.physicalProvider === 'controlled' || !!this.audio.musicPlaying?.();
+      const controlledSnapshot = controlledAudible
+        ? {
+            audioUrl: String(this.audio.currentUrl || previousPlayback.audioUrl || ''),
+            label: String(this.audio.currentLabel || previousPlayback.label || 'Suno / direct audio'),
+            position: Number(this.audio.musicElement?.currentTime || 0),
+            loop: !!this.audio.musicElement?.loop,
+            scheduledRunToken: String(this.audio.currentRunToken || previousPlayback.scheduledRunToken || ''),
+            scheduledItemId: String(previousPlayback.scheduledItemId || ''),
+            volumeMode: previousPlayback.volumeMode === 'custom' || previousPhysicalTarget?.mode === 'custom' ? 'custom' : 'global',
+            musicLevelPercent: previousTarget
+          }
+        : null;
       const spotifyCouldBePlaying = this.physicalProvider === 'spotify' ||
         this.spotify.ready ||
         this.spotify.current?.paused === false ||
@@ -1035,37 +1211,77 @@ export class ReceiverRuntime {
         try {
           this.assertAudioRequest(requestId, epoch, 'Controlled music was superseded while Spotify was pausing.');
         } catch (error) {
-          if (spotifySnapshot?.wasPlaying) this.carrySafetyRestore({ provider: 'spotify', spotifySnapshot });
+          this.applyConfiguredMusicTarget({ report: false, percent: previousTarget });
+          if (spotifySnapshot?.wasPlaying) this.carrySafetyRestore({ provider: 'spotify', spotifySnapshot, musicLevelPercent: previousTarget });
           throw error;
         }
         if (spotifyCouldBePlaying) this.physicalProvider = '';
         const safeIndex = Math.max(0, Math.min(resolved.tracks.length - 1, Number(index) || 0));
         const track = resolved.tracks[safeIndex];
         this.assertAudioRequest(requestId, epoch, 'Controlled music was superseded before its media could start.');
+        this.physicalMusicTarget = { requestId, mode: targetMode, percent: targetPercent, provider: 'controlled' };
+        this.applyConfiguredMusicTarget({ report: false, percent: targetPercent });
         try {
-          await this.audio.playMusicUrl(track.audioUrl, { label: track.title || label || resolved.playlistName, loop: resolved.tracks.length === 1 });
+          await this.audio.playMusicUrl(track.audioUrl, {
+            label: track.title || label || resolved.playlistName,
+            loop: loop === null || loop === undefined ? resolved.tracks.length === 1 : !!loop,
+            scheduledRunToken
+          });
         } catch (error) {
           let restoreError = '';
-          const carriedToSafety = spotifySnapshot?.wasPlaying && this.carrySafetyRestore({ provider: 'spotify', spotifySnapshot });
+          if (this.physicalMusicTarget?.requestId === requestId) this.physicalMusicTarget = null;
+          this.applyConfiguredMusicTarget({ report: false, percent: previousTarget });
+          const carriedControlledToSafety = controlledSnapshot && this.carrySafetyRestore({
+            provider: 'controlled',
+            controlledSnapshot: { ...controlledSnapshot, wasPlaying: true },
+            musicLevelPercent: previousTarget
+          });
+          if (!carriedControlledToSafety && controlledSnapshot?.audioUrl && this.scheduledRunAuthorized(this.state, controlledSnapshot.scheduledRunToken, controlledSnapshot.scheduledItemId) && this.isOwner() && requestId === this.audioRequestId && epoch === this.audioEpoch) {
+            try {
+              await this.audio.playMusicUrl(controlledSnapshot.audioUrl, {
+                label: controlledSnapshot.label,
+                startAt: controlledSnapshot.position,
+                loop: controlledSnapshot.loop,
+                scheduledRunToken: controlledSnapshot.scheduledRunToken
+              });
+              this.physicalProvider = 'controlled';
+              this.physicalRequestId = requestId;
+              this.physicalCommittedRequestId = requestId;
+              this.physicalMusicTarget = {
+                requestId,
+                mode: controlledSnapshot.volumeMode,
+                percent: previousTarget,
+                provider: 'controlled'
+              };
+              this.rememberCommittedPlayback(requestId);
+            } catch (caught) {
+              restoreError = caught.message || String(caught);
+            }
+          }
+          const carriedToSafety = spotifySnapshot?.wasPlaying && this.carrySafetyRestore({ provider: 'spotify', spotifySnapshot, musicLevelPercent: previousTarget });
           if (!carriedToSafety && spotifySnapshot?.wasPlaying && this.isOwner() && requestId === this.audioRequestId && epoch === this.audioEpoch) {
             await this.spotify.resumeAfterAnnouncement(spotifySnapshot, {
               assertCurrent: () => this.assertAudioRequest(requestId, epoch)
             }).then(() => { this.physicalProvider = 'spotify'; }).catch(caught => { restoreError = caught.message || String(caught); });
           }
-          throw new Error(restoreError ? `${error.message} Spotify also could not be restored: ${restoreError}` : error.message);
+          throw new Error(restoreError ? `${error.message} The prior controlled track also could not be restored: ${restoreError}` : error.message);
         }
         if (requestId !== this.audioRequestId || epoch !== this.audioEpoch) {
           this.audio.stopMusic();
-          if (spotifySnapshot?.wasPlaying) this.carrySafetyRestore({ provider: 'spotify', spotifySnapshot });
+          if (this.physicalMusicTarget?.requestId === requestId) this.physicalMusicTarget = null;
+          this.applyConfiguredMusicTarget({ report: false, percent: previousTarget });
+          if (spotifySnapshot?.wasPlaying) this.carrySafetyRestore({ provider: 'spotify', spotifySnapshot, musicLevelPercent: previousTarget });
           throw new Error('A newer audio command replaced this controlled-music start.');
         }
         if (!this.isOwner()) {
           this.audio.stopMusic();
+          if (this.physicalMusicTarget?.requestId === requestId) this.physicalMusicTarget = null;
+          this.applyConfiguredMusicTarget({ report: false, percent: previousTarget });
           throw new Error('Receiver ownership changed while music was starting, so playback was stopped.');
         }
         this.physicalProvider = 'controlled';
         this.physicalRequestId = requestId;
-        return { spotifySnapshot, safeIndex, track };
+        return { spotifySnapshot, controlledSnapshot, safeIndex, track };
       } finally {
         if (spotifyCouldBePlaying) this.endTemporarySpotifyPause();
       }
@@ -1073,6 +1289,7 @@ export class ReceiverRuntime {
     try {
       await this.store.mutate(draft => {
         this.assertReceiptCurrent(requestId, epoch, 'Controlled playback was superseded before its cloud receipt could commit.');
+        this.assertScheduledRunAuthorization(draft, scheduledRunToken, scheduledItemId);
         if (draft.receiver?.id !== this.deviceId || draft.receiver?.sessionId !== this.sessionId) {
           throw new Error('Receiver ownership changed before controlled playback could be recorded.');
         }
@@ -1087,9 +1304,13 @@ export class ReceiverRuntime {
           audioUrl: physical.track.audioUrl,
           trackIndex: physical.safeIndex,
           tracks: resolved.tracks,
+          musicLevelPercent: targetPercent,
+          volumeMode: targetMode,
+          scheduledItemId: String(scheduledItemId || ''),
+          scheduledRunToken: String(scheduledRunToken || ''),
           updatedAt: this.now()
         };
-        draft.activityLog = [makeLog('play', `Controlled music playing at ${draft.config.musicLevel}%`, draft.playback.label, this.now(), { provider: 'controlled' }), ...(draft.activityLog || [])];
+        draft.activityLog = [makeLog('play', `Controlled music playing at ${targetPercent}%`, draft.playback.label, this.now(), { provider: 'controlled', scheduledItemId: String(scheduledItemId || '') }), ...(draft.activityLog || [])];
         return draft;
       }, 'Controlled music started', { requireDurable: true });
       this.assertReceiptCurrent(requestId, epoch, 'Controlled playback was superseded while its cloud receipt was committing.');
@@ -1101,11 +1322,40 @@ export class ReceiverRuntime {
         const mustQuiet = this.physicalRequestId === requestId || this.audioRequestKind === 'safety' || this.audioRequestKind === 'terminal' || !this.isOwner();
         if (!mustQuiet) return;
         this.audio.stopMusic();
+        if (this.physicalMusicTarget?.requestId === requestId) this.physicalMusicTarget = null;
+        this.applyConfiguredMusicTarget({ report: false, percent: previousTarget });
         this.physicalProvider = '';
         this.physicalRequestId = 0;
         this.physicalCommittedRequestId = 0;
-        const carriedToSafety = physical.spotifySnapshot?.wasPlaying && this.carrySafetyRestore({ provider: 'spotify', spotifySnapshot: physical.spotifySnapshot });
-        if (!carriedToSafety && physical.spotifySnapshot?.wasPlaying && this.isOwner() && requestId === this.audioRequestId && epoch === this.audioEpoch) {
+        const carriedControlledToSafety = physical.controlledSnapshot && this.carrySafetyRestore({
+          provider: 'controlled',
+          controlledSnapshot: { ...physical.controlledSnapshot, wasPlaying: true },
+          musicLevelPercent: previousTarget
+        });
+        if (!carriedControlledToSafety && physical.controlledSnapshot?.audioUrl && this.scheduledRunAuthorized(this.state, physical.controlledSnapshot.scheduledRunToken, physical.controlledSnapshot.scheduledItemId) && this.isOwner() && requestId === this.audioRequestId && epoch === this.audioEpoch) {
+          try {
+            await this.audio.playMusicUrl(physical.controlledSnapshot.audioUrl, {
+              label: physical.controlledSnapshot.label,
+              startAt: physical.controlledSnapshot.position,
+              loop: physical.controlledSnapshot.loop,
+              scheduledRunToken: physical.controlledSnapshot.scheduledRunToken
+            });
+            this.physicalProvider = 'controlled';
+            this.physicalRequestId = requestId;
+            this.physicalCommittedRequestId = requestId;
+            this.physicalMusicTarget = {
+              requestId,
+              mode: physical.controlledSnapshot.volumeMode,
+              percent: previousTarget,
+              provider: 'controlled'
+            };
+            this.rememberCommittedPlayback(requestId);
+          } catch (caught) {
+            restoreError = caught.message || String(caught);
+          }
+        }
+        const carriedToSafety = physical.spotifySnapshot?.wasPlaying && this.carrySafetyRestore({ provider: 'spotify', spotifySnapshot: physical.spotifySnapshot, musicLevelPercent: previousTarget });
+        if (!this.physicalProvider && !carriedToSafety && physical.spotifySnapshot?.wasPlaying && this.isOwner() && requestId === this.audioRequestId && epoch === this.audioEpoch) {
           try {
             await this.spotify.resumeAfterAnnouncement(physical.spotifySnapshot, {
               assertCurrent: () => this.assertAudioRequest(requestId, epoch)
@@ -1125,20 +1375,27 @@ export class ReceiverRuntime {
         ? `Controlled music was stopped because its cloud state could not be saved: ${error.message}. Spotify restore also failed: ${restoreError}`
         : `Controlled music was stopped because its cloud state could not be saved: ${error.message}`);
     }
-    this.status(`${physical.track.title} is playing at exact ${this.state.config.musicLevel}%.`, true);
+    this.status(`${physical.track.title} is playing at exact ${targetPercent}%.`, true);
     return true;
   }
 
-  async playSpotify(url) {
+  async playSpotify(url, { volumePercent = null, volumeMode = 'global', scheduledItemId = '', scheduledRunToken = '' } = {}) {
     if (!this.isOwner()) throw new Error('This device is not the active speaker receiver.');
     this.assertNoSafetyPending();
     if (!this.spotify.loggedIn()) throw new Error('Spotify is not logged in on the speaker receiver. Open Settings on that device and choose Login Spotify.');
     if (!this.spotify.ready) throw new Error('Spotify needs a local receiver tap. On the speaker device, open Receiver and choose Connect Spotify Receiver.');
     if (!this.isOwner()) throw new Error('Receiver ownership changed before Spotify could start.');
-    this.applyConfiguredMusicTarget({ report: false });
+    const targetPercent = clamp(
+      volumePercent === null || volumePercent === undefined ? this.state.config.musicLevel : volumePercent,
+      0,
+      100,
+      this.state.config.musicLevel
+    );
+    const targetMode = volumeMode === 'custom' ? 'custom' : 'global';
     const requestId = this.nextAudioRequest();
     const epoch = this.invalidateAudioRestores();
     const previousPlayback = structuredClone(this.state.playback || {});
+    const previousTarget = this.currentMusicTarget(previousPlayback);
     const previousSourceConfig = Object.fromEntries(['musicProvider', 'musicUrl', 'musicLabel', 'spotifyUrl'].map(key => [key, this.state.config[key]]));
     const physical = await this.serializeAudio(async () => {
       this.assertAudioRequest(requestId, epoch);
@@ -1147,10 +1404,13 @@ export class ReceiverRuntime {
         ? {
             audioUrl: String(this.audio.currentUrl || this.state.playback.audioUrl || ''),
             label: String(this.audio.currentLabel || this.state.playback.label || 'Suno / direct audio'),
-            position: Number(this.audio.musicElement?.currentTime || 0)
+            position: Number(this.audio.musicElement?.currentTime || 0),
+            scheduledRunToken: String(this.audio.currentRunToken || this.state.playback.scheduledRunToken || '')
           }
         : null;
       this.audio.pauseMusic();
+      this.physicalMusicTarget = { requestId, mode: targetMode, percent: targetPercent, provider: 'spotify' };
+      this.applyConfiguredMusicTarget({ report: false, percent: targetPercent });
       let result;
       try {
         result = await this.spotify.play(url || this.state.config.spotifyUrl, {
@@ -1164,16 +1424,20 @@ export class ReceiverRuntime {
           } catch (pauseError) {
             throw new Error(`Superseded Spotify playback could not be confirmed paused: ${pauseError.message}`);
           }
+          this.applyConfiguredMusicTarget({ report: false, percent: previousTarget });
+          if (this.physicalMusicTarget?.requestId === requestId) this.physicalMusicTarget = null;
           this.physicalProvider = '';
-          if (controlledSnapshot) this.carrySafetyRestore({ provider: 'controlled', controlledSnapshot: { ...controlledSnapshot, wasPlaying: true } });
+          if (controlledSnapshot) this.carrySafetyRestore({ provider: 'controlled', controlledSnapshot: { ...controlledSnapshot, wasPlaying: true }, musicLevelPercent: previousTarget });
           throw new Error(`Spotify playback was superseded and stopped: ${error.message}`);
         }
         let restoreError = '';
+        this.applyConfiguredMusicTarget({ report: false, percent: previousTarget });
+        if (this.physicalMusicTarget?.requestId === requestId) this.physicalMusicTarget = null;
         if (controlledSnapshot && this.isOwner() && requestId === this.audioRequestId && epoch === this.audioEpoch) {
           try {
             const resumed = await this.audio.resumeMusic();
             if (!resumed && controlledSnapshot.audioUrl) {
-              await this.audio.playMusicUrl(controlledSnapshot.audioUrl, { label: controlledSnapshot.label, startAt: controlledSnapshot.position });
+              await this.audio.playMusicUrl(controlledSnapshot.audioUrl, { label: controlledSnapshot.label, startAt: controlledSnapshot.position, scheduledRunToken: controlledSnapshot.scheduledRunToken });
             }
           } catch (caught) {
             restoreError = caught.message || String(caught);
@@ -1187,8 +1451,10 @@ export class ReceiverRuntime {
         } catch (error) {
           throw new Error(`Spotify was superseded while starting and could not be confirmed paused: ${error.message}`);
         }
+        this.applyConfiguredMusicTarget({ report: false, percent: previousTarget });
+        if (this.physicalMusicTarget?.requestId === requestId) this.physicalMusicTarget = null;
         this.physicalProvider = '';
-        if (controlledSnapshot) this.carrySafetyRestore({ provider: 'controlled', controlledSnapshot: { ...controlledSnapshot, wasPlaying: true } });
+        if (controlledSnapshot) this.carrySafetyRestore({ provider: 'controlled', controlledSnapshot: { ...controlledSnapshot, wasPlaying: true }, musicLevelPercent: previousTarget });
         throw new Error('Spotify was superseded while starting, so playback was stopped.');
       }
       this.audio.stopMusic();
@@ -1196,10 +1462,11 @@ export class ReceiverRuntime {
       this.physicalRequestId = requestId;
       return { controlledSnapshot, result };
     });
-    const policy = this.currentPolicy('spotify');
+    const policy = this.currentPolicy('spotify', targetPercent);
     try {
       await this.store.mutate(draft => {
         this.assertReceiptCurrent(requestId, epoch, 'Spotify playback was superseded before its cloud receipt could commit.');
+        this.assertScheduledRunAuthorization(draft, scheduledRunToken, scheduledItemId);
         if (draft.receiver?.id !== this.deviceId || draft.receiver?.sessionId !== this.sessionId) {
           throw new Error('Receiver ownership changed before Spotify playback could be recorded.');
         }
@@ -1211,13 +1478,17 @@ export class ReceiverRuntime {
           label: this.spotify.current?.name || 'Spotify playlist',
           sourceUrl: draft.config.spotifyUrl,
           trackIndex: 0,
+          musicLevelPercent: targetPercent,
+          volumeMode: targetMode,
+          scheduledItemId: String(scheduledItemId || ''),
+          scheduledRunToken: String(scheduledRunToken || ''),
           updatedAt: this.now(),
           volumeVerified: !!physical.result.volume?.verified,
           volumeVerifiedPercent: physical.result.volume?.verified ? physical.result.volume.verifiedPercent : null,
           volumeVerifiedAt: physical.result.volume?.verified ? this.now() : 0,
           audioPolicy: policy.id
         };
-        draft.activityLog = [makeLog('play', physical.result.volume?.verified ? `Spotify playing at verified ${draft.config.musicLevel}%` : 'Spotify playing in compatibility mode', policy.detail, this.now(), { provider: 'spotify' }), ...(draft.activityLog || [])];
+        draft.activityLog = [makeLog('play', physical.result.volume?.verified ? `Spotify playing at verified ${targetPercent}%` : 'Spotify playing in compatibility mode', policy.detail, this.now(), { provider: 'spotify', scheduledItemId: String(scheduledItemId || '') }), ...(draft.activityLog || [])];
         return draft;
       }, 'Spotify playback started', { requireDurable: true });
       this.assertReceiptCurrent(requestId, epoch, 'Spotify playback was superseded while its cloud receipt was committing.');
@@ -1230,19 +1501,22 @@ export class ReceiverRuntime {
         const mustQuiet = this.physicalRequestId === requestId || this.audioRequestKind === 'safety' || this.audioRequestKind === 'terminal' || !this.isOwner();
         if (!mustQuiet) return;
         await this.spotify.pauseForAnnouncement().catch(caught => { pauseError = caught.message || String(caught); });
+        this.applyConfiguredMusicTarget({ report: false, percent: previousTarget });
+        if (this.physicalMusicTarget?.requestId === requestId) this.physicalMusicTarget = null;
         this.physicalProvider = pauseError ? 'spotify' : '';
         if (!pauseError) {
           this.physicalRequestId = 0;
           this.physicalCommittedRequestId = 0;
         }
-        const carriedToSafety = !pauseError && physical.controlledSnapshot && this.carrySafetyRestore({ provider: 'controlled', controlledSnapshot: { ...physical.controlledSnapshot, wasPlaying: true } });
+        const carriedToSafety = !pauseError && physical.controlledSnapshot && this.carrySafetyRestore({ provider: 'controlled', controlledSnapshot: { ...physical.controlledSnapshot, wasPlaying: true }, musicLevelPercent: previousTarget });
         if (!pauseError && !carriedToSafety && physical.controlledSnapshot && this.isOwner() && requestId === this.audioRequestId && epoch === this.audioEpoch) {
           try {
             const resumed = await this.audio.resumeMusic();
             if (!resumed && physical.controlledSnapshot.audioUrl) {
               await this.audio.playMusicUrl(physical.controlledSnapshot.audioUrl, {
                 label: physical.controlledSnapshot.label,
-                startAt: physical.controlledSnapshot.position
+                startAt: physical.controlledSnapshot.position,
+                scheduledRunToken: physical.controlledSnapshot.scheduledRunToken
               });
             }
             this.physicalProvider = 'controlled';
@@ -1274,6 +1548,7 @@ export class ReceiverRuntime {
       const spotifyMayBeAudible = provider === 'spotify' || this.spotify.ready || this.spotify.current?.paused === false;
       if (spotifyMayBeAudible) await this.spotify.pauseForAnnouncement();
       this.audio.pauseMusic();
+      this.physicalMusicTarget = null;
       this.physicalRequestId = 0;
       this.physicalCommittedRequestId = 0;
       this.preemptedSpotifySnapshot = null;
@@ -1282,6 +1557,7 @@ export class ReceiverRuntime {
       return { provider, positionMs };
     });
     await this.updatePlayback({ provider: physical.provider, intent: 'paused', positionMs: physical.positionMs }, 'Music paused');
+    await this.failActiveOrderPlayback('The scheduled music was paused before its advance gate completed.');
     return true;
   }
 
@@ -1319,7 +1595,8 @@ export class ReceiverRuntime {
         if (!resumed && this.state.playback.audioUrl) {
           await this.audio.playMusicUrl(this.state.playback.audioUrl, {
             label: this.state.playback.label || 'Suno / direct audio',
-            startAt: Number(this.state.playback.positionMs || 0) / 1000
+            startAt: Number(this.state.playback.positionMs || 0) / 1000,
+            scheduledRunToken: this.state.playback.scheduledRunToken
           });
           resumed = true;
         }
@@ -1335,6 +1612,12 @@ export class ReceiverRuntime {
       }
       this.physicalProvider = activeProvider;
       this.physicalRequestId = requestId;
+      this.physicalMusicTarget = {
+        requestId,
+        mode: this.state.playback.volumeMode === 'custom' ? 'custom' : 'global',
+        percent: this.currentMusicTarget(this.state.playback),
+        provider: activeProvider
+      };
       return activeProvider;
     });
     try {
@@ -1352,6 +1635,7 @@ export class ReceiverRuntime {
           this.physicalProvider = provider;
           this.physicalRequestId = 0;
           this.physicalCommittedRequestId = 0;
+          if (this.physicalMusicTarget?.requestId === requestId) this.physicalMusicTarget = null;
         }
       });
       if (error.code === 'AUDIO_RECEIPT_SUPERSEDED' && this.audioRequestKind === 'safety' && this.isOwner()) {
@@ -1369,7 +1653,12 @@ export class ReceiverRuntime {
     const playback = this.state.playback;
     if (playback.provider === 'spotify') {
       if (!this.spotify.ready) throw new Error('Spotify receiver is not connected.');
-      await this.playSpotify(playback.sourceUrl || this.state.config.spotifyUrl);
+      await this.playSpotify(playback.sourceUrl || this.state.config.spotifyUrl, {
+        volumePercent: playback.musicLevelPercent,
+        volumeMode: playback.volumeMode,
+        scheduledItemId: playback.scheduledItemId,
+        scheduledRunToken: playback.scheduledRunToken
+      });
       return true;
     }
     if (playback.audioUrl) {
@@ -1379,14 +1668,18 @@ export class ReceiverRuntime {
     if (playback.sourceUrl || this.state.config.musicUrl) {
       await this.playControlled(playback.sourceUrl || this.state.config.musicUrl, {
         label: playback.label,
-        index: Number(playback.trackIndex || 0)
+        index: Number(playback.trackIndex || 0),
+        volumePercent: playback.musicLevelPercent,
+        volumeMode: playback.volumeMode,
+        scheduledItemId: playback.scheduledItemId,
+        scheduledRunToken: playback.scheduledRunToken
       });
       return true;
     }
     return false;
   }
 
-  async stopMusic() {
+  async stopMusic({ skipOrderFailure = false } = {}) {
     const requestId = this.nextAudioRequest('terminal');
     this.invalidateAudioRestores();
     const provider = await this.serializeAudio(async () => {
@@ -1395,6 +1688,7 @@ export class ReceiverRuntime {
       const spotifyMayBeAudible = activeProvider === 'spotify' || this.spotify.ready || this.spotify.current?.paused === false;
       if (spotifyMayBeAudible) await this.spotify.pauseForAnnouncement();
       this.audio.stopMusic();
+      this.physicalMusicTarget = null;
       this.physicalProvider = '';
       this.physicalRequestId = 0;
       this.physicalCommittedRequestId = 0;
@@ -1403,14 +1697,49 @@ export class ReceiverRuntime {
       this.assertTerminalRequest(requestId, 'A newer audio command replaced this stop after the source became quiet.');
       return activeProvider;
     });
-    await this.updatePlayback({ provider, intent: 'stopped', label: 'Nothing playing' }, 'Music stopped');
+    await this.updatePlayback({
+      provider,
+      intent: 'stopped',
+      label: 'Nothing playing',
+      scheduledItemId: '',
+      scheduledRunToken: '',
+      cancelScheduledRunToken: '',
+      unavailableReason: ''
+    }, 'Music stopped');
+    if (!skipOrderFailure) await this.failActiveOrderPlayback('The scheduled music was stopped before its advance gate completed.');
     return true;
   }
 
-  async nextMusic({ automatic = false, expectedUrl = '' } = {}) {
+  async reconcileScheduledPlaybackAuthorization() {
+    if (!this.active || !this.isOwner()) return false;
+    const playback = this.state.playback || {};
+    const cancellationToken = String(playback.cancelScheduledRunToken || '');
+    if (!cancellationToken || cancellationToken !== String(playback.scheduledRunToken || '')) return false;
+    if (this.scheduleCancellationInFlight === cancellationToken) return false;
+    this.scheduleCancellationInFlight = cancellationToken;
+    this.beginExternalAudioIntent('terminal');
+    try {
+      await this.stopMusic({ skipOrderFailure: true });
+      this.status('Scheduled playback stopped because its live schedule changed.', true);
+      return true;
+    } finally {
+      if (this.scheduleCancellationInFlight === cancellationToken) this.scheduleCancellationInFlight = null;
+    }
+  }
+
+  async nextMusic({ automatic = false, expectedUrl = '', postSafety = false, externalIntentGeneration = null } = {}) {
+    this.assertExternalAudioIntent(externalIntentGeneration, 'A newer audio command replaced this deferred next-track action.');
+    if (automatic && (this.safetyPendingCount > 0 || this.currentAnnouncement?.safety || this.announcementQueue.some(job => job.safety))) {
+      this.deferredAutomaticNext = {
+        expectedUrl: String(expectedUrl || ''),
+        externalIntentGeneration: this.externalAudioIntentGeneration
+      };
+      return false;
+    }
     if (!automatic) this.assertNoSafetyPending();
-    const requestId = automatic ? this.audioRequestId : this.nextAudioRequest();
-    const epoch = automatic ? this.audioEpoch : this.invalidateAudioRestores();
+    if (!automatic) await this.failActiveOrderPlayback('The scheduled music was manually skipped before its advance gate completed.');
+    const requestId = automatic && !postSafety ? this.audioRequestId : this.nextAudioRequest();
+    const epoch = automatic && !postSafety ? this.audioEpoch : this.invalidateAudioRestores();
     const previousPlayback = structuredClone(this.state.playback || {});
     const physical = await this.serializeAudio(async () => {
       this.assertAudioRequest(requestId, epoch);
@@ -1456,7 +1785,7 @@ export class ReceiverRuntime {
       this.applyConfiguredMusicTarget({ report: false });
       const nextIndex = (Number(playback.trackIndex || 0) + 1) % tracks.length;
       const track = tracks[nextIndex];
-      await this.audio.playMusicUrl(track.audioUrl, { label: track.title, loop: tracks.length === 1 });
+      await this.audio.playMusicUrl(track.audioUrl, { label: track.title, loop: tracks.length === 1, scheduledRunToken: playback.scheduledRunToken });
       if (requestId !== this.audioRequestId || epoch !== this.audioEpoch || !this.isOwner()) {
         this.audio.stopMusic();
         throw new Error('A newer audio command replaced this controlled-track skip.');
@@ -1501,7 +1830,15 @@ export class ReceiverRuntime {
     const reason = event.type === 'error'
       ? `Controlled audio stopped with a media error: ${event.error || 'unknown media error'}`
       : 'Controlled audio was paused by the browser or device controls.';
+    const schedule = getActiveSchedule(this.state);
+    const run = schedule?.mode === 'order' ? normalizeSequenceRun(this.state.sequenceRuns?.[schedule.id]) : null;
+    const orderToken = ['waiting-track-end', 'waiting-duration'].includes(run?.status) && run.active?.token === this.state.playback.scheduledRunToken
+      ? run.active.token
+      : '';
     await this.updatePlayback({ intent: 'paused', unavailableReason: reason }, 'Controlled playback paused');
+    if (orderToken) {
+      await this.serializeOrder(() => this.failOrderStep(schedule.id, orderToken, new Error(reason)));
+    }
     this.status(reason, false);
     return true;
   }
@@ -1524,7 +1861,7 @@ export class ReceiverRuntime {
     return safetyAnnouncementText(id, item?.text, this.state.config);
   }
 
-  async prepareVoice(text, { cacheOnly = false } = {}) {
+  async prepareVoice(text, { cacheOnly = false, signal = null } = {}) {
     const message = String(text || '').trim().slice(0, 900);
     if (!message || this.state.config.voiceMode !== 'ai') return null;
     const voice = this.state.config.aiVoice || 'marin';
@@ -1532,6 +1869,11 @@ export class ReceiverRuntime {
     if (this.voiceCache.has(cacheKey)) return this.voiceCache.get(cacheKey);
     if (cacheOnly) return null;
     const controller = new AbortController();
+    const abortFromSignal = () => {
+      if (!controller.signal.aborted) controller.abort(signal?.reason || 'cancel');
+    };
+    if (signal?.aborted) abortFromSignal();
+    else signal?.addEventListener?.('abort', abortFromSignal, { once: true });
     this.voicePrepareController = controller;
     const timer = setTimeout(() => controller.abort('timeout'), 13_000);
     try {
@@ -1563,6 +1905,7 @@ export class ReceiverRuntime {
       return null;
     } finally {
       clearTimeout(timer);
+      signal?.removeEventListener?.('abort', abortFromSignal);
       if (this.voicePrepareController === controller) this.voicePrepareController = null;
     }
   }
@@ -1600,6 +1943,14 @@ export class ReceiverRuntime {
       const jobOptions = { ...options, cancellation };
       const job = { message, options: jobOptions, cancellation, safety: !!options.safety, resolve, reject };
       if (job.safety) {
+        const safetyIntentGeneration = this.beginExternalAudioIntent('safety');
+        const activeSchedule = getActiveSchedule(this.state);
+        const activeRun = activeSchedule?.mode === 'order'
+          ? normalizeSequenceRun(this.state.sequenceRuns?.[activeSchedule.id])
+          : null;
+        if (['waiting-duration', 'waiting-track-end'].includes(activeRun?.status) && activeRun?.active?.token && this.state.playback?.scheduledRunToken === activeRun.active.token) {
+          this.orderIntentGenerations.set(activeRun.active.token, safetyIntentGeneration);
+        }
         this.safetyPendingCount += 1;
         if (this.audioRequestKind !== 'terminal') this.nextAudioRequest('safety');
         const safetyEpoch = this.invalidateAudioRestores({ preservePreempted: true, preserveSafetyRestore: true });
@@ -1641,6 +1992,24 @@ export class ReceiverRuntime {
       }
     } finally {
       this.announcementRunning = false;
+      if (this.safetyPendingCount === 0 && !this.currentAnnouncement && this.active && this.isOwner()) {
+        const deferredEnd = this.deferredControlledTrackEnd;
+        const deferredNext = this.deferredAutomaticNext;
+        this.deferredControlledTrackEnd = null;
+        this.deferredAutomaticNext = null;
+        if (deferredEnd) {
+          queueMicrotask(() => this.handleControlledTrackEnded(deferredEnd)
+            .catch(error => this.status(`Deferred scheduled track completion failed: ${error.message}`, false)));
+        } else if (deferredNext && deferredNext.externalIntentGeneration === this.externalAudioIntentGeneration) {
+          queueMicrotask(() => this.nextMusic({
+            automatic: true,
+            expectedUrl: deferredNext.expectedUrl,
+            postSafety: true,
+            externalIntentGeneration: deferredNext.externalIntentGeneration
+          })
+            .catch(error => this.status(`Deferred next track failed: ${error.message}`, false)));
+        }
+      }
     }
   }
 
@@ -1735,6 +2104,9 @@ export class ReceiverRuntime {
           if (options.safety && !chainedSafety) this.preemptedSpotifySnapshot = null;
           const mayResume = announcementEpoch === this.audioEpoch && !options?.cancellation?.cancelled && this.active && this.isOwner();
           if (mayResume && resumeSnapshot?.wasPlaying) {
+            if (Number.isFinite(Number(carriedSafetyRestore?.musicLevelPercent))) {
+              this.applyConfiguredMusicTarget({ report: false, percent: carriedSafetyRestore.musicLevelPercent });
+            }
             await this.spotify.resumeAfterAnnouncement(resumeSnapshot, {
               assertCurrent: () => {
                 if (announcementEpoch !== this.audioEpoch || !this.active || !this.isOwner()) {
@@ -1750,9 +2122,13 @@ export class ReceiverRuntime {
         await this.audio.endAnnouncement({ restore: restoreCurrentBed && controlledWasPlaying });
         if (restoreAllowed && carriedSafetyRestore?.provider === 'controlled' && carriedSafetyRestore.controlledSnapshot?.wasPlaying) {
           const snapshot = carriedSafetyRestore.controlledSnapshot;
+          if (Number.isFinite(Number(carriedSafetyRestore.musicLevelPercent))) {
+            this.applyConfiguredMusicTarget({ report: false, percent: carriedSafetyRestore.musicLevelPercent });
+          }
           await this.audio.playMusicUrl(snapshot.audioUrl, {
             label: snapshot.label,
-            startAt: snapshot.position
+            startAt: snapshot.position,
+            scheduledRunToken: snapshot.scheduledRunToken
           }).then(() => { this.physicalProvider = 'controlled'; }).catch(error => this.status(`Safety announcement finished; controlled music restore failed: ${error.message}`, false));
         }
       }
@@ -1939,12 +2315,506 @@ export class ReceiverRuntime {
     throw new Error('Weather settings kept changing while the scan was running. Try again after saving Settings.');
   }
 
+  clearOrderWake(scheduleId) {
+    const timer = this.orderWakeTimers.get(scheduleId);
+    if (timer) clearTimeout(timer);
+    this.orderWakeTimers.delete(scheduleId);
+  }
+
+  armOrderWake(scheduleId, dueAt) {
+    this.clearOrderWake(scheduleId);
+    const delay = Math.max(0, Number(dueAt || 0) - this.now());
+    if (!Number.isFinite(delay)) return;
+    const timer = setTimeout(() => {
+      this.orderWakeTimers.delete(scheduleId);
+      this.tickOrderSchedule().catch(error => this.status(`Order schedule could not advance: ${error.message}`, false));
+    }, Math.min(delay, 2_147_000_000));
+    this.orderWakeTimers.set(scheduleId, timer);
+  }
+
+  async claimOrderItem(scheduleId, trigger = {}, externalIntentGeneration = null) {
+    this.assertExternalAudioIntent(externalIntentGeneration);
+    let claim = null;
+    await this.store.mutate(draft => {
+      claim = null;
+      this.assertExternalAudioIntent(externalIntentGeneration);
+      if (draft.receiver?.id !== this.deviceId || draft.receiver?.sessionId !== this.sessionId) {
+        throw new Error('Receiver ownership changed before the Order item could be claimed.');
+      }
+      const schedule = getActiveSchedule(draft);
+      if (!schedule || schedule.id !== scheduleId || schedule.mode !== 'order' || schedule.enabled === false) {
+        throw new Error('That Order schedule is not the live enabled schedule.');
+      }
+      const run = normalizeSequenceRun(draft.sequenceRuns?.[scheduleId]);
+      if (run.lastTriggerId && run.lastTriggerId === trigger.id) {
+        if (run.lastOutcome === 'failed') throw new Error(run.lastError || 'This Order request already failed and was not replayed.');
+        claim = { duplicate: true, status: run.status };
+        return draft;
+      }
+      if (run.active) throw new Error('The receiver is already completing an Order item.');
+      if (trigger.kind === 'manual') {
+        if (run.status === 'complete') throw new Error('This Order schedule is complete. Reset it before starting again.');
+        if (['waiting-duration', 'waiting-track-end', 'auto-pending', 'claiming'].includes(run.status)) {
+          throw new Error('This Order schedule is already waiting to advance automatically.');
+        }
+        const expectedOrder = Number(trigger.expectedOrder ?? run.order);
+        const expectedItemId = String(trigger.expectedItemId ?? run.itemId);
+        if (expectedOrder !== Number(run.order) || expectedItemId !== String(run.itemId || '')) {
+          throw new Error('The Order position changed before this request arrived. Refresh and tap Play Next again.');
+        }
+      } else if (run.status !== 'auto-pending') {
+        claim = { duplicate: true, status: run.status };
+        return draft;
+      }
+      const item = nextOrderScheduleItem(schedule, run.order);
+      const now = this.now();
+      if (!item) {
+        draft.sequenceRuns = {
+          ...(draft.sequenceRuns || {}),
+          [scheduleId]: {
+            ...run,
+            status: 'complete',
+            active: null,
+            lastTriggerId: String(trigger.id || ''),
+            lastOutcome: 'committed',
+            lastError: '',
+            updatedAt: now
+          }
+        };
+        claim = { complete: true, status: 'complete' };
+        return draft;
+      }
+      const token = String(trigger.id || makeId('order-step', now));
+      const kind = item.action?.kind || item.type || 'announcement';
+      const advanceMode = kind === 'announcement' ? 'complete' : (item.advance?.mode || 'manual');
+      const active = {
+        token,
+        triggerId: String(trigger.id || token),
+        itemId: item.id,
+        order: Number(item.position?.order || item.order || 0),
+        kind,
+        advanceMode,
+        receiverId: this.deviceId,
+        sessionId: this.sessionId,
+        claimedAt: now,
+        startedAt: 0,
+        dueAt: 0,
+        expectedProvider: '',
+        expectedUrl: ''
+      };
+      draft.sequenceRuns = {
+        ...(draft.sequenceRuns || {}),
+        [scheduleId]: {
+          ...run,
+          status: 'claiming',
+          active,
+          lastTriggerId: active.triggerId,
+          lastOutcome: 'pending',
+          lastError: '',
+          updatedAt: now
+        }
+      };
+      claim = { scheduleId, scheduleName: schedule.name, item: structuredClone(item), token, active, externalIntentGeneration };
+      return draft;
+    }, 'Order item claimed', { requireDurable: true });
+    if (claim?.item) {
+      this.orderIntentGenerations.set(claim.token, externalIntentGeneration);
+      try {
+        this.assertExternalAudioIntent(externalIntentGeneration, 'A newer audio command replaced this Order claim before it could start.');
+      } catch (error) {
+        await this.failOrderStep(scheduleId, claim.token, error).catch(() => {});
+        throw error;
+      }
+      const saved = normalizeSequenceRun(this.state.sequenceRuns?.[scheduleId]);
+      if (saved.active?.token !== claim.token || saved.active?.sessionId !== this.sessionId) {
+        throw new Error('The Order claim changed before audio could start.');
+      }
+    } else {
+      this.assertExternalAudioIntent(externalIntentGeneration, 'A newer audio command replaced this Order request.');
+    }
+    return claim;
+  }
+
+  async setOrderWaiting(scheduleId, token, { status, dueAt = 0, expectedProvider = '', expectedUrl = '', externalIntentGeneration = this.orderIntentGenerations.get(token) } = {}) {
+    this.assertExternalAudioIntent(externalIntentGeneration, 'A newer audio command cancelled this Order advance gate.');
+    let saved = false;
+    await this.store.mutate(draft => {
+      saved = false;
+      this.assertExternalAudioIntent(externalIntentGeneration, 'A newer audio command cancelled this Order advance gate.');
+      const run = normalizeSequenceRun(draft.sequenceRuns?.[scheduleId]);
+      if (run.active?.token !== token || run.active?.sessionId !== this.sessionId) return draft;
+      const now = this.now();
+      draft.sequenceRuns = {
+        ...(draft.sequenceRuns || {}),
+        [scheduleId]: {
+          ...run,
+          status,
+          active: {
+            ...run.active,
+            startedAt: run.active.startedAt || now,
+            dueAt: Math.max(0, Number(dueAt || 0)),
+            expectedProvider: String(expectedProvider || ''),
+            expectedUrl: String(expectedUrl || '')
+          },
+          lastOutcome: 'armed',
+          updatedAt: now
+        }
+      };
+      saved = true;
+      return draft;
+    }, 'Order advance gate armed', { requireDurable: true });
+    this.assertExternalAudioIntent(externalIntentGeneration, 'A newer audio command cancelled this Order advance gate.');
+    const authoritative = normalizeSequenceRun(this.state.sequenceRuns?.[scheduleId]);
+    if (!saved || authoritative.active?.token !== token || authoritative.active?.sessionId !== this.sessionId || authoritative.status !== status) {
+      throw new Error('The Order item was replaced before its advance gate could be saved.');
+    }
+    if (status === 'waiting-duration') this.armOrderWake(scheduleId, dueAt);
+    return true;
+  }
+
+  async completeOrderGate(scheduleId, token, nextStatus, outcome, externalIntentGeneration = this.orderIntentGenerations.get(token)) {
+    this.assertExternalAudioIntent(externalIntentGeneration, 'A newer audio command cancelled this Order item before its position could advance.');
+    let status = '';
+    let committedOrder = 0;
+    let committedItemId = '';
+    await this.store.mutate(draft => {
+      status = '';
+      committedOrder = 0;
+      committedItemId = '';
+      this.assertExternalAudioIntent(externalIntentGeneration, 'A newer audio command cancelled this Order item before its position could advance.');
+      const schedule = getActiveSchedule(draft);
+      const run = normalizeSequenceRun(draft.sequenceRuns?.[scheduleId]);
+      if (!schedule || schedule.id !== scheduleId || run.active?.token !== token || run.active?.sessionId !== this.sessionId) return draft;
+      const active = run.active;
+      const hasNext = !!nextOrderScheduleItem(schedule, active.order);
+      status = hasNext ? nextStatus : 'complete';
+      committedOrder = active.order;
+      committedItemId = active.itemId;
+      draft.sequenceRuns = {
+        ...(draft.sequenceRuns || {}),
+        [scheduleId]: {
+          ...run,
+          order: active.order,
+          itemId: active.itemId,
+          status,
+          active: null,
+          lastOutcome: 'committed',
+          lastError: '',
+          updatedAt: this.now()
+        }
+      };
+      draft.activityLog = [makeLog('schedule', 'Order item confirmed', `${active.order}. ${active.itemId} · ${outcome}`, this.now(), { scheduleId, itemId: active.itemId, orderToken: token }), ...(draft.activityLog || [])];
+      return draft;
+    }, 'Order item confirmed', { requireDurable: true });
+    this.assertExternalAudioIntent(externalIntentGeneration, 'A newer audio command cancelled this Order item before its position could advance.');
+    const authoritative = normalizeSequenceRun(this.state.sequenceRuns?.[scheduleId]);
+    if (!status || authoritative.active || authoritative.status !== status || authoritative.order !== committedOrder || authoritative.itemId !== committedItemId || authoritative.lastOutcome !== 'committed') {
+      throw new Error('The Order item was cancelled before its completion could be recorded.');
+    }
+    this.orderIntentGenerations.delete(token);
+    this.clearOrderWake(scheduleId);
+    return status;
+  }
+
+  async failOrderStep(scheduleId, token, error) {
+    this.clearOrderWake(scheduleId);
+    let failed = false;
+    await this.store.mutate(draft => {
+      failed = false;
+      const run = normalizeSequenceRun(draft.sequenceRuns?.[scheduleId]);
+      if (run.active?.token !== token) return draft;
+      const message = String(error?.message || error || 'Order item failed.').slice(0, 300);
+      draft.sequenceRuns = {
+        ...(draft.sequenceRuns || {}),
+        [scheduleId]: {
+          ...run,
+          status: 'failed',
+          active: null,
+          lastOutcome: 'failed',
+          lastError: message,
+          updatedAt: this.now()
+        }
+      };
+      draft.activityLog = [makeLog('error', 'Order item failed', message, this.now(), { scheduleId, orderToken: token }), ...(draft.activityLog || [])];
+      failed = true;
+      return draft;
+    }, 'Order item failure recorded', { requireDurable: true });
+    this.orderIntentGenerations.delete(token);
+    return failed;
+  }
+
+  async cancelAutoPendingOrder(scheduleId, reason) {
+    let cancelled = false;
+    await this.store.mutate(draft => {
+      cancelled = false;
+      const run = normalizeSequenceRun(draft.sequenceRuns?.[scheduleId]);
+      if (run.status !== 'auto-pending' || run.active) return draft;
+      const message = String(reason || 'The pending Order continuation was cancelled.').slice(0, 300);
+      draft.sequenceRuns = {
+        ...(draft.sequenceRuns || {}),
+        [scheduleId]: {
+          ...run,
+          status: 'failed',
+          active: null,
+          lastOutcome: 'failed',
+          lastError: message,
+          updatedAt: this.now()
+        }
+      };
+      draft.activityLog = [makeLog('schedule', 'Pending Order continuation cancelled', message, this.now(), { scheduleId }), ...(draft.activityLog || [])];
+      cancelled = true;
+      return draft;
+    }, 'Pending Order continuation cancelled', { requireDurable: true });
+    return cancelled;
+  }
+
+  async failActiveOrderPlayback(reason) {
+    const schedule = getActiveSchedule(this.state);
+    if (!schedule || schedule.mode !== 'order') return false;
+    const run = normalizeSequenceRun(this.state.sequenceRuns?.[schedule.id]);
+    if (!['waiting-duration', 'waiting-track-end'].includes(run.status) || !run.active?.token) return false;
+    return await this.serializeOrder(() => this.failOrderStep(schedule.id, run.active.token, new Error(reason)));
+  }
+
+  async executeOrderItem(claim) {
+    const { scheduleId, item, token } = claim;
+    const externalIntentGeneration = claim.externalIntentGeneration ?? this.orderIntentGenerations.get(token);
+    this.assertExternalAudioIntent(externalIntentGeneration);
+    const kind = item.action?.kind || item.type || 'announcement';
+    const advanceMode = kind === 'announcement' ? 'complete' : (item.advance?.mode || 'manual');
+    if (kind === 'announcement') {
+      const resolved = resolveScheduleAnnouncementText(item, this.state.announcements);
+      const announcementId = item.action?.announcementId || item.announcementId || '';
+      const text = item.action?.announcementSource === 'inline'
+        ? resolved
+        : safetyAnnouncementText(announcementId, resolved, this.state.config);
+      if (!text) throw new Error('This Order announcement has no text.');
+      this.assertExternalAudioIntent(externalIntentGeneration);
+      await this.announce(text, { label: item.label });
+      this.assertExternalAudioIntent(externalIntentGeneration, 'A newer audio command cancelled this Order announcement before its position could advance.');
+      const status = await this.completeOrderGate(scheduleId, token, 'auto-pending', 'announcement completed', externalIntentGeneration);
+      return { continue: status === 'auto-pending', status };
+    }
+
+    const url = String(item.action?.url || item.url || '').trim();
+    if (!url) throw new Error('This Order music item has no source URL.');
+    if (kind === 'spotify' && advanceMode === 'track-end') {
+      throw new Error('Spotify does not provide a schedule-safe track-end event. Choose Manual, Duration, or Immediately after start.');
+    }
+    const volumePercent = effectiveScheduleItemVolume(item, this.state.config);
+    this.assertExternalAudioIntent(externalIntentGeneration);
+    if (kind === 'spotify') {
+      await this.playSpotify(url, {
+        volumePercent,
+        volumeMode: item.volume?.mode,
+        scheduledItemId: item.id,
+        scheduledRunToken: token
+      });
+    } else {
+      await this.playControlled(url, {
+        label: item.label,
+        volumePercent,
+        volumeMode: item.volume?.mode,
+        scheduledItemId: item.id,
+        scheduledRunToken: token,
+        loop: advanceMode === 'track-end' ? false : null
+      });
+    }
+    this.assertExternalAudioIntent(externalIntentGeneration, 'A newer audio command replaced this Order item while playback was starting.');
+
+    if (advanceMode === 'duration') {
+      const durationSeconds = clamp(item.advance?.durationSeconds, 1, 86_400, 300);
+      const dueAt = this.now() + durationSeconds * 1000;
+      await this.setOrderWaiting(scheduleId, token, {
+        status: 'waiting-duration',
+        dueAt,
+        expectedProvider: kind,
+        expectedUrl: kind === 'controlled' ? String(this.state.playback.audioUrl || '') : url,
+        externalIntentGeneration
+      });
+      return { continue: false, status: 'waiting-duration' };
+    }
+    if (advanceMode === 'track-end') {
+      await this.setOrderWaiting(scheduleId, token, {
+        status: 'waiting-track-end',
+        expectedProvider: 'controlled',
+        expectedUrl: String(this.state.playback.audioUrl || ''),
+        externalIntentGeneration
+      });
+      return { continue: false, status: 'waiting-track-end' };
+    }
+    const nextStatus = advanceMode === 'complete' ? 'auto-pending' : 'waiting-manual';
+    const status = await this.completeOrderGate(scheduleId, token, nextStatus, 'playback start confirmed', externalIntentGeneration);
+    return { continue: status === 'auto-pending', status };
+  }
+
+  async runOrderChain(scheduleId, trigger, externalIntentGeneration = null) {
+    let currentTrigger = trigger;
+    for (let steps = 0; steps < 100; steps += 1) {
+      this.assertExternalAudioIntent(externalIntentGeneration);
+      const claim = await this.claimOrderItem(scheduleId, currentTrigger, externalIntentGeneration);
+      if (!claim?.item) return claim?.status !== 'failed';
+      try {
+        const result = await this.executeOrderItem(claim);
+        this.assertExternalAudioIntent(externalIntentGeneration, 'A newer audio command stopped this Order chain before the next item.');
+        if (!result.continue) return true;
+      } catch (error) {
+        if (this.state.playback?.scheduledRunToken === claim.token) {
+          await this.stopMusic({ skipOrderFailure: true }).catch(() => {});
+        }
+        const failedActive = await this.failOrderStep(scheduleId, claim.token, error).catch(() => false);
+        if (!failedActive) await this.cancelAutoPendingOrder(scheduleId, error.message || String(error)).catch(() => {});
+        throw error;
+      }
+      currentTrigger = { id: makeId('order-auto', this.now()), kind: 'automatic' };
+    }
+    throw new Error('Order schedule stopped at its 100-item safety limit.');
+  }
+
+  async requestOrderNext(event, externalIntentGeneration = null) {
+    const payload = event?.payload || {};
+    const scheduleId = String(payload.scheduleId || '');
+    if (!scheduleId) throw new Error('Order schedule ID is missing.');
+    const intentGeneration = externalIntentGeneration ?? this.beginExternalAudioIntent('schedule');
+    return await this.serializeOrder(() => this.runOrderChain(scheduleId, {
+      id: String(event.id || makeId('order-manual', this.now())),
+      kind: 'manual',
+      expectedOrder: Number(payload.expectedOrder || 0),
+      expectedItemId: String(payload.expectedItemId || '')
+    }, intentGeneration));
+  }
+
+  async resetOrderSchedule(event, externalIntentGeneration = null) {
+    const scheduleId = String(event?.payload?.scheduleId || '');
+    if (!scheduleId) throw new Error('Order schedule ID is missing.');
+    const intentGeneration = externalIntentGeneration ?? this.beginExternalAudioIntent('terminal');
+    this.assertExternalAudioIntent(intentGeneration, 'A newer command replaced this Order reset.');
+    const selectedSchedule = (this.state.schedules || []).find(schedule => schedule.id === scheduleId);
+    const scheduledItemIds = new Set((selectedSchedule?.items || []).map(item => String(item.id || '')));
+    const scheduledPlayback = this.state.playback || {};
+    if (scheduledPlayback.scheduledRunToken && scheduledItemIds.has(String(scheduledPlayback.scheduledItemId || ''))) {
+      await this.stopMusic({ skipOrderFailure: true });
+    }
+    return await this.serializeOrder(async () => {
+      this.clearOrderWake(scheduleId);
+      let cancelledToken = '';
+      await this.store.mutate(draft => {
+        cancelledToken = '';
+        if (draft.receiver?.id !== this.deviceId || draft.receiver?.sessionId !== this.sessionId) {
+          throw new Error('Receiver ownership changed before the Order schedule could reset.');
+        }
+        const schedule = getActiveSchedule(draft);
+        if (!schedule || schedule.id !== scheduleId || schedule.mode !== 'order') throw new Error('That Order schedule is not live.');
+        const previous = normalizeSequenceRun(draft.sequenceRuns?.[scheduleId]);
+        cancelledToken = String(previous.active?.token || '');
+        draft.sequenceRuns = {
+          ...(draft.sequenceRuns || {}),
+          [scheduleId]: {
+            ...normalizeSequenceRun(null),
+            status: 'idle',
+            lastTriggerId: String(event.id || ''),
+            lastOutcome: 'cancelled',
+            lastError: previous.active ? 'The prior Order advance was cancelled by Reset.' : '',
+            updatedAt: this.now()
+          }
+        };
+        return draft;
+      }, 'Order schedule reset', { requireDurable: true });
+      if (cancelledToken) this.orderIntentGenerations.delete(cancelledToken);
+      return true;
+    });
+  }
+
+  async finishPendingOrderGate(scheduleId, token, outcome, { endedEvent = false } = {}) {
+    const run = normalizeSequenceRun(this.state.sequenceRuns?.[scheduleId]);
+    if (run.active?.token !== token) return false;
+    const externalIntentGeneration = this.orderIntentGenerations.get(token);
+    try {
+      this.assertExternalAudioIntent(externalIntentGeneration, 'A newer audio command cancelled this pending Order advance.');
+    } catch (error) {
+      await this.failOrderStep(scheduleId, token, error);
+      throw error;
+    }
+    const playback = this.state.playback || {};
+    const providerMatches = !run.active.expectedProvider || playback.provider === run.active.expectedProvider;
+    const urlMatches = run.active.expectedProvider !== 'controlled' || !run.active.expectedUrl || playback.audioUrl === run.active.expectedUrl;
+    const intentMatches = playback.intent === 'playing' || (endedEvent && playback.intent === 'paused');
+    if (!intentMatches || playback.scheduledRunToken !== token || playback.scheduledItemId !== run.active.itemId || !providerMatches || !urlMatches) {
+      const error = new Error('The scheduled music was stopped or replaced before its advance gate completed.');
+      await this.failOrderStep(scheduleId, token, error);
+      throw error;
+    }
+    const status = await this.completeOrderGate(scheduleId, token, 'auto-pending', outcome, externalIntentGeneration);
+    if (status === 'auto-pending') {
+      await this.runOrderChain(scheduleId, { id: makeId('order-auto', this.now()), kind: 'automatic' }, externalIntentGeneration);
+    }
+    return true;
+  }
+
+  async tickOrderSchedule() {
+    if (!this.isOwner()) return false;
+    const schedule = getActiveSchedule(this.state);
+    if (!schedule || schedule.mode !== 'order' || schedule.enabled === false) return false;
+    const run = normalizeSequenceRun(this.state.sequenceRuns?.[schedule.id]);
+    if (run.active && run.active.sessionId !== this.sessionId && this.now() - Number(run.active.claimedAt || 0) >= RECEIVER_LEASE_MS) {
+      return await this.serializeOrder(() => this.failOrderStep(schedule.id, run.active.token, new Error('An unfinished Order item belonged to an expired receiver session and was not replayed.')));
+    }
+    if (run.active?.token && this.orderIntentGenerations.get(run.active.token) !== this.externalAudioIntentGeneration) {
+      return await this.serializeOrder(() => this.failOrderStep(schedule.id, run.active.token, new Error('A newer audio command cancelled the pending Order advance.')));
+    }
+    if (run.status === 'waiting-duration' && run.active?.token) {
+      if (this.currentAnnouncement || this.safetyPendingCount > 0) {
+        this.armOrderWake(schedule.id, this.now() + 1_000);
+        return false;
+      }
+      if (Number(run.active.dueAt || 0) > this.now()) {
+        this.armOrderWake(schedule.id, run.active.dueAt);
+        return false;
+      }
+      return await this.serializeOrder(() => this.finishPendingOrderGate(schedule.id, run.active.token, 'duration completed'));
+    }
+    if (run.status === 'auto-pending') {
+      if (this.currentAnnouncement || this.safetyPendingCount > 0 || this.announcementQueue.some(job => job.safety)) {
+        this.armOrderWake(schedule.id, this.now() + 1_000);
+        return false;
+      }
+      const intentGeneration = this.beginExternalAudioIntent('schedule');
+      return await this.serializeOrder(() => this.runOrderChain(schedule.id, { id: makeId('order-auto', this.now()), kind: 'automatic' }, intentGeneration));
+    }
+    return false;
+  }
+
+  async handleControlledTrackEnded(event = {}) {
+    const schedule = getActiveSchedule(this.state);
+    if (!schedule || schedule.mode !== 'order') return false;
+    const run = normalizeSequenceRun(this.state.sequenceRuns?.[schedule.id]);
+    if (run.status !== 'waiting-track-end' || run.active?.expectedProvider !== 'controlled') return false;
+    if (!run.active?.token || run.active.token !== String(event.scheduledRunToken || '') || run.active.expectedUrl !== String(event.url || '')) return false;
+    if (this.safetyPendingCount > 0 || this.currentAnnouncement?.safety || this.announcementQueue.some(job => job.safety)) {
+      this.deferredControlledTrackEnd = { ...event };
+      return true;
+    }
+    return await this.serializeOrder(() => this.finishPendingOrderGate(schedule.id, run.active.token, 'direct track ended', { endedEvent: true }));
+  }
+
+  hasPendingControlledTrackEnd() {
+    const schedule = getActiveSchedule(this.state);
+    if (!schedule || schedule.mode !== 'order') return false;
+    const run = normalizeSequenceRun(this.state.sequenceRuns?.[schedule.id]);
+    return run.status === 'waiting-track-end' && run.active?.expectedProvider === 'controlled';
+  }
+
   async tickSchedule() {
     if (!this.isOwner() || this.scheduleProcessing) return;
     this.scheduleProcessing = true;
     try {
+      const activeSchedule = getActiveSchedule(this.state);
+      if (activeSchedule?.mode === 'order') {
+        await this.tickOrderSchedule();
+        return;
+      }
       const now = this.now();
-      const due = dueScheduleItems(this.state.schedule, this.state.scheduleRuns, now);
+      const due = dueTimeScheduleItems(getActiveSchedule(this.state), this.state.scheduleRuns, now);
       for (const dueItem of due) {
       const dateParts = new Intl.DateTimeFormat('en-US', { timeZone: 'America/Chicago', year: 'numeric', month: '2-digit', day: '2-digit' })
         .formatToParts(new Date(now));
@@ -1952,9 +2822,12 @@ export class ReceiverRuntime {
       const dateKey = `${dateValues.year}-${dateValues.month}-${dateValues.day}`;
       const localKey = `${dueItem.id}:${dateKey}`;
       if (this.scheduleCompletedLocal.has(localKey)) continue;
+      const externalIntentGeneration = this.beginExternalAudioIntent('time-schedule');
       let item = null;
       await this.store.mutate(draft => {
-        const latest = dueScheduleItems(draft.schedule, draft.scheduleRuns, now)
+        item = null;
+        this.assertExternalAudioIntent(externalIntentGeneration, 'A newer audio command cancelled this Time schedule claim.');
+        const latest = dueTimeScheduleItems(getActiveSchedule(draft), draft.scheduleRuns, now)
           .find(candidate => candidate.id === dueItem.id);
         if (!latest) return draft;
         const existing = draft.scheduleRuns?.[latest.id];
@@ -1978,20 +2851,63 @@ export class ReceiverRuntime {
       if (!item) continue;
       const claim = this.state.scheduleRuns?.[item.id];
       if (!claim || claim.dateKey !== dateKey || claim.status !== 'in-progress' || claim.sessionId !== this.sessionId) continue;
+      try {
+        this.assertExternalAudioIntent(externalIntentGeneration, 'A newer audio command cancelled this Time schedule item before it could start.');
+      } catch (error) {
+        await this.store.mutate(draft => {
+          const run = draft.scheduleRuns?.[item.id];
+          if (run?.dateKey === dateKey && run?.status === 'in-progress' && run?.sessionId === this.sessionId) {
+            draft.scheduleRuns = {
+              ...(draft.scheduleRuns || {}),
+              [item.id]: {
+                dateKey,
+                status: 'completed',
+                completedAt: this.now(),
+                receiverId: this.deviceId,
+                sessionId: this.sessionId,
+                outcome: 'cancelled-by-newer-audio-intent'
+              }
+            };
+          }
+          draft.activityLog = [makeLog('schedule', 'Scheduled item cancelled by newer audio command', `${item.label}: ${error.message}`, this.now(), { scheduleId: item.id }), ...(draft.activityLog || [])];
+          return draft;
+        }, 'Schedule cancellation recorded', { requireDurable: true });
+        this.scheduleCompletedLocal.add(localKey);
+        continue;
+      }
       let playbackCompleted = false;
       try {
         if (item.type === 'announcement') {
-          const text = this.announcementText(item.announcementId);
-          if (!text) throw new Error(`Saved announcement ${item.announcementId || '(none)'} was not found.`);
+          const resolved = resolveScheduleAnnouncementText(item, this.state.announcements);
+          const announcementId = item.action?.announcementId || item.announcementId || '';
+          const text = item.action?.announcementSource === 'inline'
+            ? resolved
+            : safetyAnnouncementText(announcementId, resolved, this.state.config);
+          if (!text) throw new Error('The scheduled announcement has no text. Add custom text or choose a saved announcement.');
           await this.announce(text, { label: item.label });
         } else if (item.type === 'spotify') {
-          await this.playSpotify(item.url || this.state.config.spotifyUrl);
+          await this.playSpotify(item.url || item.action?.url || this.state.config.spotifyUrl, {
+            volumePercent: effectiveScheduleItemVolume(item, this.state.config),
+            volumeMode: item.volume?.mode,
+            scheduledItemId: item.id
+          });
         } else {
-          await this.playControlled(item.url || this.state.config.musicUrl, { label: item.label });
+          await this.playControlled(item.url || item.action?.url || this.state.config.musicUrl, {
+            label: item.label,
+            volumePercent: effectiveScheduleItemVolume(item, this.state.config),
+            volumeMode: item.volume?.mode,
+            scheduledItemId: item.id
+          });
         }
+        this.assertExternalAudioIntent(externalIntentGeneration, 'A newer audio command replaced this Time schedule item while it was starting.');
         playbackCompleted = true;
         this.scheduleCompletedLocal.add(localKey);
         await this.store.mutate(draft => {
+          this.assertExternalAudioIntent(externalIntentGeneration, 'A newer audio command cancelled this Time schedule receipt.');
+          const existing = draft.scheduleRuns?.[item.id];
+          if (!existing || existing.dateKey !== dateKey || existing.status !== 'in-progress' || existing.sessionId !== this.sessionId) {
+            throw new Error('The Time schedule claim changed before completion could be recorded.');
+          }
           draft.scheduleRuns = {
             ...(draft.scheduleRuns || {}),
             [item.id]: {
@@ -2006,20 +2922,36 @@ export class ReceiverRuntime {
           return draft;
         }, 'Schedule run recorded', { requireDurable: true });
       } catch (error) {
-        if (playbackCompleted) {
+        const superseded = error?.code === 'AUDIO_INTENT_SUPERSEDED' || externalIntentGeneration !== this.externalAudioIntentGeneration;
+        if (playbackCompleted && !superseded) {
           this.status(`Scheduled item played, but its cloud receipt could not be saved: ${item.label}: ${error.message}. This receiver will not replay it today.`, false);
           continue;
         }
         await this.store.mutate(draft => {
           const run = draft.scheduleRuns?.[item.id];
           if (run?.dateKey === dateKey && run?.status === 'in-progress' && run?.sessionId === this.sessionId) {
-            const scheduleRuns = { ...(draft.scheduleRuns || {}) };
-            delete scheduleRuns[item.id];
-            draft.scheduleRuns = scheduleRuns;
+            if (superseded) {
+              draft.scheduleRuns = {
+                ...(draft.scheduleRuns || {}),
+                [item.id]: {
+                  dateKey,
+                  status: 'completed',
+                  completedAt: this.now(),
+                  receiverId: this.deviceId,
+                  sessionId: this.sessionId,
+                  outcome: 'cancelled-by-newer-audio-intent'
+                }
+              };
+            } else {
+              const scheduleRuns = { ...(draft.scheduleRuns || {}) };
+              delete scheduleRuns[item.id];
+              draft.scheduleRuns = scheduleRuns;
+            }
           }
-          draft.activityLog = [makeLog('error', 'Scheduled item failed; retry remains eligible', `${item.label}: ${error.message}`, this.now(), { scheduleId: item.id }), ...(draft.activityLog || [])];
+          draft.activityLog = [makeLog(superseded ? 'schedule' : 'error', superseded ? 'Scheduled item cancelled by newer audio command' : 'Scheduled item failed; retry remains eligible', `${item.label}: ${error.message}`, this.now(), { scheduleId: item.id }), ...(draft.activityLog || [])];
           return draft;
         }, 'Schedule failure recorded', { requireDurable: true });
+        if (superseded) this.scheduleCompletedLocal.add(localKey);
         this.status(`Scheduled item failed: ${item.label}: ${error.message}`, false);
       }
       }
@@ -2028,9 +2960,24 @@ export class ReceiverRuntime {
     }
   }
 
-  async runCalibration() {
+  stopCalibration(reason = 'Sound check stopped. The temporary tone is off.') {
+    const stopped = this.audio.stopCalibration?.(reason, { ok: true, report: true }) || false;
+    if (stopped) this.onChange();
+    return stopped;
+  }
+
+  async runCalibration(externalIntentGeneration = null) {
     if (!this.isOwner()) throw new Error('Run calibration on the active speaker receiver.');
     this.assertNoSafetyPending();
+    const intentGeneration = externalIntentGeneration ?? this.beginExternalAudioIntent('calibration');
+    const activeSchedule = getActiveSchedule(this.state);
+    const activeRun = activeSchedule?.mode === 'order'
+      ? normalizeSequenceRun(this.state.sequenceRuns?.[activeSchedule.id])
+      : null;
+    if (['waiting-duration', 'waiting-track-end'].includes(activeRun?.status) && activeRun?.active?.token && this.state.playback?.scheduledRunToken === activeRun.active.token) {
+      this.orderIntentGenerations.set(activeRun.active.token, intentGeneration);
+    }
+    this.assertExternalAudioIntent(intentGeneration, 'A newer audio command replaced the sound check.');
     const requestId = this.nextAudioRequest();
     const epoch = this.invalidateAudioRestores();
     const completed = await this.serializeAudio(async () => {
@@ -2043,6 +2990,11 @@ export class ReceiverRuntime {
           wasPlaying,
           audioUrl: String(this.state.playback.audioUrl || ''),
           label: String(this.state.playback.label || 'Suno / direct audio'),
+          scheduledRunToken: String(this.state.playback.scheduledRunToken || ''),
+          scheduledItemId: String(this.state.playback.scheduledItemId || ''),
+          volumeMode: this.state.playback.volumeMode === 'custom' ? 'custom' : 'global',
+          musicLevelPercent: this.currentMusicTarget(),
+          loop: !!this.audio.musicElement?.loop,
           position: wasPlaying
             ? Number(this.audio.musicElement?.currentTime || 0)
             : Number(this.state.playback.positionMs || 0) / 1000
@@ -2060,16 +3012,20 @@ export class ReceiverRuntime {
       }
     }
     this.physicalProvider = '';
+    let soundCheckCompleted = false;
     try {
       await this.audio.runCalibration({
-        speak: async text => {
+        speak: async (text, { signal } = {}) => {
           this.assertAudioRequest(requestId, epoch, 'Sound check was replaced by a higher-priority audio action.');
-          const blob = await this.prepareVoice(text);
+          const blob = await this.prepareVoice(text, { signal });
           this.assertAudioRequest(requestId, epoch, 'Sound check was replaced by a higher-priority audio action.');
           if (blob) await this.audio.playVoiceBlob(blob);
           else await this.audio.playDeviceSpeech(text);
         }
       });
+      soundCheckCompleted = true;
+    } catch (error) {
+      if (error?.name !== 'AbortError') throw error;
     } finally {
       const superseded = !this.isOwner() || requestId !== this.audioRequestId || epoch !== this.audioEpoch;
       if (superseded) {
@@ -2083,27 +3039,53 @@ export class ReceiverRuntime {
       } else if (provider === 'spotify' && spotifySnapshot?.wasPlaying) {
         await this.spotify.resumeAfterAnnouncement(spotifySnapshot, {
           assertCurrent: () => this.assertAudioRequest(requestId, epoch)
-        }).then(() => { this.physicalProvider = 'spotify'; }).catch(error => this.status(`Sound check finished; Spotify resume failed: ${error.message}`, false));
-      } else if (controlledSnapshot?.wasPlaying && controlledSnapshot.audioUrl) {
+        }).then(() => {
+          this.physicalProvider = 'spotify';
+          this.physicalRequestId = requestId;
+          this.physicalCommittedRequestId = requestId;
+          this.physicalMusicTarget = {
+            requestId,
+            mode: this.state.playback.volumeMode === 'custom' ? 'custom' : 'global',
+            percent: this.currentMusicTarget(),
+            provider: 'spotify'
+          };
+          this.rememberCommittedPlayback(requestId);
+        }).catch(error => this.status(`Sound check finished; Spotify resume failed: ${error.message}`, false));
+      } else if (controlledSnapshot?.wasPlaying && controlledSnapshot.audioUrl && this.scheduledRunAuthorized(this.state, controlledSnapshot.scheduledRunToken, controlledSnapshot.scheduledItemId)) {
         await this.audio.playMusicUrl(controlledSnapshot.audioUrl, {
           label: controlledSnapshot.label,
-          startAt: controlledSnapshot.position
-        }).then(() => { this.physicalProvider = 'controlled'; }).catch(error => this.status(`Sound check finished; music restore failed: ${error.message}`, false));
+          startAt: controlledSnapshot.position,
+          loop: controlledSnapshot.loop,
+          scheduledRunToken: controlledSnapshot.scheduledRunToken
+        }).then(() => {
+          this.physicalProvider = 'controlled';
+          this.physicalRequestId = requestId;
+          this.physicalCommittedRequestId = requestId;
+          this.physicalMusicTarget = {
+            requestId,
+            mode: controlledSnapshot.volumeMode,
+            percent: controlledSnapshot.musicLevelPercent,
+            provider: 'controlled'
+          };
+          this.rememberCommittedPlayback(requestId);
+        }).catch(error => this.status(`Sound check finished; music restore failed: ${error.message}`, false));
       } else if (controlledSnapshot) {
         this.audio.stopMusic();
-        this.physicalProvider = 'controlled';
+        this.physicalProvider = controlledSnapshot.wasPlaying ? '' : 'controlled';
+        this.physicalMusicTarget = null;
       }
       if (spotifyPauseHeld) this.endTemporarySpotifyPause();
     }
-    return true;
+    return soundCheckCompleted;
     });
+    if (!completed) return false;
     try {
       await this.store.mutate(draft => {
         if (draft.receiver?.id !== this.deviceId || draft.receiver?.sessionId !== this.sessionId) {
           throw new Error('Receiver ownership changed before the sound-check receipt could be saved.');
         }
         const target = clamp(draft.config.musicLevel, 0, 100, 30);
-        draft.activityLog = [makeLog('diagnostic', `${target}/100 calibration completed`, `${target}% calibration bed, ${Math.min(6, target)}% duck, and 100% announcement path played on the receiver.`), ...(draft.activityLog || [])];
+        draft.activityLog = [makeLog('diagnostic', `${target}/100 calibration completed`, `${target}% calibration bed, ${Math.min(DUCK_LEVEL_PERCENT, target)}% duck, and 100% announcement path played on the receiver.`), ...(draft.activityLog || [])];
         return draft;
       }, 'Calibration completed', { requireDurable: true });
     } catch (error) {

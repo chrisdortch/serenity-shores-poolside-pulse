@@ -138,7 +138,7 @@ beforeEach(() => {
 });
 
 describe('receiver startup lease freshness', { concurrency: false }, () => {
-  test('claims its lease from the post-setup clock and records that durable heartbeat', async () => {
+  test('claims its lease after audio unlock without attempting asynchronous Spotify activation', async () => {
     const initialNow = MONDAY_1230_CHICAGO;
     let clock = initialNow;
     const state = createDefaultState(initialNow);
@@ -146,6 +146,8 @@ describe('receiver startup lease freshness', { concurrency: false }, () => {
     state.config.weatherAuto = false;
     state.playback.intent = 'stopped';
     const setupAdvanceMs = RECEIVER_LEASE_MS * 2;
+    let spotifyConnectCalls = 0;
+    let spotifyCapabilityCalls = 0;
     const { runtime, store } = runtimeHarness({
       state,
       now: () => clock,
@@ -157,8 +159,9 @@ describe('receiver startup lease freshness', { concurrency: false }, () => {
         loggedIn: () => true,
         supportsVolume: true,
         volumeVerified: true,
-        connectFromUserGesture: async () => { clock += setupAdvanceMs; },
+        connectFromUserGesture: async () => { spotifyConnectCalls += 1; clock += setupAdvanceMs; },
         refreshCapabilities: async () => {
+          spotifyCapabilityCalls += 1;
           clock += setupAdvanceMs;
           return { supportsVolume: true, volumeVerified: true };
         }
@@ -172,10 +175,12 @@ describe('receiver startup lease freshness', { concurrency: false }, () => {
     runtime.requestWakeLock = async () => {};
     runtime.armLeaseGuard = () => {};
 
-    const expectedClaimTime = initialNow + setupAdvanceMs * 3;
+    const expectedClaimTime = initialNow + setupAdvanceMs;
     const lease = await runtime.start();
 
     assert.equal(clock, expectedClaimTime);
+    assert.equal(spotifyConnectCalls, 0, 'Spotify activation must wait for its own explicit receiver tap');
+    assert.equal(spotifyCapabilityCalls, 0);
     assert.equal(lease.startedAt, expectedClaimTime);
     assert.equal(lease.lastSeen, expectedClaimTime);
     assert.equal(lease.leaseUntil, expectedClaimTime + RECEIVER_LEASE_MS);
@@ -354,15 +359,22 @@ describe('receiver schedule receipts', { concurrency: false }, () => {
   function scheduledState() {
     const state = ownerState(MONDAY_1230_CHICAGO);
     state.announcements = [{ id: 'safety', label: 'Safety', text: 'Safety message' }];
-    state.schedule = [{
+    const item = {
       id: 'midday-safety',
       label: 'Midday Safety',
       type: 'announcement',
       time: '12:30',
       announcementId: 'safety',
+      position: { time: '12:30', order: 1 },
+      action: { kind: 'announcement', announcementSource: 'saved', announcementId: 'safety', text: '', url: '' },
+      volume: { mode: 'custom', percent: 100 },
+      advance: { mode: 'complete', durationSeconds: 300 },
       enabled: true,
       days: [1]
-    }];
+    };
+    state.schedules = [{ id: 'receipt-test', name: 'Receipt Test', mode: 'time', enabled: true, items: [structuredClone(item)] }];
+    state.activeScheduleId = 'receipt-test';
+    state.schedule = [item];
     state.scheduleRuns = {};
     return state;
   }

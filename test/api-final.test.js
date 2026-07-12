@@ -83,6 +83,16 @@ describe('vFinal signed session', () => {
     assert.equal(readSession(req, 1_800_000_000_000 + (24 * 60 * 60 * 1000)), null);
     const tampered = request('GET', '/api/session', { cookie: `poolside_vfinal_session=${token.slice(0, -1)}x` });
     assert.equal(readSession(tampered, 1_800_000_001_000), null);
+
+    const originalPin = process.env.POOL_SIDE_PIN;
+    try {
+      const pinBoundToken = createSessionToken(1_800_000_000_000);
+      process.env.POOL_SIDE_PIN = '7901';
+      const priorPinSession = request('GET', '/api/session', { cookie: `poolside_vfinal_session=${pinBoundToken}` });
+      assert.equal(readSession(priorPinSession, 1_800_000_001_000), null);
+    } finally {
+      process.env.POOL_SIDE_PIN = originalPin;
+    }
   });
 
   test('renews a session after 12 hours on status and protected API requests', async () => {
@@ -256,7 +266,7 @@ describe('vFinal state isolation and command preservation', () => {
     assert.equal(first.statusCode, 200);
     assert.equal(first.json().state.config.musicLevel, 100);
     assert.equal(first.json().state.config.voiceLevel, 100);
-    assert.equal(first.json().state.config.duckLevel, 6);
+    assert.equal(first.json().state.config.duckLevel, 0);
     assert.equal(first.json().state.config.address, 'Preserve this setting');
     assert.equal(first.json().state.marker, 'preserved-state-field');
 
@@ -280,7 +290,7 @@ describe('vFinal state isolation and command preservation', () => {
     assert.equal(second.statusCode, 200);
     assert.equal(second.json().state.config.musicLevel, 0);
     assert.equal(second.json().state.config.voiceLevel, 100);
-    assert.equal(second.json().state.config.duckLevel, 6);
+    assert.equal(second.json().state.config.duckLevel, 0);
 
     const stored = Object.values(globalThis.__POOL_SIDE_MEMORY_STATES__)[0];
     stored.config = {
@@ -294,9 +304,191 @@ describe('vFinal state isolation and command preservation', () => {
     assert.equal(read.statusCode, 200);
     assert.equal(read.json().state.config.musicLevel, 30);
     assert.equal(read.json().state.config.voiceLevel, 100);
-    assert.equal(read.json().state.config.duckLevel, 6);
+    assert.equal(read.json().state.config.duckLevel, 0);
     assert.equal(read.json().state.config.address, 'Preserve this setting');
     assert.equal(read.json().state.marker, 'preserved-state-field');
+  });
+
+  test('forces final-namespace invariants and preserves config across partial writes', async () => {
+    globalThis.__POOL_SIDE_MEMORY_STATES__ = {};
+    globalThis.__POOL_SIDE_MEMORY_STATE_LOCKS__ = new Map();
+    const cookie = sessionCookie();
+    const first = await invoke(stateHandler, request('POST', '/api/state?v=final', {
+      cookie,
+      body: {
+        version: 'final',
+        expectedRevision: 0,
+        state: {
+          config: {
+            musicLevel: 47,
+            voiceLevel: 12,
+            duckLevel: 99,
+            address: 'Keep this exact address',
+            spotifyClientId: 'keep-this-client-id'
+          },
+          events: [],
+          activityLog: []
+        }
+      }
+    }));
+
+    assert.equal(first.statusCode, 200);
+    assert.equal(first.json().state.version, 'final');
+    assert.equal(first.json().state.config.musicLevel, 47);
+    assert.equal(first.json().state.config.voiceLevel, 100);
+    assert.equal(first.json().state.config.duckLevel, 0);
+
+    const second = await invoke(stateHandler, request('POST', '/api/state?v=final', {
+      cookie,
+      body: {
+        version: 'final',
+        expectedRevision: 1,
+        state: {
+          events: [{ id: 'partial-event', createdAt: Date.now(), status: 'pending' }],
+          activityLog: []
+        }
+      }
+    }));
+
+    assert.equal(second.statusCode, 200);
+    assert.equal(second.json().state.version, 'final');
+    assert.equal(second.json().state.config.musicLevel, 47);
+    assert.equal(second.json().state.config.voiceLevel, 100);
+    assert.equal(second.json().state.config.duckLevel, 0);
+    assert.equal(second.json().state.config.address, 'Keep this exact address');
+    assert.equal(second.json().state.config.spotifyClientId, 'keep-this-client-id');
+  });
+
+  test('preserves named schedules and order progress across event-only writes', async () => {
+    globalThis.__POOL_SIDE_MEMORY_STATES__ = {};
+    globalThis.__POOL_SIDE_MEMORY_STATE_LOCKS__ = new Map();
+    const cookie = sessionCookie();
+    const now = Date.now();
+    const inlineText = 'Attention guests. The custom inline schedule announcement is ready.';
+    const schedules = [
+      {
+        id: 'time-inline-77',
+        name: 'Time inline custom 77',
+        mode: 'time',
+        enabled: true,
+        items: [
+          {
+            id: 'inline-guest-reminder',
+            label: 'Inline guest reminder',
+            enabled: true,
+            days: [1, 3, 5],
+            position: { time: '14:35', order: 1 },
+            action: {
+              kind: 'announcement',
+              announcementSource: 'inline',
+              announcementId: '',
+              text: inlineText,
+              url: ''
+            },
+            volume: { mode: 'custom', percent: 77 },
+            advance: { mode: 'complete', durationSeconds: 0 },
+            type: 'announcement',
+            time: '14:35',
+            order: 1,
+            announcementId: '',
+            url: ''
+          }
+        ]
+      },
+      {
+        id: 'order-spotify-41',
+        name: 'Order Spotify custom 41',
+        mode: 'order',
+        enabled: true,
+        items: [
+          {
+            id: 'spotify-sunset-set',
+            label: 'Spotify sunset set',
+            enabled: true,
+            days: [0, 1, 2, 3, 4, 5, 6],
+            position: { time: '12:00', order: 1 },
+            action: {
+              kind: 'spotify',
+              announcementSource: 'saved',
+              announcementId: '',
+              text: '',
+              url: 'https://open.spotify.com/playlist/37i9dQZF1DX0UrRvztWcAU'
+            },
+            volume: { mode: 'custom', percent: 41 },
+            advance: { mode: 'track-end', durationSeconds: 0 },
+            type: 'spotify',
+            time: '12:00',
+            order: 1,
+            announcementId: '',
+            url: 'https://open.spotify.com/playlist/37i9dQZF1DX0UrRvztWcAU'
+          }
+        ]
+      }
+    ];
+    const sequenceRuns = {
+      'order-spotify-41': {
+        order: 1,
+        itemId: 'spotify-sunset-set',
+        updatedAt: now
+      }
+    };
+
+    const first = await invoke(stateHandler, request('POST', '/api/state?v=final', {
+      cookie,
+      body: {
+        version: 'final',
+        expectedRevision: 0,
+        state: {
+          version: '23',
+          config: { musicLevel: 30, voiceLevel: 12, duckLevel: 87 },
+          schedules,
+          activeScheduleId: 'order-spotify-41',
+          sequenceRuns,
+          events: [],
+          activityLog: []
+        }
+      }
+    }));
+
+    assert.equal(first.statusCode, 200);
+    assert.equal(first.json().state.revision, 1);
+    assert.equal(first.json().state.version, 'final');
+    assert.equal(first.json().state.config.duckLevel, 0);
+    assert.deepEqual(first.json().state.schedules, schedules);
+    assert.equal(first.json().state.activeScheduleId, 'order-spotify-41');
+    assert.deepEqual(first.json().state.sequenceRuns, sequenceRuns);
+
+    const event = { id: 'event-after-rich-schedules', createdAt: now + 1, status: 'pending' };
+    const second = await invoke(stateHandler, request('POST', '/api/state?v=final', {
+      cookie,
+      body: {
+        version: 'final',
+        expectedRevision: 1,
+        state: { events: [event], activityLog: [] }
+      }
+    }));
+
+    assert.equal(second.statusCode, 200);
+    assert.equal(second.json().state.revision, 2);
+    assert.equal(second.json().state.version, 'final');
+    assert.equal(second.json().state.config.duckLevel, 0);
+    assert.deepEqual(second.json().state.schedules, schedules);
+    assert.equal(second.json().state.activeScheduleId, 'order-spotify-41');
+    assert.deepEqual(second.json().state.sequenceRuns, sequenceRuns);
+
+    const read = await invoke(stateHandler, request('GET', '/api/state?v=final', { cookie }));
+    assert.equal(read.statusCode, 200);
+    assert.equal(read.json().state.revision, 2);
+    assert.equal(read.json().state.version, 'final');
+    assert.equal(read.json().state.config.duckLevel, 0);
+    assert.deepEqual(read.json().state.schedules, schedules);
+    assert.equal(read.json().state.activeScheduleId, 'order-spotify-41');
+    assert.deepEqual(read.json().state.sequenceRuns, sequenceRuns);
+    assert.equal(read.json().state.schedules[0].items[0].action.text, inlineText);
+    assert.deepEqual(read.json().state.schedules[0].items[0].volume, { mode: 'custom', percent: 77 });
+    assert.equal(read.json().state.schedules[1].items[0].action.kind, 'spotify');
+    assert.deepEqual(read.json().state.schedules[1].items[0].volume, { mode: 'custom', percent: 41 });
+    assert.deepEqual(read.json().state.events, [event]);
   });
 
   test('requires an expected revision for every final write', async () => {
@@ -309,6 +501,44 @@ describe('vFinal state isolation and command preservation', () => {
     assert.equal(res.statusCode, 400);
     assert.match(res.json().error, /expectedRevision/);
     assert.ok(Number.isFinite(res.json().serverTime));
+  });
+
+  test('enforces request and saved-state limits in UTF-8 bytes for parsed bodies', async () => {
+    globalThis.__POOL_SIDE_MEMORY_STATES__ = {};
+    globalThis.__POOL_SIDE_MEMORY_STATE_LOCKS__ = new Map();
+    const cookie = sessionCookie();
+
+    const multibyteState = await invoke(stateHandler, request('POST', '/api/state?v=final', {
+      cookie,
+      body: {
+        version: 'final',
+        expectedRevision: 0,
+        state: {
+          version: 'final',
+          marker: 'é'.repeat(510_000),
+          events: [],
+          activityLog: []
+        }
+      }
+    }));
+    assert.equal(multibyteState.statusCode, 400);
+    assert.match(multibyteState.json().error, /1 MB state limit/i);
+
+    const oversizedRequest = await invoke(stateHandler, request('POST', '/api/state?v=final', {
+      cookie,
+      body: {
+        version: 'final',
+        expectedRevision: 0,
+        state: {
+          version: 'final',
+          marker: 'x'.repeat(1_100_000),
+          events: [],
+          activityLog: []
+        }
+      }
+    }));
+    assert.equal(oversizedRequest.statusCode, 413);
+    assert.match(oversizedRequest.json().error, /1\.1 MB limit/i);
   });
 
   test('rejects stale revisions under memory serialization and supports a safe retry', async () => {
