@@ -221,6 +221,76 @@ describe('vFinal state isolation and command preservation', () => {
     assert.equal(read.json().state.events.length, 2);
   });
 
+  test('sanitizes persisted mix levels on final state writes and reads', async () => {
+    globalThis.__POOL_SIDE_MEMORY_STATES__ = {};
+    globalThis.__POOL_SIDE_MEMORY_STATE_LOCKS__ = new Map();
+    const cookie = sessionCookie();
+    const first = await invoke(stateHandler, request('POST', '/api/state?v=final', {
+      cookie,
+      body: {
+        version: 'final',
+        expectedRevision: 0,
+        state: {
+          version: 'final',
+          config: {
+            musicLevel: 175,
+            voiceLevel: -20,
+            duckLevel: 88,
+            address: 'Preserve this setting'
+          },
+          events: [],
+          activityLog: [],
+          marker: 'preserved-state-field'
+        }
+      }
+    }));
+
+    assert.equal(first.statusCode, 200);
+    assert.equal(first.json().state.config.musicLevel, 100);
+    assert.equal(first.json().state.config.voiceLevel, 100);
+    assert.equal(first.json().state.config.duckLevel, 6);
+    assert.equal(first.json().state.config.address, 'Preserve this setting');
+    assert.equal(first.json().state.marker, 'preserved-state-field');
+
+    const second = await invoke(stateHandler, request('POST', '/api/state?v=final', {
+      cookie,
+      body: {
+        version: 'final',
+        expectedRevision: 1,
+        state: {
+          ...first.json().state,
+          config: {
+            ...first.json().state.config,
+            musicLevel: -15,
+            voiceLevel: 0,
+            duckLevel: 0
+          }
+        }
+      }
+    }));
+
+    assert.equal(second.statusCode, 200);
+    assert.equal(second.json().state.config.musicLevel, 0);
+    assert.equal(second.json().state.config.voiceLevel, 100);
+    assert.equal(second.json().state.config.duckLevel, 6);
+
+    const stored = Object.values(globalThis.__POOL_SIDE_MEMORY_STATES__)[0];
+    stored.config = {
+      ...stored.config,
+      musicLevel: 'not-a-number',
+      voiceLevel: 45,
+      duckLevel: 45
+    };
+    const read = await invoke(stateHandler, request('GET', '/api/state?v=final', { cookie }));
+
+    assert.equal(read.statusCode, 200);
+    assert.equal(read.json().state.config.musicLevel, 30);
+    assert.equal(read.json().state.config.voiceLevel, 100);
+    assert.equal(read.json().state.config.duckLevel, 6);
+    assert.equal(read.json().state.config.address, 'Preserve this setting');
+    assert.equal(read.json().state.marker, 'preserved-state-field');
+  });
+
   test('requires an expected revision for every final write', async () => {
     globalThis.__POOL_SIDE_MEMORY_STATES__ = {};
     globalThis.__POOL_SIDE_MEMORY_STATE_LOCKS__ = new Map();

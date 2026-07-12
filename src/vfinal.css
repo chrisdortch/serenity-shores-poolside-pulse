@@ -633,6 +633,21 @@ select:focus-visible {
   box-shadow: var(--shadow-small);
 }
 
+.deviceMode.roleBadge {
+  min-height: 36px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-color: #55717c;
+  border-radius: 999px;
+  padding: 6px 11px;
+  color: #e7f0f1;
+  font-size: 0.7rem;
+  font-weight: 800;
+  line-height: 1.1;
+  text-align: center;
+}
+
 .appShell {
   min-height: calc(100vh - var(--header-height));
   min-height: calc(100dvh - var(--header-height));
@@ -721,6 +736,27 @@ select:focus-visible {
 .feedback.bad::before {
   border-radius: 2px;
   background: var(--coral-700);
+}
+
+.unsavedPrompt {
+  flex-wrap: wrap;
+  justify-content: space-between;
+}
+
+.unsavedPrompt > strong {
+  flex: 1 1 320px;
+}
+
+.promptActions {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.promptActions button {
+  min-height: 44px;
+  padding-block: 8px;
+  font-size: 0.78rem;
 }
 
 .appShell.busy {
@@ -1180,6 +1216,119 @@ select:focus-visible {
 .receiverRibbon.offline::before {
   border-radius: 2px;
   background: var(--coral-700);
+}
+
+.volumeControl {
+  margin: 0 0 24px;
+  border: 1px solid #8bb8b2;
+  border-radius: 12px;
+  padding: clamp(17px, 3vw, 23px);
+  background: linear-gradient(145deg, #f2fbf9, #ffffff 72%);
+}
+
+.volumeHeading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  margin-bottom: 15px;
+}
+
+.volumeHeading h2,
+.volumeHeading p {
+  margin-bottom: 0;
+}
+
+.volumeHeading output {
+  min-width: 70px;
+  border: 1px solid #77aaa6;
+  border-radius: 10px;
+  padding: 7px 10px;
+  background: var(--paper);
+  color: var(--teal-700);
+  font-size: 1.08rem;
+  font-weight: 880;
+  text-align: center;
+}
+
+#musicLevel {
+  --level: 0.3;
+  min-height: 44px;
+  appearance: none;
+  -webkit-appearance: none;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  cursor: pointer;
+}
+
+#musicLevel::-webkit-slider-runnable-track {
+  height: 10px;
+  border: 1px solid #9cb7b2;
+  border-radius: 999px;
+  background: linear-gradient(to right, var(--teal-700) 0 calc(var(--level) * 100%), #dce6e3 calc(var(--level) * 100%) 100%);
+}
+
+#musicLevel::-webkit-slider-thumb {
+  width: 30px;
+  height: 30px;
+  margin-top: -11px;
+  appearance: none;
+  -webkit-appearance: none;
+  border: 3px solid var(--paper);
+  border-radius: 50%;
+  background: var(--teal-700);
+  box-shadow: 0 0 0 2px var(--teal-700), 0 3px 9px rgba(12, 37, 51, 0.22);
+}
+
+#musicLevel::-moz-range-track {
+  height: 10px;
+  border: 1px solid #9cb7b2;
+  border-radius: 999px;
+  background: #dce6e3;
+}
+
+#musicLevel::-moz-range-progress {
+  height: 10px;
+  border-radius: 999px;
+  background: var(--teal-700);
+}
+
+#musicLevel::-moz-range-thumb {
+  width: 24px;
+  height: 24px;
+  border: 3px solid var(--paper);
+  border-radius: 50%;
+  background: var(--teal-700);
+  box-shadow: 0 0 0 2px var(--teal-700), 0 3px 9px rgba(12, 37, 51, 0.22);
+}
+
+#musicLevel:focus-visible {
+  box-shadow: 0 0 0 3px rgba(160, 93, 0, 0.28);
+}
+
+#musicLevel:disabled {
+  cursor: progress;
+  opacity: 0.68;
+}
+
+.volumeScale {
+  display: flex;
+  justify-content: space-between;
+  margin-top: -2px;
+  color: var(--muted);
+  font-size: 0.68rem;
+  font-weight: 700;
+}
+
+.volumeControl > p {
+  margin: 12px 0 0;
+  color: var(--muted-strong);
+  font-size: 0.84rem;
+}
+
+.sourceHeading {
+  padding-top: 2px;
 }
 
 .providerSelector {
@@ -1717,6 +1866,26 @@ select:focus-visible {
   flex: 1 1 auto;
 }
 
+.shortcutLink {
+  min-height: 48px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--teal-700);
+  border-radius: var(--control-radius);
+  padding: 10px 14px;
+  background: var(--teal-700);
+  color: #fff;
+  font-weight: 800;
+  text-align: center;
+  text-decoration: none;
+}
+
+.shortcutLink.loud {
+  border-color: var(--navy-800);
+  background: var(--navy-800);
+}
+
 .diagnosticList {
   display: grid;
   margin: 20px 0 0;
@@ -2007,6 +2176,72 @@ select:focus-visible {
 }
 
 @media (max-width: 600px) {
+  :root {
+    --tabs-height: 99px;
+  }
+
+  .shellStatus {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    justify-content: stretch;
+    gap: 4px;
+    overflow: visible;
+  }
+
+  .shellStatus .statusPill {
+    width: 100%;
+    min-width: 0;
+    justify-content: center;
+    gap: 4px;
+    padding: 3px 4px;
+    font-size: 0.61rem;
+    line-height: 1.05;
+    text-align: center;
+    white-space: normal;
+  }
+
+  .shellStatus .statusPill::before {
+    width: 6px;
+    height: 6px;
+  }
+
+  .shellStatus .statusPill.mix::before {
+    width: 8px;
+    height: 3px;
+  }
+
+  .tabs,
+  .tabs.tabs-6 {
+    height: var(--tabs-height);
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    grid-template-rows: repeat(2, minmax(44px, 1fr));
+    align-items: stretch;
+    justify-content: stretch;
+    gap: 2px;
+    overflow: visible;
+    padding: 4px max(8px, env(safe-area-inset-right)) 4px max(8px, env(safe-area-inset-left));
+  }
+
+  .tabs.tabs-5 {
+    grid-template-columns: repeat(6, minmax(0, 1fr));
+  }
+
+  .tabs.tabs-5 button:nth-child(-n + 3) {
+    grid-column: span 2;
+  }
+
+  .tabs.tabs-5 button:nth-child(n + 4) {
+    grid-column: span 3;
+  }
+
+  .tabs button {
+    width: 100%;
+    min-width: 0;
+    min-height: 44px;
+    padding: 6px 8px;
+  }
+
   .centerStage {
     place-items: start center;
     padding-top: calc(34px + env(safe-area-inset-top));

@@ -3,6 +3,7 @@ import {
   SAFETY_EVENT_TTL_MS,
   WEATHER_INTERVAL_MS,
   audioPolicy,
+  clamp,
   completeEvent,
   createTargetedEvent,
   dueScheduleItems,
@@ -200,6 +201,7 @@ export class ReceiverRuntime {
     this.scheduleProcessing = false;
     this.weatherTail = Promise.resolve();
     this.audioTail = Promise.resolve();
+    this.volumeTail = Promise.resolve();
     this.audioEpoch = 0;
     this.audioRequestId = 0;
     this.audioRequestKind = 'none';
@@ -363,12 +365,66 @@ export class ReceiverRuntime {
   }
 
   currentPolicy(provider = this.state.config.musicProvider) {
+    const musicPercent = clamp(this.state.config.musicLevel, 0, 100, 30);
     return audioPolicy({
       provider,
       isIOS: isIOSLike(),
       supportsVolume: !!this.spotify.supportsVolume,
-      volumeVerified: !!this.spotify.volumeVerified
+      volumeVerified: !!this.spotify.volumeVerified,
+      verifiedPercent: this.spotify.verifiedPercent,
+      musicPercent
     });
+  }
+
+  applyConfiguredMusicTarget({ report = false } = {}) {
+    const target = clamp(this.state.config.musicLevel, 0, 100, 30);
+    this.audio.setMusicLevelPercent?.(target, { report });
+    this.spotify.setTargetVolumePercent?.(target);
+    return target;
+  }
+
+  async setMusicLevel(percent) {
+    const requested = clamp(percent, 0, 100, 30);
+    const work = async () => {
+      if (!this.isOwner()) throw new Error('This device is not the active speaker receiver.');
+      const target = requested;
+      this.audio.setMusicLevelPercent?.(target, { report: false });
+      this.spotify.setTargetVolumePercent?.(target);
+      let verification = null;
+      const spotifyActive = this.physicalProvider === 'spotify' ||
+        (this.state.playback.provider === 'spotify' && this.state.playback.intent === 'playing');
+      if (spotifyActive && this.spotify.ready) verification = await this.spotify.enforceVolume(target);
+      await this.store.mutate(draft => {
+        if (draft.receiver?.id !== this.deviceId || draft.receiver?.sessionId !== this.sessionId) {
+          throw new Error('Receiver ownership changed before the music level could be recorded.');
+        }
+        draft.config.musicLevel = target;
+        if (draft.playback?.provider === 'spotify') {
+          draft.playback = {
+            ...draft.playback,
+            volumeVerified: verification?.verified === true,
+            volumeVerifiedPercent: verification?.verified === true ? target : null,
+            volumeVerifiedAt: verification?.verified === true ? this.now() : 0,
+            updatedAt: this.now()
+          };
+        }
+        draft.activityLog = [makeLog('settings', 'Music level applied', `${target}% target; announcements remain 100%.`, this.now()), ...(draft.activityLog || [])];
+        return draft;
+      }, 'Music level applied', { requireDurable: true });
+      const policy = this.currentPolicy(this.physicalProvider || this.state.playback.provider || this.state.config.musicProvider);
+      await this.updateReceiverDetail(policy.detail, policy.id);
+      this.status(
+        spotifyActive && verification?.verified !== true
+          ? `Music target is ${target}%. Spotify could not verify that level on this receiver; announcements will still pause Spotify.`
+          : `Music level is ${target}%. Announcements remain fixed at 100%.`,
+        !spotifyActive || verification?.verified === true,
+        { policy, verification }
+      );
+      return target;
+    };
+    const job = this.volumeTail.then(work, work);
+    this.volumeTail = job.catch(() => {});
+    return await job;
   }
 
   async start({ takeover = false, takeoverTarget = null } = {}) {
@@ -394,6 +450,7 @@ export class ReceiverRuntime {
       error.takeoverTarget = { id: current.id, sessionId: current.sessionId };
       throw error;
     }
+    this.applyConfiguredMusicTarget({ report: false });
     await this.audio.unlock({ audibleTest: false });
     let spotifyCapability = null;
     const startupProvider = this.state.playback.intent === 'stopped'
@@ -594,6 +651,7 @@ export class ReceiverRuntime {
   async stop({ release = true } = {}) {
     this.nextAudioRequest();
     this.invalidateAudioRestores();
+    const stoppingProvider = this.physicalProvider;
     this.cancelPendingAnnouncements('Receiver stop requested.');
     this.audio.stopVoice();
     this.audio.stopMusic();
@@ -605,7 +663,8 @@ export class ReceiverRuntime {
       if (release) throw new Error(`Receiver stayed active because an older audio action could not be settled safely: ${error.message}`);
     }
     const spotifyCouldBePlaying = this.spotify.ready ||
-      this.physicalProvider === 'spotify' ||
+      stoppingProvider === 'spotify' ||
+      this.spotify.current?.paused === false ||
       (this.state.playback.provider === 'spotify' && this.state.playback.intent === 'playing');
     if (this.active && spotifyCouldBePlaying) {
       try {
@@ -697,6 +756,7 @@ export class ReceiverRuntime {
 
   async heartbeat() {
     if (!this.active) return;
+    const musicTarget = this.applyConfiguredMusicTarget({ report: false });
     let spotifyPlayback = null;
     let spotifyUnavailableReason = '';
     let spotifyCheckSuperseded = false;
@@ -740,13 +800,15 @@ export class ReceiverRuntime {
             this.physicalRequestId = 0;
             throw new Error(spotifyUnavailableReason);
           } else if (cloudSpotifyExpected && localPlayback) {
-            const measured = await this.spotify.readLocalVolume();
-            if (!measured.matches || !this.spotify.volumeVerified) await this.spotify.enforceThirtyPercent();
+            const measured = await this.spotify.readLocalVolume(musicTarget);
+            if (!measured.matches || !this.spotify.volumeVerified || this.spotify.verifiedPercent !== musicTarget) {
+              await this.spotify.enforceVolume(musicTarget);
+            }
           }
         }
       } catch (error) {
         this.spotify.resetVolumeVerification();
-        this.status(`Spotify 30% verification will retry: ${error.message}`, false);
+        this.status(`Spotify ${musicTarget}% verification will retry: ${error.message}`, false);
       }
     }
     const policy = this.currentPolicy(this.state.playback.provider || this.state.config.musicProvider);
@@ -772,6 +834,7 @@ export class ReceiverRuntime {
             positionMs: Number(spotifyPlayback?.position || draft.playback.positionMs || 0),
             unavailableReason: spotifyUnavailableReason,
             volumeVerified: !!this.spotify.volumeVerified,
+            volumeVerifiedPercent: this.spotify.volumeVerified ? this.spotify.verifiedPercent : null,
             volumeVerifiedAt: this.spotify.volumeVerified ? heartbeatNow : 0,
             audioPolicy: policy.id,
             updatedAt: heartbeatNow
@@ -919,6 +982,8 @@ export class ReceiverRuntime {
         return await this.stopMusic();
       case 'next-music':
         return await this.nextMusic();
+      case 'set-music-level':
+        return await this.setMusicLevel(payload.percent);
       case 'announce':
       case 'announce-safety':
         return await this.announce(payload.text, { safety: event.type === 'announce-safety', label: payload.label, eventId: event.id });
@@ -943,6 +1008,7 @@ export class ReceiverRuntime {
   async playControlled(url, { label = '', index = 0 } = {}) {
     if (!this.isOwner()) throw new Error('This device is not the active speaker receiver.');
     this.assertNoSafetyPending();
+    this.applyConfiguredMusicTarget({ report: false });
     const requestId = this.nextAudioRequest();
     const previousPlayback = structuredClone(this.state.playback || {});
     const previousSourceConfig = Object.fromEntries(['musicProvider', 'musicUrl', 'musicLabel', 'spotifyUrl'].map(key => [key, this.state.config[key]]));
@@ -952,7 +1018,9 @@ export class ReceiverRuntime {
     const epoch = this.invalidateAudioRestores();
     const physical = await this.serializeAudio(async () => {
       this.assertAudioRequest(requestId, epoch);
-      const spotifyCouldBePlaying = this.spotify.ready ||
+      const spotifyCouldBePlaying = this.physicalProvider === 'spotify' ||
+        this.spotify.ready ||
+        this.spotify.current?.paused === false ||
         (this.state.playback.provider === 'spotify' && this.state.playback.intent === 'playing');
       if (spotifyCouldBePlaying) this.beginTemporarySpotifyPause();
       let spotifySnapshot = null;
@@ -1021,7 +1089,7 @@ export class ReceiverRuntime {
           tracks: resolved.tracks,
           updatedAt: this.now()
         };
-        draft.activityLog = [makeLog('play', 'Controlled music playing at 30%', draft.playback.label, this.now(), { provider: 'controlled' }), ...(draft.activityLog || [])];
+        draft.activityLog = [makeLog('play', `Controlled music playing at ${draft.config.musicLevel}%`, draft.playback.label, this.now(), { provider: 'controlled' }), ...(draft.activityLog || [])];
         return draft;
       }, 'Controlled music started', { requireDurable: true });
       this.assertReceiptCurrent(requestId, epoch, 'Controlled playback was superseded while its cloud receipt was committing.');
@@ -1057,7 +1125,7 @@ export class ReceiverRuntime {
         ? `Controlled music was stopped because its cloud state could not be saved: ${error.message}. Spotify restore also failed: ${restoreError}`
         : `Controlled music was stopped because its cloud state could not be saved: ${error.message}`);
     }
-    this.status(`${physical.track.title} is playing at exact 30%.`, true);
+    this.status(`${physical.track.title} is playing at exact ${this.state.config.musicLevel}%.`, true);
     return true;
   }
 
@@ -1067,21 +1135,22 @@ export class ReceiverRuntime {
     if (!this.spotify.loggedIn()) throw new Error('Spotify is not logged in on the speaker receiver. Open Settings on that device and choose Login Spotify.');
     if (!this.spotify.ready) throw new Error('Spotify needs a local receiver tap. On the speaker device, open Receiver and choose Connect Spotify Receiver.');
     if (!this.isOwner()) throw new Error('Receiver ownership changed before Spotify could start.');
+    this.applyConfiguredMusicTarget({ report: false });
     const requestId = this.nextAudioRequest();
     const epoch = this.invalidateAudioRestores();
     const previousPlayback = structuredClone(this.state.playback || {});
     const previousSourceConfig = Object.fromEntries(['musicProvider', 'musicUrl', 'musicLabel', 'spotifyUrl'].map(key => [key, this.state.config[key]]));
     const physical = await this.serializeAudio(async () => {
       this.assertAudioRequest(requestId, epoch);
-      const controlledSnapshot = this.state.playback.provider === 'controlled' &&
-        this.state.playback.intent === 'playing' && this.audio.musicPlaying()
+      const controlledAudible = this.physicalProvider === 'controlled' || !!this.audio.musicPlaying?.();
+      const controlledSnapshot = controlledAudible
         ? {
-            audioUrl: String(this.state.playback.audioUrl || ''),
-            label: String(this.state.playback.label || 'Suno / direct audio'),
+            audioUrl: String(this.audio.currentUrl || this.state.playback.audioUrl || ''),
+            label: String(this.audio.currentLabel || this.state.playback.label || 'Suno / direct audio'),
             position: Number(this.audio.musicElement?.currentTime || 0)
           }
         : null;
-      if (controlledSnapshot) this.audio.pauseMusic();
+      this.audio.pauseMusic();
       let result;
       try {
         result = await this.spotify.play(url || this.state.config.spotifyUrl, {
@@ -1144,9 +1213,11 @@ export class ReceiverRuntime {
           trackIndex: 0,
           updatedAt: this.now(),
           volumeVerified: !!physical.result.volume?.verified,
+          volumeVerifiedPercent: physical.result.volume?.verified ? physical.result.volume.verifiedPercent : null,
+          volumeVerifiedAt: physical.result.volume?.verified ? this.now() : 0,
           audioPolicy: policy.id
         };
-        draft.activityLog = [makeLog('play', physical.result.volume?.verified ? 'Spotify playing at verified 30%' : 'Spotify playing in compatibility mode', policy.detail, this.now(), { provider: 'spotify' }), ...(draft.activityLog || [])];
+        draft.activityLog = [makeLog('play', physical.result.volume?.verified ? `Spotify playing at verified ${draft.config.musicLevel}%` : 'Spotify playing in compatibility mode', policy.detail, this.now(), { provider: 'spotify' }), ...(draft.activityLog || [])];
         return draft;
       }, 'Spotify playback started', { requireDurable: true });
       this.assertReceiptCurrent(requestId, epoch, 'Spotify playback was superseded while its cloud receipt was committing.');
@@ -1200,7 +1271,8 @@ export class ReceiverRuntime {
       const positionMs = provider === 'controlled' && this.audio.musicElement
         ? Math.max(0, Math.round(Number(this.audio.musicElement.currentTime || 0) * 1000))
         : Number(this.state.playback.positionMs || 0);
-      if (provider === 'spotify') await this.spotify.pauseForAnnouncement();
+      const spotifyMayBeAudible = provider === 'spotify' || this.spotify.ready || this.spotify.current?.paused === false;
+      if (spotifyMayBeAudible) await this.spotify.pauseForAnnouncement();
       this.audio.pauseMusic();
       this.physicalRequestId = 0;
       this.physicalCommittedRequestId = 0;
@@ -1224,6 +1296,7 @@ export class ReceiverRuntime {
       const activeProvider = this.physicalProvider || this.state.playback.provider || this.state.config.musicProvider;
       let resumed;
       if (activeProvider === 'spotify') {
+        this.audio.pauseMusic();
         try {
           resumed = await this.spotify.resume({ assertCurrent: () => this.assertAudioRequest(requestId, epoch) });
         } catch (error) {
@@ -1237,6 +1310,11 @@ export class ReceiverRuntime {
           throw error;
         }
       } else {
+        if (this.spotify.ready || this.spotify.current?.paused === false) {
+          await this.spotify.pauseForAnnouncement();
+          this.assertAudioRequest(requestId, epoch, 'Controlled resume was superseded while Spotify was being silenced.');
+        }
+        this.applyConfiguredMusicTarget({ report: false });
         resumed = await this.audio.resumeMusic();
         if (!resumed && this.state.playback.audioUrl) {
           await this.audio.playMusicUrl(this.state.playback.audioUrl, {
@@ -1314,7 +1392,8 @@ export class ReceiverRuntime {
     const provider = await this.serializeAudio(async () => {
       this.assertTerminalRequest(requestId);
       const activeProvider = this.physicalProvider || this.state.playback.provider || this.state.config.musicProvider;
-      if (activeProvider === 'spotify') await this.spotify.pauseForAnnouncement();
+      const spotifyMayBeAudible = activeProvider === 'spotify' || this.spotify.ready || this.spotify.current?.paused === false;
+      if (spotifyMayBeAudible) await this.spotify.pauseForAnnouncement();
       this.audio.stopMusic();
       this.physicalProvider = '';
       this.physicalRequestId = 0;
@@ -1339,6 +1418,7 @@ export class ReceiverRuntime {
       const provider = this.physicalProvider || playback.provider || this.state.config.musicProvider;
       if (automatic && (provider !== 'controlled' || playback.intent !== 'playing' || (expectedUrl && playback.audioUrl !== expectedUrl))) return null;
       if (provider === 'spotify') {
+      this.audio.pauseMusic();
       let state;
       try {
         state = await this.spotify.next({ assertCurrent: () => this.assertAudioRequest(requestId, epoch) });
@@ -1369,6 +1449,11 @@ export class ReceiverRuntime {
       }
       const tracks = Array.isArray(playback.tracks) ? playback.tracks : [];
       if (!tracks.length) throw new Error('No controlled playlist is loaded.');
+      if (this.spotify.ready || this.spotify.current?.paused === false) {
+        await this.spotify.pauseForAnnouncement();
+        this.assertAudioRequest(requestId, epoch, 'Controlled skip was superseded while Spotify was being silenced.');
+      }
+      this.applyConfiguredMusicTarget({ report: false });
       const nextIndex = (Number(playback.trackIndex || 0) + 1) % tracks.length;
       const track = tracks[nextIndex];
       await this.audio.playMusicUrl(track.audioUrl, { label: track.title, loop: tracks.length === 1 });
@@ -1950,6 +2035,7 @@ export class ReceiverRuntime {
     const epoch = this.invalidateAudioRestores();
     const completed = await this.serializeAudio(async () => {
     this.assertAudioRequest(requestId, epoch);
+    this.applyConfiguredMusicTarget({ report: false });
     const provider = this.physicalProvider || this.state.playback.provider || this.state.config.musicProvider;
     const wasPlaying = this.state.playback.intent === 'playing';
     const controlledSnapshot = provider === 'controlled'
@@ -1963,7 +2049,8 @@ export class ReceiverRuntime {
         }
       : null;
     let spotifySnapshot = null;
-    if (provider === 'spotify') {
+    const spotifyPauseHeld = provider === 'spotify' || this.spotify.ready || this.spotify.current?.paused === false;
+    if (spotifyPauseHeld) {
       this.beginTemporarySpotifyPause();
       try {
         spotifySnapshot = await this.spotify.pauseForAnnouncement();
@@ -1993,7 +2080,7 @@ export class ReceiverRuntime {
             ? this.carrySafetyRestore({ provider: 'controlled', controlledSnapshot })
             : false;
         if (!carried) await this.spotify.pauseForAnnouncement().catch(() => {});
-      } else if (spotifySnapshot?.wasPlaying) {
+      } else if (provider === 'spotify' && spotifySnapshot?.wasPlaying) {
         await this.spotify.resumeAfterAnnouncement(spotifySnapshot, {
           assertCurrent: () => this.assertAudioRequest(requestId, epoch)
         }).then(() => { this.physicalProvider = 'spotify'; }).catch(error => this.status(`Sound check finished; Spotify resume failed: ${error.message}`, false));
@@ -2006,7 +2093,7 @@ export class ReceiverRuntime {
         this.audio.stopMusic();
         this.physicalProvider = 'controlled';
       }
-      if (provider === 'spotify') this.endTemporarySpotifyPause();
+      if (spotifyPauseHeld) this.endTemporarySpotifyPause();
     }
     return true;
     });
@@ -2015,7 +2102,8 @@ export class ReceiverRuntime {
         if (draft.receiver?.id !== this.deviceId || draft.receiver?.sessionId !== this.sessionId) {
           throw new Error('Receiver ownership changed before the sound-check receipt could be saved.');
         }
-        draft.activityLog = [makeLog('diagnostic', '30/100 calibration completed', '30% calibration bed, 6% duck, and 100% announcement path played on the receiver.'), ...(draft.activityLog || [])];
+        const target = clamp(draft.config.musicLevel, 0, 100, 30);
+        draft.activityLog = [makeLog('diagnostic', `${target}/100 calibration completed`, `${target}% calibration bed, ${Math.min(6, target)}% duck, and 100% announcement path played on the receiver.`), ...(draft.activityLog || [])];
         return draft;
       }, 'Calibration completed', { requireDurable: true });
     } catch (error) {

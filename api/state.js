@@ -238,9 +238,24 @@ function sanitizeV23QuietBed(clean) {
   return clean;
 }
 
+function sanitizeFinalState(state) {
+  const clean = { ...state };
+  const sourceConfig = state.config && typeof state.config === 'object' && !Array.isArray(state.config)
+    ? state.config
+    : {};
+  clean.config = {
+    ...sourceConfig,
+    musicLevel: clampNumber(sourceConfig.musicLevel, 0, 100, 30),
+    voiceLevel: 100,
+    duckLevel: 6
+  };
+  return clean;
+}
+
 function sanitizeState(state) {
   if (!state || typeof state !== 'object') return state;
   const version = String(state.version || '');
+  if (version === FINAL_STATE_VERSION) return sanitizeFinalState(state);
   if (!['18', '20', '21', '22', '23'].includes(version)) return state;
   const modern = version === '20' || version === '21' || version === '22' || version === '23';
   const clean = { ...state };

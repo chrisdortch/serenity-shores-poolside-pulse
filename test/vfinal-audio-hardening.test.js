@@ -7,7 +7,7 @@ import { AudioEngine, estimateDeviceSpeechTimeoutMs } from '../src/vfinal/audio-
 import { SpotifyReceiver } from '../src/vfinal/spotify-receiver.js';
 
 describe('Spotify volume truthfulness', () => {
-  test('keeps device capability separate from exact volume verification', async () => {
+  test('keeps device capability separate from exact verification at a non-30 target', async () => {
     const statuses = [];
     const receiver = new SpotifyReceiver({ onStatus: status => statuses.push(status) });
     receiver.deviceId = 'receiver-a';
@@ -25,54 +25,118 @@ describe('Spotify volume truthfulness', () => {
     let setValue = null;
     receiver.player = {
       async setVolume(value) { setValue = value; },
-      async getVolume() { return 0.3; }
+      async getVolume() { return 0.42; }
     };
-    const verification = await receiver.enforceThirtyPercent();
-    assert.equal(setValue, 0.3);
+    receiver.setTargetVolumePercent(42);
+    const verification = await receiver.enforceVolume(42);
+    assert.equal(setValue, 0.42);
     assert.equal(verification.verified, true);
+    assert.equal(verification.verifiedPercent, 42);
     assert.equal(receiver.supportsVolume, true);
+    assert.equal(receiver.targetVolumePercent, 42);
     assert.equal(receiver.volumeVerified, true);
+    assert.equal(receiver.verifiedPercent, 42);
     assert.equal(statuses.at(-1).supportsVolume, true);
+    assert.equal(statuses.at(-1).targetVolumePercent, 42);
     assert.equal(statuses.at(-1).volumeVerified, true);
+    assert.equal(statuses.at(-1).verifiedPercent, 42);
   });
 
-  test('does not turn support into verification when the measured level differs', async () => {
+  test('does not verify a non-30 target when the measured level differs', async () => {
     const receiver = new SpotifyReceiver();
     receiver.deviceId = 'receiver-a';
     receiver.ready = true;
     receiver.supportsVolume = true;
     receiver.player = {
       async setVolume() {},
-      async getVolume() { return 0.31; }
+      async getVolume() { return 0.66; }
     };
 
-    const verification = await receiver.enforceThirtyPercent();
+    receiver.setTargetVolumePercent(67);
+    const verification = await receiver.enforceVolume(67);
     assert.equal(verification.verified, false);
-    assert.equal(verification.actual, 31);
+    assert.equal(verification.actual, 66);
+    assert.equal(verification.verifiedPercent, null);
+    assert.equal(receiver.targetVolumePercent, 67);
     assert.equal(receiver.supportsVolume, true);
     assert.equal(receiver.volumeVerified, false);
+    assert.equal(receiver.verifiedPercent, null);
   });
 
-  test('resets exact verification on a capability error and disconnect', async () => {
+  test('resets target-bound verification on target change, capability error, and disconnect', async () => {
     const receiver = new SpotifyReceiver();
     receiver.deviceId = 'receiver-a';
     receiver.ready = true;
     receiver.supportsVolume = true;
+    receiver.setTargetVolumePercent(42);
     receiver.volumeVerified = true;
+    receiver.verifiedPercent = 42;
+    receiver.verifiedDeviceId = 'receiver-a';
+
+    receiver.setTargetVolumePercent(55);
+    assert.equal(receiver.targetVolumePercent, 55);
+    assert.equal(receiver.volumeVerified, false);
+    assert.equal(receiver.verifiedPercent, null);
+    assert.equal(receiver.verifiedDeviceId, '');
+
+    receiver.volumeVerified = true;
+    receiver.verifiedPercent = 55;
     receiver.verifiedDeviceId = 'receiver-a';
     receiver.api = async () => { throw new Error('temporary failure'); };
 
     const capability = await receiver.refreshCapabilities();
     assert.equal(capability.supportsVolume, false);
     assert.equal(capability.volumeVerified, false);
+    assert.equal(capability.verifiedPercent, null);
     assert.equal(receiver.volumeVerified, false);
+    assert.equal(receiver.verifiedPercent, null);
 
     receiver.volumeVerified = true;
+    receiver.verifiedPercent = 55;
     receiver.verifiedDeviceId = 'receiver-a';
     receiver.disconnect();
     assert.equal(receiver.supportsVolume, false);
     assert.equal(receiver.volumeVerified, false);
+    assert.equal(receiver.verifiedPercent, null);
     assert.equal(receiver.deviceId, '');
+  });
+
+  test('serializes target changes so an older volume operation cannot finish last', async () => {
+    const firstSet = Promise.withResolvers();
+    const firstStarted = Promise.withResolvers();
+    const calls = [];
+    let actual = 0.3;
+    const receiver = new SpotifyReceiver();
+    receiver.deviceId = 'receiver-a';
+    receiver.ready = true;
+    receiver.supportsVolume = true;
+    receiver.player = {
+      async setVolume(value) {
+        calls.push(value);
+        if (calls.length === 1) {
+          firstStarted.resolve();
+          await firstSet.promise;
+        }
+        actual = value;
+      },
+      async getVolume() { return actual; }
+    };
+
+    receiver.setTargetVolumePercent(42);
+    const older = receiver.enforceVolume(42);
+    await firstStarted.promise;
+    receiver.setTargetVolumePercent(55);
+    const newer = receiver.enforceVolume(55);
+    firstSet.resolve();
+
+    const [oldResult, newResult] = await Promise.all([older, newer]);
+    assert.equal(oldResult.stale, true);
+    assert.equal(newResult.verified, true);
+    assert.equal(newResult.verifiedPercent, 55);
+    assert.deepEqual(calls, [0.42, 0.55]);
+    assert.equal(actual, 0.55);
+    assert.equal(receiver.targetVolumePercent, 55);
+    assert.equal(receiver.verifiedPercent, 55);
   });
 
   test('treats unknown playback as potentially audible, confirms pause, and does not resume it', async () => {
@@ -248,6 +312,29 @@ describe('receiver media-element priming', { concurrency: false }, () => {
       globalThis.URL.createObjectURL = originalCreateObjectURL;
       globalThis.URL.revokeObjectURL = originalRevokeObjectURL;
     }
+  });
+});
+
+describe('adjustable controlled-audio mixer', () => {
+  test('applies a live non-30 target and never raises quiet music while an announcement is active', () => {
+    const engine = new AudioEngine();
+    const ramps = [];
+    engine.musicBus = {};
+    engine.setMusicBus = (level, rampMs) => ramps.push({ level, rampMs });
+
+    assert.equal(engine.setMusicLevelPercent(42, { report: false }), 42);
+    assert.equal(engine.status().musicLevelPercent, 42);
+    assert.equal(engine.status().duckLevelPercent, 6);
+    assert.deepEqual(ramps.at(-1), { level: 0.42, rampMs: 140 });
+
+    engine.announcementDepth = 1;
+    assert.equal(engine.setMusicLevelPercent(4, { rampMs: 25, report: false }), 4);
+    assert.equal(engine.status().duckLevelPercent, 4);
+    assert.deepEqual(ramps.at(-1), { level: 0.04, rampMs: 25 });
+
+    assert.equal(engine.setMusicLevelPercent(140, { report: false }), 100);
+    assert.equal(engine.status().musicLevelPercent, 100);
+    assert.deepEqual(ramps.at(-1), { level: 0.06, rampMs: 140 }, 'an active announcement keeps the bus ducked even when the target rises');
   });
 });
 

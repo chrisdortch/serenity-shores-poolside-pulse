@@ -121,8 +121,12 @@ export class SpotifyReceiver {
     this.ready = false;
     this.current = null;
     this.supportsVolume = false;
+    this.targetVolumePercent = MUSIC_LEVEL_PERCENT;
     this.volumeVerified = false;
+    this.verifiedPercent = null;
     this.verifiedDeviceId = '';
+    this.volumeGeneration = 0;
+    this.volumeOperationTail = Promise.resolve();
     this.connectPromise = null;
     this.sdkPromise = null;
     this.playerPrepared = false;
@@ -131,7 +135,20 @@ export class SpotifyReceiver {
 
   resetVolumeVerification() {
     this.volumeVerified = false;
+    this.verifiedPercent = null;
     this.verifiedDeviceId = '';
+  }
+
+  invalidateVolumeOperations() {
+    this.volumeGeneration += 1;
+    this.resetVolumeVerification();
+  }
+
+  setTargetVolumePercent(percent) {
+    const target = clamp(percent, 0, 100, MUSIC_LEVEL_PERCENT);
+    if (target !== this.targetVolumePercent) this.invalidateVolumeOperations();
+    this.targetVolumePercent = target;
+    return target;
   }
 
   report(message, ok = true, extra = {}) {
@@ -141,7 +158,9 @@ export class SpotifyReceiver {
       ready: this.ready,
       deviceId: this.deviceId,
       supportsVolume: this.supportsVolume,
+      targetVolumePercent: this.targetVolumePercent,
       volumeVerified: this.volumeVerified,
+      verifiedPercent: this.verifiedPercent,
       ...extra
     });
   }
@@ -300,7 +319,7 @@ export class SpotifyReceiver {
 
   registerListeners() {
     this.player.addListener('ready', ({ device_id }) => {
-      this.resetVolumeVerification();
+      this.invalidateVolumeOperations();
       this.deviceId = device_id;
       this.ready = true;
       // The SDK ready event does not report the device volume capability. Keep
@@ -311,7 +330,7 @@ export class SpotifyReceiver {
     this.player.addListener('not_ready', () => {
       this.ready = false;
       this.supportsVolume = false;
-      this.resetVolumeVerification();
+      this.invalidateVolumeOperations();
       this.report('Spotify receiver went offline. Tap Start Receiver again.', false);
     });
     this.player.addListener('autoplay_failed', () => {
@@ -357,7 +376,7 @@ export class SpotifyReceiver {
         this.player = new Spotify.Player({
           name: PLAYER_NAME,
           getOAuthToken: callback => this.accessToken().then(callback).catch(error => this.report(error.message, false)),
-          volume: MUSIC_LEVEL_PERCENT / 100
+          volume: this.targetVolumePercent / 100
         });
         this.registerListeners();
       }
@@ -412,28 +431,28 @@ export class SpotifyReceiver {
     if (!this.deviceId) {
       this.supportsVolume = false;
       this.resetVolumeVerification();
-      return { supportsVolume: false, volumeVerified: false, device: null };
+      return { supportsVolume: false, volumeVerified: false, verifiedPercent: null, device: null };
     }
     const requestedDeviceId = String(this.deviceId);
     try {
       const data = await this.api('GET', '/me/player/devices');
       if (requestedDeviceId !== String(this.deviceId || '')) {
         this.supportsVolume = false;
-        this.resetVolumeVerification();
-        return { supportsVolume: false, volumeVerified: false, device: null, error: 'Spotify receiver changed while its capability was checked.' };
+        this.invalidateVolumeOperations();
+        return { supportsVolume: false, volumeVerified: false, verifiedPercent: null, device: null, error: 'Spotify receiver changed while its capability was checked.' };
       }
       const device = (data.devices || []).find(item => String(item.id || '') === requestedDeviceId);
       this.supportsVolume = !isIOSLike() && device?.is_restricted !== true && device?.supports_volume === true;
       if (!this.supportsVolume || this.verifiedDeviceId !== requestedDeviceId) this.resetVolumeVerification();
-      return { supportsVolume: this.supportsVolume, volumeVerified: this.volumeVerified, device: device || null };
+      return { supportsVolume: this.supportsVolume, volumeVerified: this.volumeVerified, verifiedPercent: this.verifiedPercent, device: device || null };
     } catch (error) {
       this.supportsVolume = false;
       this.resetVolumeVerification();
-      return { supportsVolume: false, volumeVerified: false, error: error.message };
+      return { supportsVolume: false, volumeVerified: false, verifiedPercent: null, error: error.message };
     }
   }
 
-  async readLocalVolume(expected = MUSIC_LEVEL_PERCENT) {
+  async readLocalVolume(expected = this.targetVolumePercent) {
     if (!this.player || typeof this.player.getVolume !== 'function' || isIOSLike()) {
       return { matches: false, actual: null, raw: null, reason: 'iOS/browser volume is under physical device control.' };
     }
@@ -449,49 +468,84 @@ export class SpotifyReceiver {
     };
   }
 
-  async enforceThirtyPercent() {
+  async enforceVolume(percent = this.targetVolumePercent) {
     if (!this.deviceId || !this.player) throw new Error('Spotify receiver is not connected.');
-    this.resetVolumeVerification();
-    if (isIOSLike()) {
-      this.supportsVolume = false;
-      return { supportsVolume: false, volumeVerified: false, verified: false, actual: null, reason: 'iPhone and iPad keep Spotify volume under physical control.' };
+    const targetPercent = clamp(percent, 0, 100, MUSIC_LEVEL_PERCENT);
+    const staleResult = reason => ({
+      supportsVolume: this.supportsVolume,
+      volumeVerified: false,
+      verifiedPercent: null,
+      verified: false,
+      actual: null,
+      stale: true,
+      reason
+    });
+    if (targetPercent !== this.targetVolumePercent) {
+      return staleResult(`A newer ${this.targetVolumePercent}% Spotify target replaced the stale ${targetPercent}% request.`);
     }
-    if (!this.supportsVolume || typeof this.player.setVolume !== 'function' || typeof this.player.getVolume !== 'function') {
-      return { supportsVolume: this.supportsVolume, volumeVerified: false, verified: false, actual: null, reason: 'This Spotify receiver did not confirm software volume control.' };
-    }
+    const generation = this.volumeGeneration;
     const expectedDeviceId = String(this.deviceId);
-    try {
-      await withTimeout(this.player.setVolume(MUSIC_LEVEL_PERCENT / 100), 4_000, 'Spotify volume setting timed out.');
-      await wait(400);
-      const measurement = await this.readLocalVolume(MUSIC_LEVEL_PERCENT);
-      const sameDevice = expectedDeviceId === String(this.deviceId || '') && this.ready;
-      this.volumeVerified = sameDevice && measurement.matches;
-      this.verifiedDeviceId = this.volumeVerified ? expectedDeviceId : '';
-      const verification = {
-        supportsVolume: this.supportsVolume,
-        volumeVerified: this.volumeVerified,
-        verified: this.volumeVerified,
-        actual: measurement.actual,
-        reason: sameDevice ? measurement.reason : 'Spotify receiver changed before volume could be verified.'
-      };
-      this.report(
-        verification.verified ? 'Spotify volume verified at 30%.' : `Spotify volume was not verified: ${verification.reason}`,
-        verification.verified,
-        verification
-      );
-      return verification;
-    } catch (error) {
+    const operationCurrent = () => generation === this.volumeGeneration &&
+      targetPercent === this.targetVolumePercent &&
+      expectedDeviceId === String(this.deviceId || '') && this.ready;
+    const work = async () => {
+      if (!operationCurrent()) return staleResult('A newer Spotify target or receiver replaced this volume request.');
       this.resetVolumeVerification();
-      const verification = {
-        supportsVolume: this.supportsVolume,
-        volumeVerified: false,
-        verified: false,
-        actual: null,
-        reason: 'Spotify volume control could not be verified.'
-      };
-      this.report(verification.reason, false, verification);
-      return verification;
-    }
+      if (isIOSLike()) {
+        this.supportsVolume = false;
+        return { supportsVolume: false, volumeVerified: false, verifiedPercent: null, verified: false, actual: null, reason: `iPhone and iPad keep Spotify volume under physical control; ${targetPercent}% is only the requested target.` };
+      }
+      if (!this.supportsVolume || typeof this.player.setVolume !== 'function' || typeof this.player.getVolume !== 'function') {
+        return { supportsVolume: this.supportsVolume, volumeVerified: false, verifiedPercent: null, verified: false, actual: null, reason: 'This Spotify receiver did not confirm software volume control.' };
+      }
+      try {
+        await withTimeout(this.player.setVolume(targetPercent / 100), 4_000, 'Spotify volume setting timed out.');
+        if (!operationCurrent()) return staleResult('A newer Spotify target replaced this request while volume was changing.');
+        for (let elapsed = 0; elapsed < 400; elapsed += 50) {
+          await wait(50);
+          if (!operationCurrent()) return staleResult('A newer Spotify target replaced this request before verification.');
+        }
+        const measurement = await this.readLocalVolume(targetPercent);
+        if (!operationCurrent()) return staleResult('A newer Spotify target replaced this request while volume was being verified.');
+        this.volumeVerified = measurement.matches;
+        this.verifiedPercent = this.volumeVerified ? targetPercent : null;
+        this.verifiedDeviceId = this.volumeVerified ? expectedDeviceId : '';
+        const verification = {
+          supportsVolume: this.supportsVolume,
+          volumeVerified: this.volumeVerified,
+          verifiedPercent: this.verifiedPercent,
+          verified: this.volumeVerified,
+          actual: measurement.actual,
+          reason: measurement.reason
+        };
+        this.report(
+          verification.verified ? `Spotify volume verified at ${targetPercent}%.` : `Spotify volume was not verified at ${targetPercent}%: ${verification.reason}`,
+          verification.verified,
+          verification
+        );
+        return verification;
+      } catch {
+        if (!operationCurrent()) return staleResult('A newer Spotify target or receiver replaced the failed volume request.');
+        this.resetVolumeVerification();
+        const verification = {
+          supportsVolume: this.supportsVolume,
+          volumeVerified: false,
+          verifiedPercent: null,
+          verified: false,
+          actual: null,
+          reason: 'Spotify volume control could not be verified.'
+        };
+        this.report(verification.reason, false, verification);
+        return verification;
+      }
+    };
+    const job = this.volumeOperationTail.then(work, work);
+    this.volumeOperationTail = job.catch(() => {});
+    return await job;
+  }
+
+  async enforceThirtyPercent() {
+    return await this.enforceVolume(this.targetVolumePercent);
   }
 
   async playbackState() {
@@ -511,7 +565,8 @@ export class SpotifyReceiver {
       deviceId: stateDeviceId,
       volume: Number.isFinite(Number(state?.device?.volume_percent)) ? Number(state.device.volume_percent) : null,
       supportsVolume,
-      volumeVerified: localDevice && this.volumeVerified && this.verifiedDeviceId === stateDeviceId,
+      volumeVerified: localDevice && this.volumeVerified && this.verifiedDeviceId === stateDeviceId && this.verifiedPercent === this.targetVolumePercent,
+      verifiedPercent: localDevice && this.volumeVerified && this.verifiedDeviceId === stateDeviceId ? this.verifiedPercent : null,
       position: Number(state?.progress_ms || 0),
       uri: state?.item?.uri || '',
       name: String(state?.item?.name || ''),
@@ -543,7 +598,7 @@ export class SpotifyReceiver {
     await wait(250);
     // Calibrate while playback is still paused so a previously changed SDK
     // volume never leaks through during the audible startup transition.
-    if (this.supportsVolume) await this.enforceThirtyPercent();
+    if (this.supportsVolume) await this.enforceVolume();
     assertOperation(assertCurrent);
     await this.api('PUT', '/me/player/play', body, { device_id: deviceId });
     assertOperation(assertCurrent);
@@ -552,9 +607,9 @@ export class SpotifyReceiver {
     }
     const state = await this.waitForPlayback(true, 6_000);
     assertOperation(assertCurrent);
-    const volume = await this.enforceThirtyPercent();
+    const volume = await this.enforceVolume();
     assertOperation(assertCurrent);
-    this.report(volume.verified ? 'Spotify is playing at verified 30%.' : 'Spotify is playing in pause-for-voice compatibility mode.', true, { playback: state, volume });
+    this.report(volume.verified ? `Spotify is playing at verified ${this.targetVolumePercent}%.` : 'Spotify is playing in pause-for-voice compatibility mode.', true, { playback: state, volume });
     return { state, volume };
   }
 
@@ -578,7 +633,7 @@ export class SpotifyReceiver {
     assertOperation(assertCurrent);
     // Set and read the exact target before making the player audible. A second
     // verification below catches any device change during resume.
-    if (this.supportsVolume) await this.enforceThirtyPercent();
+    if (this.supportsVolume) await this.enforceVolume();
     assertOperation(assertCurrent);
     let accepted = false;
     try {
@@ -594,7 +649,7 @@ export class SpotifyReceiver {
     if (accepted) {
       await this.waitForPlayback(true);
       assertOperation(assertCurrent);
-      await this.enforceThirtyPercent().catch(() => {});
+      await this.enforceVolume().catch(() => {});
       assertOperation(assertCurrent);
     }
     return accepted;
@@ -605,7 +660,7 @@ export class SpotifyReceiver {
     assertOperation(assertCurrent);
     const before = await this.playbackState().catch(() => null);
     assertOperation(assertCurrent);
-    if (this.supportsVolume) await this.enforceThirtyPercent();
+    if (this.supportsVolume) await this.enforceVolume();
     assertOperation(assertCurrent);
     await this.api('POST', '/me/player/next', null, { device_id: this.deviceId });
     assertOperation(assertCurrent);
@@ -623,7 +678,7 @@ export class SpotifyReceiver {
       state = await this.playbackState();
       assertOperation(assertCurrent);
     } else {
-      await this.enforceThirtyPercent().catch(() => {});
+      await this.enforceVolume().catch(() => {});
     }
     if (state?.name) {
       this.current = {
@@ -683,7 +738,7 @@ export class SpotifyReceiver {
     this.ready = false;
     this.deviceId = '';
     this.supportsVolume = false;
-    this.resetVolumeVerification();
+    this.invalidateVolumeOperations();
     this.current = null;
   }
 }

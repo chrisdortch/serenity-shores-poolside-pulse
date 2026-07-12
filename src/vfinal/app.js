@@ -1,10 +1,10 @@
 import {
   DEFAULT_ANNOUNCEMENTS,
   DEFAULT_SPOTIFY_PLAYLIST,
-  MUSIC_LEVEL_PERCENT,
   VOICE_LEVEL_PERCENT,
   VERSION,
   audioPolicy,
+  clamp,
   isSpotifyUrl,
   makeId,
   makeLog,
@@ -28,6 +28,13 @@ let feedback = { message: 'Starting Poolside Pulse vFinal...', ok: true };
 let busy = false;
 let takeoverTarget = null;
 let renderQueued = false;
+let renderQueuedForce = false;
+let actionSettled = Promise.resolve();
+let settleCurrentAction = null;
+let queuedMusicLevel = null;
+let musicLevelDrain = null;
+let roleChangePending = false;
+let pendingTab = '';
 
 function escapeHtml(value) {
   return String(value ?? '')
@@ -40,6 +47,10 @@ function escapeHtml(value) {
 
 function escapeAttr(value) {
   return escapeHtml(value).replace(/`/g, '&#96;');
+}
+
+function shortcutRunUrl(name) {
+  return `shortcuts://run-shortcut?name=${encodeURIComponent(String(name || ''))}`;
 }
 
 function setFeedback(message, ok = true) {
@@ -73,11 +84,14 @@ function focusedEditor() {
 }
 
 function renderWhenIdle(force = false) {
+  renderQueuedForce = renderQueuedForce || force;
   if (renderQueued) return;
   renderQueued = true;
   requestAnimationFrame(() => {
+    const shouldForce = renderQueuedForce;
     renderQueued = false;
-    if (!force && focusedEditor()) {
+    renderQueuedForce = false;
+    if (!shouldForce && focusedEditor()) {
       updateLiveStatus();
       return;
     }
@@ -88,6 +102,8 @@ function renderWhenIdle(force = false) {
 const store = new CloudStore({
   onState: state => {
     spotify.clientId = String(state.config.spotifyClientId || spotify.clientId);
+    audio.setMusicLevelPercent?.(state.config.musicLevel, { report: false });
+    spotify.setTargetVolumePercent?.(state.config.musicLevel);
     if (takeoverTarget && (!receiverOnline(state.receiver, store.now()) || state.receiver?.id !== takeoverTarget.id || state.receiver?.sessionId !== takeoverTarget.sessionId)) {
       takeoverTarget = null;
     }
@@ -124,6 +140,9 @@ const spotify = new SpotifyReceiver({
   onState: () => renderWhenIdle()
 });
 
+audio.setMusicLevelPercent(store.state.config.musicLevel, { report: false });
+spotify.setTargetVolumePercent(store.state.config.musicLevel);
+
 const runtime = new ReceiverRuntime({
   store,
   audio,
@@ -140,22 +159,29 @@ function effectiveProvider() {
 
 function cloudSpotifyVerified() {
   const playback = store.state.playback;
+  const target = clamp(store.state.config.musicLevel, 0, 100, 30);
+  const verifiedPercent = playback.volumeVerifiedPercent;
   return playback.provider === 'spotify' &&
     playback.volumeVerified === true &&
-    store.state.receiver?.audioMode === 'spotify-verified-30-pause' &&
+    verifiedPercent !== null && verifiedPercent !== '' &&
+    Number.isFinite(Number(verifiedPercent)) && Number(verifiedPercent) === target &&
+    store.state.receiver?.audioMode === 'spotify-verified-volume-pause' &&
     receiverOnline(store.state.receiver, store.now()) &&
     store.now() - Number(playback.volumeVerifiedAt || playback.updatedAt || 0) <= 25_000;
 }
 
 function displayAudioPolicy(provider = effectiveProvider()) {
+  const musicPercent = clamp(store.state.config.musicLevel, 0, 100, 30);
   if (provider === 'spotify' && cloudSpotifyVerified()) {
-    return audioPolicy({ provider: 'spotify', isIOS: false, supportsVolume: true, volumeVerified: true });
+    return audioPolicy({ provider: 'spotify', isIOS: false, supportsVolume: true, volumeVerified: true, verifiedPercent: musicPercent, musicPercent });
   }
   return audioPolicy({
     provider,
     isIOS: isIOSLike(),
     supportsVolume: !!spotify.supportsVolume,
-    volumeVerified: !!spotify.volumeVerified
+    volumeVerified: !!spotify.volumeVerified,
+    verifiedPercent: spotify.verifiedPercent,
+    musicPercent
   });
 }
 
@@ -176,6 +202,7 @@ function updateLiveStatus() {
 async function runAction(label, action) {
   if (busy) return;
   busy = true;
+  actionSettled = new Promise(resolve => { settleCurrentAction = resolve; });
   setFeedback(`${label}...`, true);
   renderWhenIdle(true);
   try {
@@ -188,6 +215,8 @@ async function runAction(label, action) {
     throw error;
   } finally {
     busy = false;
+    settleCurrentAction?.();
+    settleCurrentAction = null;
     renderWhenIdle(true);
   }
 }
@@ -201,7 +230,7 @@ async function bootstrapAuthenticatedApp() {
     setFeedback(error.message, false);
   }
   const requestedRole = location.hash === '#receiver' ? 'receiver' : location.hash === '#command' ? 'command' : '';
-  if (requestedRole && !role) setRole(requestedRole, { silent: true });
+  if (requestedRole) await setRole(requestedRole, { silent: true });
   if (role === 'command') spotify.disconnect();
   if (spotify.loggedIn()) spotify.preparePlayer().catch(() => {});
   store.startPolling(2_500);
@@ -291,7 +320,7 @@ function shellStatus() {
     <div class="shellStatus">
       <span class="statusPill ${syncGood ? 'online' : 'warn'}">${store.syncMode === 'kv' ? 'Cloud synced' : store.syncMode === 'local' ? 'Local preview' : escapeHtml(store.syncMode)}</span>
       <span class="statusPill ${online ? 'online' : 'offline'}" data-live-receiver>${online ? 'Receiver online' : 'Receiver offline'}</span>
-      <span class="statusPill mix">${policy.exact ? '30% / 100%' : 'Spotify: unverified'}</span>
+      <span class="statusPill mix">${policy.exact ? `${policy.musicPercent}% / 100%` : `Spotify ${store.state.config.musicLevel}%?`}</span>
     </div>`;
 }
 
@@ -303,10 +332,7 @@ function renderHeader() {
         <div><span>Lake123</span><strong>Poolside Pulse</strong><small>vFinal</small></div>
       </div>
       ${shellStatus()}
-      <div class="deviceMode" aria-label="Device role">
-        <button data-action="set-role" data-role="receiver" class="${role === 'receiver' ? 'active' : ''}" ${busy ? 'disabled' : ''}>Receiver</button>
-        <button data-action="set-role" data-role="command" class="${role === 'command' ? 'active' : ''}" ${busy ? 'disabled' : ''}>Remote</button>
-      </div>
+      <div class="deviceMode roleBadge" aria-label="Device role"><span>${role === 'receiver' ? 'Speaker Receiver' : 'Remote Control'}</span></div>
     </header>`;
 }
 
@@ -315,10 +341,13 @@ function tabs() {
     ? [['receiver', 'Receiver'], ['control', 'Music'], ['announce', 'Announce'], ['schedule', 'Schedule'], ['activity', 'Activity'], ['settings', 'Settings']]
     : [['control', 'Music'], ['announce', 'Announce'], ['schedule', 'Schedule'], ['activity', 'Activity'], ['settings', 'Settings']];
   if (!items.some(([id]) => id === activeTab)) activeTab = items[0][0];
-  return `<nav class="tabs" aria-label="Poolside controls">${items.map(([id, label]) => `<button data-action="tab" data-tab="${id}" class="${activeTab === id ? 'active' : ''}">${label}</button>`).join('')}</nav>`;
+  return `<nav class="tabs tabs-${items.length}" aria-label="Poolside controls">${items.map(([id, label]) => `<button data-action="tab" data-tab="${id}" class="${activeTab === id ? 'active' : ''}" ${activeTab === id ? 'aria-current="page"' : ''}>${label}</button>`).join('')}</nav>`;
 }
 
 function feedbackBanner() {
+  if (pendingTab) {
+    return `<div class="feedback bad unsavedPrompt" role="alertdialog" aria-modal="false" aria-labelledby="unsavedPromptTitle"><strong id="unsavedPromptTitle">Unsaved edits will be discarded if you leave this page.</strong><span class="promptActions"><button data-action="confirm-tab" data-tab="${escapeAttr(pendingTab)}" class="danger">Discard & Leave</button><button data-action="cancel-tab" class="secondary">Keep Editing</button></span></div>`;
+  }
   return `<div class="feedback ${feedback.ok ? 'good' : 'bad'}" data-live-feedback role="status">${escapeHtml(feedback.message)}</div>`;
 }
 
@@ -344,7 +373,7 @@ function playbackCard() {
       <div class="nowText">
         <p class="kicker">${playing ? 'Now playing' : playback.intent === 'paused' ? 'Paused' : 'Ready'}</p>
         <h2>${escapeHtml(localSpotifyLabel || playback.label || 'Nothing playing')}</h2>
-        <p>${escapeHtml(provider)} · ${playback.provider === 'spotify' ? (spotifyVerified ? 'receiver-verified at 30%' : 'pause-for-voice mode; 30% unverified') : 'music bus locked at 30%'}</p>
+        <p>${escapeHtml(provider)} · ${playback.provider === 'spotify' ? (spotifyVerified ? `receiver-verified at ${store.state.config.musicLevel}%` : `pause-for-voice mode; ${store.state.config.musicLevel}% target unverified`) : `music bus set to ${store.state.config.musicLevel}%`}</p>
       </div>
       <div class="transport" aria-label="Playback controls">
         <button data-action="transport" data-command="${paused ? 'resume-music' : 'pause-music'}" class="secondary" title="${paused ? 'Resume' : 'Pause'}" ${!playing && !paused ? 'disabled' : ''}>${paused ? 'Resume' : 'Pause'}</button>
@@ -364,7 +393,7 @@ function renderReceiver() {
   const audioStatus = audio.status();
   const readiness = [
     ['Cloud commands', store.syncMode === 'kv', store.syncMode === 'kv' ? 'Durable KV connected' : `Current mode: ${store.syncMode}`],
-    ['Audio mixer', owned && audioStatus.unlocked, owned ? '30/100 mixer unlocked' : 'Tap Start Receiver'],
+    ['Audio mixer', owned && audioStatus.unlocked, owned ? `${store.state.config.musicLevel}/100 mixer unlocked` : 'Tap Start Receiver'],
     ['Receiver lease', owned, owned ? 'This is the only active sound owner' : online ? `${receiver.name || 'Receiver'} owns sound` : 'No active receiver'],
     ['Weather scan', Number(store.state.weather.checkedAt || 0) > 0, store.state.weather.checkedAt ? `Last check ${relativeTime(store.state.weather.checkedAt)}` : 'Runs after receiver starts'],
     ['Screen awake', !!runtime.wakeLock, runtime.wakeLock ? 'Wake lock active' : 'Keep this page visible and device plugged in']
@@ -377,7 +406,7 @@ function renderReceiver() {
         <p>${escapeHtml(owned ? policy.detail : other ? `${receiver.name || 'Another device'} is currently controlling speaker audio.` : 'One tap unlocks audio, starts a fresh command session, and ignores every older queued command.')}</p>
         <div class="receiverActions">
           ${owned
-            ? `<button data-action="stop-receiver" class="danger">Stop Receiver</button><button data-action="calibration" class="secondary">Run 30/100 Sound Check</button>`
+              ? `<button data-action="stop-receiver" class="danger">Stop Receiver</button><button data-action="calibration" class="secondary">Run ${store.state.config.musicLevel}/100 Sound Check</button>`
             : takeoverTarget
               ? `<button data-action="start-receiver" data-takeover="true" class="danger heroButton">Confirm Take Over Receiver</button>`
               : `<button data-action="start-receiver" class="primary heroButton">${other ? 'Review Receiver Takeover' : 'Start Receiver'}</button>`}
@@ -388,12 +417,15 @@ function renderReceiver() {
             : ''}
         </div>
       </div>
-      <div class="mixMeter" aria-label="Locked audio levels">
-        <div><span>Music</span><strong>${policy.exact ? '30%' : 'Device'}</strong><i style="--level:${policy.exact ? '.3' : '.5'}"></i></div>
+      <div class="mixMeter" aria-label="Audio levels">
+        <div><span>Music target</span><strong>${policy.exact ? `${policy.musicPercent}%` : `${store.state.config.musicLevel}%?`}</strong><i style="--level:${policy.exact ? policy.musicPercent / 100 : store.state.config.musicLevel / 100}"></i></div>
         <div><span>Voice</span><strong>100%</strong><i style="--level:1"></i></div>
-        <small>${policy.exact ? 'Exact level is receiver-verified. No false volume claims.' : 'Spotify volume is not software-verified here. It is paused before voice.'}</small>
+        <small>${policy.exact ? 'The receiver has verified this level. Voice remains fixed at 100%.' : 'Spotify volume is not software-verified here. It is paused before voice.'}</small>
       </div>
     </section>
+    ${isIOSLike() ? `<div class="callout ${owned ? 'warning' : ''}"><strong>iPhone receiver level setup</strong><p>${owned
+      ? 'Keep this page visible while the receiver is live. For the exact unattended adjustable-music/100%-voice mix, use Suno/direct; iPhone Spotify cannot switch physical volume around announcements by itself.'
+      : 'For exact Suno/direct scheduling, run Volume Up, return here, then tap Start Receiver. Apple Shortcuts are manual app switches, so alternating iPhone Spotify and 100% announcements cannot be automated reliably.'}</p>${owned ? '' : `<div class="stackedActions"><a class="shortcutLink loud" href="${escapeAttr(shortcutRunUrl('Volume Up'))}">Run Volume Up · 100%</a><a class="shortcutLink" href="${escapeAttr(shortcutRunUrl('Volume Down'))}">Run Volume Down · 30%</a></div>`}</div>` : ''}
     ${other ? `<div class="callout warning"><strong>Takeover protection</strong><p>Starting here will stop commands from targeting ${escapeHtml(receiver.name || 'the other receiver')}. Only take over if that device is no longer connected to the speakers.</p></div>` : ''}
     <section class="readinessPanel">
       <div class="sectionHeading"><div><p class="kicker">Live readiness</p><h2>Everything that must stay healthy</h2></div><span class="score">${readiness.filter(([, ok]) => ok).length}/${readiness.length}</span></div>
@@ -408,17 +440,29 @@ function renderReceiver() {
 
 function providerSelector() {
   const provider = store.state.config.musicProvider;
+  const target = store.state.config.musicLevel;
   return `
-    <div class="providerSelector" role="tablist" aria-label="Music source">
-      <button data-action="provider" data-provider="controlled" class="${provider === 'controlled' ? 'active' : ''}"><strong>Suno / Direct</strong><small>Exact 30/100 mix</small></button>
-      <button data-action="provider" data-provider="spotify" class="${provider === 'spotify' ? 'active' : ''}"><strong>Spotify</strong><small>Compatibility mode</small></button>
+    <div class="providerSelector" role="group" aria-label="Music source">
+      <button aria-pressed="${provider === 'controlled'}" data-action="provider" data-provider="controlled" class="${provider === 'controlled' ? 'active' : ''}"><strong>Suno / Direct</strong><small>Exact ${target}/100 mix</small></button>
+      <button aria-pressed="${provider === 'spotify'}" data-action="provider" data-provider="spotify" class="${provider === 'spotify' ? 'active' : ''}"><strong>Spotify</strong><small>${cloudSpotifyVerified() ? `Verified ${target}%` : `${target}% target`}</small></button>
     </div>`;
+}
+
+function musicLevelControl() {
+  const target = clamp(store.state.config.musicLevel, 0, 100, 30);
+  return `
+    <section class="volumeControl" aria-labelledby="musicLevelLabel">
+      <div class="volumeHeading"><div><p class="kicker">Shared music target</p><h2 id="musicLevelLabel">Music volume</h2></div><output for="musicLevel" data-music-level-output>${target}%</output></div>
+      <input id="musicLevel" type="range" min="0" max="100" step="1" value="${target}" aria-labelledby="musicLevelLabel" aria-describedby="musicLevelHelp" aria-valuetext="${target}% music; announcements 100%" style="--level:${target / 100}" ${busy ? 'disabled' : ''} />
+      <div class="volumeScale" aria-hidden="true"><span>0%</span><span>Default 30%</span><span>100%</span></div>
+      <p id="musicLevelHelp">Applies immediately to Suno/direct on the receiver and to Spotify only when that exact Spotify receiver verifies volume control. Announcements stay fixed at 100%.</p>
+    </section>`;
 }
 
 function musicSourceForm() {
   const config = store.state.config;
   if (config.musicProvider === 'spotify') {
-    const policy = audioPolicy({ provider: 'spotify', isIOS: isIOSLike(), supportsVolume: spotify.supportsVolume, volumeVerified: spotify.volumeVerified });
+    const policy = audioPolicy({ provider: 'spotify', isIOS: isIOSLike(), supportsVolume: spotify.supportsVolume, volumeVerified: spotify.volumeVerified, verifiedPercent: spotify.verifiedPercent, musicPercent: config.musicLevel });
     return `
       <form data-form="spotify-play" class="sourceForm">
         <label for="spotifyUrl">Spotify playlist, album, artist, or track</label>
@@ -429,25 +473,26 @@ function musicSourceForm() {
         <strong>${escapeHtml(policy.label)}</strong>
         <p>${escapeHtml(policy.detail)}</p>
       </div>
-      <div class="policyNote"><strong>Important:</strong> Spotify’s current developer policy does not allow mixing Spotify content with other audio or public/business broadcasting. vFinal pauses Spotify before voice. Use properly licensed Suno/direct audio for the resort’s guaranteed operating mode.</div>`;
+      <div class="policyNote"><strong>Important:</strong> Poolside Pulse stops Suno before Spotify starts and pauses Spotify before every announcement. On iPhone, Spotify volume remains physical and the slider target cannot be verified. Confirm that your Spotify use has the prior written approval required for commercial streaming.</div>`;
   }
   return `
     <form data-form="controlled-play" class="sourceForm">
       <label for="musicUrl">Suno playlist, Suno song, or direct HTTPS audio URL</label>
-      <div class="inputAction"><input id="musicUrl" name="url" type="url" value="${escapeAttr(config.musicUrl || '')}" placeholder="https://suno.com/playlist/..." required /><button type="submit" class="primary">Play at 30%</button></div>
+      <div class="inputAction"><input id="musicUrl" name="url" type="url" value="${escapeAttr(config.musicUrl || '')}" placeholder="https://suno.com/playlist/..." required /><button type="submit" class="primary">Play at ${config.musicLevel}%</button></div>
     </form>
-    <div class="capabilityCard verified"><span>Guaranteed path</span><strong>One calibrated mixer</strong><p>Music stays at exactly 30%. During announcements it fades to 6%, voice plays at 100%, and the same track continues afterward.</p></div>`;
+    <div class="capabilityCard verified"><span>Guaranteed path</span><strong>One calibrated mixer</strong><p>Music stays at exactly ${config.musicLevel}%. During announcements it fades to ${Math.min(6, config.musicLevel)}%, voice plays at 100%, and the same track continues afterward.</p></div>`;
 }
 
 function renderControl() {
   const online = receiverOnline(store.state.receiver, store.now());
   const policy = displayAudioPolicy(store.state.config.musicProvider);
   return `
-    <section class="pageHeading"><p class="kicker">Music control</p><h1>One source. One receiver.</h1><p>Every command targets the current receiver session; expired commands are never replayed.</p></section>
+    <section class="pageHeading"><p class="kicker">Music control</p><h1>One source. One receiver.</h1><p>Suno and Spotify are mutually exclusive. Every command targets the current receiver session; expired commands are never replayed.</p></section>
     <div class="receiverRibbon ${online ? 'online' : 'offline'}">${receiverSummary()}</div>
     ${playbackCard()}
     <section class="workspacePanel">
-      <div class="sectionHeading"><div><p class="kicker">Choose music</p><h2>Playback source</h2></div><span class="fixedMix">${policy.exact ? '30 / 100 locked' : 'Spotify level unverified'}</span></div>
+      ${musicLevelControl()}
+      <div class="sectionHeading sourceHeading"><div><p class="kicker">Choose music</p><h2>Playback source</h2></div><span class="fixedMix">${policy.exact ? `${policy.musicPercent} / 100` : `Target ${store.state.config.musicLevel}%`}</span></div>
       ${providerSelector()}
       ${musicSourceForm()}
     </section>`;
@@ -468,7 +513,7 @@ function renderAnnounce() {
     <section class="workspacePanel">
       <div class="sectionHeading"><div><p class="kicker">Saved messages</p><h2>One-tap announcements</h2></div></div>
       <div class="announcementGrid">${announcements.map(item => `<button class="announcementButton" data-action="saved-announcement" data-id="${escapeAttr(item.id)}"><strong>${escapeHtml(item.label)}</strong><small>${escapeHtml(renderedText(item))}</small></button>`).join('')}</div>
-      <details class="savedEditor">
+      <details class="savedEditor" data-persist-open="saved-editor">
         <summary>Edit saved messages</summary>
         <div class="savedEditorList">${announcements.map(item => ['lightning', 'lightning-clear'].includes(item.id) ? `
           <div class="savedEditorRow"><strong>${escapeHtml(item.label)}</strong><p>${escapeHtml(renderedText(item))}</p><small>Generated from Lightning miles and Hold minutes in Settings so safety wording cannot become stale.</small></div>` : `
@@ -503,7 +548,7 @@ function renderScheduleRow(item) {
 
 function renderSchedule() {
   return `
-    <section class="pageHeading"><p class="kicker">Daily schedule</p><h1>Make the day run itself.</h1><p>Schedule execution belongs to the active receiver. Keep that device awake, plugged in, and online.</p></section>
+    <section class="pageHeading"><p class="kicker">Daily schedule</p><h1>Make the day run itself.</h1><p>Announcements, Suno/direct tracks, and Spotify tracks use the same exclusive source handoff. Schedule execution belongs to the active receiver.</p></section>
     <div class="scheduleList">${store.state.schedule.map(renderScheduleRow).join('')}</div>
     <button data-action="add-schedule" class="secondary addButton">Add Scheduled Item</button>
     <div class="callout warning"><strong>Receiver requirement</strong><p>Web browsers cannot run reliably after an iPhone suspends the tab. For unattended scheduling, use an always-on Mac mini, Windows mini PC, or supported desktop receiver.</p></div>`;
@@ -521,9 +566,14 @@ function renderActivity() {
 
 function renderSettings() {
   const config = store.state.config;
-  const spotifyPolicy = audioPolicy({ provider: 'spotify', isIOS: isIOSLike(), supportsVolume: spotify.supportsVolume, volumeVerified: spotify.volumeVerified });
+  const spotifyPolicy = audioPolicy({ provider: 'spotify', isIOS: isIOSLike(), supportsVolume: spotify.supportsVolume, volumeVerified: spotify.volumeVerified, verifiedPercent: spotify.verifiedPercent, musicPercent: config.musicLevel });
+  const roleControls = role === 'receiver' && runtime.active
+    ? roleChangePending
+      ? `<div class="callout warning"><strong>Stop the live receiver?</strong><p>Changing this device to Remote Control stops speaker audio and releases its receiver lease.</p><div class="stackedActions"><button data-action="set-role" data-role="command" class="danger">Confirm Stop & Change Role</button><button data-action="cancel-role-change" class="secondary">Keep Receiver Live</button></div></div>`
+      : '<button data-action="request-role-change" class="secondary">Stop Receiver & Change to Remote Control</button>'
+    : `<button data-action="set-role" data-role="${role === 'receiver' ? 'command' : 'receiver'}" class="secondary">Change to ${role === 'receiver' ? 'Remote Control' : 'Speaker Receiver'}</button>`;
   return `
-    <section class="pageHeading"><p class="kicker">Settings & diagnostics</p><h1>Simple controls, honest status.</h1><p>The operating mix is locked. Settings change sources and safety rules, not arbitrary gain multipliers.</p></section>
+    <section class="pageHeading"><p class="kicker">Settings & diagnostics</p><h1>Simple controls, honest status.</h1><p>Music has one shared adjustable target. Announcement voice remains fixed at 100%, and unsupported Spotify receivers are never presented as verified.</p></section>
     <section class="settingsGrid">
       <form data-form="settings" class="workspacePanel">
         <div class="sectionHeading"><div><p class="kicker">Weather & voice</p><h2>Operating settings</h2></div></div>
@@ -541,16 +591,23 @@ function renderSettings() {
           ? `<div class="stackedActions">${spotify.loggedIn() ? `${spotify.playerPrepared ? `<button data-action="connect-spotify" class="spotifyButton">${spotify.ready ? 'Reconnect Spotify Receiver' : 'Connect Spotify Receiver'}</button>` : `<button data-action="prepare-spotify" class="spotifyButton" ${spotify.prepareError ? '' : 'disabled'}>${spotify.prepareError ? 'Retry Spotify Setup' : 'Preparing Spotify...'}</button>`}<button data-action="spotify-logout" class="secondary">Remove Spotify Login</button>` : '<button data-action="spotify-login" class="spotifyButton">Login Spotify on Receiver</button>'}</div>`
           : '<div class="callout"><strong>Login only on the speaker receiver.</strong><p>Remote devices send commands and never need Spotify credentials.</p></div>'}
       </section>
+      ${isIOSLike() && role === 'receiver' ? `<section class="workspacePanel">
+        <div class="sectionHeading"><div><p class="kicker">iPhone helpers</p><h2>Your Apple Shortcuts</h2></div></div>
+        <p>These are manual device-volume tools. Apple opens the Shortcuts app, so Poolside Pulse does not silently call them during unattended schedule items.</p>
+        <div class="stackedActions"><a class="shortcutLink" href="${escapeAttr(shortcutRunUrl('Volume Down'))}">Run Volume Down · 30%</a><a class="shortcutLink loud" href="${escapeAttr(shortcutRunUrl('Volume Up'))}">Run Volume Up · 100%</a></div>
+        <div class="callout warning"><strong>Spotify on this iPhone</strong><p>Volume Down matches the slider only when its target is 30%. Suno/direct uses the slider exactly without leaving this app; iPhone Spotify remains a physical-volume compatibility path.</p></div>
+      </section>` : ''}
       <section class="workspacePanel">
         <div class="sectionHeading"><div><p class="kicker">Sound verification</p><h2>Receiver sound check</h2></div></div>
-        <p>Plays a 30% calibration bed, ducks it to 6%, speaks a 100% announcement, then restores the same bed.</p>
-        <button data-action="calibration" class="primary" ${role !== 'receiver' || !runtime.isOwner() ? 'disabled' : ''}>Run 30/100 Sound Check</button>
+        <p>Plays a ${config.musicLevel}% calibration bed, ducks it to ${Math.min(6, config.musicLevel)}%, speaks a 100% announcement, then restores the same bed.</p>
+        <button data-action="calibration" class="primary" ${role !== 'receiver' || !runtime.isOwner() ? 'disabled' : ''}>Run ${config.musicLevel}/100 Sound Check</button>
         <dl class="diagnosticList"><div><dt>Audio context</dt><dd>${escapeHtml(audio.status().contextState)}</dd></div><div><dt>Cloud state</dt><dd>${escapeHtml(store.syncMode)}</dd></div><div><dt>Receiver</dt><dd>${receiverOnline(store.state.receiver, store.now()) ? 'online' : 'offline'}</dd></div><div><dt>Last weather</dt><dd>${escapeHtml(relativeTime(store.state.weather.checkedAt))}</dd></div></dl>
       </section>
       <section class="workspacePanel">
         <div class="sectionHeading"><div><p class="kicker">This device</p><h2>${role === 'receiver' ? 'Speaker Receiver' : 'Remote Control'}</h2></div></div>
         <p>Device ID: <code>${escapeHtml(runtime.deviceId)}</code></p>
-        <div class="stackedActions"><button data-action="set-role" data-role="${role === 'receiver' ? 'command' : 'receiver'}" class="secondary">Change to ${role === 'receiver' ? 'Remote Control' : 'Speaker Receiver'}</button><button data-action="logout" class="secondary">Lock Poolside Pulse</button><a href="/v23-backup.html" class="textLink">Open archived v23 backup</a></div>
+        ${roleControls}
+        <div class="stackedActions"><button data-action="logout" class="secondary">Lock Poolside Pulse</button><a href="/v23-backup.html" class="textLink">Open archived v23 backup</a></div>
       </section>
     </section>`;
 }
@@ -573,14 +630,114 @@ function renderApp() {
       ${feedbackBanner()}
       <main class="content">${renderContent()}</main>
     </div>
-    <footer class="appFooter"><span>Poolside Pulse vFinal</span><span>${policy.exact ? 'Music 30% · Voice 100%' : 'Spotify device volume · Voice 100%'} · Weather every 2 minutes</span></footer>`;
+    <footer class="appFooter"><span>Poolside Pulse vFinal</span><span>${policy.exact ? `Music ${policy.musicPercent}% · Voice 100%` : `Spotify target ${store.state.config.musicLevel}% unverified · Voice 100%`} · Weather every 2 minutes</span></footer>`;
 }
 
-function render() {
+function formIdentity(form) {
+  if (!form?.dataset?.form || form.dataset.form === 'login') return '';
+  return `${form.dataset.form}:${form.dataset.id || ''}`;
+}
+
+function captureDirtyFormDrafts() {
+  return [...root.querySelectorAll('form[data-form][data-dirty="true"]')].map(form => {
+    const key = formIdentity(form);
+    if (!key) return null;
+    const controls = [...form.elements].map(control => ({
+      name: control.name || '',
+      tag: control.tagName,
+      type: control.type || '',
+      value: !['password', 'file'].includes(control.type) ? control.value : '',
+      checked: !!control.checked,
+      selected: control.tagName === 'SELECT' ? [...control.options].map(option => option.selected) : null
+    }));
+    const activeIndex = [...form.elements].indexOf(document.activeElement);
+    const active = activeIndex >= 0 ? document.activeElement : null;
+    return {
+      key,
+      controls,
+      activeIndex,
+      selectionStart: active && Number.isFinite(active.selectionStart) ? active.selectionStart : null,
+      selectionEnd: active && Number.isFinite(active.selectionEnd) ? active.selectionEnd : null
+    };
+  }).filter(Boolean);
+}
+
+function restoreDirtyFormDrafts(drafts) {
+  for (const draft of drafts) {
+    const form = [...root.querySelectorAll('form[data-form]')].find(candidate => formIdentity(candidate) === draft.key);
+    if (!form) continue;
+    const controls = [...form.elements];
+    draft.controls.forEach((saved, index) => {
+      const control = controls[index];
+      if (!control || control.name !== saved.name || control.tagName !== saved.tag) return;
+      if (saved.selected && control.tagName === 'SELECT') {
+        [...control.options].forEach((option, optionIndex) => { option.selected = !!saved.selected[optionIndex]; });
+      } else if (saved.type === 'checkbox' || saved.type === 'radio') {
+        control.checked = saved.checked;
+      } else if (!['password', 'file'].includes(saved.type)) {
+        control.value = saved.value;
+      }
+    });
+    form.dataset.dirty = 'true';
+    const active = controls[draft.activeIndex];
+    if (active) {
+      active.focus({ preventScroll: true });
+      if (draft.selectionStart !== null && typeof active.setSelectionRange === 'function') {
+        try { active.setSelectionRange(draft.selectionStart, draft.selectionEnd); } catch {}
+      }
+    }
+  }
+}
+
+function clearDirtyForm(key) {
+  if (!key) return;
+  const form = [...root.querySelectorAll('form[data-form]')].find(candidate => formIdentity(candidate) === key);
+  if (form) delete form.dataset.dirty;
+}
+
+function render({ preserveDetails = true, preserveForms = true } = {}) {
+  const openDetails = preserveDetails
+    ? [...root.querySelectorAll('details[open][data-persist-open]')].map(item => item.dataset.persistOpen)
+    : [];
+  const dirtyDrafts = preserveForms ? captureDirtyFormDrafts() : [];
   if (!authChecked) root.innerHTML = renderLoading();
   else if (!authenticated) root.innerHTML = renderLogin();
   else if (!role) root.innerHTML = renderRolePicker();
   else root.innerHTML = renderApp();
+  for (const key of openDetails) {
+    const detail = root.querySelector(`details[data-persist-open="${CSS.escape(key)}"]`);
+    if (detail) detail.open = true;
+  }
+  restoreDirtyFormDrafts(dirtyDrafts);
+}
+
+function selectTab(nextTab, { discardDirty = false } = {}) {
+  const requested = String(nextTab || 'control');
+  if (!discardDirty && requested !== activeTab && root.querySelector('form[data-dirty="true"]')) {
+    pendingTab = requested;
+    feedback = { message: 'Choose whether to keep editing or discard the unsaved changes.', ok: false };
+    renderWhenIdle(true);
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      const prompt = root.querySelector('.unsavedPrompt');
+      prompt?.scrollIntoView({ block: 'start', behavior: 'auto' });
+      prompt?.querySelector('[data-action="cancel-tab"]')?.focus({ preventScroll: true });
+    }));
+    return false;
+  }
+  pendingTab = '';
+  activeTab = requested;
+  localStorage.setItem(TAB_KEY, activeTab);
+  roleChangePending = false;
+  render({ preserveDetails: false, preserveForms: false });
+  requestAnimationFrame(() => {
+    window.scrollTo({ top: 0, behavior: 'auto' });
+    const heading = root.querySelector('main.content h1');
+    if (heading) {
+      heading.setAttribute('tabindex', '-1');
+      heading.focus({ preventScroll: true });
+    }
+  });
+  return true;
 }
 
 async function setRole(nextRole, { silent = false } = {}) {
@@ -588,10 +745,15 @@ async function setRole(nextRole, { silent = false } = {}) {
   if (role === 'receiver' && nextRole === 'command' && runtime.active) await runtime.stop();
   role = nextRole;
   localStorage.setItem(ROLE_KEY, role);
-  location.hash = role;
+  try {
+    const cleanUrl = new URL(location.href);
+    cleanUrl.hash = '';
+    history.replaceState(null, '', cleanUrl);
+  } catch {}
   activeTab = role === 'receiver' ? 'receiver' : 'control';
   localStorage.setItem(TAB_KEY, activeTab);
   takeoverTarget = null;
+  roleChangePending = false;
   if (role === 'command') {
     spotify.disconnect();
     if (!silent) setFeedback('Remote Control mode: this device will never produce receiver audio.', true);
@@ -602,12 +764,56 @@ async function setRole(nextRole, { silent = false } = {}) {
 }
 
 async function setProvider(provider) {
+  const target = clamp(store.state.config.musicLevel, 0, 100, 30);
   await store.mutate(draft => {
     draft.config.musicProvider = provider === 'spotify' ? 'spotify' : 'controlled';
-    draft.activityLog = [makeLog('settings', 'Music source selected', draft.config.musicProvider === 'spotify' ? 'Spotify compatibility mode' : 'Suno/direct exact 30/100 mode'), ...(draft.activityLog || [])];
+    draft.activityLog = [makeLog('settings', 'Music source selected', draft.config.musicProvider === 'spotify' ? `Spotify ${target}% target` : `Suno/direct exact ${target}/100 mode`), ...(draft.activityLog || [])];
     return draft;
   }, 'Music source selected');
-  setFeedback(provider === 'spotify' ? 'Spotify selected. vFinal will pause it for announcements.' : 'Suno/direct selected for guaranteed 30/100 mixing.', true);
+  setFeedback(provider === 'spotify' ? `Spotify selected with a ${target}% target. It will pause for announcements.` : `Suno/direct selected for guaranteed ${target}/100 mixing.`, true);
+}
+
+async function saveMusicLevel(percent) {
+  const target = clamp(percent, 0, 100, 30);
+  audio.setMusicLevelPercent(target, { report: false });
+  spotify.setTargetVolumePercent(target);
+  await store.mutate(draft => {
+    draft.config.musicLevel = target;
+    if (draft.playback?.provider === 'spotify') {
+      draft.playback.volumeVerified = false;
+      draft.playback.volumeVerifiedPercent = null;
+      draft.playback.volumeVerifiedAt = 0;
+    }
+    draft.activityLog = [makeLog('settings', 'Music target changed', `${target}% music; 100% announcements.`), ...(draft.activityLog || [])];
+    return draft;
+  }, `Music target ${target}% saved`);
+  if (receiverOnline(store.state.receiver, store.now())) {
+    await runtime.sendCommand('set-music-level', { percent: target, label: `${target}% music target` }, `Music target ${target}% sent to receiver.`);
+  } else {
+    setFeedback(`Music target saved at ${target}%. It will apply when the speaker receiver starts.`, true);
+  }
+  return target;
+}
+
+function queueMusicLevelSave(percent) {
+  queuedMusicLevel = clamp(percent, 0, 100, 30);
+  if (musicLevelDrain) return musicLevelDrain;
+  musicLevelDrain = (async () => {
+    while (queuedMusicLevel !== null) {
+      const target = queuedMusicLevel;
+      queuedMusicLevel = null;
+      if (busy) await actionSettled;
+      try {
+        await runAction(`Setting music to ${target}%`, () => saveMusicLevel(target));
+      } catch (error) {
+        setFeedback(error.message || String(error), false);
+      }
+    }
+  })().finally(() => {
+    musicLevelDrain = null;
+    if (queuedMusicLevel !== null) queueMusicLevelSave(queuedMusicLevel);
+  });
+  return musicLevelDrain;
 }
 
 async function sendTransport(command) {
@@ -634,14 +840,31 @@ root.addEventListener('click', event => {
   const button = event.target.closest('[data-action]');
   if (!button || button.disabled) return;
   const action = button.dataset.action;
-  if (busy) return;
+  if (busy) {
+    setFeedback('Finish the current action before opening another page.', false);
+    return;
+  }
   const execute = async () => {
     if (action === 'choose-role') return await setRole(button.dataset.role);
     if (action === 'set-role') return await runAction('Changing device role', () => setRole(button.dataset.role));
-    if (action === 'tab') {
-      activeTab = button.dataset.tab;
-      localStorage.setItem(TAB_KEY, activeTab);
+    if (action === 'request-role-change') {
+      roleChangePending = true;
+      setFeedback('Confirm whether to stop this live receiver.', false);
       return renderWhenIdle(true);
+    }
+    if (action === 'cancel-role-change') {
+      roleChangePending = false;
+      setFeedback('Speaker Receiver remains live.', true);
+      return renderWhenIdle(true);
+    }
+    if (action === 'confirm-tab') return selectTab(button.dataset.tab, { discardDirty: true });
+    if (action === 'cancel-tab') {
+      pendingTab = '';
+      setFeedback('Unsaved edits are still here.', true);
+      return renderWhenIdle(true);
+    }
+    if (action === 'tab') {
+      return selectTab(button.dataset.tab);
     }
     if (action === 'start-receiver') {
       return await runAction('Starting receiver', async () => {
@@ -660,7 +883,9 @@ root.addEventListener('click', event => {
       return await runAction('Sending announcement', () => runtime.sendCommand(action === 'safety-announcement' ? 'announce-safety' : 'announce', { text, label: item.label }, `${item.label} sent to receiver.`));
     }
     if (action === 'weather-check') return await runAction('Sending weather check', () => runtime.sendCommand('weather-check', { announce: true, label: 'Manual weather check' }, 'Weather check sent to receiver.'));
-    if (action === 'calibration') return await runAction('Running 30/100 sound check', () => runtime.runCalibration());
+    if (action === 'calibration') {
+      return await runAction(`Running ${store.state.config.musicLevel}/100 sound check`, () => runtime.runCalibration());
+    }
     if (action === 'connect-spotify') {
       return await runAction('Connecting Spotify receiver', async () => {
         await spotify.connectFromUserGesture();
@@ -713,10 +938,39 @@ root.addEventListener('click', event => {
   execute().catch(error => setFeedback(error.message || String(error), false));
 });
 
+root.addEventListener('input', event => {
+  const form = event.target.closest?.('form[data-form]');
+  if (formIdentity(form)) form.dataset.dirty = 'true';
+  const slider = event.target.closest?.('#musicLevel');
+  if (!slider) return;
+  const target = clamp(slider.value, 0, 100, 30);
+  slider.style.setProperty('--level', target / 100);
+  slider.setAttribute('aria-valuetext', `${target}% music; announcements 100%`);
+  const output = root.querySelector('[data-music-level-output]');
+  if (output) {
+    output.value = `${target}%`;
+    output.textContent = `${target}%`;
+  }
+});
+
+root.addEventListener('change', event => {
+  const form = event.target.closest?.('form[data-form]');
+  if (formIdentity(form)) form.dataset.dirty = 'true';
+  const slider = event.target.closest?.('#musicLevel');
+  if (!slider) return;
+  const target = clamp(slider.value, 0, 100, 30);
+  queueMusicLevelSave(target);
+});
+
 root.addEventListener('submit', event => {
   const form = event.target.closest('form[data-form]');
   if (!form) return;
   event.preventDefault();
+  if (busy) {
+    setFeedback('Finish the current action before submitting this form.', false);
+    return;
+  }
+  const submittedFormKey = formIdentity(form);
   const data = new FormData(form);
   const kind = form.dataset.form;
   const execute = async () => {
@@ -735,7 +989,8 @@ root.addEventListener('submit', event => {
           draft.config.musicUrl = url;
           return draft;
         }, 'Controlled music source saved');
-        await runtime.sendCommand('play-controlled', { url, label: 'Suno / Direct Audio' }, 'Play at 30% sent to receiver.');
+        const target = clamp(store.state.config.musicLevel, 0, 100, 30);
+        await runtime.sendCommand('play-controlled', { url, label: 'Suno / Direct Audio' }, `Play at ${target}% sent to receiver.`);
       });
     }
     if (kind === 'spotify-play') {
@@ -806,7 +1061,10 @@ root.addEventListener('submit', event => {
       }, 'Schedule item saved'));
     }
   };
-  execute().catch(error => setFeedback(error.message || String(error), false));
+  execute().then(() => {
+    clearDirtyForm(submittedFormKey);
+    renderWhenIdle(true);
+  }).catch(error => setFeedback(error.message || String(error), false));
 });
 
 window.addEventListener('pagehide', () => {

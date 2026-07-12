@@ -80,6 +80,7 @@ function runtimeHarness({
   const defaultAudio = {
     musicElement: null,
     unlock: async () => true,
+    setMusicLevelPercent: () => 30,
     stopVoice: () => {},
     stopMusic: () => {},
     pauseMusic: () => false,
@@ -95,6 +96,7 @@ function runtimeHarness({
     ready: false,
     supportsVolume: false,
     volumeVerified: false,
+    verifiedPercent: null,
     deviceId: 'spotify-local-device',
     current: null,
     loggedIn: () => false,
@@ -105,6 +107,8 @@ function runtimeHarness({
     next: async () => null,
     playbackState: async () => null,
     readLocalVolume: async () => ({ matches: true, actual: 30 }),
+    setTargetVolumePercent: percent => Number(percent),
+    enforceVolume: async percent => ({ verified: true, verifiedPercent: Number(percent), actual: Number(percent) }),
     enforceThirtyPercent: async () => ({ verified: true, actual: 30 }),
     resetVolumeVerification: () => {},
     disconnect: () => {}
@@ -192,6 +196,168 @@ beforeEach(() => {
     },
     configurable: true,
     writable: true
+  });
+});
+
+describe('adjustable levels and exclusive source handoffs', { concurrency: false }, () => {
+  test('setMusicLevel applies a non-30 target to active controlled playback and preserves 100% voice', async () => {
+    const state = ownerState();
+    state.config.musicLevel = 30;
+    state.playback = { ...state.playback, provider: 'controlled', intent: 'playing' };
+    const applied = [];
+    const targets = [];
+    const { runtime, store, mutations } = runtimeHarness({
+      state,
+      audio: {
+        setMusicLevelPercent: (percent, options) => applied.push({ percent, options })
+      },
+      spotify: {
+        setTargetVolumePercent: percent => targets.push(percent)
+      }
+    });
+    runtime.physicalProvider = 'controlled';
+
+    const result = await runtime.setMusicLevel(42);
+
+    assert.equal(result, 42);
+    assert.deepEqual(applied, [{ percent: 42, options: { report: false } }]);
+    assert.deepEqual(targets, [42]);
+    assert.equal(store.state.config.musicLevel, 42);
+    assert.equal(store.state.config.voiceLevel, 100);
+    assert.equal(store.state.config.duckLevel, 6);
+    assert.equal(store.state.playback.provider, 'controlled');
+    assert.equal(store.state.playback.intent, 'playing');
+    assert.deepEqual(mutations.map(entry => entry.reason), ['Music level applied', 'Receiver capability']);
+    assert.match(store.state.activityLog[0].detail, /42% target; announcements remain 100%/i);
+  });
+
+  test('setMusicLevel enforces and records the selected target on active Spotify', async () => {
+    const state = ownerState();
+    state.config.musicProvider = 'spotify';
+    state.playback = { ...state.playback, provider: 'spotify', intent: 'playing' };
+    const enforced = [];
+    const audioTargets = [];
+    const { runtime, store } = runtimeHarness({
+      state,
+      audio: {
+        setMusicLevelPercent: percent => audioTargets.push(percent)
+      },
+      spotify: {
+        ready: true,
+        supportsVolume: true,
+        setTargetVolumePercent: percent => percent
+      }
+    });
+    runtime.physicalProvider = 'spotify';
+    runtime.spotify.enforceVolume = async percent => {
+      enforced.push(percent);
+      runtime.spotify.volumeVerified = true;
+      runtime.spotify.verifiedPercent = percent;
+      return { verified: true, volumeVerified: true, verifiedPercent: percent, actual: percent };
+    };
+
+    await runtime.setMusicLevel(42);
+
+    assert.deepEqual(audioTargets, [42]);
+    assert.deepEqual(enforced, [42]);
+    assert.equal(store.state.config.musicLevel, 42);
+    assert.equal(store.state.config.voiceLevel, 100);
+    assert.equal(store.state.playback.volumeVerified, true);
+    assert.equal(store.state.playback.volumeVerifiedPercent, 42);
+    assert.equal(store.state.playback.volumeVerifiedAt, NOW);
+    assert.equal(store.state.receiver.audioMode, 'spotify-verified-volume-pause');
+  });
+
+  test('controlled to Spotify to controlled handoffs never leave both local sources audible', async () => {
+    const state = ownerState();
+    state.config.musicLevel = 42;
+    state.playback.intent = 'stopped';
+    let controlledAudible = false;
+    let spotifyAudible = false;
+    const calls = [];
+    const assertExclusive = stage => {
+      assert.equal(controlledAudible && spotifyAudible, false, `sources overlapped during ${stage}`);
+    };
+    const { runtime, store } = runtimeHarness({
+      state,
+      audio: {
+        musicElement: { currentTime: 7 },
+        musicPlaying: () => controlledAudible,
+        playMusicUrl: async url => {
+          assert.equal(spotifyAudible, false, 'Spotify must be silent before controlled audio starts');
+          controlledAudible = true;
+          calls.push(`controlled-play:${url}`);
+          assertExclusive('controlled start');
+          return true;
+        },
+        pauseMusic: () => {
+          calls.push('controlled-pause');
+          controlledAudible = false;
+          return true;
+        },
+        stopMusic: () => {
+          calls.push('controlled-stop');
+          controlledAudible = false;
+          return true;
+        }
+      },
+      spotify: {
+        ready: true,
+        supportsVolume: true,
+        volumeVerified: true,
+        verifiedPercent: 42,
+        loggedIn: () => true,
+        play: async (_url, { assertCurrent }) => {
+          assertCurrent();
+          assert.equal(controlledAudible, false, 'controlled audio must be paused before Spotify starts');
+          spotifyAudible = true;
+          calls.push('spotify-play');
+          assertExclusive('Spotify start');
+          return { volume: { verified: true, verifiedPercent: 42, actual: 42 } };
+        },
+        pauseForAnnouncement: async () => {
+          const wasPlaying = spotifyAudible;
+          spotifyAudible = false;
+          calls.push(`spotify-pause:${wasPlaying}`);
+          assertExclusive('Spotify pause');
+          return { wasPlaying };
+        }
+      }
+    });
+    runtime.resolveControlledTracks = async url => ({
+      playlistName: url.includes('second') ? 'Second controlled' : 'First controlled',
+      tracks: [{
+        id: url.includes('second') ? 'second' : 'first',
+        title: url.includes('second') ? 'Second controlled' : 'First controlled',
+        artist: 'Test',
+        audioUrl: url
+      }]
+    });
+
+    await runtime.playControlled('https://audio.test/first.mp3');
+    assert.equal(runtime.physicalProvider, 'controlled');
+    assert.deepEqual({ controlledAudible, spotifyAudible }, { controlledAudible: true, spotifyAudible: false });
+
+    await runtime.playSpotify('https://open.spotify.com/playlist/exclusive-test');
+    assert.equal(runtime.physicalProvider, 'spotify');
+    assert.deepEqual({ controlledAudible, spotifyAudible }, { controlledAudible: false, spotifyAudible: true });
+
+    // Deliberately stale cloud truth: the physical provider must still win and
+    // force a confirmed local Spotify pause before controlled audio can start.
+    store.state.playback = { ...store.state.playback, provider: 'controlled', intent: 'playing' };
+    await runtime.playControlled('https://audio.test/second.mp3');
+
+    assert.equal(runtime.physicalProvider, 'controlled');
+    assert.deepEqual({ controlledAudible, spotifyAudible }, { controlledAudible: true, spotifyAudible: false });
+    assert.deepEqual(calls, [
+      'spotify-pause:false',
+      'controlled-play:https://audio.test/first.mp3',
+      'controlled-pause',
+      'spotify-play',
+      'controlled-stop',
+      'spotify-pause:true',
+      'controlled-play:https://audio.test/second.mp3'
+    ]);
   });
 });
 

@@ -150,9 +150,9 @@ export class AudioEngine {
       supported: !!audioContextConstructor(),
       unlocked: this.unlocked,
       contextState: this.context?.state || 'not-created',
-      musicLevelPercent: MUSIC_LEVEL_PERCENT,
+      musicLevelPercent: Math.round(this.musicLevel * 100),
       voiceLevelPercent: VOICE_LEVEL_PERCENT,
-      duckLevelPercent: DUCK_LEVEL_PERCENT,
+      duckLevelPercent: Math.round(this.duckLevel * 100),
       musicPlaying: this.musicPlaying(),
       label: this.currentLabel,
       url: this.currentUrl
@@ -219,7 +219,8 @@ export class AudioEngine {
     const context = this.ensureGraph();
     // Start the real HTMLMediaElement inside the receiver tap call stack. This
     // preserves the user-activation grant Safari/iOS requires when a scheduled
-    // track is loaded later, while sending only silent PCM through the 30% bus.
+    // track is loaded later, while sending only silent PCM through the current
+    // music bus target.
     const mediaPrime = this.primeMusicElement();
     const contextResume = context.state === 'running'
       ? Promise.resolve(true)
@@ -232,7 +233,7 @@ export class AudioEngine {
     if (context.state !== 'running') throw new Error(`Receiver audio is ${context.state}. Tap Start Receiver again while this page is visible.`);
     this.unlocked = true;
     if (audibleTest) await this.playUnlockTone();
-    this.report('Receiver mixer ready: music is locked to 30% and announcements to 100%.', true);
+    this.report(`Receiver mixer ready: music is set to ${Math.round(this.musicLevel * 100)}% and announcements to 100%.`, true);
     return true;
   }
 
@@ -330,6 +331,18 @@ export class AudioEngine {
     this.musicBus.gain.linearRampToValueAtTime(target, now + Math.max(0.01, rampMs / 1000));
   }
 
+  setMusicLevelPercent(percent, { rampMs = 140, report = true } = {}) {
+    const targetPercent = clamp(percent, 0, 100, MUSIC_LEVEL_PERCENT);
+    this.musicLevel = targetPercent / 100;
+    this.duckLevel = Math.min(DUCK_LEVEL_PERCENT, targetPercent) / 100;
+    if (this.musicBus) {
+      const audibleTarget = this.announcementDepth > 0 ? this.duckLevel : this.musicLevel;
+      this.setMusicBus(audibleTarget, rampMs);
+    }
+    if (report) this.report(`Music target set to ${targetPercent}%. Announcements remain fixed at 100%.`, true);
+    return targetPercent;
+  }
+
   async verifyMusicSignal(timeoutMs = 4_000) {
     if (!this.musicAnalyser) return false;
     const samples = new Float32Array(this.musicAnalyser.fftSize);
@@ -364,7 +377,7 @@ export class AudioEngine {
     this.currentLabel = String(label || 'Suno / direct audio');
     this.setMusicBus(this.musicLevel, 80);
     if (!changed && !audio.paused && !audio.ended) {
-      this.report(`${this.currentLabel} is already playing through the exact 30% music bus.`, true);
+      this.report(`${this.currentLabel} is already playing through the exact ${Math.round(this.musicLevel * 100)}% music bus.`, true);
       return true;
     }
     if (startAt > 0) {
@@ -382,7 +395,7 @@ export class AudioEngine {
       audio.pause();
       throw new Error('The track started, but no audio entered the calibrated mixer. Use a public Suno link or a direct audio host that permits browser audio (CORS).');
     }
-    this.report(`${this.currentLabel} is playing through the exact 30% music bus.`, true);
+    this.report(`${this.currentLabel} is playing through the exact ${Math.round(this.musicLevel * 100)}% music bus.`, true);
     return true;
   }
 
@@ -418,7 +431,7 @@ export class AudioEngine {
       this.musicElement.pause();
       throw new Error('The track resumed, but no audio entered the calibrated mixer. Music was paused instead of reporting a false playing state.');
     }
-    this.report(`${this.currentLabel || 'Music'} resumed at 30%.`, true);
+    this.report(`${this.currentLabel || 'Music'} resumed at ${Math.round(this.musicLevel * 100)}%.`, true);
     return true;
   }
 
@@ -464,7 +477,7 @@ export class AudioEngine {
     this.currentLabel = label;
     this.currentUrl = 'poolside://calibration-bed';
     this.setMusicBus(this.musicLevel, 120);
-    this.report(`${label} is playing through the exact 30% music bus.`, true);
+    this.report(`${label} is playing through the exact ${Math.round(this.musicLevel * 100)}% music bus.`, true);
     return true;
   }
 
@@ -607,13 +620,15 @@ export class AudioEngine {
 
   async runCalibration({ speak = null } = {}) {
     await this.unlock({ audibleTest: true });
-    this.playBuiltInBed({ label: '30% calibration bed' });
+    const targetPercent = Math.round(this.musicLevel * 100);
+    this.playBuiltInBed({ label: `${targetPercent}% calibration bed` });
     try {
       await wait(1_100);
       await this.beginAnnouncement();
       try {
-        if (typeof speak === 'function') await speak('Poolside Pulse sound check. Music is at thirty percent. This announcement is at one hundred percent.');
-        else await this.playDeviceSpeech('Poolside Pulse sound check. Music is at thirty percent. This announcement is at one hundred percent.');
+        const message = `Poolside Pulse sound check. Music is at ${targetPercent} percent. This announcement is at one hundred percent.`;
+        if (typeof speak === 'function') await speak(message);
+        else await this.playDeviceSpeech(message);
       } finally {
         await this.endAnnouncement();
       }

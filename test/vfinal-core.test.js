@@ -35,14 +35,14 @@ import {
 
 const T0 = 1_800_000_000_000;
 
-describe('fixed mix state and foundational helpers', () => {
-  test('publishes the immutable 30/100/6 mix contract', () => {
+describe('adjustable mix state and foundational helpers', () => {
+  test('publishes a 30% music default with fixed 100% voice and 6% maximum duck', () => {
     assert.equal(MUSIC_LEVEL_PERCENT, 30);
     assert.equal(VOICE_LEVEL_PERCENT, 100);
     assert.equal(DUCK_LEVEL_PERCENT, 6);
   });
 
-  test('normalization overrides persisted or hostile mix values every time', () => {
+  test('normalization preserves adjustable music while overriding hostile voice and duck values', () => {
     const normalized = normalizeState({
       version: 'old',
       config: {
@@ -56,15 +56,35 @@ describe('fixed mix state and foundational helpers', () => {
 
     assert.equal(normalized.version, 'final');
     assert.equal(normalized.config.musicProvider, 'spotify');
-    assert.equal(normalized.config.musicLevel, 30);
+    assert.equal(normalized.config.musicLevel, 99);
     assert.equal(normalized.config.voiceLevel, 100);
     assert.equal(normalized.config.duckLevel, 6);
     assert.equal(normalized.config.weatherIntervalMinutes, 2);
 
     const renormalized = normalizeState(normalized, T0 + 1);
-    assert.equal(renormalized.config.musicLevel, 30);
+    assert.equal(renormalized.config.musicLevel, 99);
     assert.equal(renormalized.config.voiceLevel, 100);
     assert.equal(renormalized.config.duckLevel, 6);
+  });
+
+  test('normalization clamps music to 0-100 and falls back to the 30% default', () => {
+    const cases = [
+      { value: -1, expected: 0 },
+      { value: 0, expected: 0 },
+      { value: 42, expected: 42 },
+      { value: 100, expected: 100 },
+      { value: 101, expected: 100 },
+      { value: 'not-a-level', expected: 30 }
+    ];
+
+    for (const { value, expected } of cases) {
+      const normalized = normalizeState({
+        config: { musicLevel: value, voiceLevel: value, duckLevel: value }
+      }, T0);
+      assert.equal(normalized.config.musicLevel, expected);
+      assert.equal(normalized.config.voiceLevel, 100);
+      assert.equal(normalized.config.duckLevel, 6);
+    }
   });
 
   test('normalization clamps weather controls and sanitizes provider choice', () => {
@@ -352,8 +372,8 @@ describe('schedule due-time policy', () => {
 });
 
 describe('audio policy', () => {
-  test('controlled Suno/direct playback guarantees an exact 30/100 mix and 6% duck', () => {
-    const policy = audioPolicy({ provider: 'controlled', isIOS: true, supportsVolume: false });
+  test('controlled Suno/direct playback uses the adjustable target with voice fixed at 100%', () => {
+    const policy = audioPolicy({ provider: 'controlled', isIOS: true, supportsVolume: false, musicPercent: 42 });
 
     assert.deepEqual({
       id: policy.id,
@@ -363,24 +383,60 @@ describe('audio policy', () => {
       duringVoicePercent: policy.duringVoicePercent,
       action: policy.action
     }, {
-      id: 'exact-30-100',
+      id: 'controlled-adjustable-duck',
       exact: true,
-      musicPercent: 30,
+      musicPercent: 42,
       voicePercent: 100,
       duringVoicePercent: 6,
       action: 'duck'
     });
+
+    const quietTarget = audioPolicy({ provider: 'controlled', musicPercent: 4 });
+    assert.equal(quietTarget.duringVoicePercent, 4, 'duck must never raise music above its selected target');
   });
 
   test('desktop Spotify with verified volume support uses 30% and pauses for voice', () => {
-    const policy = audioPolicy({ provider: 'spotify', isIOS: false, supportsVolume: true, volumeVerified: true });
+    const policy = audioPolicy({
+      provider: 'spotify',
+      isIOS: false,
+      supportsVolume: true,
+      volumeVerified: true,
+      verifiedPercent: 30,
+      musicPercent: 30
+    });
 
-    assert.equal(policy.id, 'spotify-verified-30-pause');
+    assert.equal(policy.id, 'spotify-verified-volume-pause');
     assert.equal(policy.exact, true);
     assert.equal(policy.musicPercent, 30);
     assert.equal(policy.voicePercent, 100);
     assert.equal(policy.duringVoicePercent, 0);
     assert.equal(policy.action, 'pause');
+  });
+
+  test('Spotify exactness requires verifiedPercent to match a non-30 target', () => {
+    const verified = audioPolicy({
+      provider: 'spotify',
+      isIOS: false,
+      supportsVolume: true,
+      volumeVerified: true,
+      verifiedPercent: 42,
+      musicPercent: 42
+    });
+    const staleVerification = audioPolicy({
+      provider: 'spotify',
+      isIOS: false,
+      supportsVolume: true,
+      volumeVerified: true,
+      verifiedPercent: 30,
+      musicPercent: 42
+    });
+
+    assert.equal(verified.id, 'spotify-verified-volume-pause');
+    assert.equal(verified.exact, true);
+    assert.equal(verified.musicPercent, 42);
+    assert.equal(staleVerification.id, 'spotify-unverified-pause-only');
+    assert.equal(staleVerification.exact, false);
+    assert.equal(staleVerification.musicPercent, null);
   });
 
   test('iOS Spotify never claims controllable volume even if support is reported', () => {

@@ -145,8 +145,9 @@ export class CloudStore {
     this.syncMode = data.syncMode || 'cloud';
     this.cloudSync = !!data.cloudSync;
     const incoming = normalizeState(data.state == null ? createDefaultState(this.now()) : data.state, this.now());
+    const unchanged = JSON.stringify(incoming) === JSON.stringify(this.state);
     this.state = incoming;
-    this.emit('cloud refresh');
+    if (!unchanged) this.emit('cloud refresh');
     return this.state;
   }
 

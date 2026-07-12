@@ -16,6 +16,7 @@ const MONDAY_1230_CHICAGO = Date.UTC(2026, 6, 6, 17, 30, 30);
 class MemoryStorage {
   constructor() {
     this.values = new Map();
+    this.setCalls = 0;
   }
 
   getItem(key) {
@@ -23,6 +24,7 @@ class MemoryStorage {
   }
 
   setItem(key, value) {
+    this.setCalls += 1;
     this.values.set(String(key), String(value));
   }
 
@@ -503,6 +505,33 @@ describe('receiver weather failure state', { concurrency: false }, () => {
 });
 
 describe('CloudStore optimistic concurrency and durability', { concurrency: false }, () => {
+  test('an unchanged authoritative poll updates sync metadata without emitting or rewriting local state', async () => {
+    const now = Date.now();
+    const authoritativeState = { ...createDefaultState(now), revision: 4, marker: 'unchanged' };
+    let responseMetadata = { syncMode: 'kv', cloudSync: true };
+    const previousFetch = globalThis.fetch;
+    globalThis.fetch = async () => jsonResponse({ state: authoritativeState, ...responseMetadata });
+    try {
+      const emitted = [];
+      const store = new CloudStore({ onState: (state, metadata) => emitted.push({ state, metadata }) });
+
+      await store.fetchRemote();
+      assert.equal(emitted.length, 1);
+      assert.equal(globalThis.localStorage.setCalls, 1);
+
+      responseMetadata = { syncMode: 'memory', cloudSync: false };
+      const fetched = await store.fetchRemote();
+
+      assert.equal(fetched.marker, 'unchanged');
+      assert.equal(store.syncMode, 'memory');
+      assert.equal(store.cloudSync, false);
+      assert.equal(emitted.length, 1, 'unchanged polling must not notify state listeners');
+      assert.equal(globalThis.localStorage.setCalls, 1, 'unchanged polling must not rewrite localStorage');
+    } finally {
+      globalThis.fetch = previousFetch;
+    }
+  });
+
   test('retries an HTTP 409 from the latest state and advances revision monotonically', async () => {
     const now = Date.now();
     const revisionZero = { ...createDefaultState(now), revision: 0, marker: 0 };

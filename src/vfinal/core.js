@@ -1,5 +1,7 @@
 export const VERSION = 'final';
 export const STATE_VERSION = 'final';
+// Default music target. The persisted operating target is config.musicLevel
+// and is intentionally adjustable from 0-100.
 export const MUSIC_LEVEL_PERCENT = 30;
 export const VOICE_LEVEL_PERCENT = 100;
 export const DUCK_LEVEL_PERCENT = 6;
@@ -206,7 +208,7 @@ export function normalizeState(input, now = Date.now()) {
   const source = input && typeof input === 'object' ? input : {};
   const config = { ...defaults.config, ...(source.config || {}) };
   config.musicProvider = config.musicProvider === 'spotify' ? 'spotify' : 'controlled';
-  config.musicLevel = MUSIC_LEVEL_PERCENT;
+  config.musicLevel = clamp(config.musicLevel, 0, 100, MUSIC_LEVEL_PERCENT);
   config.voiceLevel = VOICE_LEVEL_PERCENT;
   config.duckLevel = DUCK_LEVEL_PERCENT;
   config.latitude = clamp(config.latitude, -90, 90, defaults.config.latitude);
@@ -360,29 +362,38 @@ export function makeLog(kind, title, detail = '', now = Date.now(), meta = {}) {
   };
 }
 
-export function audioPolicy({ provider = 'controlled', isIOS = false, supportsVolume = false, volumeVerified = false } = {}) {
+export function audioPolicy({
+  provider = 'controlled',
+  isIOS = false,
+  supportsVolume = false,
+  volumeVerified = false,
+  verifiedPercent = null,
+  musicPercent = MUSIC_LEVEL_PERCENT
+} = {}) {
+  const target = clamp(musicPercent, 0, 100, MUSIC_LEVEL_PERCENT);
+  const verifiedAtTarget = volumeVerified === true && Number(verifiedPercent) === target;
   if (provider !== 'spotify') {
     return {
-      id: 'exact-30-100',
+      id: 'controlled-adjustable-duck',
       exact: true,
-      musicPercent: MUSIC_LEVEL_PERCENT,
+      musicPercent: target,
       voicePercent: VOICE_LEVEL_PERCENT,
-      duringVoicePercent: DUCK_LEVEL_PERCENT,
+      duringVoicePercent: Math.min(DUCK_LEVEL_PERCENT, target),
       action: 'duck',
-      label: 'Exact 30/100 mix',
-      detail: 'Receiver-owned Suno/direct audio is routed through one Web Audio mixer: music 30%, announcements 100%, music 6% during speech.'
+      label: `Exact ${target}/100 mix`,
+      detail: `Receiver-owned Suno/direct audio is routed through one Web Audio mixer: music ${target}%, announcements 100%, music ${Math.min(DUCK_LEVEL_PERCENT, target)}% during speech.`
     };
   }
-  if (!isIOS && supportsVolume && volumeVerified) {
+  if (!isIOS && supportsVolume && verifiedAtTarget) {
     return {
-      id: 'spotify-verified-30-pause',
+      id: 'spotify-verified-volume-pause',
       exact: true,
-      musicPercent: MUSIC_LEVEL_PERCENT,
+      musicPercent: target,
       voicePercent: VOICE_LEVEL_PERCENT,
       duringVoicePercent: 0,
       action: 'pause',
-      label: 'Verified Spotify 30% + voice takeover',
-      detail: 'This receiver reports Spotify volume support. Spotify is verified at 30%, paused for announcements, then resumed without restarting the track.'
+      label: `Verified Spotify ${target}% + voice takeover`,
+      detail: `This receiver reports Spotify volume support. Spotify is verified at ${target}%, paused for announcements, then resumed without restarting the track.`
     };
   }
   return {
@@ -394,8 +405,8 @@ export function audioPolicy({ provider = 'controlled', isIOS = false, supportsVo
     action: 'pause',
     label: 'Spotify pause-for-voice compatibility',
     detail: isIOS
-      ? 'iPhone/iPad browsers cannot set Spotify playback volume. Spotify will pause for announcements and resume afterward; use Suno/direct audio for guaranteed 30/100 levels.'
-      : 'Spotify volume has not been verified at 30% on this receiver. Spotify will pause for announcements and resume afterward; use Suno/direct audio for guaranteed 30/100 levels.'
+      ? `iPhone/iPad browsers cannot set Spotify playback volume. The ${target}% slider target is not verified for Spotify here; Spotify will pause for announcements and resume afterward.`
+      : `Spotify volume has not been verified at ${target}% on this receiver. Spotify will pause for announcements and resume afterward.`
   };
 }
 
