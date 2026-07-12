@@ -3,6 +3,8 @@ import { before, describe, test } from 'node:test';
 
 import {
   createSessionToken,
+  expectedPin,
+  pinMatches,
   readSession,
   sessionSecurityReadiness
 } from '../api/_auth.js';
@@ -97,7 +99,7 @@ describe('vFinal signed session', () => {
     assert.match(String(protectedApi.getHeader('set-cookie')), /Max-Age=86400/);
   });
 
-  test('requires an explicit strong PIN in production readiness', async () => {
+  test('accepts an explicit four-digit PIN or strong passphrase in production readiness', async () => {
     const originalPin = process.env.POOL_SIDE_PIN;
     const originalVercel = process.env.VERCEL;
     try {
@@ -116,9 +118,15 @@ describe('vFinal signed session', () => {
       const unavailable = await invoke(sessionHandler, request('GET', '/api/session'));
       assert.equal(unavailable.statusCode, 503);
 
-      process.env.POOL_SIDE_PIN = 'eight888';
+      process.env.POOL_SIDE_PIN = '7900';
       process.env.KV_REST_API_URL = 'https://kv.example.invalid';
       process.env.KV_REST_API_TOKEN = 'test-token';
+      assert.equal(sessionSecurityReadiness().ready, true);
+      assert.equal(expectedPin(), '7900');
+      assert.equal(pinMatches('7900'), true);
+      assert.equal(pinMatches('7901'), false);
+
+      process.env.POOL_SIDE_PIN = 'eight888';
       assert.equal(sessionSecurityReadiness().ready, true);
     } finally {
       if (originalPin === undefined) delete process.env.POOL_SIDE_PIN;

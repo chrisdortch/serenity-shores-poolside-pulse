@@ -27,7 +27,7 @@ For unattended scheduling, use an always-on desktop-class receiver connected to 
 ## Required production configuration
 
 - `KV_REST_API_URL` and `KV_REST_API_TOKEN`: mandatory durable state, receiver ownership, conflict control, and distributed login throttling.
-- `POOL_SIDE_PIN`: mandatory 8–64 character production access code.
+- `POOL_SIDE_PIN`: mandatory four-digit numeric access code or 8–64 character production passphrase.
 - `POOL_SIDE_SESSION_SECRET`: recommended dedicated signing secret; a configured server-side integration secret is used only as a fallback.
 - `OPENAI_API_KEY`: optional natural announcement voice; device speech is the bounded fallback.
 - Existing weather-provider variables remain server-side and optional; failures are shown as unknown rather than clear.

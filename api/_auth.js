@@ -9,10 +9,15 @@ const SESSION_COOKIE = 'poolside_vfinal_session';
 const SESSION_TTL_SECONDS = 24 * 60 * 60;
 const SESSION_RENEW_AFTER_SECONDS = 12 * 60 * 60;
 const SESSION_CLOCK_SKEW_SECONDS = 5 * 60;
-const PRODUCTION_PIN_MIN_LENGTH = 8;
+const PRODUCTION_PASSPHRASE_MIN_LENGTH = 8;
 const SECRET_CONTEXT = 'serenity-shores-poolside-pulse:vfinal:session:v1';
 
 globalThis.__POOL_SIDE_API_RATE_LIMITS__ ||= new Map();
+
+function validProductionPin(value) {
+  const pin = String(value || '').trim();
+  return /^\d{4}$/.test(pin) || (pin.length >= PRODUCTION_PASSPHRASE_MIN_LENGTH && pin.length <= 64);
+}
 
 function header(req, name) {
   const value = req?.headers?.[name] ?? req?.headers?.[name.toLowerCase()];
@@ -98,7 +103,7 @@ export function sessionSecurityReadiness() {
   const configuredPin = String(process.env.POOL_SIDE_PIN || '').trim();
   const production = process.env.VERCEL === '1';
   const pinReady = production
-    ? configuredPin.length >= PRODUCTION_PIN_MIN_LENGTH && configuredPin.length <= 64
+    ? validProductionPin(configuredPin)
     : (!configuredPin || configuredPin.length <= 64);
   const signingReady = Boolean(sessionSigningKey());
   const limiterReady = !production || Boolean(process.env.KV_REST_API_URL && process.env.KV_REST_API_TOKEN);
@@ -118,7 +123,7 @@ export function sessionSecurityReady() {
 export function expectedPin() {
   const configured = String(process.env.POOL_SIDE_PIN || '').trim();
   if (process.env.VERCEL === '1') {
-    return configured.length >= PRODUCTION_PIN_MIN_LENGTH && configured.length <= 64 ? configured : '';
+    return validProductionPin(configured) ? configured : '';
   }
   return configured || '7900';
 }
