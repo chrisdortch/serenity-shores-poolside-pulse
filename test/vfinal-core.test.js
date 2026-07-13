@@ -49,7 +49,7 @@ import {
   resolveScheduleAnnouncementText,
   renewReceiverLease,
   weatherRequestUrl
-} from '../src/vfinal/core.js';
+} from '../src/v30/core.js';
 
 const T0 = 1_800_000_000_000;
 
@@ -491,6 +491,7 @@ describe('named schedule model and migration', () => {
           token: ` ${'t'.repeat(200)} `,
           triggerId: ` ${'g'.repeat(200)} `,
           itemId: 'active-item',
+          fingerprint: ` ${'f'.repeat(120)} `,
           order: 999,
           kind: 'spotify',
           advanceMode: 'duration',
@@ -517,6 +518,7 @@ describe('named schedule model and migration', () => {
     assert.equal(run.itemId.length, 120);
     assert.equal(run.active.token.length, 160);
     assert.equal(run.active.triggerId.length, 160);
+    assert.equal(run.active.fingerprint.length, 80);
     assert.equal(run.active.order, MAX_SCHEDULE_ITEMS);
     assert.equal(run.active.kind, 'spotify');
     assert.equal(run.active.advanceMode, 'duration');
@@ -635,7 +637,10 @@ describe('receiver lease lifecycle', () => {
       leaseUntil: T0 + RECEIVER_LEASE_MS,
       platform: 'Safari on iPad',
       audioMode: 'unlocked',
-      detail: 'Receiver audio unlocked and command session active.'
+      detail: 'Receiver audio unlocked and command session active.',
+      spotifyStatus: 'login-required',
+      spotifyDetail: '',
+      spotifyVerifiedAt: 0
     });
   });
 

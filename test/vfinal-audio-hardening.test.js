@@ -3,9 +3,9 @@ import { describe, test } from 'node:test';
 
 import { createSessionToken } from '../api/_auth.js';
 import ttsHandler from '../api/tts.js';
-import { AudioEngine, estimateDeviceSpeechTimeoutMs } from '../src/vfinal/audio-engine.js';
-import { DUCK_LEVEL_PERCENT } from '../src/vfinal/core.js';
-import { SpotifyReceiver } from '../src/vfinal/spotify-receiver.js';
+import { AudioEngine, estimateDeviceSpeechTimeoutMs } from '../src/v30/audio-engine.js';
+import { DUCK_LEVEL_PERCENT } from '../src/v30/core.js';
+import { SpotifyReceiver } from '../src/v30/spotify-receiver.js';
 
 function installControlledAudioHarness({ signal = 0.24 } = {}) {
   const originalDocument = globalThis.document;

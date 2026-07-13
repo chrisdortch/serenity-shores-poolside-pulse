@@ -3,14 +3,14 @@ import { beforeEach, describe, test } from 'node:test';
 
 import { createSessionToken } from '../api/_auth.js';
 import sunoHandler from '../api/suno-playlist.js';
-import { CloudStore } from '../src/vfinal/cloud.js';
+import { CloudStore } from '../src/v30/cloud.js';
 import {
   RECEIVER_LEASE_MS,
   createDefaultState,
   makeReceiverLease
-} from '../src/vfinal/core.js';
-import { ReceiverRuntime } from '../src/vfinal/receiver-runtime.js';
-import { SpotifyReceiver } from '../src/vfinal/spotify-receiver.js';
+} from '../src/v30/core.js';
+import { ReceiverRuntime } from '../src/v30/receiver-runtime.js';
+import { SpotifyReceiver } from '../src/v30/spotify-receiver.js';
 
 const NOW = Date.UTC(2026, 6, 6, 17, 30, 30);
 const OWNER_ID = 'vfinal-concurrency-receiver';

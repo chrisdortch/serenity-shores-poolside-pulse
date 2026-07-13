@@ -1,13 +1,13 @@
 import assert from 'node:assert/strict';
 import { beforeEach, describe, test } from 'node:test';
 
-import { CloudStore } from '../src/vfinal/cloud.js';
+import { CloudStore } from '../src/v30/cloud.js';
 import {
   RECEIVER_LEASE_MS,
   createDefaultState,
   makeReceiverLease
-} from '../src/vfinal/core.js';
-import { ReceiverRuntime } from '../src/vfinal/receiver-runtime.js';
+} from '../src/v30/core.js';
+import { ReceiverRuntime } from '../src/v30/receiver-runtime.js';
 
 const OWNER_ID = 'receiver-test-device';
 const SESSION_ID = 'receiver-test-session';
@@ -353,6 +353,103 @@ describe('receiver fail-safe and command dispatch', { concurrency: false }, () =
     assert.equal(result, true);
     assert.deepEqual(events, ['resume']);
   });
+
+  test('does not enqueue a remote Spotify command until the receiver publishes verified readiness', async () => {
+    const state = ownerState();
+    state.receiver.spotifyStatus = 'access-blocked';
+    state.receiver.spotifyDetail = 'Spotify denied GET /me with HTTP 403.';
+    const { runtime, store } = runtimeHarness({ state });
+    runtime.active = false;
+
+    await assert.rejects(
+      runtime.sendCommand('play-spotify', { url: 'spotify:track:abc', label: 'Spotify' }),
+      /not Spotify-ready.*HTTP 403/i
+    );
+    assert.equal(store.state.events.length, 0);
+
+    store.state.receiver.spotifyStatus = 'ready';
+    await runtime.sendCommand('play-spotify', { url: 'spotify:track:abc', label: 'Spotify' });
+    assert.equal(store.state.events.length, 1);
+    assert.equal(store.state.events[0].type, 'play-spotify');
+  });
+
+  test('records safe Spotify failure phase metadata with the durable failed command', async () => {
+    const state = ownerState();
+    state.receiver.spotifyStatus = 'ready';
+    const failure = new Error('Spotify denied PUT /me/player/play with HTTP 403. Spotify said: Restriction violated.');
+    failure.code = 'SPOTIFY_ACCESS_RESTRICTED';
+    failure.status = 403;
+    failure.spotifyOperation = 'PUT /me/player/play';
+    failure.spotifyReason = 'Restriction violated';
+    const { runtime, store } = runtimeHarness({
+      state,
+      spotify: {
+        ready: true,
+        loggedIn: () => true,
+        readiness: () => ({ status: 'ready', ready: true, detail: 'Spotify ready.' }),
+        play: async () => { throw failure; }
+      }
+    });
+    const event = {
+      id: 'spotify-failure-event',
+      type: 'play-spotify',
+      payload: { label: 'Spotify' },
+      targetReceiverId: OWNER_ID,
+      targetSessionId: SESSION_ID,
+      createdAt: MONDAY_1230_CHICAGO,
+      expiresAt: MONDAY_1230_CHICAGO + 60_000,
+      status: 'pending'
+    };
+
+    assert.equal(await runtime.processEvent(event), false);
+    const saved = store.state.events.find(item => item.id === event.id);
+    assert.equal(saved.status, 'failed');
+    assert.equal(saved.errorCode, 'SPOTIFY_ACCESS_RESTRICTED');
+    assert.equal(saved.errorStatus, 403);
+    assert.equal(saved.errorOperation, 'PUT /me/player/play');
+    assert.equal(saved.spotifyReason, 'Restriction violated');
+    const log = store.state.activityLog.find(item => item.eventId === event.id);
+    assert.equal(log.errorOperation, 'PUT /me/player/play');
+  });
+
+  test('public Spotify diagnostic plays without replacing the saved source', async () => {
+    const state = ownerState();
+    state.config.musicProvider = 'controlled';
+    state.config.spotifyUrl = 'spotify:playlist:saved-source';
+    state.receiver.spotifyStatus = 'ready';
+    const { runtime, store } = runtimeHarness({
+      state,
+      spotify: {
+        ready: true,
+        loggedIn: () => true,
+        readiness: () => ({ status: 'ready', ready: true, detail: 'Spotify ready.' }),
+        play: async () => ({
+          state: { isPlaying: true, deviceId: 'receiver-a', uri: 'spotify:track:public-test' },
+          volume: { verified: false }
+        })
+      }
+    });
+    const event = {
+      id: 'spotify-public-diagnostic',
+      type: 'play-spotify',
+      payload: {
+        url: 'spotify:track:public-test',
+        label: 'Public test track',
+        persistSource: false
+      },
+      targetReceiverId: OWNER_ID,
+      targetSessionId: SESSION_ID,
+      createdAt: MONDAY_1230_CHICAGO,
+      expiresAt: MONDAY_1230_CHICAGO + 60_000,
+      status: 'pending'
+    };
+
+    assert.equal(await runtime.processEvent(event), true);
+    assert.equal(store.state.config.musicProvider, 'controlled');
+    assert.equal(store.state.config.spotifyUrl, 'spotify:playlist:saved-source');
+    assert.equal(store.state.playback.provider, 'spotify');
+    assert.equal(store.state.playback.sourceUrl, 'spotify:track:public-test');
+  });
 });
 
 describe('receiver schedule receipts', { concurrency: false }, () => {
@@ -395,15 +492,299 @@ describe('receiver schedule receipts', { concurrency: false }, () => {
     await runtime.tickSchedule();
 
     assert.deepEqual(order, ['mutation:Schedule run claimed', 'playback-completed', 'mutation:Schedule run recorded']);
-    assert.deepEqual(store.state.scheduleRuns['midday-safety'], {
+    const completed = store.state.scheduleRuns['midday-safety'];
+    assert.deepEqual(completed, {
       dateKey: '2026-07-06',
       status: 'completed',
+      token: completed.token,
+      scheduleId: 'receipt-test',
+      fingerprint: completed.fingerprint,
       completedAt: MONDAY_1230_CHICAGO,
       receiverId: OWNER_ID,
       sessionId: SESSION_ID
     });
+    assert.match(completed.token, /^time-run-/);
+    assert.match(completed.fingerprint, /^v1-[a-f0-9]{8}-[a-f0-9]{8}$/);
     assert.equal(runtime.scheduleCompletedLocal.has('midday-safety:2026-07-06'), true);
     assert.equal(mutations.at(-1).options.requireDurable, true);
+  });
+
+  test('a Time schedule edit during controlled-source resolution prevents any physical start', async () => {
+    const state = scheduledState();
+    state.schedules[0].items[0] = {
+      ...state.schedules[0].items[0],
+      type: 'controlled',
+      url: 'https://audio.test/time-controlled.mp3',
+      action: { kind: 'controlled', url: 'https://audio.test/time-controlled.mp3' },
+      volume: { mode: 'custom', percent: 30 }
+    };
+    const sourceReached = Promise.withResolvers();
+    const releaseSource = Promise.withResolvers();
+    const starts = [];
+    const { runtime, store } = runtimeHarness({
+      state,
+      audio: {
+        musicPlaying: () => false,
+        setMusicLevelPercent: () => 30,
+        playMusicUrl: async url => starts.push(url)
+      }
+    });
+    runtime.resolveControlledTracks = async () => {
+      sourceReached.resolve();
+      await releaseSource.promise;
+      return {
+        tracks: [{ id: 'one', title: 'One', artist: 'Test', audioUrl: 'https://audio.test/resolved.mp3' }],
+        playlistName: 'Resolved test source'
+      };
+    };
+
+    const ticking = runtime.tickSchedule();
+    await sourceReached.promise;
+    const claim = structuredClone(store.state.scheduleRuns['midday-safety']);
+    store.state.scheduleRuns['midday-safety'] = {
+      ...claim,
+      status: 'completed',
+      completedAt: MONDAY_1230_CHICAGO,
+      outcome: 'cancelled-by-schedule-change'
+    };
+    store.state.schedules[0].items[0].label = 'Edited after claim';
+    releaseSource.resolve();
+    await ticking;
+
+    assert.deepEqual(starts, [], 'a cancelled Time source must never reach the physical audio element');
+    assert.equal(store.state.playback.intent, 'stopped');
+    assert.equal(store.state.scheduleRuns['midday-safety'].outcome, 'cancelled-by-schedule-change');
+  });
+
+  test('a Time schedule edit while Spotify is preparing forces pause and prevents a playback receipt', async () => {
+    const state = scheduledState();
+    state.schedules[0].items[0] = {
+      ...state.schedules[0].items[0],
+      type: 'spotify',
+      url: 'spotify:track:public-test',
+      action: { kind: 'spotify', url: 'spotify:track:public-test' },
+      volume: { mode: 'custom', percent: 30 }
+    };
+    const playReached = Promise.withResolvers();
+    const releasePlay = Promise.withResolvers();
+    let pauseCalls = 0;
+    const { runtime, store } = runtimeHarness({
+      state,
+      audio: {
+        musicPlaying: () => false,
+        setMusicLevelPercent: () => 30
+      },
+      spotify: {
+        ready: true,
+        current: { paused: true },
+        loggedIn: () => true,
+        play: async (_url, options) => {
+          playReached.resolve();
+          await releasePlay.promise;
+          options.assertCurrent();
+          return { state: { isPlaying: true }, volume: { verified: false } };
+        },
+        pauseForAnnouncement: async () => {
+          pauseCalls += 1;
+          return { wasPlaying: false };
+        }
+      }
+    });
+
+    const ticking = runtime.tickSchedule();
+    await playReached.promise;
+    const claim = structuredClone(store.state.scheduleRuns['midday-safety']);
+    store.state.scheduleRuns['midday-safety'] = {
+      ...claim,
+      status: 'completed',
+      completedAt: MONDAY_1230_CHICAGO,
+      outcome: 'cancelled-by-schedule-change'
+    };
+    store.state.schedules[0].items[0].url = 'spotify:track:edited-after-claim';
+    store.state.schedules[0].items[0].action.url = 'spotify:track:edited-after-claim';
+    releasePlay.resolve();
+    await ticking;
+
+    assert.ok(pauseCalls >= 1, 'a possibly started Spotify command must be explicitly paused after cancellation');
+    assert.notEqual(store.state.playback.intent, 'playing');
+    assert.equal(store.state.scheduleRuns['midday-safety'].outcome, 'cancelled-by-schedule-change');
+  });
+
+  test('dual Spotify pause failure never restores controlled audio after a cancelled scheduled start', async () => {
+    const state = scheduledState();
+    state.schedules[0].items[0] = {
+      ...state.schedules[0].items[0],
+      type: 'spotify',
+      url: 'spotify:track:publicTest',
+      action: { kind: 'spotify', url: 'spotify:track:publicTest' },
+      volume: { mode: 'custom', percent: 30 }
+    };
+    state.config.musicProvider = 'controlled';
+    state.playback = {
+      ...state.playback,
+      provider: 'controlled',
+      intent: 'playing',
+      audioUrl: 'https://audio.test/prior-controlled.mp3',
+      label: 'Prior controlled bed'
+    };
+    const playReached = Promise.withResolvers();
+    const releasePlay = Promise.withResolvers();
+    const calls = [];
+    const { runtime, store } = runtimeHarness({
+      state,
+      audio: {
+        currentUrl: 'https://audio.test/prior-controlled.mp3',
+        currentLabel: 'Prior controlled bed',
+        musicPlaying: () => true,
+        setMusicLevelPercent: () => 30,
+        pauseMusic: () => { calls.push('controlled-pause'); return true; },
+        stopMusic: () => calls.push('controlled-stop'),
+        resumeMusic: async () => { calls.push('controlled-resume'); return true; },
+        playMusicUrl: async () => calls.push('controlled-play')
+      },
+      spotify: {
+        ready: true,
+        current: { paused: false },
+        loggedIn: () => true,
+        play: async (_url, options) => {
+          playReached.resolve();
+          await releasePlay.promise;
+          options.assertCurrent();
+          return { state: { isPlaying: true }, volume: { verified: false } };
+        },
+        pauseForAnnouncement: async () => {
+          calls.push('spotify-confirmed-pause');
+          throw new Error('Spotify paused state was not confirmed.');
+        },
+        pause: async () => {
+          calls.push('spotify-fallback-pause');
+          throw new Error('Spotify fallback pause also failed.');
+        }
+      }
+    });
+    runtime.physicalProvider = 'controlled';
+
+    const ticking = runtime.tickSchedule();
+    await playReached.promise;
+    const claim = structuredClone(store.state.scheduleRuns['midday-safety']);
+    store.state.scheduleRuns['midday-safety'] = {
+      ...claim,
+      status: 'completed',
+      completedAt: MONDAY_1230_CHICAGO,
+      outcome: 'cancelled-by-schedule-change'
+    };
+    store.state.schedules[0].items[0].label = 'Edited after Spotify might have started';
+    await assert.rejects(
+      runtime.reconcileScheduledPlaybackAuthorization(),
+      error => error.code === 'SPOTIFY_PAUSE_UNCONFIRMED' && error.spotifyPauseUnconfirmed === true
+    );
+    releasePlay.resolve();
+    await ticking;
+
+    assert.deepEqual(calls, [
+      'controlled-pause',
+      'controlled-stop',
+      'spotify-confirmed-pause',
+      'spotify-fallback-pause',
+      'spotify-confirmed-pause',
+      'spotify-fallback-pause'
+    ]);
+    assert.ok(runtime.pendingScheduledPlayback, 'the unresolved cancellation must remain pending for a later retry');
+    assert.equal(runtime.physicalProvider, 'spotify', 'the uncertain provider must remain Spotify until silence is confirmed');
+    assert.match(store.state.activityLog[0].detail, /no (?:other|another) source was restored.*pause path confirmed silence/i);
+  });
+
+  test('live reconciliation durably reports an unconfirmed scheduled Spotify pause', async () => {
+    const state = scheduledState();
+    state.schedules[0].items[0] = {
+      ...state.schedules[0].items[0],
+      type: 'spotify',
+      url: 'spotify:track:publicTest',
+      action: { kind: 'spotify', url: 'spotify:track:publicTest' }
+    };
+    state.scheduleRuns['midday-safety'] = {
+      dateKey: '2026-07-06',
+      status: 'completed',
+      token: 'cancelled-time-token',
+      scheduleId: 'receipt-test',
+      fingerprint: 'v1-stale-stale',
+      completedAt: MONDAY_1230_CHICAGO,
+      receiverId: OWNER_ID,
+      sessionId: SESSION_ID,
+      outcome: 'cancelled-by-schedule-change'
+    };
+    const calls = [];
+    const { runtime, store, mutations, statuses } = runtimeHarness({
+      state,
+      audio: { stopMusic: () => calls.push('controlled-stop') },
+      spotify: {
+        pauseForAnnouncement: async () => {
+          calls.push('spotify-confirmed-pause');
+          throw new Error('Spotify paused state was not confirmed.');
+        },
+        pause: async () => {
+          calls.push('spotify-fallback-pause');
+          return false;
+        }
+      }
+    });
+    runtime.pendingScheduledPlayback = {
+      token: 'cancelled-time-token',
+      itemId: 'midday-safety',
+      provider: 'spotify',
+      requestId: 41
+    };
+
+    await assert.rejects(
+      runtime.reconcileScheduledPlaybackAuthorization(),
+      error => error.code === 'SPOTIFY_PAUSE_UNCONFIRMED' && error.spotifyPauseUnconfirmed === true
+    );
+
+    assert.deepEqual(calls, ['controlled-stop', 'spotify-confirmed-pause', 'spotify-fallback-pause']);
+    assert.equal(runtime.pendingScheduledPlayback.requestId, 41);
+    assert.equal(runtime.physicalProvider, 'spotify');
+    assert.equal(store.state.activityLog[0].title, 'Scheduled Spotify cancellation could not confirm silence');
+    assert.equal(mutations.at(-1).reason, 'Scheduled Spotify pause failure recorded');
+    assert.equal(mutations.at(-1).options.requireDurable, true);
+    assert.equal(statuses.at(-1).ok, false);
+  });
+
+  test('a Time schedule edit during voice preparation cancels speech before it begins', async () => {
+    const voiceReached = Promise.withResolvers();
+    const releaseVoice = Promise.withResolvers();
+    const spoken = [];
+    let stopVoiceCalls = 0;
+    const { runtime, store } = runtimeHarness({
+      state: scheduledState(),
+      audio: {
+        stopVoice: () => { stopVoiceCalls += 1; },
+        playVoiceBlob: async () => spoken.push('blob'),
+        playDeviceSpeech: async () => spoken.push('device')
+      }
+    });
+    runtime.prepareVoice = async () => {
+      voiceReached.resolve();
+      await releaseVoice.promise;
+      return null;
+    };
+
+    const ticking = runtime.tickSchedule();
+    await voiceReached.promise;
+    const claim = structuredClone(store.state.scheduleRuns['midday-safety']);
+    store.state.scheduleRuns['midday-safety'] = {
+      ...claim,
+      status: 'completed',
+      completedAt: MONDAY_1230_CHICAGO,
+      outcome: 'cancelled-by-schedule-change'
+    };
+    store.state.schedules[0].items[0].label = 'Edited while voice prepared';
+    await runtime.reconcileScheduledPlaybackAuthorization();
+    releaseVoice.resolve();
+    await ticking;
+
+    assert.deepEqual(spoken, [], 'cancelled scheduled speech must never reach either voice path');
+    assert.ok(stopVoiceCalls >= 1);
+    assert.equal(store.state.scheduleRuns['midday-safety'].outcome, 'cancelled-by-schedule-change');
   });
 
   test('failed playback does not mark scheduleRuns and remains retry eligible', async () => {

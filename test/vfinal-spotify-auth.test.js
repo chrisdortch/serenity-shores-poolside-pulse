@@ -7,10 +7,10 @@ import {
   SpotifyReceiver,
   isCanonicalSpotifyLocation,
   safeSpotifyReturnPath
-} from '../src/vfinal/spotify-receiver.js';
+} from '../src/v30/spotify-receiver.js';
 
-const PKCE_KEY = 'poolside-pulse-vfinal-spotify-pkce';
-const TOKEN_KEY = 'poolside-pulse-vfinal-spotify-token';
+const PKCE_KEY = 'poolside-pulse-v30-spotify-pkce';
+const TOKEN_KEY = 'poolside-pulse-v30-spotify-token';
 
 class MemoryStorage {
   constructor() {
@@ -90,7 +90,7 @@ function pendingTransaction(overrides = {}) {
   return {
     state: 's'.repeat(32),
     verifier: 'v'.repeat(96),
-    returnPath: '/?v=final#receiver',
+    returnPath: '/?v=30#receiver',
     redirectUri: SPOTIFY_REDIRECT_URI,
     createdAt: 1_000,
     ...overrides
@@ -99,8 +99,9 @@ function pendingTransaction(overrides = {}) {
 
 describe('Spotify canonical PKCE login', { concurrency: false }, () => {
   test('uses the exact production redirect and stores verifier only in an expiring local transaction', async () => {
-    const env = browserEnvironment('https://serenity-shores-poolside-pulse.vercel.app/?v=final#receiver');
+    const env = browserEnvironment('https://serenity-shores-poolside-pulse.vercel.app/?v=30#receiver');
     try {
+      env.localStorage.setItem('poolside-pulse-vfinal-spotify-token', JSON.stringify({ access_token: 'obsolete' }));
       const receiver = new SpotifyReceiver({
         clientId: 'client-id',
         now: () => 1_000,
@@ -108,7 +109,7 @@ describe('Spotify canonical PKCE login', { concurrency: false }, () => {
         pkceChallenge: async verifier => `challenge-${verifier.length}`
       });
 
-      await receiver.beginLogin('/?v=final#receiver');
+      await receiver.beginLogin('/?v=30#receiver');
 
       const authorization = new URL(env.assigned);
       const pending = JSON.parse(env.localStorage.getItem(PKCE_KEY));
@@ -116,9 +117,12 @@ describe('Spotify canonical PKCE login', { concurrency: false }, () => {
       assert.equal(authorization.searchParams.get('redirect_uri'), SPOTIFY_REDIRECT_URI);
       assert.equal(authorization.searchParams.get('state'), pending.state);
       assert.equal(authorization.searchParams.get('code_challenge'), 'challenge-96');
+      assert.equal(authorization.searchParams.get('show_dialog'), 'true');
+      assert.match(authorization.searchParams.get('scope'), /playlist-read-private/);
       assert.equal(pending.verifier, 'v'.repeat(96));
       assert.notEqual(pending.state, pending.verifier, 'the PKCE verifier must never be embedded in OAuth state');
       assert.equal(pending.createdAt, 1_000);
+      assert.equal(env.localStorage.getItem('poolside-pulse-vfinal-spotify-token'), null);
       assert.equal(env.sessionStorage.values.size, 0, 'the transaction survives a new tab/PWA context through localStorage');
     } finally {
       env.restore();
@@ -131,10 +135,10 @@ describe('Spotify canonical PKCE login', { concurrency: false }, () => {
       const receiver = new SpotifyReceiver({ clientId: 'client-id' });
       await receiver.beginLogin('https://attacker.example/steal');
 
-      assert.equal(env.assigned, 'https://serenity-shores-poolside-pulse.vercel.app/?v=final#receiver');
+      assert.equal(env.assigned, 'https://serenity-shores-poolside-pulse.vercel.app/?v=30#receiver');
       assert.equal(env.localStorage.getItem(PKCE_KEY), null);
       assert.equal(isCanonicalSpotifyLocation(), false);
-      assert.equal(safeSpotifyReturnPath('//attacker.example/steal'), '/?v=final#receiver');
+      assert.equal(safeSpotifyReturnPath('//attacker.example/steal'), '/?v=30#receiver');
     } finally {
       env.restore();
     }
@@ -146,12 +150,20 @@ describe('Spotify canonical PKCE login', { concurrency: false }, () => {
     let tokenRequest = null;
     env.localStorage.setItem(PKCE_KEY, JSON.stringify(pendingTransaction()));
     globalThis.fetch = async (url, options) => {
-      tokenRequest = { url: String(url), options };
-      return response(200, {
-        access_token: 'access-token',
-        refresh_token: 'refresh-token',
-        expires_in: 3_600
-      });
+      const href = String(url);
+      if (href === 'https://accounts.spotify.com/api/token') {
+        tokenRequest = { url: href, options };
+        return response(200, {
+          access_token: 'access-token',
+          refresh_token: 'refresh-token',
+          expires_in: 3_600
+        });
+      }
+      if (href === 'https://api.spotify.com/v1/me') {
+        return response(200, { display_name: 'Pool Receiver', email: 'receiver@example.com', product: 'premium', account_id: 'account-a' });
+      }
+      if (href === 'https://api.spotify.com/v1/me/player/devices') return response(200, { devices: [] });
+      throw new Error(`Unexpected Spotify request: ${href}`);
     };
     try {
       const receiver = new SpotifyReceiver({ clientId: 'client-id', now: () => 2_000 });
@@ -163,8 +175,10 @@ describe('Spotify canonical PKCE login', { concurrency: false }, () => {
       assert.equal(body.get('code_verifier'), 'v'.repeat(96));
       assert.equal(env.localStorage.getItem(PKCE_KEY), null);
       assert.equal(JSON.parse(env.localStorage.getItem(TOKEN_KEY)).access_token, 'access-token');
-      assert.equal(env.replacements.at(-1), '/?v=final#receiver');
-      assert.equal(env.location.search, '?v=final');
+      assert.equal(receiver.accessVerified, true);
+      assert.deepEqual(receiver.accountProfile, { displayName: 'Pool Receiver', accountId: 'account-a' });
+      assert.equal(env.replacements.at(-1), '/?v=30#receiver');
+      assert.equal(env.location.search, '?v=30');
     } finally {
       globalThis.fetch = originalFetch;
       env.restore();
@@ -178,22 +192,50 @@ describe('Spotify canonical PKCE login', { concurrency: false }, () => {
       const denied = new SpotifyReceiver({ clientId: 'client-id', now: () => 2_000 });
       await assert.rejects(denied.completeLoginFromCallback(), /cancelled or permission was not granted/i);
       assert.equal(env.localStorage.getItem(PKCE_KEY), null);
-      assert.equal(env.replacements.at(-1), '/?v=final#receiver');
+      assert.equal(env.replacements.at(-1), '/?v=30#receiver');
 
       env.location.setHref(`${SPOTIFY_REDIRECT_URI}?code=late-code&state=${'s'.repeat(32)}`);
       env.localStorage.setItem(PKCE_KEY, JSON.stringify(pendingTransaction()));
       const expired = new SpotifyReceiver({ clientId: 'client-id', now: () => 1_000 + SPOTIFY_PKCE_TTL_MS + 1 });
       await assert.rejects(expired.completeLoginFromCallback(), /took too long and expired/i);
       assert.equal(env.localStorage.getItem(PKCE_KEY), null);
-      assert.equal(env.replacements.at(-1), '/?v=final#receiver');
+      assert.equal(env.replacements.at(-1), '/?v=30#receiver');
 
       env.location.setHref(`${SPOTIFY_REDIRECT_URI}?code=wrong-state&state=${'x'.repeat(32)}`);
       env.localStorage.setItem(PKCE_KEY, JSON.stringify(pendingTransaction()));
       const mismatched = new SpotifyReceiver({ clientId: 'client-id', now: () => 2_000 });
       await assert.rejects(mismatched.completeLoginFromCallback(), /state did not match/i);
       assert.equal(env.localStorage.getItem(PKCE_KEY), null);
-      assert.equal(env.replacements.at(-1), '/?v=final#receiver');
+      assert.equal(env.replacements.at(-1), '/?v=30#receiver');
     } finally {
+      env.restore();
+    }
+  });
+
+  test('rejects a false-green login when Spotify accepts OAuth but denies Development Mode API access', async () => {
+    const env = browserEnvironment(`${SPOTIFY_REDIRECT_URI}?code=spotify-code&state=${'s'.repeat(32)}`);
+    const originalFetch = globalThis.fetch;
+    env.localStorage.setItem(PKCE_KEY, JSON.stringify(pendingTransaction()));
+    globalThis.fetch = async url => String(url) === 'https://accounts.spotify.com/api/token'
+      ? response(200, { access_token: 'access-token', refresh_token: 'refresh-token', expires_in: 3_600 })
+      : response(403, { error: { message: 'Restriction violated' } });
+    try {
+      const receiver = new SpotifyReceiver({ clientId: 'client-id', now: () => 2_000 });
+      await assert.rejects(
+        receiver.completeLoginFromCallback(),
+        error => error.code === 'SPOTIFY_ACCESS_RESTRICTED' &&
+          error.status === 403 &&
+          error.spotifyOperation === 'GET /me' &&
+          error.spotifyReason === 'Restriction violated' &&
+          /Development Mode|Users Management/i.test(error.message)
+      );
+      assert.equal(receiver.loggedIn(), true, 'the token remains available so the UI can offer Remove Login and a deliberate account change');
+      assert.equal(receiver.accessVerified, false);
+      assert.equal(receiver.accessState, 'blocked');
+      assert.match(receiver.accessError, /Restriction violated/i);
+      assert.equal(env.replacements.at(-1), '/?v=30#receiver');
+    } finally {
+      globalThis.fetch = originalFetch;
       env.restore();
     }
   });
@@ -224,9 +266,13 @@ describe('Spotify activation and authorization recovery', { concurrency: false }
 
       receiver.ready = true;
       receiver.deviceId = 'receiver-a';
-      receiver.api = async method => method === 'GET'
+      receiver.accessVerified = true;
+      receiver.accessVerifiedAt = Date.now();
+      receiver.accessState = 'verified';
+      receiver.api = async (method, path) => method === 'GET' && path === '/me/player/devices'
         ? { devices: [{ id: 'receiver-a', is_restricted: false, supports_volume: false }] }
         : {};
+      receiver.validatePlaybackSource = async () => ({ type: 'track', id: 'abc123', uri: 'spotify:track:abc123' });
       receiver.waitForPlayback = async () => ({ isPlaying: true, deviceId: 'receiver-a' });
 
       await receiver.connectFromUserGesture();
@@ -275,13 +321,228 @@ describe('Spotify activation and authorization recovery', { concurrency: false }
       await receiver.api('PUT', '/me/player/pause');
       assert.deepEqual(apiTokens, ['Bearer old-access', 'Bearer new-access']);
 
+      receiver.accessVerified = true;
+      receiver.accessVerifiedAt = Date.now();
+      receiver.accessState = 'verified';
+      receiver.playerPrepared = true;
+      receiver.activationState = 'active';
+      receiver.ready = true;
+      receiver.deviceUsable = true;
+      receiver.deviceId = 'receiver-a';
+
       globalThis.fetch = async () => response(403, { error: { message: 'forbidden' } });
       await assert.rejects(
         receiver.api('PUT', '/me/player/play'),
-        error => /Premium/i.test(error.message) && /allowlist/i.test(error.message)
+        error => /Premium/i.test(error.message) && /Users Management/i.test(error.message) &&
+          error.code === 'SPOTIFY_ACCESS_RESTRICTED' && error.spotifyOperation === 'PUT /me/player/play' && error.spotifyReason === 'Forbidden'
       );
+      assert.equal(receiver.readiness().ready, false, 'a real API 403 must revoke previously green readiness');
     } finally {
       globalThis.fetch = originalFetch;
+      env.restore();
+    }
+  });
+
+  test('fails closed when capability access is denied instead of marking an SDK-ready device usable', async () => {
+    const env = browserEnvironment();
+    env.localStorage.setItem(TOKEN_KEY, JSON.stringify({ access_token: 'access-token', expiresAt: Date.now() + 3_600_000 }));
+    try {
+      const receiver = new SpotifyReceiver({ clientId: 'client-id' });
+      receiver.accessVerified = true;
+      receiver.accessVerifiedAt = Date.now();
+      receiver.accessState = 'verified';
+      receiver.playerPrepared = true;
+      receiver.player = {};
+      receiver.ready = true;
+      receiver.deviceId = 'receiver-a';
+      const restricted = new Error('Spotify denied GET /me/player/devices with HTTP 403.');
+      restricted.code = 'SPOTIFY_ACCESS_RESTRICTED';
+      restricted.status = 403;
+      restricted.spotifyOperation = 'GET /me/player/devices';
+      receiver.api = async () => { throw restricted; };
+
+      await assert.rejects(receiver.refreshCapabilities({ strict: true }), error => error === restricted);
+      assert.equal(receiver.supportsVolume, false);
+      assert.equal(receiver.accessVerified, false);
+      assert.equal(receiver.readiness().ready, false, 'a capability 403 must revoke false-green receiver readiness');
+    } finally {
+      env.restore();
+    }
+  });
+
+  test('revokes readiness when an expired-token retry ends in a Spotify 403', async () => {
+    const env = browserEnvironment();
+    const originalFetch = globalThis.fetch;
+    env.localStorage.setItem(TOKEN_KEY, JSON.stringify({
+      access_token: 'old-access',
+      refresh_token: 'refresh-token',
+      expiresAt: Date.now() + 3_600_000
+    }));
+    let apiCalls = 0;
+    globalThis.fetch = async url => {
+      if (String(url) === 'https://accounts.spotify.com/api/token') {
+        return response(200, { access_token: 'new-access', expires_in: 3_600 });
+      }
+      apiCalls += 1;
+      return apiCalls === 1
+        ? response(401, { error: { message: 'expired' } })
+        : response(403, { error: { message: 'Restriction violated' } });
+    };
+    try {
+      const receiver = new SpotifyReceiver({ clientId: 'client-id' });
+      receiver.accessVerified = true;
+      receiver.accessVerifiedAt = Date.now();
+      receiver.accessState = 'verified';
+      receiver.playerPrepared = true;
+      receiver.activationState = 'active';
+      receiver.ready = true;
+      receiver.deviceUsable = true;
+      receiver.deviceId = 'receiver-a';
+
+      await assert.rejects(receiver.api('PUT', '/me/player/play'), error => error.status === 403);
+      assert.equal(receiver.accessVerified, false);
+      assert.equal(receiver.deviceUsable, false);
+      assert.equal(receiver.readiness().ready, false);
+    } finally {
+      globalThis.fetch = originalFetch;
+      env.restore();
+    }
+  });
+
+  test('distinguishes an inaccessible playlist and requires the exact receiver and requested source', async () => {
+    const env = browserEnvironment();
+    env.localStorage.setItem(TOKEN_KEY, JSON.stringify({ access_token: 'access-token', expiresAt: Date.now() + 3_600_000 }));
+    try {
+      const receiver = new SpotifyReceiver({ clientId: 'client-id' });
+      receiver.accessVerified = true;
+      receiver.accessVerifiedAt = Date.now();
+      receiver.accessState = 'verified';
+      receiver.deviceId = 'receiver-a';
+      const missing = new Error('not found');
+      missing.status = 404;
+      missing.spotifyOperation = 'GET /playlists/missing';
+      missing.spotifyReason = 'Resource not found';
+      receiver.api = async () => { throw missing; };
+      await assert.rejects(
+        receiver.validatePlaybackSource('spotify:playlist:missing'),
+        error => error.code === 'SPOTIFY_SOURCE_UNAVAILABLE' && /deleted, private/i.test(error.message)
+      );
+
+      receiver.playbackState = async () => ({ isPlaying: true, deviceId: '' });
+      await assert.rejects(receiver.waitForPlayback(true, 10), /did not confirm/i);
+      receiver.playbackState = async () => ({ isPlaying: true, deviceId: 'receiver-a', uri: 'spotify:track:wrong' });
+      await assert.rejects(
+        receiver.waitForPlayback(true, 10, { type: 'track', uri: 'spotify:track:requested' }),
+        error => error.code === 'SPOTIFY_PLAYBACK_NOT_CONFIRMED' && /requested track/i.test(error.message)
+      );
+      receiver.playbackState = async () => ({ isPlaying: true, deviceId: 'receiver-a', uri: 'spotify:track:requested' });
+      assert.equal((await receiver.waitForPlayback(true, 10, { type: 'track', uri: 'spotify:track:requested' })).deviceId, 'receiver-a');
+    } finally {
+      env.restore();
+    }
+  });
+
+  test('keeps a healthy receiver usable after a source-only 403 and still validates a public track', async () => {
+    const env = browserEnvironment();
+    const originalFetch = globalThis.fetch;
+    env.localStorage.setItem(TOKEN_KEY, JSON.stringify({ access_token: 'access-token', expiresAt: Date.now() + 3_600_000 }));
+    globalThis.fetch = async url => {
+      const href = String(url);
+      if (href.endsWith('/playlists/privateSource')) {
+        return response(403, { error: { message: 'Insufficient client scope' } });
+      }
+      if (href.endsWith('/me')) return response(200, { display_name: 'Pool Receiver', id: 'account-a' });
+      if (href.endsWith('/me/player/devices')) {
+        return response(200, { devices: [{ id: 'receiver-a', is_restricted: false, supports_volume: true }] });
+      }
+      if (href.endsWith('/tracks/publicTrack')) {
+        return response(200, { id: 'publicTrack', name: 'Public diagnostic track' });
+      }
+      throw new Error(`Unexpected Spotify request: ${href}`);
+    };
+    try {
+      const receiver = new SpotifyReceiver({ clientId: 'client-id' });
+      receiver.accessVerified = true;
+      receiver.accessVerifiedAt = Date.now();
+      receiver.accessState = 'verified';
+      receiver.playerPrepared = true;
+      receiver.activationState = 'active';
+      receiver.ready = true;
+      receiver.deviceUsable = true;
+      receiver.deviceId = 'receiver-a';
+
+      await assert.rejects(
+        receiver.validatePlaybackSource('spotify:playlist:privateSource'),
+        error => error.code === 'SPOTIFY_SOURCE_UNAVAILABLE' && error.status === 403
+      );
+      assert.equal(receiver.readiness().ready, true, 'a private source must not falsely revoke healthy account/device readiness');
+
+      const publicSource = await receiver.validatePlaybackSource('spotify:track:publicTrack');
+      assert.equal(publicSource.uri, 'spotify:track:publicTrack');
+      assert.equal(receiver.readiness().ready, true);
+    } finally {
+      globalThis.fetch = originalFetch;
+      env.restore();
+    }
+  });
+
+  test('revokes device usability when Spotify returns player 404 to a formerly green receiver', async () => {
+    const env = browserEnvironment();
+    const originalFetch = globalThis.fetch;
+    env.localStorage.setItem(TOKEN_KEY, JSON.stringify({ access_token: 'access-token', expiresAt: Date.now() + 3_600_000 }));
+    globalThis.fetch = async () => response(404, { error: { message: 'Player command failed: No active device found' } });
+    try {
+      const receiver = new SpotifyReceiver({ clientId: 'client-id' });
+      receiver.accessVerified = true;
+      receiver.accessVerifiedAt = Date.now();
+      receiver.accessState = 'verified';
+      receiver.playerPrepared = true;
+      receiver.activationState = 'active';
+      receiver.ready = true;
+      receiver.deviceUsable = true;
+      receiver.deviceId = 'receiver-a';
+
+      await assert.rejects(receiver.api('PUT', '/me/player/play'), error => error.status === 404);
+      assert.equal(receiver.accessVerified, true, 'a missing active device is not an account-access denial');
+      assert.equal(receiver.deviceUsable, false);
+      assert.equal(receiver.readiness().ready, false);
+    } finally {
+      globalThis.fetch = originalFetch;
+      env.restore();
+    }
+  });
+
+  test('preserves structured polling failures and accepts current playlist response shapes without claiming Premium', async () => {
+    const env = browserEnvironment();
+    env.localStorage.setItem(TOKEN_KEY, JSON.stringify({ access_token: 'access-token', expiresAt: Date.now() + 3_600_000 }));
+    try {
+      const statuses = [];
+      const receiver = new SpotifyReceiver({ clientId: 'client-id', onStatus: status => statuses.push(status) });
+      receiver.api = async (method, path, _body, query) => {
+        assert.equal(method, 'GET');
+        if (path === '/me') return { display_name: 'Pool Receiver', account_id: 'account-a' };
+        if (path === '/me/player/devices') return { devices: [] };
+        if (path === '/playlists/current') {
+          assert.equal(query, undefined);
+          return { id: 'current', name: 'Current playlist', items: { total: 12 } };
+        }
+        throw new Error(`Unexpected API path: ${path}`);
+      };
+      await receiver.verifyAccess({ force: true });
+      assert.equal(receiver.accountProfile.product, undefined);
+      assert.equal(receiver.accountProfile.email, undefined);
+      assert.doesNotMatch(statuses.at(-1).message, /Premium.*verified/i);
+      const source = await receiver.validatePlaybackSource('spotify:playlist:current', { force: true });
+      assert.equal(source.trackCount, 12);
+
+      const restricted = new Error('Spotify denied GET /me/player with HTTP 403.');
+      restricted.code = 'SPOTIFY_ACCESS_RESTRICTED';
+      restricted.status = 403;
+      restricted.spotifyOperation = 'GET /me/player';
+      restricted.spotifyReason = 'Restriction violated';
+      receiver.playbackState = async () => { throw restricted; };
+      await assert.rejects(receiver.waitForPlayback(true, 50), error => error === restricted);
+    } finally {
       env.restore();
     }
   });

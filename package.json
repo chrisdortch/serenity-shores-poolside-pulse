@@ -11,7 +11,7 @@
     "build": "vite build",
     "preview": "vite preview --host 0.0.0.0",
     "test": "node --test",
-    "check": "node --check src/vfinal/core.js && node --check src/vfinal/audio-engine.js && node --check src/vfinal/cloud.js && node --check src/vfinal/spotify-receiver.js && node --check src/vfinal/receiver-runtime.js && node --check src/vfinal/app.js && node --check api/state.js && node --check api/session.js && node --check api/tts.js && node --check api/weather.js && node --check api/suno-playlist.js",
+    "check": "node --check src/v30/core.js && node --check src/v30/audio-engine.js && node --check src/v30/cloud.js && node --check src/v30/spotify-receiver.js && node --check src/v30/receiver-runtime.js && node --check src/v30/app.js && node --check api/state.js && node --check api/session.js && node --check api/tts.js && node --check api/weather.js && node --check api/suno-playlist.js",
     "verify": "npm run check && npm test && npm run build"
   },
   "dependencies": {

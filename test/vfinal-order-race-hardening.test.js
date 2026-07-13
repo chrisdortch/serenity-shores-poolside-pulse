@@ -5,8 +5,8 @@ import {
   createDefaultState,
   makeReceiverLease,
   normalizeNamedSchedule
-} from '../src/vfinal/core.js';
-import { ReceiverRuntime } from '../src/vfinal/receiver-runtime.js';
+} from '../src/v30/core.js';
+import { ReceiverRuntime } from '../src/v30/receiver-runtime.js';
 
 const NOW = Date.UTC(2026, 6, 12, 18, 0, 0);
 const OWNER_ID = 'order-race-receiver';
@@ -735,5 +735,72 @@ describe('vFinal Order race hardening', { concurrency: false }, () => {
         );
       });
     }
+  });
+
+  test('an Order claim fingerprint rejects a source edit before playback can start', async () => {
+    const { runtime, store } = runtimeHarness({
+      state: orderState([controlled('fingerprinted-claim', 1)])
+    });
+    const generation = runtime.beginExternalAudioIntent('schedule');
+    const claim = await runtime.claimOrderItem(SCHEDULE_ID, {
+      id: 'fingerprinted-claim-event',
+      kind: 'manual',
+      expectedOrder: 0,
+      expectedItemId: ''
+    }, generation);
+
+    assert.match(claim.active.fingerprint, /^v1-[a-f0-9]{8}-[a-f0-9]{8}$/);
+    store.state.schedules[0].items[0].action.url = 'https://audio.test/edited-after-claim.mp3';
+    assert.throws(
+      () => runtime.assertScheduledRunAuthorization(store.state, claim.token, claim.item.id),
+      error => error.code === 'SCHEDULE_RUN_CANCELLED'
+    );
+  });
+
+  test('a post-commit Order bed is stopped when an older client edits its live item', async () => {
+    const { runtime, store } = runtimeHarness({
+      state: orderState([
+        controlled('committed-fingerprint-bed', 1),
+        announcement('later-announcement', 2)
+      ])
+    });
+    const generation = runtime.beginExternalAudioIntent('schedule');
+    const claim = await runtime.claimOrderItem(SCHEDULE_ID, {
+      id: 'committed-fingerprint-event',
+      kind: 'manual',
+      expectedOrder: 0,
+      expectedItemId: ''
+    }, generation);
+    store.state.playback = {
+      ...store.state.playback,
+      provider: 'controlled',
+      intent: 'playing',
+      scheduledItemId: claim.item.id,
+      scheduledRunToken: claim.token,
+      scheduledFingerprint: claim.active.fingerprint
+    };
+    await runtime.completeOrderGate(SCHEDULE_ID, claim.token, 'waiting-manual', 'playback start confirmed', generation);
+    assert.equal(runtime.scheduledRunAuthorized(store.state, claim.token, claim.item.id), true);
+    store.state.sequenceRuns[SCHEDULE_ID] = {
+      ...store.state.sequenceRuns[SCHEDULE_ID],
+      order: 2,
+      itemId: 'later-announcement',
+      status: 'complete'
+    };
+    assert.equal(
+      runtime.scheduledRunAuthorized(store.state, claim.token, claim.item.id),
+      true,
+      'a later announcement receipt must not invalidate the exact prior music bed restored after ducking'
+    );
+
+    store.state.schedules[0].items[0].label = 'Edited by stale open schedule tab';
+    const stops = [];
+    runtime.stopMusic = async options => {
+      stops.push(options);
+      return true;
+    };
+    assert.equal(await runtime.reconcileScheduledPlaybackAuthorization(), true);
+
+    assert.deepEqual(stops, [{ skipOrderFailure: true }]);
   });
 });

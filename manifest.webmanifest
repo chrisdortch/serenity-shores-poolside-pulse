@@ -1,8 +1,8 @@
 {
-  "name": "Lake123 - Poolside Pulse - vFinal",
+  "name": "Lake123 - Poolside Pulse - v30",
   "short_name": "Poolside Pulse",
   "description": "Serenity Shores pool music, announcements, schedules, and weather safety control.",
-  "start_url": "/?v=final",
+  "start_url": "/?v=30",
   "scope": "/",
   "display": "standalone",
   "background_color": "#f4f8f7",

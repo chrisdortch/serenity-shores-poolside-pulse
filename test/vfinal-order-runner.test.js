@@ -5,8 +5,8 @@ import {
   createDefaultState,
   makeReceiverLease,
   normalizeNamedSchedule
-} from '../src/vfinal/core.js';
-import { ReceiverRuntime } from '../src/vfinal/receiver-runtime.js';
+} from '../src/v30/core.js';
+import { ReceiverRuntime } from '../src/v30/receiver-runtime.js';
 
 const NOW = Date.UTC(2026, 6, 6, 17, 30, 30);
 const OWNER_ID = 'order-runner-receiver';

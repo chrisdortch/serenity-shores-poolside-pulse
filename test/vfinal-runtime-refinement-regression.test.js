@@ -5,8 +5,8 @@ import {
   createDefaultState,
   makeReceiverLease,
   normalizeNamedSchedule
-} from '../src/vfinal/core.js';
-import { ReceiverRuntime } from '../src/vfinal/receiver-runtime.js';
+} from '../src/v30/core.js';
+import { ReceiverRuntime } from '../src/v30/receiver-runtime.js';
 
 const NOW = Date.UTC(2026, 6, 6, 17, 30, 30); // Monday 12:30:30 America/Chicago.
 const OWNER_ID = 'runtime-refinement-receiver';
@@ -432,25 +432,23 @@ describe('runtime refinement regressions', { concurrency: false }, () => {
 
     await runtime.tickSchedule();
 
-    assert.deepEqual(calls, [
-      {
-        kind: 'announcement',
-        text: 'Custom one-off notice. Swim lessons begin in ten minutes.',
-        options: { label: 'One-off notice' }
-      },
-      {
-        kind: 'controlled',
-        url: 'https://audio.test/quiet-track.mp3',
-        options: {
-          label: 'Quiet custom music',
-          volumePercent: 17,
-          volumeMode: 'custom',
-          scheduledItemId: 'custom-music'
-        }
-      }
-    ]);
+    assert.equal(calls.length, 2);
+    assert.equal(calls[0].kind, 'announcement');
+    assert.equal(calls[0].text, 'Custom one-off notice. Swim lessons begin in ten minutes.');
+    assert.equal(calls[0].options.label, 'One-off notice');
+    assert.equal(calls[0].options.scheduledItemId, 'inline-announcement');
+    assert.match(calls[0].options.scheduledRunToken, /^time-run-/);
+    assert.equal(calls[1].kind, 'controlled');
+    assert.equal(calls[1].url, 'https://audio.test/quiet-track.mp3');
+    assert.equal(calls[1].options.label, 'Quiet custom music');
+    assert.equal(calls[1].options.volumePercent, 17);
+    assert.equal(calls[1].options.volumeMode, 'custom');
+    assert.equal(calls[1].options.scheduledItemId, 'custom-music');
+    assert.match(calls[1].options.scheduledRunToken, /^time-run-/);
     assert.equal(store.state.scheduleRuns['inline-announcement']?.status, 'completed');
     assert.equal(store.state.scheduleRuns['custom-music']?.status, 'completed');
+    assert.equal(store.state.scheduleRuns['inline-announcement']?.token, calls[0].options.scheduledRunToken);
+    assert.equal(store.state.scheduleRuns['custom-music']?.token, calls[1].options.scheduledRunToken);
   });
 
   test('a pending custom playback receipt keeps its physical target through global saves and cloud refreshes', async () => {
