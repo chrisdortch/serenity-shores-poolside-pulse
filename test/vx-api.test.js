@@ -1,0 +1,318 @@
+import assert from 'node:assert/strict';
+import {
+  generateKeyPairSync,
+  verify as cryptoVerify
+} from 'node:crypto';
+import { after, beforeEach, describe, test } from 'node:test';
+
+import {
+  createSessionToken,
+  readSession
+} from '../api/_auth.js';
+import appleMusicTokenHandler from '../api/apple-music-token.js';
+import sessionHandler from '../api/session.js';
+import stateXHandler from '../api/state-x.js';
+
+const SESSION_SECRET = 'version-x-test-session-secret-with-sufficient-length';
+const MANAGED_ENV = [
+  'POOL_SIDE_SESSION_SECRET',
+  'POOL_SIDE_PIN',
+  'KV_REST_API_URL',
+  'KV_REST_API_TOKEN',
+  'APPLE_MUSIC_TEAM_ID',
+  'APPLE_MUSIC_KEY_ID',
+  'APPLE_MUSIC_PRIVATE_KEY',
+  'APPLE_MUSIC_ALLOWED_ORIGINS',
+  'VERCEL',
+  'OPENAI_API_KEY',
+  'XWEATHER_CLIENT_SECRET'
+];
+const originalEnv = Object.fromEntries(MANAGED_ENV.map(name => [name, process.env[name]]));
+const originalFetch = globalThis.fetch;
+
+function request(method, url, {
+  body = undefined,
+  cookie = '',
+  origin = 'https://poolside.test',
+  host = 'poolside.test',
+  ip = '203.0.113.10'
+} = {}) {
+  const headers = {
+    host,
+    cookie,
+    'x-forwarded-host': host,
+    'x-forwarded-proto': 'https',
+    'x-forwarded-for': ip,
+    'sec-fetch-site': 'same-origin'
+  };
+  if (origin) headers.origin = origin;
+  return {
+    method,
+    url,
+    body,
+    headers,
+    socket: { encrypted: true, remoteAddress: ip }
+  };
+}
+
+function response() {
+  let raw = '';
+  const headers = new Map();
+  return {
+    statusCode: 200,
+    setHeader(name, value) { headers.set(String(name).toLowerCase(), value); },
+    getHeader(name) { return headers.get(String(name).toLowerCase()); },
+    end(value = '') { raw += Buffer.isBuffer(value) ? value.toString('utf8') : String(value); },
+    json() { return raw ? JSON.parse(raw) : null; },
+    raw() { return raw; }
+  };
+}
+
+async function invoke(handler, req) {
+  const res = response();
+  await handler(req, res);
+  return res;
+}
+
+function cookieFor(variant) {
+  const token = createSessionToken(Date.now(), variant);
+  assert.ok(token);
+  const name = variant === 'x' ? 'poolside_vx_session' : 'poolside_vfinal_session';
+  return `${name}=${encodeURIComponent(token)}`;
+}
+
+function decodeJwtPart(value) {
+  return JSON.parse(Buffer.from(value, 'base64url').toString('utf8'));
+}
+
+beforeEach(() => {
+  for (const name of MANAGED_ENV) delete process.env[name];
+  process.env.POOL_SIDE_SESSION_SECRET = SESSION_SECRET;
+  process.env.POOL_SIDE_PIN = '7900';
+  globalThis.fetch = originalFetch;
+  globalThis.__POOL_SIDE_LOGIN_ATTEMPTS__ = new Map();
+  globalThis.__POOL_SIDE_API_RATE_LIMITS__ = new Map();
+  globalThis.__POOL_SIDE_X_MEMORY_STATES__ = Object.create(null);
+  globalThis.__POOL_SIDE_X_MEMORY_STATE_LOCKS__ = new Map();
+  globalThis.__POOL_SIDE_MEMORY_STATES__ = { untouchedFinalSentinel: { revision: 77 } };
+});
+
+after(() => {
+  for (const [name, value] of Object.entries(originalEnv)) {
+    if (value === undefined) delete process.env[name];
+    else process.env[name] = value;
+  }
+  globalThis.fetch = originalFetch;
+});
+
+describe('Version X API isolation', { concurrency: false }, () => {
+  test('uses an isolated cookie and signing context while preserving vFinal defaults', async () => {
+    const xLogin = await invoke(sessionHandler, request('POST', '/api/session?v=x', {
+      body: { pin: '7900' }
+    }));
+    assert.equal(xLogin.statusCode, 200);
+    assert.match(String(xLogin.getHeader('set-cookie')), /^poolside_vx_session=/);
+    assert.doesNotMatch(String(xLogin.getHeader('set-cookie')), /poolside_vfinal_session/);
+
+    const xCookie = String(xLogin.getHeader('set-cookie')).split(';')[0];
+    const xStatus = await invoke(sessionHandler, request('GET', '/api/session?v=x', { cookie: xCookie }));
+    assert.equal(xStatus.statusCode, 200);
+    assert.equal(xStatus.json().authenticated, true);
+
+    const finalStatusWithXCookie = await invoke(sessionHandler, request('GET', '/api/session', { cookie: xCookie }));
+    assert.equal(finalStatusWithXCookie.statusCode, 200);
+    assert.equal(finalStatusWithXCookie.json().authenticated, false);
+
+    const finalCookie = cookieFor('final');
+    const xStatusWithFinalCookie = await invoke(sessionHandler, request('GET', '/api/session?v=x', { cookie: finalCookie }));
+    assert.equal(xStatusWithFinalCookie.statusCode, 200);
+    assert.equal(xStatusWithFinalCookie.json().authenticated, false);
+
+    const finalToken = createSessionToken();
+    assert.ok(readSession(request('GET', '/api/session', {
+      cookie: `poolside_vfinal_session=${finalToken}`
+    })));
+  });
+
+  test('uses distinct durable login limiter key prefixes', async () => {
+    process.env.KV_REST_API_URL = 'https://kv.test.invalid';
+    process.env.KV_REST_API_TOKEN = 'test-kv-token';
+    const commands = [];
+    globalThis.fetch = async (_url, options) => {
+      commands.push(JSON.parse(options.body));
+      return {
+        ok: true,
+        async json() { return { result: [1, 900] }; }
+      };
+    };
+
+    const finalAttempt = await invoke(sessionHandler, request('POST', '/api/session', {
+      body: { pin: '0000' }
+    }));
+    const xAttempt = await invoke(sessionHandler, request('POST', '/api/session?v=x', {
+      body: { pin: '0000' }
+    }));
+    assert.equal(finalAttempt.statusCode, 401);
+    assert.equal(xAttempt.statusCode, 401);
+    assert.equal(commands.length, 2);
+    assert.match(commands[0][3], /^poolside:vfinal:login:/);
+    assert.match(commands[1][3], /^poolside:vx:login:/);
+    assert.notEqual(commands[0][3], commands[1][3]);
+  });
+
+  test('stores only Version X state, enforces CAS revisions, and sanitizes adjustable levels', async () => {
+    const xCookie = cookieFor('x');
+    const finalCookie = cookieFor('final');
+    const denied = await invoke(stateXHandler, request('GET', '/api/state-x?v=x', { cookie: finalCookie }));
+    assert.equal(denied.statusCode, 401);
+
+    const now = Date.now();
+    const first = await invoke(stateXHandler, request('POST', '/api/state-x?v=x', {
+      cookie: xCookie,
+      body: {
+        version: 'x',
+        expectedRevision: 0,
+        state: {
+          version: 'x',
+          marker: 'version-x-only',
+          config: {
+            musicProvider: 'apple',
+            musicLevel: 130,
+            voiceLevel: 42,
+            duckLevel: 80,
+            address: 'Preserve this setting',
+            appleMusicPrivateKey: 'must-not-persist'
+          },
+          events: [{ id: 'event-x-1', createdAt: now, status: 'pending' }],
+          activityLog: []
+        }
+      }
+    }));
+
+    assert.equal(first.statusCode, 200);
+    assert.equal(first.json().syncMode, 'memory');
+    assert.equal(first.json().state.version, 'x');
+    assert.equal(first.json().state.revision, 1);
+    assert.equal(first.json().state.config.musicLevel, 100);
+    assert.equal(first.json().state.config.voiceLevel, 42);
+    assert.equal(first.json().state.config.duckLevel, 0);
+    assert.equal(first.json().state.config.address, 'Preserve this setting');
+    assert.equal('appleMusicPrivateKey' in first.json().state.config, false);
+    assert.deepEqual(globalThis.__POOL_SIDE_MEMORY_STATES__, { untouchedFinalSentinel: { revision: 77 } });
+    assert.equal(Object.keys(globalThis.__POOL_SIDE_X_MEMORY_STATES__).length, 1);
+
+    const conflict = await invoke(stateXHandler, request('POST', '/api/state-x?v=x', {
+      cookie: xCookie,
+      body: {
+        version: 'x',
+        expectedRevision: 0,
+        state: { version: 'x', marker: 'stale-write' }
+      }
+    }));
+    assert.equal(conflict.statusCode, 409);
+    assert.equal(conflict.json().currentRevision, 1);
+    assert.equal(conflict.json().state.marker, 'version-x-only');
+
+    const second = await invoke(stateXHandler, request('POST', '/api/state-x?v=x', {
+      cookie: xCookie,
+      body: {
+        version: 'x',
+        expectedRevision: 1,
+        state: { version: 'x', config: { voiceLevel: 17 } }
+      }
+    }));
+    assert.equal(second.statusCode, 200);
+    assert.equal(second.json().state.revision, 2);
+    assert.equal(second.json().state.config.musicLevel, 100);
+    assert.equal(second.json().state.config.voiceLevel, 17);
+    assert.equal(second.json().state.marker, 'version-x-only');
+
+    const read = await invoke(stateXHandler, request('GET', '/api/state-x?v=x', { cookie: xCookie }));
+    assert.equal(read.statusCode, 200);
+    assert.equal(read.json().state.version, 'x');
+    assert.equal(read.json().state.revision, 2);
+  });
+
+  test('uses the isolated Version X KV key for GET and compare-and-set only', async () => {
+    process.env.KV_REST_API_URL = 'https://kv.test.invalid';
+    process.env.KV_REST_API_TOKEN = 'test-kv-token';
+    const commands = [];
+    globalThis.fetch = async (_url, options) => {
+      const command = JSON.parse(options.body);
+      commands.push(command);
+      return {
+        ok: true,
+        async json() {
+          if (command[0] === 'GET') return { result: null };
+          return { result: [1, 1] };
+        }
+      };
+    };
+
+    const result = await invoke(stateXHandler, request('POST', '/api/state-x?v=x', {
+      cookie: cookieFor('x'),
+      body: {
+        version: 'x',
+        expectedRevision: 0,
+        state: { version: 'x', config: { musicLevel: 31, voiceLevel: 67 } }
+      }
+    }));
+    assert.equal(result.statusCode, 200);
+    assert.deepEqual(commands.map(command => command[0]), ['GET', 'EVAL']);
+    const keys = commands.map(command => command[0] === 'GET' ? command[1] : command[3]);
+    assert.equal(new Set(keys).size, 1);
+    assert.match(keys[0], /vx-20260714$/);
+    assert.doesNotMatch(keys[0], /vfinal|final/i);
+    assert.equal(JSON.stringify(commands).includes('serenity-shores-poolside-radio-vfinal'), false);
+  });
+
+  test('issues a short-lived, origin-scoped ES256 Apple Music token without key leakage', async () => {
+    const { privateKey, publicKey } = generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
+    const privatePem = privateKey.export({ format: 'pem', type: 'pkcs8' }).toString();
+    process.env.APPLE_MUSIC_TEAM_ID = 'TEAMID1234';
+    process.env.APPLE_MUSIC_KEY_ID = 'KEYID12345';
+    process.env.APPLE_MUSIC_PRIVATE_KEY = privatePem.replace(/\n/g, '\\n');
+    process.env.APPLE_MUSIC_ALLOWED_ORIGINS = 'https://poolside.test, https://preview.poolside.test';
+
+    const result = await invoke(appleMusicTokenHandler, request('GET', '/api/apple-music-token?v=x', {
+      cookie: cookieFor('x')
+    }));
+    assert.equal(result.statusCode, 200);
+    assert.equal(result.getHeader('cache-control'), 'no-store, max-age=0');
+    assert.equal(result.raw().includes('BEGIN PRIVATE KEY'), false);
+    assert.equal(result.raw().includes(privatePem), false);
+
+    const parts = result.json().token.split('.');
+    assert.equal(parts.length, 3);
+    const jwtHeader = decodeJwtPart(parts[0]);
+    const payload = decodeJwtPart(parts[1]);
+    assert.deepEqual(jwtHeader, { alg: 'ES256', kid: 'KEYID12345' });
+    assert.equal(payload.iss, 'TEAMID1234');
+    assert.deepEqual(payload.origin, ['https://poolside.test']);
+    assert.ok(payload.exp > payload.iat);
+    assert.ok(payload.exp - payload.iat <= (15 * 60) + 5);
+    assert.ok(result.json().expiresAt > Date.now());
+
+    const verified = cryptoVerify(
+      'sha256',
+      Buffer.from(`${parts[0]}.${parts[1]}`, 'utf8'),
+      { key: publicKey, dsaEncoding: 'ieee-p1363' },
+      Buffer.from(parts[2], 'base64url')
+    );
+    assert.equal(verified, true);
+
+    const finalCookieDenied = await invoke(appleMusicTokenHandler, request('GET', '/api/apple-music-token?v=x', {
+      cookie: cookieFor('final')
+    }));
+    assert.equal(finalCookieDenied.statusCode, 401);
+    assert.equal('token' in finalCookieDenied.json(), false);
+
+    const disallowed = await invoke(appleMusicTokenHandler, request('GET', '/api/apple-music-token?v=x', {
+      cookie: cookieFor('x'),
+      origin: 'https://unapproved.test',
+      host: 'unapproved.test'
+    }));
+    assert.equal(disallowed.statusCode, 403);
+    assert.equal('token' in disallowed.json(), false);
+  });
+});

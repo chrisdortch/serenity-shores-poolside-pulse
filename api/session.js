@@ -10,6 +10,7 @@ import {
   readSession,
   renewSessionIfNeeded,
   sessionSecurityReady,
+  sessionVariant,
   setSessionCookie
 } from './_auth.js';
 
@@ -37,12 +38,17 @@ function json(res, status, body) {
   res.end(JSON.stringify(body));
 }
 
-function attemptEntry(ip, now = Date.now()) {
+function attemptStoreKey(ip, req) {
+  return sessionVariant(req) === 'x' ? `x:${ip}` : ip;
+}
+
+function attemptEntry(ip, req, now = Date.now()) {
   const store = globalThis.__POOL_SIDE_LOGIN_ATTEMPTS__;
-  let entry = store.get(ip);
+  const key = attemptStoreKey(ip, req);
+  let entry = store.get(key);
   if (!entry || entry.resetAt <= now) {
     entry = { failures: 0, resetAt: now + LOGIN_WINDOW_MS };
-    store.set(ip, entry);
+    store.set(key, entry);
   }
   if (store.size > 500) {
     for (const [key, value] of store) {
@@ -57,9 +63,10 @@ function limiterKvReady() {
   return Boolean(process.env.KV_REST_API_URL && process.env.KV_REST_API_TOKEN);
 }
 
-function limiterKey(ip) {
+function limiterKey(ip, req) {
   const digest = createHash('sha256').update(String(ip)).digest('hex').slice(0, 32);
-  return `poolside:vfinal:login:${digest}`;
+  const namespace = sessionVariant(req) === 'x' ? 'vx' : 'vfinal';
+  return `poolside:${namespace}:login:${digest}`;
 }
 
 async function limiterKv(command) {
@@ -85,9 +92,9 @@ async function limiterKv(command) {
   }
 }
 
-async function reserveAttempt(ip) {
+async function reserveAttempt(ip, req) {
   if (!limiterKvReady()) {
-    const entry = attemptEntry(ip);
+    const entry = attemptEntry(ip, req);
     entry.failures += 1;
     return {
       blocked: entry.failures > LOGIN_MAX_FAILURES,
@@ -98,7 +105,7 @@ async function reserveAttempt(ip) {
     'EVAL',
     LOGIN_ATTEMPT_SCRIPT,
     '1',
-    limiterKey(ip),
+    limiterKey(ip, req),
     String(LOGIN_WINDOW_SECONDS)
   ]);
   if (!Array.isArray(result) || result.length < 2) throw new Error('Login protection storage is unavailable.');
@@ -108,15 +115,15 @@ async function reserveAttempt(ip) {
   };
 }
 
-async function clearFailures(ip) {
-  globalThis.__POOL_SIDE_LOGIN_ATTEMPTS__.delete(ip);
-  if (limiterKvReady()) await limiterKv(['DEL', limiterKey(ip)]);
+async function clearFailures(ip, req) {
+  globalThis.__POOL_SIDE_LOGIN_ATTEMPTS__.delete(attemptStoreKey(ip, req));
+  if (limiterKvReady()) await limiterKv(['DEL', limiterKey(ip, req)]);
 }
 
 export default async function handler(req, res) {
   if (req.method === 'GET') {
     if (!isSameOriginMutation(req)) return json(res, 403, { ok: false, authenticated: false, error: 'Same-origin request required.' });
-    if (!sessionSecurityReady()) {
+    if (!sessionSecurityReady(req)) {
       return json(res, 503, { ok: false, authenticated: false, error: 'Secure session service is unavailable.' });
     }
     const currentSession = readSession(req);
@@ -132,7 +139,7 @@ export default async function handler(req, res) {
 
   if (req.method === 'POST') {
     if (!isSameOriginMutation(req)) return json(res, 403, { ok: false, authenticated: false, error: 'Same-origin request required.' });
-    if (!sessionSecurityReady()) return json(res, 503, { ok: false, authenticated: false, error: 'Secure session service is unavailable.' });
+    if (!sessionSecurityReady(req)) return json(res, 503, { ok: false, authenticated: false, error: 'Secure session service is unavailable.' });
 
     let body;
     try { body = await readJsonBody(req, 2_000); }
@@ -140,7 +147,7 @@ export default async function handler(req, res) {
 
     const ip = clientIp(req);
     let attempt;
-    try { attempt = await reserveAttempt(ip); }
+    try { attempt = await reserveAttempt(ip, req); }
     catch { return json(res, 503, { ok: false, authenticated: false, error: 'Sign-in protection is temporarily unavailable.' }); }
     if (attempt.blocked) {
       res.setHeader('Retry-After', String(attempt.retryAfterSeconds));
@@ -151,9 +158,9 @@ export default async function handler(req, res) {
       return json(res, 401, { ok: false, authenticated: false, error: 'Incorrect PIN.' });
     }
 
-    try { await clearFailures(ip); }
+    try { await clearFailures(ip, req); }
     catch { return json(res, 503, { ok: false, authenticated: false, error: 'Sign-in protection is temporarily unavailable.' }); }
-    const token = createSessionToken();
+    const token = createSessionToken(Date.now(), req);
     if (!token) return json(res, 503, { ok: false, authenticated: false, error: 'Secure session service is unavailable.' });
     setSessionCookie(res, req, token);
     return json(res, 200, { ok: true, authenticated: true });

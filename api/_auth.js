@@ -5,12 +5,23 @@ import {
   timingSafeEqual
 } from 'node:crypto';
 
-const SESSION_COOKIE = 'poolside_vfinal_session';
 const SESSION_TTL_SECONDS = 24 * 60 * 60;
 const SESSION_RENEW_AFTER_SECONDS = 12 * 60 * 60;
 const SESSION_CLOCK_SKEW_SECONDS = 5 * 60;
 const PRODUCTION_PASSPHRASE_MIN_LENGTH = 8;
-const SECRET_CONTEXT = 'serenity-shores-poolside-pulse:vfinal:session:v2:pin-bound';
+const DEFAULT_SESSION_VARIANT = 'final';
+const SESSION_CONTEXTS = Object.freeze({
+  final: Object.freeze({
+    variant: 'final',
+    cookie: 'poolside_vfinal_session',
+    secretContext: 'serenity-shores-poolside-pulse:vfinal:session:v2:pin-bound'
+  }),
+  x: Object.freeze({
+    variant: 'x',
+    cookie: 'poolside_vx_session',
+    secretContext: 'serenity-shores-poolside-pulse:vx:session:v1:pin-bound'
+  })
+});
 
 globalThis.__POOL_SIDE_API_RATE_LIMITS__ ||= new Map();
 
@@ -22,6 +33,24 @@ function validProductionPin(value) {
 function header(req, name) {
   const value = req?.headers?.[name] ?? req?.headers?.[name.toLowerCase()];
   return Array.isArray(value) ? value[0] : String(value || '');
+}
+
+export function sessionVariant(req) {
+  let requested = '';
+  const rawUrl = String(req?.url || '');
+  if (rawUrl) {
+    try { requested = new URL(rawUrl, 'https://poolside.local').searchParams.get('v') || ''; }
+    catch {}
+  }
+  if (!requested && req?.query) requested = req.query.v || req.query.version || '';
+  return String(requested).trim().toLowerCase() === 'x' ? 'x' : DEFAULT_SESSION_VARIANT;
+}
+
+function sessionContext(reqOrVariant) {
+  const variant = typeof reqOrVariant === 'string'
+    ? (reqOrVariant.trim().toLowerCase() === 'x' ? 'x' : DEFAULT_SESSION_VARIANT)
+    : sessionVariant(reqOrVariant);
+  return SESSION_CONTEXTS[variant];
 }
 
 function json(res, status, body) {
@@ -42,11 +71,12 @@ function sessionSecretSource() {
   return candidates.map(value => String(value || '').trim()).find(value => value.length >= 16) || '';
 }
 
-function sessionSigningKey() {
+function sessionSigningKey(reqOrVariant) {
   const source = sessionSecretSource();
   if (!source) return null;
+  const context = sessionContext(reqOrVariant);
   const pinBinding = createHash('sha256').update(expectedPin()).digest('hex');
-  return createHash('sha256').update(`${SECRET_CONTEXT}\0${source}\0${pinBinding}`).digest();
+  return createHash('sha256').update(`${context.secretContext}\0${source}\0${pinBinding}`).digest();
 }
 
 function sign(encodedPayload, key) {
@@ -78,8 +108,9 @@ function secureRequest(req) {
 }
 
 function sessionCookie(token, req, maxAge = SESSION_TTL_SECONDS) {
+  const context = sessionContext(req);
   const parts = [
-    `${SESSION_COOKIE}=${encodeURIComponent(token)}`,
+    `${context.cookie}=${encodeURIComponent(token)}`,
     'Path=/',
     'HttpOnly',
     'SameSite=Strict',
@@ -100,13 +131,13 @@ function trimRateLimits(now) {
   while (store.size > 400) store.delete(store.keys().next().value);
 }
 
-export function sessionSecurityReadiness() {
+export function sessionSecurityReadiness(reqOrVariant) {
   const configuredPin = String(process.env.POOL_SIDE_PIN || '').trim();
   const production = process.env.VERCEL === '1';
   const pinReady = production
     ? validProductionPin(configuredPin)
     : (!configuredPin || configuredPin.length <= 64);
-  const signingReady = Boolean(sessionSigningKey());
+  const signingReady = Boolean(sessionSigningKey(reqOrVariant));
   const limiterReady = !production || Boolean(process.env.KV_REST_API_URL && process.env.KV_REST_API_TOKEN);
   return {
     ready: signingReady && pinReady && limiterReady,
@@ -117,8 +148,8 @@ export function sessionSecurityReadiness() {
   };
 }
 
-export function sessionSecurityReady() {
-  return sessionSecurityReadiness().ready;
+export function sessionSecurityReady(reqOrVariant) {
+  return sessionSecurityReadiness(reqOrVariant).ready;
 }
 
 export function expectedPin() {
@@ -135,12 +166,14 @@ export function pinMatches(candidate) {
   return equalText(supplied, expectedPin());
 }
 
-export function createSessionToken(nowMs = Date.now()) {
-  const key = sessionSigningKey();
+export function createSessionToken(nowMs = Date.now(), reqOrVariant = DEFAULT_SESSION_VARIANT) {
+  const context = sessionContext(reqOrVariant);
+  const key = sessionSigningKey(context.variant);
   if (!key) return '';
   const issuedAt = Math.floor(nowMs / 1000);
   const payload = {
     v: 1,
+    ...(context.variant === 'x' ? { ctx: 'x' } : {}),
     sid: randomBytes(18).toString('base64url'),
     iat: issuedAt,
     exp: issuedAt + SESSION_TTL_SECONDS
@@ -149,8 +182,9 @@ export function createSessionToken(nowMs = Date.now()) {
   return `${encoded}.${sign(encoded, key)}`;
 }
 
-function readSessionToken(token, nowMs = Date.now()) {
-  const key = sessionSigningKey();
+function readSessionToken(token, nowMs = Date.now(), reqOrVariant = DEFAULT_SESSION_VARIANT) {
+  const context = sessionContext(reqOrVariant);
+  const key = sessionSigningKey(context.variant);
   if (!key) return null;
   if (!token || token.length > 2048) return null;
   const separator = token.indexOf('.');
@@ -163,6 +197,8 @@ function readSessionToken(token, nowMs = Date.now()) {
     const payload = JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8'));
     const now = Math.floor(nowMs / 1000);
     if (payload?.v !== 1 || !/^[A-Za-z0-9_-]{20,80}$/.test(String(payload.sid || ''))) return null;
+    if (context.variant === 'x' && payload.ctx !== 'x') return null;
+    if (context.variant === 'final' && payload.ctx != null) return null;
     if (!Number.isFinite(payload.iat) || !Number.isFinite(payload.exp)) return null;
     if (payload.iat > now + SESSION_CLOCK_SKEW_SECONDS || payload.exp <= now) return null;
     if (payload.exp - payload.iat !== SESSION_TTL_SECONDS) return null;
@@ -173,7 +209,8 @@ function readSessionToken(token, nowMs = Date.now()) {
 }
 
 export function readSession(req, nowMs = Date.now()) {
-  return readSessionToken(cookieValues(req)[SESSION_COOKIE], nowMs);
+  const context = sessionContext(req);
+  return readSessionToken(cookieValues(req)[context.cookie], nowMs, context.variant);
 }
 
 export function renewSessionIfNeeded(req, res, session, nowMs = Date.now()) {
@@ -181,15 +218,15 @@ export function renewSessionIfNeeded(req, res, session, nowMs = Date.now()) {
   if (!session || now - session.iat < SESSION_RENEW_AFTER_SECONDS) {
     return { session, renewed: false };
   }
-  const token = createSessionToken(nowMs);
-  const renewedSession = token ? readSessionToken(token, nowMs) : null;
+  const token = createSessionToken(nowMs, req);
+  const renewedSession = token ? readSessionToken(token, nowMs, req) : null;
   if (!renewedSession) return { session, renewed: false };
   setSessionCookie(res, req, token);
   return { session: renewedSession, renewed: true };
 }
 
 export function requireSession(req, res) {
-  if (!sessionSecurityReady()) {
+  if (!sessionSecurityReady(req)) {
     json(res, 503, { ok: false, error: 'Secure session service is unavailable.' });
     return null;
   }

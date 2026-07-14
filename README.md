@@ -1,43 +1,64 @@
-# Serenity Shores Poolside Pulse v30
+# Serenity Shores Poolside Pulse — Version X
 
-Poolside Pulse coordinates scheduled announcements, weather safety messages, Suno/direct music, and Spotify from one dedicated speaker receiver.
+Version X replaces the Spotify path with Apple Music while preserving the proven Suno/direct mixer, spoken announcements, weather safety checks, receiver leases, stale-command protection, and Time/Order schedules.
 
-Automatic weather checks run every two minutes. Each request overlaps at least six minutes of NOAA GLM lightning data, and the lookback expands after an incomplete check so a single provider failure does not create a blind gap.
+It is isolated from the current V30 app:
 
-## Operating contract
+- Branch: `codex/version-x-apple-music-suno`
+- V30 backup tag: `poolside-pulse-v30-backup-20260714`
+- Browser keys: `poolside-pulse-vx-*`
+- Session cookie/signing context: Version X only
+- Durable state endpoint: `/api/state-x?v=x`
+- Durable state key: Version X only; it never reads or writes the V30 `final` key
 
-- Exactly one speaker receiver owns audio. Phones and laptops in Remote Control mode only send commands to that receiver.
-- Suno/direct audio runs through one Web Audio graph with an adjustable 0–100% music target (30% by default), voice fixed at 100%, and music silenced to 0% while speech plays.
-- Spotify is always confirmed paused before voice. A supported desktop receiver may report the selected music target only after the local SDK sets and re-reads that exact value; iPhone/iPad Spotify volume is never presented as software-controlled.
-- Spotify is not marked ready until the logged-in account passes Web API preflight, a local activation tap succeeds, and Spotify confirms that playback commands can target the exact receiver device. Each selected link is validated before it plays.
-- Suno/direct and Spotify are mutually exclusive. Every play, resume, skip, stop, and scheduled handoff silences the other local source before the selected source can become audible.
-- Receiver leases, expiring commands, revision-checked writes, and server-adjusted time prevent stale playback and split ownership.
-- Scheduled items are recorded only after successful playback. Weather failures persist an explicit unknown state and never manufacture an all-clear.
-- The receiver stops audio if durable cloud heartbeats are unavailable for a full lease.
+No other Serenity Shores repository, Vercel project, database namespace, domain, or secret is used by this work.
 
-For unattended scheduling, use an always-on desktop-class receiver connected to the speakers, keep the page visible, and keep the device plugged in.
+## What Version X does
 
-## Start-up
+- Plays Suno shares/playlists and direct HTTPS audio through the receiver-owned Web Audio mixer.
+- Plays Apple Music URLs inside the same open, signed-in MusicKit receiver page.
+- Provides independent 0–100 global music and spoken-announcement controls.
+- Lets every scheduled music or announcement item inherit its global level or use a custom 0–100 level.
+- Fully silences Suno/direct music during speech, then continues the same track.
+- Fades and pauses Apple Music before Suno or speech. Apple Music and the interruption do not overlap. It resumes only after the interruption finishes and only if it was playing beforehand.
+- Shows Apple Music volume as exact only when a desktop-class receiver sets and reads back the same MusicKit value. iPhone/iPad is honestly labeled pause-only because browser code cannot control physical output volume there.
+- Requires one open, plugged-in desktop receiver for unattended schedules. A suspended browser cannot be treated as a reliable audio appliance.
 
-1. Open v30 on the device connected to the pool speakers.
-2. Choose **Speaker Receiver**, then **Start Receiver**.
-3. Use other devices in **Remote Control** mode.
-4. Set the shared **Music volume** slider (30% by default). Prefer **Suno / Direct** when exact adjustable music and 100% announcements are required.
-5. On an iPhone receiver, use **Volume Up** once to put the physical device at 100% before Suno/direct mixing. The **Volume Down** and **Volume Up** Shortcut buttons are manual helpers; iOS cannot run them invisibly during an unattended schedule.
+Apple Music playback also requires an active Apple Music subscription on the Apple Account authorized on the speaker receiver. Apple Developer Program membership alone does not supply playback entitlement.
 
-For Spotify, the app owner and receiver account must have Spotify Premium. In a Development Mode Spotify app, add the exact receiver account under **Users Management**. v30 forces an account chooser during login, adds private/collaborative playlist permissions, and checks access before enabling Spotify commands. The public-track diagnostic separates account/device failures from an inaccessible saved playlist.
+## Three things needed from the owner
 
-## Required production configuration
+1. In [Certificates, Identifiers & Profiles](https://developer.apple.com/account/resources/identifiers/list), create a **Media ID** named `Poolside Pulse X`, use a unique identifier such as `com.serenityshores.poolsidepulsex`, and enable MusicKit.
+2. In [Keys](https://developer.apple.com/account/resources/authkeys/list), create a dedicated **Media Services key** connected to that Media ID. Send the Team ID, Key ID, Media ID, and the local filesystem path where the downloaded `.p8` file is saved. Do not paste the private key into chat and do not place it in this repository.
+3. Send the exact `https://music.apple.com/...` song/album/playlist URLs to use and confirm the receiver Apple Account has an active Apple Music subscription.
 
-- `KV_REST_API_URL` and `KV_REST_API_TOKEN`: mandatory durable state, receiver ownership, conflict control, and distributed login throttling.
-- `POOL_SIDE_PIN`: mandatory four-digit numeric access code or 8–64 character production passphrase.
-- `POOL_SIDE_SESSION_SECRET`: recommended dedicated signing secret; a configured server-side integration secret is used only as a fallback.
-- `OPENAI_API_KEY`: optional natural announcement voice; device speech is the bounded fallback.
-- Existing weather-provider variables remain server-side and optional; failures are shown as unknown rather than clear.
+Apple’s detailed setup reference is [Create a media identifier and private key](https://developer.apple.com/help/account/capabilities/create-a-media-identifier-and-private-key). Poolside Pulse generates short-lived MusicKit developer tokens on the server; the `.p8` private key is never sent to the browser.
 
-The receiver refuses to start unless live state reports durable KV sync. Do not use temporary server-memory mode for operations.
+## Required server configuration
 
-## Commands
+```dotenv
+POOL_SIDE_PIN=
+POOL_SIDE_SESSION_SECRET=
+KV_REST_API_URL=
+KV_REST_API_TOKEN=
+
+APPLE_MUSIC_TEAM_ID=
+APPLE_MUSIC_KEY_ID=
+APPLE_MUSIC_MEDIA_ID=
+APPLE_MUSIC_PRIVATE_KEY=
+APPLE_MUSIC_ALLOWED_ORIGINS=https://serenity-shores-poolside-pulse.vercel.app
+```
+
+`APPLE_MUSIC_PRIVATE_KEY` is the secret PEM content from the dedicated `.p8` key. Configure it only as a protected server environment variable. `APPLE_MUSIC_ALLOWED_ORIGINS` is a comma-separated allowlist and must include each exact preview/production origin that will request a developer token.
+
+Also supported:
+
+- `OPENAI_API_KEY` for the natural announcement voice; bounded device speech is the fallback.
+- `XWEATHER_CLIENT_ID` and `XWEATHER_CLIENT_SECRET` as an optional weather supplement.
+
+Production requires durable KV, a dedicated session secret, and a valid access code. The receiver refuses to claim operational ownership without durable synchronization.
+
+## Local verification
 
 ```bash
 npm install
@@ -45,10 +66,12 @@ npm run dev
 npm run verify
 ```
 
-Vercel settings: Vite framework, `npm install`, `npm run build`, output directory `dist`.
+Vercel settings remain Vite framework, `npm install`, `npm run build`, output directory `dist`.
 
-## Backup and isolation
+## Apple operating and policy boundary
 
-The exact vFinal production source from immediately before v30 is preserved at commit `7ab64347960a3b7fb490bc0e586aa8f7e1e3eaa5` and remote branch `codex/backup-vfinal-before-v30-20260713`. The earlier vFinal and V23 backup branches also remain available. The in-app archive page is informational and does not activate either old receiver.
+MusicKit playback starts only after the receiver operator explicitly authorizes Apple Music and taps the receiver activation control. Standard Play, Pause, Next, and Stop controls remain visible. Version X does not extract or store the Music User Token.
 
-This repository is standalone and must remain isolated from Lakeside Essentials, RollinD, Lifeguard Scheduler, Boat Rental, and every other Serenity Shores project.
+The safe default is non-overlapping playback: Apple Music is paused before a spoken announcement or Suno source. Apple’s terms can restrict synchronizing Apple Music content with other content, so overlap ducking stays disabled unless Apple gives written approval for this exact use. The property operator remains responsible for the public/commercial performance rights for all music played at the pool.
+
+References: [MusicKit](https://developer.apple.com/musickit/), [MusicKit user authorization](https://developer.apple.com/documentation/applemusicapi/user-authentication-for-musickit), [developer tokens](https://developer.apple.com/documentation/applemusicapi/generating-developer-tokens), [App Review Guidelines](https://developer.apple.com/app-store/review/guidelines/#apple-sites-and-services), and the [Apple Developer Program License Agreement](https://developer.apple.com/support/terms/apple-developer-program-license-agreement/).
