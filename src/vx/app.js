@@ -154,6 +154,16 @@ function audibleVoiceTarget(state = store?.state, globalOverride = null) {
   return clamp(sharedTarget, 0, 100, VOICE_LEVEL_PERCENT);
 }
 
+function platformIsIOS(userAgent = '') {
+  return /iPhone|iPad|iPod|Macintosh[^\n]*Mobile/i.test(String(userAgent || ''));
+}
+
+function activeReceiverIsIOS(state = store?.state) {
+  const receiver = state?.receiver;
+  if (receiverOnline(receiver, store.now())) return platformIsIOS(receiver?.platform);
+  return role === 'receiver' && isIOSLike();
+}
+
 const store = new CloudStore({
   onState: state => {
     if (!(state.schedules || []).some(schedule => schedule.id === selectedScheduleId)) {
@@ -243,13 +253,28 @@ function displayAudioPolicy(provider = effectiveProvider()) {
   }
   return audioPolicy({
     provider,
-    isIOS: isIOSLike(),
+    isIOS: activeReceiverIsIOS(),
     supportsVolume: !!apple.supportsVolume,
     volumeVerified: !!apple.volumeVerified,
     verifiedPercent: apple.verifiedPercent,
     musicPercent,
     voicePercent: audibleVoiceTarget()
   });
+}
+
+function appleSetupButton({ disabled = false } = {}) {
+  const disabledAttribute = disabled ? ' disabled title="Start this speaker receiver first"' : '';
+  if (apple.loggedIn()) {
+    const label = apple.playerPrepared
+      ? (apple.readiness().ready ? 'Reconnect Apple Music' : 'Connect Apple Music Receiver')
+      : (apple.prepareError ? 'Retry Apple Music Session Restore' : 'Restore Apple Music Session');
+    return `<button data-action="connect-apple" class="appleButton"${disabledAttribute}>${label}</button>`;
+  }
+  if (apple.authorizationPrepared) {
+    return '<button data-action="apple-login" class="appleButton">Authorize Apple Music</button>';
+  }
+  const label = apple.authorizationPrepareError ? 'Retry Apple Music Preparation' : 'Prepare Apple Music';
+  return `<button data-action="apple-prepare" class="appleButton">${label}</button>`;
 }
 
 function updateLiveStatus() {
@@ -297,7 +322,7 @@ async function restoreStoredAppleAuthorization({ reportSuccess = false } = {}) {
     }
     return restored;
   } catch (error) {
-    const nextStep = apple.loggedIn() ? 'Tap Retry Apple Music Setup.' : 'Tap Authorize Apple Music.';
+    const nextStep = apple.loggedIn() ? 'Tap Retry Apple Music Setup.' : 'Tap Prepare Apple Music, then Authorize Apple Music.';
     setFeedback(`Apple Music setup needs attention: ${error.message || String(error)} ${nextStep}`, false);
     return false;
   }
@@ -369,20 +394,20 @@ function renderRolePicker() {
         <div class="brandSeal">PP</div>
         <p class="kicker">Poolside Pulse Version X</p>
         <h1>What is this device?</h1>
-        <p class="lead">Choose once. You can change it later in Settings.</p>
+        <p class="lead">For iPhone operation, use two separate iPhones: one stays on the speakers and one sends commands.</p>
         <div class="roleChoices">
           <button class="roleChoice receiverChoice" data-action="choose-role" data-role="receiver">
             <span class="roleIcon" aria-hidden="true">◉</span>
             <strong>Speaker Receiver</strong>
-            <small>The one device connected to the pool speakers. Keep it plugged in and open.</small>
+            <small>The iPhone connected to the pool speakers. Keep it plugged in with this page visible.</small>
           </button>
           <button class="roleChoice commandChoice" data-action="choose-role" data-role="command">
             <span class="roleIcon" aria-hidden="true">⌁</span>
             <strong>Remote Control</strong>
-            <small>Your phone or laptop for music, announcements, weather, and schedules.</small>
+            <small>The second iPhone for music, announcements, weather, and schedules.</small>
           </button>
         </div>
-        <div class="truthNote"><strong>Version X rule:</strong> only the Speaker Receiver can produce sound. Remote devices never become Apple Music players.</div>
+        <div class="truthNote"><strong>Two-device rule:</strong> leave the receiver iPhone on this page. Operate Poolside Pulse from the separate command iPhone; remote devices never become Apple Music players.</div>
       </section>
     </main>`;
 }
@@ -396,7 +421,7 @@ function shellStatus() {
     <div class="shellStatus">
       <span class="statusPill ${syncGood ? 'online' : 'warn'}">${store.syncMode === 'kv' ? 'Cloud synced' : store.syncMode === 'local' ? 'Local preview' : escapeHtml(store.syncMode)}</span>
       <span class="statusPill ${online ? 'online' : 'offline'}" data-live-receiver>${online ? 'Receiver online' : 'Receiver offline'}</span>
-      <span class="statusPill mix">${policy.exact ? `${policy.musicPercent}% music / ${audibleVoiceTarget()}% voice` : `Apple Music ${store.state.config.musicLevel}%?`}</span>
+      <span class="statusPill mix">${policy.exact ? `${policy.musicPercent}% music / ${audibleVoiceTarget()}% voice` : activeReceiverIsIOS() && effectiveProvider() === 'apple' ? `Apple physical / ${audibleVoiceTarget()}% voice` : `Apple Music ${store.state.config.musicLevel}%?`}</span>
     </div>`;
 }
 
@@ -456,7 +481,9 @@ function playbackCard() {
     : (localAppleMusicLabel || playback.label || 'Nothing playing');
   const displayDetail = calibrationActive
     ? `Temporary test tone · announcements silence it to ${DUCK_LEVEL_PERCENT}%`
-    : `${provider} · ${playback.provider === 'apple' ? (appleVerified ? `receiver-verified at ${audibleTarget}%` : `pause-for-voice mode; ${audibleTarget}% target unverified`) : `music bus set to ${audibleTarget}%`}`;
+    : `${provider} · ${playback.provider === 'apple'
+      ? (appleVerified ? `receiver-verified at ${audibleTarget}%` : activeReceiverIsIOS() ? 'iPhone physical speaker volume; pause-for-voice mode' : `pause-for-voice mode; ${audibleTarget}% target unverified`)
+      : `music bus set to ${audibleTarget}%`}`;
   const allowedTabs = allowedTabsForRole();
   const safePreviousTab = allowedTabs.includes(previousTab) && previousTab !== activeTab ? previousTab : '';
   const safeFallbackTab = activeTab !== 'control'
@@ -511,7 +538,7 @@ function renderReceiver() {
   if (appleRelevant) {
     const localAppleMusicReadiness = apple.readiness();
     readiness.push(
-      ['Apple Music authorization', apple.loggedIn(), apple.loggedIn() ? 'Authorized on this speaker receiver' : scheduledAppleMusic ? 'Required by an enabled item in the live schedule' : 'Tap Authorize Apple Music on this receiver'],
+      ['Apple Music authorization', apple.loggedIn(), apple.loggedIn() ? 'Authorized on this speaker receiver' : apple.authorizationPrepared ? 'Tap Authorize Apple Music now' : scheduledAppleMusic ? 'Tap Prepare Apple Music, then Authorize Apple Music' : 'First tap Prepare Apple Music, then tap Authorize Apple Music'],
       ['Apple Music receiver', localAppleMusicReadiness.ready, localAppleMusicReadiness.detail]
     );
   }
@@ -529,22 +556,18 @@ function renderReceiver() {
             : takeoverTarget
               ? `<button data-action="start-receiver" data-takeover="true" class="danger heroButton">Confirm Take Over Receiver</button>`
               : `<button data-action="start-receiver" class="primary heroButton">${other ? 'Review Receiver Takeover' : 'Start Receiver'}</button>`}
-          ${owned
-            ? apple.loggedIn()
-              ? `<button data-action="connect-apple" class="appleButton">${apple.playerPrepared ? (apple.readiness().ready ? 'Reconnect Apple Music' : 'Connect Apple Music') : (apple.prepareError ? 'Retry Apple Music Setup' : 'Prepare Apple Music')}</button>`
-              : '<button data-action="apple-login" class="appleButton">Authorize Apple Music</button>'
-            : ''}
+          ${other ? '' : appleSetupButton({ disabled: apple.loggedIn() && !owned })}
         </div>
       </div>
       <div class="mixMeter" aria-label="Audio levels">
-        <div><span>Music target</span><strong>${policy.exact ? `${policy.musicPercent}%` : `${audibleTarget}%?`}</strong><i style="--level:${policy.exact ? policy.musicPercent / 100 : audibleTarget / 100}"></i></div>
+        <div><span>${activeReceiverIsIOS() && activeProvider === 'apple' ? 'Apple volume' : 'Music target'}</span><strong>${policy.exact ? `${policy.musicPercent}%` : activeReceiverIsIOS() && activeProvider === 'apple' ? 'Physical' : `${audibleTarget}%?`}</strong><i style="--level:${policy.exact ? policy.musicPercent / 100 : activeReceiverIsIOS() && activeProvider === 'apple' ? 0 : audibleTarget / 100}"></i></div>
         <div><span>Voice</span><strong>${audibleVoiceTarget()}%</strong><i style="--level:${audibleVoiceTarget() / 100}"></i></div>
-        <small>${policy.exact ? `The receiver has verified this music level. Voice is set to ${audibleVoiceTarget()}%.` : 'Apple Music volume is not software-verified here. It pauses completely before voice or Suno plays.'}</small>
+        <small>${policy.exact ? `The receiver has verified this music level. Voice is set to ${audibleVoiceTarget()}%.` : activeReceiverIsIOS() && activeProvider === 'apple' ? `Set Apple Music loudness with the iPhone or connected speaker controls. Voice remains adjustable at ${audibleVoiceTarget()}%.` : 'Apple Music volume is not software-verified here. It pauses completely before voice or Suno plays.'}</small>
       </div>
     </section>
-    ${isIOSLike() ? `<div class="callout ${owned ? 'warning' : ''}"><strong>iPhone receiver level setup</strong><p>${owned
-      ? 'Keep this page visible while the receiver is live. Apple Music pauses fully before Suno or speech. On iPhone, Poolside Pulse cannot verify an exact Apple Music volume, so this is pause-only compatibility.'
-      : 'For reliable schedules, use an always-on desktop receiver. An iPhone may suspend the page and cannot provide verified Apple Music volume control.'}</p></div>` : ''}
+    ${isIOSLike() ? `<div class="callout ${owned ? 'warning' : ''}"><strong>Use two separate iPhones</strong><p>${owned
+      ? 'Leave this receiver iPhone plugged in, connected to the speakers, and visible on this page. Use the second iPhone for commands. Hiding or locking this page stops the receiver and requires fresh Start and Connect taps. Apple Music uses physical speaker volume and pauses fully before Suno or speech.'
+      : 'Prepare and Authorize Apple Music before tapping Start Receiver. Then leave this iPhone on the receiver page and use a second iPhone for commands. Foreground schedules work while this page stays visible; background or unattended iPhone schedules are not guaranteed.'}</p></div>` : ''}
     ${other ? `<div class="callout warning"><strong>Takeover protection</strong><p>Starting here will stop commands from targeting ${escapeHtml(receiver.name || 'the other receiver')}. Only take over if that device is no longer connected to the speakers.</p></div>` : ''}
     <section class="readinessPanel">
       <div class="sectionHeading"><div><p class="kicker">Live readiness</p><h2>Everything that must stay healthy</h2></div><span class="score">${readiness.filter(([, ok]) => ok).length}/${readiness.length}</span></div>
@@ -560,22 +583,26 @@ function renderReceiver() {
 function providerSelector() {
   const provider = store.state.config.musicProvider;
   const target = store.state.config.musicLevel;
+  const iphoneApple = activeReceiverIsIOS();
   return `
     <div class="providerSelector" role="group" aria-label="Music source">
       <button aria-pressed="${provider === 'controlled'}" data-action="provider" data-provider="controlled" class="${provider === 'controlled' ? 'active' : ''}"><strong>Suno / Direct</strong><small>Exact ${target}/${audibleVoiceTarget()} mix</small></button>
-      <button aria-pressed="${provider === 'apple'}" data-action="provider" data-provider="apple" class="${provider === 'apple' ? 'active' : ''}"><strong>Apple Music</strong><small>${cloudAppleMusicVerified() ? `Verified ${target}%` : `${target}% target`}</small></button>
+      <button aria-pressed="${provider === 'apple'}" data-action="provider" data-provider="apple" class="${provider === 'apple' ? 'active' : ''}"><strong>Apple Music</strong><small>${cloudAppleMusicVerified() ? `Verified ${target}%` : iphoneApple ? 'Physical iPhone volume' : `${target}% target`}</small></button>
     </div>`;
 }
 
 function musicLevelControl() {
   const target = clamp(musicLevelDraft === null ? store.state.config.musicLevel : musicLevelDraft, 0, 100, 30);
   const customTarget = customPlaybackMusicTarget(store.state);
+  const iphoneApple = store.state.config.musicProvider === 'apple' && activeReceiverIsIOS();
   return `
     <section class="volumeControl" aria-labelledby="musicLevelLabel">
-      <div class="volumeHeading"><div><p class="kicker">Shared music target</p><h2 id="musicLevelLabel">Music volume</h2></div><output for="musicLevel" data-music-level-output>${target}%</output></div>
-      <input id="musicLevel" type="range" min="0" max="100" step="1" value="${target}" aria-labelledby="musicLevelLabel" aria-describedby="musicLevelHelp" aria-valuetext="${target}% music; announcements ${audibleVoiceTarget()}%" style="--level:${target / 100}" />
+      <div class="volumeHeading"><div><p class="kicker">${iphoneApple ? 'iPhone Apple Music' : 'Shared music target'}</p><h2 id="musicLevelLabel">${iphoneApple ? 'Use physical speaker volume' : 'Music volume'}</h2></div><output for="musicLevel" data-music-level-output>${iphoneApple ? 'Physical' : `${target}%`}</output></div>
+      <input id="musicLevel" type="range" min="0" max="100" step="1" value="${target}" aria-labelledby="musicLevelLabel" aria-describedby="musicLevelHelp" aria-valuetext="${iphoneApple ? 'Apple Music volume uses the iPhone or connected speaker controls' : `${target}% music; announcements ${audibleVoiceTarget()}%`}" style="--level:${iphoneApple ? 0 : target / 100}" ${iphoneApple ? 'disabled' : ''} />
       <div class="volumeScale" aria-hidden="true"><span>0%</span><span>Default 30%</span><span>100%</span></div>
-      <p id="musicLevelHelp">${customTarget === null ? 'Applies immediately' : `Saves the shared target for later; the current schedule item remains at its custom ${customTarget}%`} for Suno/direct on the receiver and to Apple Music only when that desktop receiver verifies volume control. Apple Music always pauses before Suno or speech; it never overlaps an announcement.</p>
+      <p id="musicLevelHelp">${iphoneApple
+        ? `Poolside Pulse cannot apply an Apple Music percentage on the active iPhone receiver. Set loudness with the iPhone or connected speaker controls. Suno music and announcement voice remain adjustable; shared Suno music is currently ${target}%.`
+        : `${customTarget === null ? 'Applies immediately' : `Saves the shared target for later; the current schedule item remains at its custom ${customTarget}%`} for Suno/direct on the receiver and to Apple Music only when that desktop receiver verifies volume control. Apple Music always pauses before Suno or speech; it never overlaps an announcement.`}</p>
     </section>`;
 }
 
@@ -586,19 +613,20 @@ function voiceLevelControl() {
       <div class="volumeHeading"><div><p class="kicker">Shared announcement target</p><h2 id="voiceLevelLabel">Voice volume</h2></div><output for="voiceLevel" data-voice-level-output>${target}%</output></div>
       <input id="voiceLevel" type="range" min="0" max="100" step="1" value="${target}" aria-labelledby="voiceLevelLabel" aria-describedby="voiceLevelHelp" aria-valuetext="${target}% announcement voice" style="--level:${target / 100}" />
       <div class="volumeScale" aria-hidden="true"><span>0%</span><span style="left:${target}%">Shared ${target}%</span><span>100%</span></div>
-      <p id="voiceLevelHelp">Applies to Speak Now, saved messages, safety announcements, and schedule items using the shared voice level. A scheduled announcement can override it with its own custom volume.</p>
+      <p id="voiceLevelHelp">Applies to Speak Now, saved messages, safety announcements, and schedule items using the shared voice level. A scheduled announcement can override it. Generated voice uses the Version X mixer; emergency device-speech fallback treats this percentage as a requested target because iPhone speaker loudness cannot be verified.</p>
     </section>`;
 }
 
 function musicSourceForm() {
   const config = store.state.config;
   if (config.musicProvider === 'apple') {
-    const policy = audioPolicy({ provider: 'apple', isIOS: isIOSLike(), supportsVolume: apple.supportsVolume, volumeVerified: apple.volumeVerified, verifiedPercent: apple.verifiedPercent, musicPercent: config.musicLevel, voicePercent: audibleVoiceTarget() });
+    const iphoneApple = activeReceiverIsIOS();
+    const policy = audioPolicy({ provider: 'apple', isIOS: iphoneApple, supportsVolume: apple.supportsVolume, volumeVerified: apple.volumeVerified, verifiedPercent: apple.verifiedPercent, musicPercent: config.musicLevel, voicePercent: audibleVoiceTarget() });
     const receiverAppleMusicReady = receiverOnline(store.state.receiver, store.now()) && store.state.receiver?.appleStatus === 'ready';
     return `
       <form data-form="apple-play" class="sourceForm">
         <label for="appleUrl">Apple Music playlist, album, artist, or track</label>
-        <div class="inputAction"><input id="appleUrl" name="url" type="url" value="${escapeAttr(config.appleUrl || '')}" placeholder="https://music.apple.com/us/album/..." required /><button type="submit" class="appleButton" ${receiverAppleMusicReady ? '' : 'disabled'}>Play Apple Music</button></div>
+        <div class="inputAction"><input id="appleUrl" name="url" type="url" value="${escapeAttr(config.appleUrl || '')}" placeholder="https://music.apple.com/us/album/..." required /><button type="submit" class="appleButton" ${receiverAppleMusicReady ? '' : 'disabled'}>${iphoneApple ? 'Play Apple Music · physical volume' : 'Play Apple Music'}</button></div>
       </form>
       ${receiverAppleMusicReady ? '' : `<div class="callout warning"><strong>Apple Music is not ready on the speaker receiver.</strong><p>${escapeHtml(store.state.receiver?.appleDetail || 'Open Settings on the receiver, authorize Apple Music, then tap Connect Apple Music.')}</p></div>`}
       <div class="capabilityCard ${policy.exact ? 'verified' : 'limited'}">
@@ -606,7 +634,7 @@ function musicSourceForm() {
         <strong>${escapeHtml(policy.label)}</strong>
         <p>${escapeHtml(policy.detail)}</p>
       </div>
-      <div class="policyNote"><strong>Safe Apple behavior:</strong> Poolside Pulse pauses Apple Music completely before Suno or speech and resumes it only afterward; the sources never overlap. Exact Apple Music volume is shown only after a desktop receiver verifies it. iPhone is pause-only. An active Apple Music subscription and an open, signed-in receiver are required.</div>`;
+      <div class="policyNote"><strong>Safe Apple behavior:</strong> Poolside Pulse pauses Apple Music completely before Suno or speech and resumes it only afterward; the sources never overlap. ${iphoneApple ? 'The active receiver is an iPhone: set Apple Music loudness with the iPhone or connected speaker controls. Suno and announcement voice percentages remain adjustable.' : 'Exact Apple Music volume is shown only after a desktop receiver verifies it.'} An active Apple Music subscription and an open, signed-in receiver are required.</div>`;
   }
   return `
     <form data-form="controlled-play" class="sourceForm">
@@ -625,7 +653,7 @@ function renderControl() {
     ${playbackCard()}
     <section class="workspacePanel">
       ${musicLevelControl()}
-      <div class="sectionHeading sourceHeading"><div><p class="kicker">Choose music</p><h2>Playback source</h2></div><span class="fixedMix">${policy.exact ? `${policy.musicPercent} / ${policy.voicePercent}` : `Target ${store.state.config.musicLevel}%`}</span></div>
+      <div class="sectionHeading sourceHeading"><div><p class="kicker">Choose music</p><h2>Playback source</h2></div><span class="fixedMix">${policy.exact ? `${policy.musicPercent} / ${policy.voicePercent}` : activeReceiverIsIOS() && store.state.config.musicProvider === 'apple' ? 'Apple volume: physical' : `Target ${store.state.config.musicLevel}%`}</span></div>
       ${providerSelector()}
       ${musicSourceForm()}
     </section>`;
@@ -742,7 +770,9 @@ function scheduleKindLabel(item) {
 function scheduleVolumeLabel(item) {
   const percent = effectiveScheduleItemVolume(item, store.state.config);
   if (scheduleItemKind(item) === 'announcement') return `Voice ${percent}%`;
-  return scheduleItemKind(item) === 'apple' ? `Target ${percent}%` : `Music ${percent}%`;
+  return scheduleItemKind(item) === 'apple'
+    ? (activeReceiverIsIOS() ? 'Physical speaker level' : `Target ${percent}%`)
+    : `Music ${percent}%`;
 }
 
 function scheduleAdvanceLabel(item) {
@@ -761,6 +791,7 @@ function renderWeekdayControls(days = []) {
 
 function renderScheduleRow(item, schedule, index) {
   const kind = scheduleItemKind(item);
+  const iphoneAppleVolume = kind === 'apple' && activeReceiverIsIOS();
   const announcementSource = item.action?.announcementSource || 'saved';
   const volumeMode = item.volume?.mode || 'global';
   const itemVolume = effectiveScheduleItemVolume(item, store.state.config);
@@ -796,10 +827,11 @@ function renderScheduleRow(item, schedule, index) {
               <label>Music URL<input name="url" type="url" value="${escapeAttr(item.action?.url || item.url || '')}" placeholder="Apple Music, Suno, or direct HTTPS audio URL" ${kind === 'announcement' ? '' : 'required'} /></label>
               ${schedule.mode === 'order' ? `<label>Advance<select name="advanceMode" data-advance-mode><option value="manual" ${advanceMode === 'manual' ? 'selected' : ''}>Manually with Play Next</option><option value="track-end" ${advanceMode === 'track-end' ? 'selected' : ''} ${kind === 'apple' ? 'disabled' : ''}>At direct track end (Suno/direct only)</option><option value="duration" ${advanceMode === 'duration' ? 'selected' : ''}>After a duration</option><option value="complete" ${advanceMode === 'complete' ? 'selected' : ''}>Immediately after playback starts</option></select></label><label data-show-advance-mode="duration" ${advanceMode === 'duration' ? '' : 'hidden'}>Duration seconds<input name="durationSeconds" type="number" min="1" max="86400" step="1" value="${escapeAttr(item.advance?.durationSeconds || 300)}" /></label>` : ''}
             </div>
-            <div class="conditionalFields scheduleVolumeFields">
-              <label>Volume<select name="volumeMode" data-volume-mode><option value="global" ${volumeMode === 'global' ? 'selected' : ''}>Use shared volume</option><option value="custom" ${volumeMode === 'custom' ? 'selected' : ''}>Custom for this item</option></select><small>${kind === 'announcement' ? `Shared voice is ${audibleVoiceTarget()}%.` : `Shared music is ${store.state.config.musicLevel}%.`}</small></label>
-              <label data-show-volume-mode="custom" ${volumeMode === 'custom' ? '' : 'hidden'}>Item ${kind === 'announcement' ? 'voice' : 'music'} volume<div class="itemVolumeControl"><input name="volumePercent" class="itemVolumeSlider" type="range" min="0" max="100" step="1" value="${itemVolume}" /><output>${itemVolume}%</output></div></label>
+            <div class="conditionalFields scheduleVolumeFields" data-standard-volume-fields ${iphoneAppleVolume ? 'hidden' : ''}>
+              <label>Volume<select name="volumeMode" data-volume-mode ${iphoneAppleVolume ? 'disabled' : ''}><option value="global" ${volumeMode === 'global' ? 'selected' : ''}>Use shared volume</option><option value="custom" ${volumeMode === 'custom' ? 'selected' : ''}>Custom for this item</option></select><small>${kind === 'announcement' ? `Shared voice is ${audibleVoiceTarget()}%.` : `Shared music is ${store.state.config.musicLevel}%.`}</small></label>
+              <label data-show-volume-mode="custom" ${volumeMode === 'custom' && !iphoneAppleVolume ? '' : 'hidden'}>Item ${kind === 'announcement' ? 'voice' : 'music'} volume<div class="itemVolumeControl"><input name="volumePercent" class="itemVolumeSlider" type="range" min="0" max="100" step="1" value="${itemVolume}" ${iphoneAppleVolume ? 'disabled' : ''} /><output>${itemVolume}%</output></div></label>
             </div>
+            <div class="fixedVoiceNote" data-apple-ios-volume-note ${iphoneAppleVolume ? '' : 'hidden'}><strong>Apple Music volume: physical control</strong><span>The active receiver is an iPhone. Set Apple Music loudness with the iPhone or connected speaker; custom Apple percentages cannot be applied. Suno and voice controls remain adjustable.</span></div>
           </div>
           <div class="rowActions scheduleRowActions"><button type="submit" class="primary">Save Item</button><button type="submit" name="intent" value="play" class="secondary">Save & Play Now</button><button type="button" data-action="move-schedule-item" data-id="${escapeAttr(item.id)}" data-direction="-1" class="secondary" aria-label="Move ${escapeAttr(item.label)} up">Move Up</button><button type="button" data-action="move-schedule-item" data-id="${escapeAttr(item.id)}" data-direction="1" class="secondary" aria-label="Move ${escapeAttr(item.label)} down">Move Down</button><button type="button" data-action="duplicate-schedule-item" data-id="${escapeAttr(item.id)}" class="secondary">Duplicate</button><button type="button" data-action="delete-schedule-item" data-id="${escapeAttr(item.id)}" class="textDanger">Delete</button></div>
         </form>
@@ -850,7 +882,7 @@ function renderSchedule() {
       <div class="scheduleList">${items.map((item, index) => renderScheduleRow(item, schedule, index)).join('')}</div>
       <button type="button" data-action="add-schedule-item" class="secondary addButton">+ Add Schedule Item</button>
     </section>
-    <div class="callout warning"><strong>Receiver requirement</strong><p>Keep an authorized, signed-in receiver page open for scheduled playback. Apple Music also requires an active subscription. For unattended schedules, use an always-on Mac mini, Windows mini PC, or supported desktop receiver; an iPhone can suspend the tab and is pause-only for Apple volume.</p></div>`;
+    <div class="callout warning"><strong>iPhone schedule requirement</strong><p>Keep the authorized receiver iPhone plugged in and this page visible; use a separate iPhone for commands. If the receiver page is hidden or locked, Version X stops safely and requires fresh Start and Connect taps. Apple Music also requires an active subscription and uses physical speaker volume. For genuinely unattended schedules, use an always-on desktop or a purpose-built native receiver.</p></div>`;
 }
 
 function renderActivity() {
@@ -865,20 +897,23 @@ function renderActivity() {
 
 function renderSettings() {
   const config = store.state.config;
-  const applePolicy = audioPolicy({ provider: 'apple', isIOS: isIOSLike(), supportsVolume: apple.supportsVolume, volumeVerified: apple.volumeVerified, verifiedPercent: apple.verifiedPercent, musicPercent: config.musicLevel, voicePercent: audibleVoiceTarget() });
+  const iphoneApple = activeReceiverIsIOS();
+  const applePolicy = audioPolicy({ provider: 'apple', isIOS: iphoneApple, supportsVolume: apple.supportsVolume, volumeVerified: apple.volumeVerified, verifiedPercent: apple.verifiedPercent, musicPercent: config.musicLevel, voicePercent: audibleVoiceTarget() });
   const appleReadiness = apple.readiness();
   const appleStage = !apple.loggedIn()
-    ? 'Authorization required'
+    ? apple.authorizationPrepared
+      ? 'Step 2 · authorize Apple Music'
+      : 'Step 1 · prepare Apple Music'
     : appleReadiness.ready
       ? 'Apple Music connected'
-      : 'Authorized · connect this receiver';
+      : 'Step 3 · connect this receiver';
   const roleControls = role === 'receiver' && runtime.active
     ? roleChangePending
       ? `<div class="callout warning"><strong>Stop the live receiver?</strong><p>Changing this device to Remote Control stops speaker audio and releases its receiver lease.</p><div class="stackedActions"><button data-action="set-role" data-role="command" class="danger">Confirm Stop & Change Role</button><button data-action="cancel-role-change" class="secondary">Keep Receiver Live</button></div></div>`
       : '<button data-action="request-role-change" class="secondary">Stop Receiver & Change to Remote Control</button>'
     : `<button data-action="set-role" data-role="${role === 'receiver' ? 'command' : 'receiver'}" class="secondary">Change to ${role === 'receiver' ? 'Remote Control' : 'Speaker Receiver'}</button>`;
   return `
-    <section class="pageHeading"><p class="kicker">Settings & diagnostics</p><h1>Simple controls, honest status.</h1><p>Music and announcement voice each have an adjustable shared target. Apple Music volume is labeled exact only when this desktop receiver verifies it.</p></section>
+    <section class="pageHeading"><p class="kicker">Settings & diagnostics</p><h1>Simple controls, honest status.</h1><p>Suno/direct music and announcement voice each have an adjustable shared target. Apple Music uses physical volume on iPhone and is labeled exact only when a desktop receiver verifies it.</p></section>
     <section class="settingsGrid">
       <form data-form="settings" class="workspacePanel">
         <div class="sectionHeading"><div><p class="kicker">Weather & voice</p><h2>Operating settings</h2></div></div>
@@ -891,14 +926,12 @@ function renderSettings() {
       </form>
       <section class="workspacePanel">
         <div class="sectionHeading"><div><p class="kicker">Apple Music receiver</p><h2>${escapeHtml(appleStage)}</h2></div></div>
-        <div class="capabilityCard ${apple.loggedIn() ? 'verified' : 'limited'}"><span>${apple.loggedIn() ? 'MusicKit authorized' : 'Apple Music subscription required'}</span><strong>${apple.loggedIn() ? 'This receiver is authorized' : 'Authorize on the speaker receiver'}</strong><p>Authorization is handled by Apple Music in this browser. Poolside Pulse does not ask a remote-control device to sign in.</p></div>
+        <div class="capabilityCard ${apple.loggedIn() ? 'verified' : 'limited'}"><span>${apple.loggedIn() ? 'MusicKit authorized' : apple.authorizationPrepared ? 'Preparation complete' : 'Apple Music subscription required'}</span><strong>${apple.loggedIn() ? 'This receiver is authorized' : apple.authorizationPrepared ? 'Now tap Authorize Apple Music' : 'First tap Prepare Apple Music'}</strong><p>Preparation loads MusicKit and the server token. Authorization is a separate tap so iPhone can open Apple's account sheet inside that tap. Poolside Pulse never asks a remote-control device to sign in.</p></div>
         <div class="capabilityCard ${applePolicy.exact ? 'verified' : 'limited'}"><span>${applePolicy.exact ? 'Supported receiver' : 'Compatibility only'}</span><strong>${escapeHtml(applePolicy.label)}</strong><p>${escapeHtml(applePolicy.detail)}</p></div>
         ${role === 'receiver'
-          ? `<div class="stackedActions">${apple.loggedIn()
-              ? `<button data-action="connect-apple" class="appleButton" ${runtime.isOwner() ? '' : 'disabled title="Start this speaker receiver first"'}>${apple.playerPrepared ? (appleReadiness.ready ? 'Reconnect Apple Music' : 'Connect Apple Music') : (apple.prepareError ? 'Retry Apple Music Setup' : 'Prepare Apple Music')}</button><button data-action="apple-logout" class="secondary">Remove Apple Music Authorization</button>`
-              : '<button data-action="apple-login" class="appleButton">Authorize Apple Music</button>'}</div>${apple.loggedIn() && !runtime.isOwner() ? '<div class="callout"><strong>Start Receiver before connecting Apple Music.</strong><p>Only the device holding the live receiver lease may become the Apple Music player.</p></div>' : ''}`
+          ? `<div class="stackedActions">${appleSetupButton({ disabled: apple.loggedIn() && !runtime.isOwner() })}${apple.loggedIn() ? '<button data-action="apple-logout" class="secondary">Remove Apple Music Authorization</button>' : ''}</div>${apple.loggedIn() && !runtime.isOwner() ? '<div class="callout"><strong>Start Receiver before connecting Apple Music.</strong><p>Only the device holding the live receiver lease may become the Apple Music player.</p></div>' : ''}`
           : '<div class="callout"><strong>Apple Music controls live only on the speaker receiver.</strong><p>Remote devices send commands and never authorize or connect an Apple Music account.</p></div>'}
-        <div class="policyNote"><strong>Required for live and scheduled playback:</strong> an active Apple Music subscription, an authorized MusicKit session, and this receiver page kept open on the speaker device. Apple pauses before Suno or speech; there is no overlap. Desktop receivers may verify exact volume. iPhone uses pause-only compatibility.</div>
+        <div class="policyNote"><strong>Required for live and scheduled playback:</strong> an active Apple Music subscription, an authorized MusicKit session, and this receiver page kept open on the speaker device. Apple pauses before Suno or speech; there is no overlap. ${iphoneApple ? 'This active iPhone receiver uses its physical speaker volume; Apple custom percentage targets are disabled. Suno and voice remain adjustable.' : 'Desktop receivers may verify exact Apple Music volume.'}</div>
       </section>
       <section class="workspacePanel">
         <div class="sectionHeading"><div><p class="kicker">Sound verification</p><h2>Receiver sound check</h2></div></div>
@@ -928,6 +961,11 @@ function renderContent() {
 
 function renderApp() {
   const policy = displayAudioPolicy();
+  const footerMix = policy.exact
+    ? `Music ${policy.musicPercent}% · Voice ${audibleVoiceTarget()}%`
+    : activeReceiverIsIOS() && effectiveProvider() === 'apple'
+      ? `Apple Music physical volume · Voice ${audibleVoiceTarget()}%`
+      : `Apple Music target ${store.state.config.musicLevel}% unverified · Voice ${audibleVoiceTarget()}%`;
   return `
     ${renderHeader()}
     <div class="appShell ${busy ? 'busy' : ''}" aria-busy="${busy}">
@@ -935,7 +973,7 @@ function renderApp() {
       ${feedbackBanner()}
       <main class="content">${renderContent()}</main>
     </div>
-    <footer class="appFooter"><span>Poolside Pulse Version X</span><span>${policy.exact ? `Music ${policy.musicPercent}% · Voice ${audibleVoiceTarget()}%` : `Apple Music target ${store.state.config.musicLevel}% unverified · Voice ${audibleVoiceTarget()}%`} · Weather every 2 minutes</span></footer>`;
+    <footer class="appFooter"><span>Poolside Pulse Version X</span><span>${footerMix} · Weather every 2 minutes</span></footer>`;
 }
 
 function formIdentity(form) {
@@ -1253,6 +1291,7 @@ function updateScheduleFormVisibility(form) {
   const kind = form.querySelector('[data-schedule-kind]')?.value || form.dataset.kind || 'announcement';
   const announcementSource = form.querySelector('[data-announcement-source]')?.value || form.dataset.announcementSource || 'saved';
   const volumeMode = form.querySelector('[data-volume-mode]')?.value || form.dataset.volumeMode || 'global';
+  const iphoneAppleVolume = kind === 'apple' && activeReceiverIsIOS();
   const advanceSelect = form.querySelector('[data-advance-mode]');
   const trackEndOption = advanceSelect?.querySelector('option[value="track-end"]');
   if (trackEndOption) trackEndOption.disabled = kind === 'apple';
@@ -1272,7 +1311,14 @@ function updateScheduleFormVisibility(form) {
     field.hidden = field.dataset.showAnnouncementSource !== announcementSource;
   }
   for (const field of form.querySelectorAll('[data-show-volume-mode]')) {
-    field.hidden = field.dataset.showVolumeMode !== volumeMode;
+    field.hidden = iphoneAppleVolume || field.dataset.showVolumeMode !== volumeMode;
+  }
+  const standardVolumeFields = form.querySelector('[data-standard-volume-fields]');
+  if (standardVolumeFields) standardVolumeFields.hidden = iphoneAppleVolume;
+  const iphoneVolumeNote = form.querySelector('[data-apple-ios-volume-note]');
+  if (iphoneVolumeNote) iphoneVolumeNote.hidden = !iphoneAppleVolume;
+  for (const control of form.querySelectorAll('[data-standard-volume-fields] select, [data-standard-volume-fields] input')) {
+    control.disabled = iphoneAppleVolume;
   }
   for (const field of form.querySelectorAll('[data-show-advance-mode]')) {
     field.hidden = field.dataset.showAdvanceMode !== advanceMode;
@@ -1381,10 +1427,10 @@ root.addEventListener('click', event => {
     if (action === 'connect-apple') {
       if (role !== 'receiver' || !runtime.isOwner()) throw new Error('Start this device as the live Speaker Receiver before connecting Apple Music.');
       if (!apple.playerPrepared) {
-        return await runAction('Preparing Apple Music', async () => {
+        return await runAction('Restoring Apple Music session', async () => {
           const restored = await apple.restoreAuthorization();
           if (!restored) throw new Error('Apple Music authorization could not be restored. Authorize Apple Music again.');
-          setFeedback('Apple Music is prepared. Tap Connect Apple Music Receiver once more to activate audio.', true);
+          setFeedback('Apple Music session restored. Tap Connect Apple Music Receiver once more to activate audio.', true);
         });
       }
       const activation = apple.activateFromUserGesture?.();
@@ -1398,9 +1444,14 @@ root.addEventListener('click', event => {
         }
       });
     }
+    if (action === 'apple-prepare') {
+      if (role !== 'receiver') throw new Error('Prepare Apple Music only on the Speaker Receiver.');
+      return await runAction('Preparing Apple Music', () => apple.prepareAuthorization());
+    }
     if (action === 'apple-login') {
       if (role !== 'receiver') throw new Error('Authorize Apple Music only on the Speaker Receiver.');
-      return await runAction('Authorizing Apple Music', () => apple.beginLogin());
+      const authorization = apple.authorizeFromUserGesture();
+      return await runAction('Authorizing Apple Music', () => authorization);
     }
     if (action === 'apple-logout') {
       return await runAction('Removing Apple Music login', async () => {
@@ -1857,6 +1908,7 @@ root.addEventListener('submit', event => {
       const id = String(form.dataset.id || '');
       const scheduleId = String(form.dataset.scheduleId || '');
       const actionKind = ['announcement', 'controlled', 'apple'].includes(String(data.get('kind'))) ? String(data.get('kind')) : 'announcement';
+      const iphoneAppleVolume = actionKind === 'apple' && activeReceiverIsIOS();
       const announcementSource = data.get('announcementSource') === 'inline' ? 'inline' : 'saved';
       const inlineText = String(data.get('text') || '').trim();
       const itemUrl = String(data.get('url') || '').trim();
@@ -1876,7 +1928,7 @@ root.addEventListener('submit', event => {
         if (index < 0) throw new Error('Schedule item no longer exists.');
         const existing = schedule.items[index];
         const targetOrder = clamp(data.get('order') || existing.position?.order || index + 1, 1, 100, index + 1);
-        const volumeMode = data.get('volumeMode') === 'custom' ? 'custom' : 'global';
+        const volumeMode = !iphoneAppleVolume && data.get('volumeMode') === 'custom' ? 'custom' : 'global';
       const advanceMode = ['complete', 'track-end', 'duration', 'manual'].includes(String(data.get('advanceMode')))
           ? String(data.get('advanceMode'))
           : (actionKind === 'announcement' ? 'complete' : 'manual');
@@ -1900,7 +1952,7 @@ root.addEventListener('submit', event => {
           volume: {
             mode: volumeMode,
             percent: clamp(
-              data.get('volumePercent'),
+              iphoneAppleVolume ? existing.volume?.percent : data.get('volumePercent'),
               0,
               100,
               actionKind === 'announcement' ? draft.config.voiceLevel : draft.config.musicLevel
@@ -1934,7 +1986,11 @@ root.addEventListener('submit', event => {
 });
 
 window.addEventListener('pagehide', () => {
-  if (role === 'command') apple.disconnect();
+  if (role === 'command') {
+    apple.disconnect();
+  } else if (role === 'receiver' && runtime.active && isIOSLike()) {
+    runtime.failSafeStop('The iPhone receiver page was hidden. Audio stopped so this device cannot remain a stale live receiver. Reopen Poolside Pulse, tap Start Receiver, then reconnect Apple Music.').catch(() => {});
+  }
 });
 
 bootstrap();

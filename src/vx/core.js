@@ -827,7 +827,7 @@ export function audioPolicy({
     action: 'pause',
     label: 'Apple Music pause-for-voice compatibility',
     detail: isIOS
-      ? `iPhone/iPad browsers cannot set Apple Music playback volume. The ${target}% slider target is not verified for Apple Music here; Apple Music will pause for announcements and resume afterward.`
+      ? 'iPhone/iPad browsers cannot set Apple Music playback volume. Use the receiver iPhone or connected speaker controls; Apple Music will pause for announcements and resume afterward.'
       : `Apple Music volume has not been verified at ${target}% on this receiver. Apple Music will pause for announcements and resume afterward.`
   };
 }

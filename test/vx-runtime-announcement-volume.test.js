@@ -93,8 +93,23 @@ describe('Version X announcement-volume delivery', { concurrency: false }, () =>
     store.state.config.voiceLevel = 88;
     release.resolve();
     await announcement;
+    await new Promise(resolve => setTimeout(resolve, 0));
 
     assert.deepEqual(calls, ['duck', 'voice-37', 'speech-at-37', 'voice-100', 'restore-music']);
+    assert.equal(store.state.activityLog[0].voiceOutput, 'device-speech-fallback');
+    assert.match(store.state.activityLog[0].detail, /device speech requested target 37%/i);
+  });
+
+  test('records generated speech as mixer-controlled output', async () => {
+    const { runtime, store, calls } = harness({ voiceLevel: 64 });
+    runtime.prepareVoice = async () => ({ arrayBuffer: async () => new ArrayBuffer(0) });
+
+    await runtime.announce('Generated pool update');
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    assert.equal(calls.includes('blob-at-64'), true);
+    assert.equal(store.state.activityLog[0].voiceOutput, 'ai-mixer');
+    assert.match(store.state.activityLog[0].detail, /Version X mixer voice 64%/i);
   });
 
   test('passes a live command volume through event dispatch', async () => {

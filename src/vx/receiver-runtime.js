@@ -841,7 +841,13 @@ export class ReceiverRuntime {
       const run = async () => {
         if (!this.active || this.loopInFlight.has(key)) return;
         this.loopInFlight.add(key);
-        try { await fn(); }
+        try {
+          if (isIOSLike() && !this.receiverAudioOperational()) {
+            await this.failSafeStop('The iPhone receiver audio session is no longer running. Audio and cloud ownership stopped; keep this page visible and tap Start Receiver again.');
+            return;
+          }
+          await fn();
+        }
         catch (error) { this.status(error.message || String(error), false); }
         finally { this.loopInFlight.delete(key); }
       };
@@ -958,10 +964,27 @@ export class ReceiverRuntime {
     }
   }
 
+  receiverAudioOperational() {
+    const status = this.audio.status?.() || {};
+    return status.unlocked === true && status.contextState === 'running';
+  }
+
   async onVisibilityChange() {
     if (!this.active) return;
+    if (isIOSLike() && document.visibilityState !== 'visible') {
+      await this.failSafeStop('The iPhone receiver left the foreground. Audio and cloud ownership stopped before Safari could suspend; keep this page visible and tap Start Receiver again.');
+      return;
+    }
     if (document.visibilityState === 'visible') {
-      await this.audio.unlock().catch(() => {});
+      try {
+        await this.audio.unlock();
+        if (isIOSLike() && !this.receiverAudioOperational()) {
+          throw new Error('the iPhone audio context did not return to the running state');
+        }
+      } catch (error) {
+        await this.failSafeStop(`Receiver audio could not resume after the page returned: ${error.message || String(error)}. Tap Start Receiver again.`);
+        return;
+      }
       await this.requestWakeLock();
       await this.heartbeat();
       await this.processPendingEvents();
@@ -1110,8 +1133,21 @@ export class ReceiverRuntime {
     this.audio.stopVoice();
     this.audio.stopMusic();
     this.physicalMusicTarget = null;
+    let immediateApplePauseError = '';
+    let immediateApplePause = Promise.resolve(false);
+    try {
+      // Invoke MusicKit pause synchronously before Safari can suspend this
+      // lifecycle handler. Async confirmation still runs after older work settles.
+      immediateApplePause = Promise.resolve(this.apple.pauseImmediately?.()).catch(error => {
+        immediateApplePauseError = error.message || String(error);
+        return false;
+      });
+    } catch (error) {
+      immediateApplePauseError = error.message || String(error);
+    }
     let settleError = '';
     await this.settleAudioOperations().catch(error => { settleError = error.message || String(error); });
+    await immediateApplePause;
     let applePauseError = '';
     const appleCouldBePlaying = this.apple.ready ||
       this.physicalProvider === 'apple' ||
@@ -1133,7 +1169,7 @@ export class ReceiverRuntime {
       try { await this.wakeLock.release(); } catch {}
       this.wakeLock = null;
     }
-    const stopDetail = [settleError ? `Older audio action still settling: ${settleError}` : '', applePauseError ? `Apple Music could not be confirmed paused: ${applePauseError}` : ''].filter(Boolean).join(' ');
+    const stopDetail = [settleError ? `Older audio action still settling: ${settleError}` : '', immediateApplePauseError ? `Immediate Apple Music pause failed: ${immediateApplePauseError}` : '', applePauseError ? `Apple Music could not be confirmed paused: ${applePauseError}` : ''].filter(Boolean).join(' ');
     this.status(stopDetail ? `${message} ${stopDetail}` : message, false);
     this.onChange();
   }
@@ -2329,6 +2365,8 @@ export class ReceiverRuntime {
   async performAnnouncement(message, options = {}) {
     this.assertAnnouncementActive(options, 'Announcement was cancelled before voice preparation.');
     const voiceBlob = await this.prepareVoice(message, { cacheOnly: !!options.safety });
+    const voiceOutput = voiceBlob ? 'ai-mixer' : 'device-speech-fallback';
+    const voicePercent = clamp(options.volumePercent, 0, 100, this.state.config.voiceLevel);
     this.assertAnnouncementActive(options, 'Announcement was preempted while its voice was preparing.');
     const completed = await this.serializeAudio(async () => {
     this.assertAnnouncementActive(options, 'Announcement was cancelled while waiting for the audio mixer.');
@@ -2342,7 +2380,6 @@ export class ReceiverRuntime {
       : this.physicalCommittedRequestId === this.physicalRequestId;
     let appleSnapshot = null;
     let controlledDucked = false;
-    const voicePercent = clamp(options.volumePercent, 0, 100, this.state.config.voiceLevel);
     const previousVoicePercent = clamp(this.audio.status?.().voiceLevelPercent, 0, 100, this.state.config.voiceLevel);
     let voiceTargetApplied = false;
     const applePauseHeld = provider === 'apple' || !!this.apple.ready;
@@ -2438,10 +2475,18 @@ export class ReceiverRuntime {
         if (draft.receiver?.id !== this.deviceId || draft.receiver?.sessionId !== this.sessionId) {
           throw new Error('Receiver ownership changed before the announcement receipt could be saved.');
         }
-        draft.activityLog = [makeLog(options.safety ? 'safety' : 'announcement', options.label || (options.safety ? 'Safety announcement played' : 'Announcement played'), `${message} [voice ${voicePercent}%]`, this.now(), { eventId: options.eventId || '', voicePercent }), ...(draft.activityLog || [])];
+        const voiceReceipt = voiceOutput === 'ai-mixer'
+          ? `Version X mixer voice ${voicePercent}%`
+          : `device speech requested target ${voicePercent}%`;
+        draft.activityLog = [makeLog(options.safety ? 'safety' : 'announcement', options.label || (options.safety ? 'Safety announcement played' : 'Announcement played'), `${message} [${voiceReceipt}]`, this.now(), { eventId: options.eventId || '', voicePercent, voiceOutput }), ...(draft.activityLog || [])];
         return draft;
       }, 'Announcement completed', { requireDurable: true })
-      .then(() => this.status(`Announcement completed at the ${voicePercent}% voice setting.`, true))
+      .then(() => this.status(
+        voiceOutput === 'ai-mixer'
+          ? `Announcement completed through the Version X mixer at the ${voicePercent}% voice setting.`
+          : `Announcement completed through device speech with a requested ${voicePercent}% target; iPhone speaker loudness cannot be verified in browser code.`,
+        true
+      ))
       .catch(error => this.status(`Announcement completed, but its cloud receipt could not be saved: ${error.message}`, false));
     return completed;
   }

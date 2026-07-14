@@ -188,6 +188,9 @@ export class AppleMusicReceiver {
 
     this.playerPrepared = false;
     this.prepareError = '';
+    this.authorizationPrepared = false;
+    this.authorizationPrepareError = '';
+    this.authorizationPreparePromise = null;
     this.connectPromise = null;
     this.loginPromise = null;
     this.activationState = 'idle';
@@ -206,7 +209,11 @@ export class AppleMusicReceiver {
   }
 
   readiness() {
-    if (!this.loggedIn()) return { status: 'login-required', ready: false, detail: 'Authorize Apple Music on the speaker receiver.' };
+    if (!this.loggedIn()) {
+      return this.authorizationPrepared
+        ? { status: 'authorization-required', ready: false, detail: 'Apple Music setup is ready. Tap Authorize Apple Music in a separate tap.' }
+        : { status: 'setup-required', ready: false, detail: this.authorizationPrepareError || 'First tap Prepare Apple Music, then tap Authorize Apple Music.' };
+    }
     if (this.accessState === 'checking') return { status: 'checking-access', ready: false, detail: 'Apple Music authorization is being checked.' };
     if (!this.accessVerified) return { status: 'access-blocked', ready: false, detail: this.accessError || 'Apple Music authorization has not been verified.' };
     if (!this.playerPrepared) return { status: 'preparing-sdk', ready: false, detail: this.prepareError || 'MusicKit is preparing.' };
@@ -233,6 +240,7 @@ export class AppleMusicReceiver {
       volumeVerified: this.volumeVerified,
       verifiedPercent: this.verifiedPercent,
       activationState: this.activationState,
+      authorizationPrepared: this.authorizationPrepared,
       accessVerified: this.accessVerified,
       ...extra
     });
@@ -274,6 +282,17 @@ export class AppleMusicReceiver {
     this.activationState = 'failed';
     this.activationPromise = null;
     this.activationError = String(message || 'Apple Music audio activation failed.');
+  }
+
+  revokePlaybackReadiness(message) {
+    const detail = String(message || 'Apple Music playback could not be confirmed. Tap Connect Apple Music Receiver again.');
+    this.ready = false;
+    this.deviceUsable = false;
+    this.deviceId = '';
+    this.supportsVolume = false;
+    this.invalidateVolumeOperations();
+    this.failActivation(detail);
+    this.onState(this.current);
   }
 
   loggedIn() {
@@ -427,12 +446,15 @@ export class AppleMusicReceiver {
         this.authorizedThisSession = false;
         storageRemove(AUTHORIZATION_HINT_KEY);
         this.resetAccessVerification('Apple Music authorization ended. Authorize this receiver again.');
+        this.revokePlaybackReadiness('Apple Music authorization ended. Authorize this receiver, then tap Connect Apple Music Receiver again.');
       }
       this.onState(this.current);
     });
     listen('playbackError', event => {
       const message = cleanErrorMessage(event?.error || event, 'Apple Music playback failed.');
-      this.report(`Apple Music playback failed: ${message}`, false, { errorCode: 'APPLE_MUSIC_PLAYBACK' });
+      const detail = `Apple Music playback failed: ${message} Tap Connect Apple Music Receiver again.`;
+      this.revokePlaybackReadiness(detail);
+      this.report(detail, false, { errorCode: 'APPLE_MUSIC_PLAYBACK' });
     });
   }
 
@@ -465,14 +487,60 @@ export class AppleMusicReceiver {
     return await withTimeout(Promise.resolve(target[method](...args)), COMMAND_TIMEOUT_MS, `Apple Music ${method} timed out.`);
   }
 
-  async beginLogin() {
-    if (this.loginPromise) return await this.loginPromise;
-    this.loginPromise = (async () => {
+  async prepareAuthorization() {
+    if (this.authorizationPrepared && this.music) return true;
+    if (this.authorizationPreparePromise) return await this.authorizationPreparePromise;
+    this.authorizationPrepareError = '';
+    this.authorizationPreparePromise = (async () => {
       const music = await this.ensureMusicKit();
-      if (typeof music.authorize !== 'function') throw new Error('MusicKit authorization is unavailable in this browser.');
-      // MusicKit owns the user token. Poolside Pulse never receives it from a
-      // callback and never writes it to local or cloud storage.
-      await withTimeout(Promise.resolve(music.authorize()), 2 * 60_000, 'Apple Music authorization timed out. Tap Login Apple Music and try again.');
+      if (typeof music?.authorize !== 'function') throw new Error('MusicKit authorization is unavailable in this browser.');
+      this.authorizationPrepared = true;
+      this.authorizationPrepareError = '';
+      this.report('Apple Music setup is ready. Tap Authorize Apple Music in a separate tap.', true);
+      return true;
+    })();
+    try {
+      return await this.authorizationPreparePromise;
+    } catch (error) {
+      const message = cleanErrorMessage(error, 'Apple Music setup failed.');
+      this.authorizationPrepared = false;
+      this.authorizationPrepareError = message;
+      this.report(`Apple Music setup is not ready: ${message}`, false);
+      throw error;
+    } finally {
+      this.authorizationPreparePromise = null;
+    }
+  }
+
+  // Backward-compatible name for callers that previously started login here.
+  // Authorization itself must happen in authorizeFromUserGesture on a later tap.
+  async beginLogin() {
+    return await this.prepareAuthorization();
+  }
+
+  // Intentionally not async: MusicKit authorize must be invoked before this
+  // dedicated click handler yields or awaits any other work.
+  authorizeFromUserGesture() {
+    if (this.loggedIn()) return Promise.resolve(true);
+    if (!this.authorizationPrepared || !this.music) {
+      throw new Error('Apple Music is not prepared. Tap Prepare Apple Music first, wait for it to finish, then tap Authorize Apple Music.');
+    }
+    if (this.loginPromise) return this.loginPromise;
+    let authorization;
+    try {
+      // MusicKit owns the user token. Poolside Pulse does not store or forward it.
+      authorization = this.music.authorize();
+    } catch (error) {
+      const message = cleanErrorMessage(error, 'Apple Music authorization could not start from this tap.');
+      this.resetAccessVerification(message);
+      this.report(message, false);
+      throw error;
+    }
+    this.loginPromise = withTimeout(
+      Promise.resolve(authorization),
+      2 * 60_000,
+      'Apple Music authorization timed out. Tap Authorize Apple Music and try again.'
+    ).then(async () => {
       this.authorizedThisSession = true;
       storageSet(AUTHORIZATION_HINT_KEY, '1');
       this.resetAccessVerification();
@@ -480,17 +548,15 @@ export class AppleMusicReceiver {
       await this.preparePlayer();
       this.report('Apple Music authorization passed. Tap Connect Apple Music Receiver on this speaker device.', true);
       return true;
-    })();
-    try {
-      return await this.loginPromise;
-    } catch (error) {
+    }).catch(error => {
       const message = cleanErrorMessage(error, 'Apple Music authorization failed.');
       this.resetAccessVerification(message);
       this.report(message, false);
       throw error;
-    } finally {
+    }).finally(() => {
       this.loginPromise = null;
-    }
+    });
+    return this.loginPromise;
   }
 
   async completeLoginFromCallback() {
@@ -590,13 +656,15 @@ export class AppleMusicReceiver {
     if (!this.loggedIn()) return false;
     const restored = await this.preparePlayer();
     if (restored) {
+      this.authorizationPrepared = true;
+      this.authorizationPrepareError = '';
       this.report('Previous Apple Music authorization restored. Tap Connect Apple Music Receiver on this speaker device.', true);
     }
     return restored;
   }
 
-  // Intentionally not async. When MusicKit exposes prepareToPlay, invoking it
-  // here keeps that call directly inside the receiver's click handler.
+  // Intentionally not async. MusicKit v3 deferPlayback must be invoked directly
+  // inside this dedicated receiver click before the handler awaits other work.
   activateFromUserGesture() {
     if (!this.loggedIn()) throw new Error('Authorize Apple Music on this receiver first.');
     if (!this.playerPrepared || !this.music) throw new Error('Apple Music is still preparing. Wait, then tap Connect Apple Music Receiver.');
@@ -606,10 +674,13 @@ export class AppleMusicReceiver {
     this.activationError = '';
     let activation;
     try {
-      const player = this.music?.player || this.music;
-      activation = typeof player?.prepareToPlay === 'function' ? player.prepareToPlay() : true;
-    } catch {
-      const message = 'Apple Music could not activate from this tap. Tap Connect Apple Music Receiver again.';
+      if (typeof this.music?.deferPlayback !== 'function') {
+        throw new Error('MusicKit deferPlayback is unavailable on this receiver.');
+      }
+      activation = this.music.deferPlayback();
+    } catch (error) {
+      const reason = cleanErrorMessage(error, 'MusicKit deferPlayback failed.');
+      const message = `Apple Music could not activate from this tap: ${reason} Tap Connect Apple Music Receiver again.`;
       this.failActivation(message);
       throw new Error(message);
     }
@@ -842,8 +913,11 @@ export class AppleMusicReceiver {
       if (last.isPlaying === expectedPlaying) return last;
       await wait(150);
     }
+    const message = `Apple Music did not confirm that playback was ${expectedPlaying ? 'playing' : 'paused'} on this receiver. Tap Connect Apple Music Receiver again.`;
+    this.revokePlaybackReadiness(message);
+    this.report(message, false, { errorCode: 'APPLE_MUSIC_PLAYBACK_NOT_CONFIRMED' });
     throw appleError(
-      `Apple Music did not confirm that playback was ${expectedPlaying ? 'playing' : 'paused'} on this receiver.`,
+      message,
       'APPLE_MUSIC_PLAYBACK_NOT_CONFIRMED',
       'MusicKit playbackState'
     );
@@ -868,9 +942,8 @@ export class AppleMusicReceiver {
     try {
       await this.callPlayer('play');
     } catch (error) {
-      if (/not.?allowed|gesture|autoplay/i.test(cleanErrorMessage(error))) {
-        this.failActivation('Apple Music autoplay was blocked. Tap Connect Apple Music Receiver once on this speaker device.');
-      }
+      const reason = cleanErrorMessage(error, 'Apple Music playback failed.');
+      this.revokePlaybackReadiness(`Apple Music could not start playback: ${reason} Tap Connect Apple Music Receiver again.`);
       throw error;
     }
     this.syncCurrent(false);
@@ -897,6 +970,16 @@ export class AppleMusicReceiver {
     return true;
   }
 
+  // Intentionally not async. Lifecycle handlers call this before their first
+  // await so iPhone Safari receives a direct pause request before suspension.
+  pauseImmediately() {
+    const target = typeof this.music?.pause === 'function' ? this.music : this.music?.player;
+    if (!target || typeof target.pause !== 'function') return Promise.resolve(false);
+    const result = target.pause();
+    this.syncCurrent(true);
+    return Promise.resolve(result).then(() => true);
+  }
+
   async resume({ assertCurrent = null } = {}) {
     if (!this.music || !this.ready || !this.deviceId) return false;
     assertOperation(assertCurrent);
@@ -905,9 +988,8 @@ export class AppleMusicReceiver {
     try {
       await this.callPlayer('play');
     } catch (error) {
-      if (/not.?allowed|gesture|autoplay/i.test(cleanErrorMessage(error))) {
-        this.failActivation('Apple Music autoplay was blocked. Tap Connect Apple Music Receiver again.');
-      }
+      const reason = cleanErrorMessage(error, 'Apple Music playback failed.');
+      this.revokePlaybackReadiness(`Apple Music could not resume playback: ${reason} Tap Connect Apple Music Receiver again.`);
       throw error;
     }
     this.syncCurrent(false);
@@ -999,7 +1081,13 @@ export class AppleMusicReceiver {
       this.resetVolumeVerification();
     }
     assertOperation(assertCurrent);
-    await this.callPlayer('play');
+    try {
+      await this.callPlayer('play');
+    } catch (error) {
+      const reason = cleanErrorMessage(error, 'Apple Music playback failed.');
+      this.revokePlaybackReadiness(`Apple Music could not resume after the announcement: ${reason} Tap Connect Apple Music Receiver again.`);
+      throw error;
+    }
     this.syncCurrent(false);
     assertOperation(assertCurrent);
     await this.waitForPlayback(true);

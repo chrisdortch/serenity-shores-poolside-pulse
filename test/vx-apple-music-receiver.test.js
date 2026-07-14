@@ -28,6 +28,7 @@ function installBrowser({ ios = false } = {}) {
 
 function fakeMusicKit() {
   const calls = [];
+  const listeners = new Map();
   const music = {
     isAuthorized: false,
     authorizationStatus: 0,
@@ -42,10 +43,16 @@ function fakeMusicKit() {
         return { data: [{ id: 'us' }] };
       }
     },
-    addEventListener() {},
-    removeEventListener() {},
+    tapActive: false,
+    addEventListener(event, handler) {
+      const handlers = listeners.get(event) || new Set();
+      handlers.add(handler);
+      listeners.set(event, handlers);
+    },
+    removeEventListener(event, handler) { listeners.get(event)?.delete(handler); },
+    emit(event, detail = {}) { for (const handler of listeners.get(event) || []) handler(detail); },
     async authorize() {
-      calls.push(['authorize']);
+      calls.push(['authorize', this.tapActive]);
       this.isAuthorized = true;
       this.authorizationStatus = 3;
       return 'music-user-token-that-must-not-be-stored';
@@ -55,7 +62,10 @@ function fakeMusicKit() {
       this.isAuthorized = false;
       this.authorizationStatus = 0;
     },
-    async prepareToPlay() { calls.push(['prepareToPlay']); },
+    deferPlayback() {
+      calls.push(['deferPlayback', this.tapActive]);
+      return Promise.resolve();
+    },
     async setQueue(options) {
       calls.push(['setQueue', options]);
       this.nowPlayingItem = {
@@ -110,8 +120,18 @@ describe('Version X MusicKit adapter', { concurrency: false }, () => {
     const { kit, music, calls } = fakeMusicKit();
     const receiver = new AppleMusicReceiver({ musicKit: kit, fetchImpl: tokenFetch(calls) });
 
-    await receiver.beginLogin();
-    await receiver.activateFromUserGesture();
+    await receiver.prepareAuthorization();
+    assert.equal(calls.some(call => call[0] === 'authorize'), false);
+    music.tapActive = true;
+    const authorization = receiver.authorizeFromUserGesture();
+    music.tapActive = false;
+    assert.equal(calls.find(call => call[0] === 'authorize')?.[1], true);
+    await authorization;
+    music.tapActive = true;
+    const activation = receiver.activateFromUserGesture();
+    music.tapActive = false;
+    assert.equal(calls.find(call => call[0] === 'deferPlayback')?.[1], true);
+    await activation;
     await receiver.connectFromUserGesture();
     receiver.setTargetVolumePercent(42);
     const played = await receiver.play('https://music.apple.com/us/album/example/123?i=456');
@@ -145,7 +165,8 @@ describe('Version X MusicKit adapter', { concurrency: false }, () => {
     const { kit, calls } = fakeMusicKit();
     const receiver = new AppleMusicReceiver({ musicKit: kit, fetchImpl: tokenFetch(calls) });
 
-    await receiver.beginLogin();
+    await receiver.prepareAuthorization();
+    await receiver.authorizeFromUserGesture();
     await receiver.activateFromUserGesture();
     await receiver.connectFromUserGesture();
     receiver.setTargetVolumePercent(35);
@@ -173,14 +194,15 @@ describe('Version X MusicKit adapter', { concurrency: false }, () => {
     await receiver.activateFromUserGesture();
     await receiver.connectFromUserGesture();
     assert.equal(receiver.ready, true);
-    assert.equal(calls.some(call => call[0] === 'prepareToPlay'), true);
+    assert.equal(calls.some(call => call[0] === 'deferPlayback'), true);
   });
 
   test('blocks speech safety if a playing Apple receiver cannot confirm pause', async () => {
     installBrowser();
     const { kit, music, calls } = fakeMusicKit();
     const receiver = new AppleMusicReceiver({ musicKit: kit, fetchImpl: tokenFetch(calls) });
-    await receiver.beginLogin();
+    await receiver.prepareAuthorization();
+    await receiver.authorizeFromUserGesture();
     await receiver.activateFromUserGesture();
     await receiver.connectFromUserGesture();
     music.playbackState = 'playing';
@@ -188,5 +210,70 @@ describe('Version X MusicKit adapter', { concurrency: false }, () => {
 
     await assert.rejects(receiver.pauseForAnnouncement(), /pause transport failed/i);
     assert.equal(music.playbackState, 'playing');
+  });
+
+  test('fails closed when MusicKit v3 deferPlayback is unavailable', async () => {
+    installBrowser({ ios: true });
+    const { kit, music, calls } = fakeMusicKit();
+    const receiver = new AppleMusicReceiver({ musicKit: kit, fetchImpl: tokenFetch(calls) });
+    await receiver.prepareAuthorization();
+    await receiver.authorizeFromUserGesture();
+    delete music.deferPlayback;
+
+    assert.throws(() => receiver.activateFromUserGesture(), /deferPlayback is unavailable/i);
+    assert.equal(receiver.activationState, 'failed');
+    assert.equal(receiver.ready, false);
+    await assert.rejects(receiver.connectFromUserGesture(), /fresh tap/i);
+  });
+
+  test('playbackError revokes readiness until a fresh Connect tap calls deferPlayback again', async () => {
+    installBrowser({ ios: true });
+    const { kit, music, calls } = fakeMusicKit();
+    const receiver = new AppleMusicReceiver({ musicKit: kit, fetchImpl: tokenFetch(calls) });
+    await receiver.prepareAuthorization();
+    await receiver.authorizeFromUserGesture();
+    await receiver.activateFromUserGesture();
+    await receiver.connectFromUserGesture();
+    assert.equal(receiver.ready, true);
+
+    music.emit('playbackError', { error: new Error('decoder failed') });
+    assert.equal(receiver.ready, false);
+    assert.equal(receiver.activationState, 'failed');
+    await assert.rejects(receiver.connectFromUserGesture(), /fresh tap/i);
+
+    await receiver.activateFromUserGesture();
+    await receiver.connectFromUserGesture();
+    assert.equal(receiver.ready, true);
+    assert.equal(calls.filter(call => call[0] === 'deferPlayback').length, 2);
+  });
+
+  test('playback confirmation failure revokes readiness and requires a fresh Connect tap', async () => {
+    installBrowser({ ios: true });
+    const { kit, music, calls } = fakeMusicKit();
+    const receiver = new AppleMusicReceiver({ musicKit: kit, fetchImpl: tokenFetch(calls) });
+    await receiver.prepareAuthorization();
+    await receiver.authorizeFromUserGesture();
+    await receiver.activateFromUserGesture();
+    await receiver.connectFromUserGesture();
+    music.playbackState = 'paused';
+
+    await assert.rejects(receiver.waitForPlayback(true, 1), /did not confirm.*playing/i);
+    assert.equal(receiver.ready, false);
+    assert.equal(receiver.activationState, 'failed');
+    await assert.rejects(receiver.connectFromUserGesture(), /fresh tap/i);
+  });
+
+  test('invokes a direct lifecycle pause before its promise settles', async () => {
+    installBrowser({ ios: true });
+    const { kit, music, calls } = fakeMusicKit();
+    const receiver = new AppleMusicReceiver({ musicKit: kit, fetchImpl: tokenFetch(calls) });
+    await receiver.prepareAuthorization();
+    music.playbackState = 'playing';
+
+    const pausing = receiver.pauseImmediately();
+
+    assert.equal(calls.at(-1)?.[0], 'pause');
+    assert.equal(receiver.current?.paused, true);
+    assert.equal(await pausing, true);
   });
 });

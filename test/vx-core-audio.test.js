@@ -61,6 +61,15 @@ describe('Poolside Pulse Version X state isolation and volume model', () => {
     assert.equal(controlled.duringVoicePercent, 0);
     assert.equal(apple.duringVoicePercent, 0);
   });
+
+  test('labels iPhone Apple Music as physical-volume pause compatibility', () => {
+    const policy = audioPolicy({ provider: 'apple', isIOS: true, musicPercent: 41, voicePercent: 68 });
+    assert.equal(policy.id, 'apple-ios-pause-only');
+    assert.equal(policy.exact, false);
+    assert.equal(policy.musicPercent, null);
+    assert.match(policy.detail, /receiver iPhone or connected speaker controls/i);
+    assert.doesNotMatch(policy.detail, /41% slider/i);
+  });
 });
 
 describe('Version X announcement output level', () => {
@@ -71,5 +80,37 @@ describe('Version X announcement output level', () => {
     assert.equal(engine.status().voiceLevelPercent, 48);
     assert.equal(engine.setVoiceLevelPercent(500, { report: false }), 100);
     assert.equal(engine.status().voiceLevelPercent, 100);
+  });
+
+  test('clears a stale unlock after iPhone audio resume fails', async () => {
+    const engine = new AudioEngine();
+    const context = {
+      state: 'suspended',
+      async resume() { throw new Error('resume blocked'); }
+    };
+    engine.context = context;
+    engine.unlocked = true;
+    engine.ensureGraph = () => context;
+    engine.primeMusicElement = async () => true;
+
+    await assert.rejects(engine.unlock(), /resume blocked/i);
+    assert.equal(engine.unlocked, false);
+    assert.equal(engine.status().unlocked, false);
+  });
+
+  test('does not treat a fulfilled resume as unlocked while the context stays suspended', async () => {
+    const engine = new AudioEngine();
+    const context = {
+      state: 'suspended',
+      async resume() { return true; }
+    };
+    engine.context = context;
+    engine.unlocked = true;
+    engine.ensureGraph = () => context;
+    engine.primeMusicElement = async () => true;
+
+    await assert.rejects(engine.unlock(), /audio is suspended/i);
+    assert.equal(engine.status().unlocked, false);
+    assert.equal(engine.musicPlaying(), false);
   });
 });

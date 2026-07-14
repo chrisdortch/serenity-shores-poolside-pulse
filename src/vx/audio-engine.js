@@ -207,7 +207,7 @@ export class AudioEngine {
   status() {
     return {
       supported: !!audioContextConstructor(),
-      unlocked: this.unlocked,
+      unlocked: this.isOperational(),
       contextState: this.context?.state || 'not-created',
       musicLevelPercent: Math.round(this.musicLevel * 100),
       voiceLevelPercent: Math.round(this.voiceLevel * 100),
@@ -218,6 +218,10 @@ export class AudioEngine {
       url: this.currentUrl,
       scheduledRunToken: this.currentRunToken
     };
+  }
+
+  isOperational() {
+    return this.unlocked && this.context?.state === 'running';
   }
 
   report(message, ok = true) {
@@ -294,12 +298,17 @@ export class AudioEngine {
           5_000,
           'Receiver audio did not start. Keep this page visible, check the browser sound permission, and tap Start Receiver again.'
         );
-    await Promise.all([contextResume, mediaPrime]);
-    if (context.state !== 'running') throw new Error(`Receiver audio is ${context.state}. Tap Start Receiver again while this page is visible.`);
-    this.unlocked = true;
-    if (audibleTest) await this.playUnlockTone();
-    this.report(`Receiver mixer ready: music is set to ${Math.round(this.musicLevel * 100)}% and announcements to ${Math.round(this.voiceLevel * 100)}%.`, true);
-    return true;
+    try {
+      await Promise.all([contextResume, mediaPrime]);
+      if (context.state !== 'running') throw new Error(`Receiver audio is ${context.state}. Tap Start Receiver again while this page is visible.`);
+      this.unlocked = true;
+      if (audibleTest) await this.playUnlockTone();
+      this.report(`Receiver mixer ready: music is set to ${Math.round(this.musicLevel * 100)}% and announcements to ${Math.round(this.voiceLevel * 100)}%.`, true);
+      return true;
+    } catch (error) {
+      this.unlocked = false;
+      throw error;
+    }
   }
 
   async playUnlockTone() {
@@ -475,7 +484,7 @@ export class AudioEngine {
   }
 
   async playMusicUrl(url, { label = 'Suno / direct audio', loop = false, startAt = 0, scheduledRunToken = '' } = {}) {
-    if (!this.unlocked) throw new Error('Start Receiver before playing music.');
+    if (!this.isOperational()) throw new Error('Start Receiver before playing music.');
     const raw = String(url || '').trim();
     if (!/^https:\/\//i.test(raw)) throw new Error('Music needs a secure HTTPS Suno or direct audio URL.');
     this.stopBuiltInBed();
@@ -518,6 +527,7 @@ export class AudioEngine {
   }
 
   musicPlaying() {
+    if (!this.isOperational()) return false;
     return !!this.builtInBed || (!!this.musicElement && !this.musicElement.paused && !this.musicElement.ended);
   }
 
@@ -566,7 +576,7 @@ export class AudioEngine {
   }
 
   playBuiltInBed({ label = 'Receiver calibration bed' } = {}) {
-    if (!this.unlocked) throw new Error('Start Receiver before playing the calibration bed.');
+    if (!this.isOperational()) throw new Error('Start Receiver before playing the calibration bed.');
     this.stopMusic();
     const context = this.ensureGraph();
     const master = context.createGain();
@@ -636,7 +646,7 @@ export class AudioEngine {
   }
 
   async playVoiceBlob(blob) {
-    if (!this.unlocked) throw new Error('Start Receiver before playing announcements.');
+    if (!this.isOperational()) throw new Error('Start Receiver before playing announcements.');
     const context = this.ensureGraph();
     const bytes = await blob.arrayBuffer();
     const buffer = await context.decodeAudioData(bytes.slice(0));

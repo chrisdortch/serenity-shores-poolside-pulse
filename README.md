@@ -17,20 +17,20 @@ No other Serenity Shores repository, Vercel project, database namespace, domain,
 
 - Plays Suno shares/playlists and direct HTTPS audio through the receiver-owned Web Audio mixer.
 - Plays Apple Music URLs inside the same open, signed-in MusicKit receiver page.
-- Provides independent 0–100 global music and spoken-announcement controls.
-- Lets every scheduled music or announcement item inherit its global level or use a custom 0–100 level.
+- Provides independent 0–100 global Suno/direct-music and spoken-announcement controls.
+- Lets every scheduled Suno/direct music or announcement item inherit its global level or use a custom 0–100 level.
 - Fully silences Suno/direct music during speech, then continues the same track.
 - Fades and pauses Apple Music before Suno or speech. Apple Music and the interruption do not overlap. It resumes only after the interruption finishes and only if it was playing beforehand.
 - Shows Apple Music volume as exact only when a desktop-class receiver sets and reads back the same MusicKit value. iPhone/iPad is honestly labeled pause-only because browser code cannot control physical output volume there.
-- Requires one open, plugged-in desktop receiver for unattended schedules. A suspended browser cannot be treated as a reliable audio appliance.
+- Supports foreground schedules on an iPhone receiver. A suspended iPhone browser cannot be treated as an unattended audio appliance; hiding the page intentionally stops audio and stops lease renewal so cloud ownership expires safely.
 
 Apple Music playback also requires an active Apple Music subscription on the Apple Account authorized on the speaker receiver. Apple Developer Program membership alone does not supply playback entitlement.
 
-## Three things needed from the owner
+## Owner setup status
 
-1. In [Certificates, Identifiers & Profiles](https://developer.apple.com/account/resources/identifiers/list), create a **Media ID** named `Poolside Pulse X`, use a unique identifier such as `com.serenityshores.poolsidepulsex`, and enable MusicKit.
-2. In [Keys](https://developer.apple.com/account/resources/authkeys/list), create a dedicated **Media Services key** connected to that Media ID. Send the Team ID, Key ID, Media ID, and the local filesystem path where the downloaded `.p8` file is saved. Do not paste the private key into chat and do not place it in this repository.
-3. Send the exact `https://music.apple.com/...` song/album/playlist URLs to use and confirm the receiver Apple Account has an active Apple Music subscription.
+The dedicated Apple configuration is ready: Team ID `HHX689967A`, Key ID `8G28BYBZT2`, and Media ID `media.com.serenityshores.poolsidepulsex`. The `.p8` private key stays outside this repository and is used only as a protected server environment variable.
+
+The remaining owner inputs are the exact `https://music.apple.com/...` song, album, or playlist URLs to save and an active Apple Music subscription on the receiver iPhone's Apple Account.
 
 Apple’s detailed setup reference is [Create a media identifier and private key](https://developer.apple.com/help/account/capabilities/create-a-media-identifier-and-private-key). Poolside Pulse generates short-lived MusicKit developer tokens on the server; the `.p8` private key is never sent to the browser.
 
@@ -57,6 +57,19 @@ Also supported:
 - `XWEATHER_CLIENT_ID` and `XWEATHER_CLIENT_SECRET` as an optional weather supplement.
 
 Production requires durable KV, a dedicated session secret, and a valid access code. The receiver refuses to claim operational ownership without durable synchronization.
+
+## Two-iPhone operation
+
+Use two separate iPhones:
+
+1. **Receiver iPhone:** connect it to the pool speakers and power, turn off Low Power Mode, set **Settings → Display & Brightness → Auto-Lock → Never**, and keep the Version X receiver page visible in Safari or its Home Screen web app. Choose **Speaker Receiver**, tap **Prepare Apple Music**, then tap **Authorize Apple Music**. After Apple accepts the account, tap **Start Receiver**, followed by **Connect Apple Music Receiver**.
+2. **Command iPhone:** open Version X in Remote Control mode and send live or scheduled Apple Music, Suno, and announcement commands from this second phone.
+
+Do not switch apps, lock, or hide the receiver page during a schedule. Version X fails closed when the iPhone receiver leaves the foreground: it stops its audio paths immediately, stops renewing cloud ownership so the 45-second lease expires, and requires fresh Start/Connect taps when reopened.
+
+On an iPhone receiver, Apple Music playback level is set with the receiver iPhone or connected speaker's physical volume controls. MusicKit for the web cannot set or verify that physical output level, so Version X does not claim that Apple Music live or scheduled percentages were applied. Suno/direct audio and generated announcement audio remain adjustable from 0–100 in Version X. If generated speech is unavailable and iPhone device speech is used as a fallback, its percentage is a requested target rather than verified speaker loudness.
+
+For genuinely unattended schedules, use an always-on desktop receiver or build a native iOS receiver with the required background-audio behavior; a foreground browser page is not an unattended service.
 
 ## Local verification
 
