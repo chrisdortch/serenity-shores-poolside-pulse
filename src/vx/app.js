@@ -347,7 +347,7 @@ async function bootstrapAuthenticatedApp() {
   const requestedRole = location.hash === '#receiver' ? 'receiver' : location.hash === '#command' ? 'command' : '';
   if (requestedRole) await setRole(requestedRole, { silent: true });
   if (role === 'command') apple.disconnect();
-  else await restoreStoredAppleAuthorization();
+  else if (!apple.nativeEnabled?.()) await restoreStoredAppleAuthorization();
   store.startPolling(2_500);
   render();
 }
@@ -639,7 +639,7 @@ function musicSourceForm() {
   const config = store.state.config;
   if (config.musicProvider === 'apple') {
     const iphoneApple = activeReceiverIsIOS();
-    const policy = audioPolicy({ provider: 'apple', isIOS: iphoneApple, supportsVolume: apple.supportsVolume, volumeVerified: apple.volumeVerified, verifiedPercent: apple.verifiedPercent, musicPercent: config.musicLevel, voicePercent: audibleVoiceTarget() });
+    const policy = displayAudioPolicy('apple');
     const receiverAppleMusicReady = receiverOnline(store.state.receiver, store.now()) && store.state.receiver?.appleStatus === 'ready';
     return `
       <form data-form="apple-play" class="sourceForm">
@@ -862,6 +862,9 @@ function renderSchedule() {
   const schedule = activeSavedSchedule();
   const items = Array.isArray(schedule.items) ? schedule.items : [];
   const enabledItems = items.filter(item => item.enabled !== false);
+  const scheduleHasApple = enabledItems.some(item => scheduleItemKind(item) === 'apple');
+  const nativeScheduleReceiver = nativeMusicContext();
+  const nativeAppleReady = store.state.receiver?.appleStatus === 'ready';
   const sequenceRun = normalizeSequenceRun(store.state.sequenceRuns?.[schedule.id]);
   const isLiveSchedule = store.state.activeScheduleId === schedule.id && schedule.enabled !== false;
   const orderBusy = ['claiming', 'waiting-duration', 'waiting-track-end', 'auto-pending'].includes(sequenceRun.status);
@@ -900,8 +903,8 @@ function renderSchedule() {
       <div class="scheduleList">${items.map((item, index) => renderScheduleRow(item, schedule, index)).join('')}</div>
       <button type="button" data-action="add-schedule-item" class="secondary addButton">+ Add Schedule Item</button>
     </section>
-    ${liveReceiverIsNative()
-      ? `<div class="callout ${store.state.receiver?.appleStatus === 'ready' ? '' : 'warning'}"><strong>${store.state.receiver?.appleStatus === 'ready' ? 'Mac schedule receiver ready' : 'Apple schedule setup required'}</strong><p>${store.state.receiver?.appleStatus === 'ready' ? 'Leave Poolside Pulse X Music Receiver running, Music.app signed in, and the Mac connected to the pool speaker output. The app keeps the Mac awake; use any other device for commands.' : escapeHtml(store.state.receiver?.appleDetail || 'On the receiver Mac, allow Music.app control and tap Connect Music.app Receiver before relying on Apple schedule items.')}</p></div>`
+    ${nativeScheduleReceiver
+      ? `<div class="callout ${scheduleHasApple && !nativeAppleReady ? 'warning' : ''}"><strong>${scheduleHasApple ? nativeAppleReady ? 'Mac Apple schedule receiver ready' : 'Apple schedule setup required' : 'Mac schedule receiver'}</strong><p>${scheduleHasApple && !nativeAppleReady ? escapeHtml(store.state.receiver?.appleDetail || 'On the receiver Mac, tap Start Receiver, allow Music.app control, then tap Connect Music.app Receiver before relying on Apple schedule items.') : 'Leave Poolside Pulse X Music Receiver running and the Mac connected to the pool speaker output. The app keeps the Mac awake; use any other device for commands.'}</p></div>`
       : `<div class="callout warning"><strong>iPhone schedule requirement</strong><p>Keep the authorized receiver iPhone plugged in and this page visible; use a separate iPhone for commands. If the receiver page is hidden or locked, Version X stops safely and requires fresh Start and Connect taps. Apple Music also requires an active subscription and uses physical speaker volume. For unattended Apple Music schedules, use the Poolside Pulse X Music Receiver Mac app.</p></div>`}`;
 }
 
@@ -967,7 +970,7 @@ function renderSettings() {
           ? `<div class="capabilityCard ${(nativeLocal ? apple.accessVerified : store.state.receiver?.appleVolumeCapability === 'read-write-0-100') ? 'verified' : 'limited'}"><span>Manager volume path</span><strong>Music.app read/write 0–100</strong><p>${cloudAppleMusicVerified() ? `The receiver most recently read back the active ${config.musicLevel}% target.` : `The receiver applies ${config.musicLevel}% and reads it back whenever Apple Music playback starts or the manager moves the slider.`}</p></div>`
           : `<div class="capabilityCard ${applePolicy.exact ? 'verified' : 'limited'}"><span>${applePolicy.exact ? 'Supported receiver' : 'Compatibility only'}</span><strong>${escapeHtml(applePolicy.label)}</strong><p>${escapeHtml(applePolicy.detail)}</p></div>`}
         ${role === 'receiver'
-          ? `<div class="stackedActions">${appleSetupButton({ disabled: apple.loggedIn() && !runtime.isOwner() })}${apple.loggedIn() ? `<button data-action="apple-logout" class="secondary">${nativeLocal ? 'Disconnect Music.app' : 'Remove Apple Music Authorization'}</button>` : ''}</div>${apple.loggedIn() && !runtime.isOwner() ? '<div class="callout"><strong>Start Receiver before connecting Apple Music.</strong><p>Only the device holding the live receiver lease may become the Apple Music player.</p></div>' : ''}`
+          ? `<div class="stackedActions">${appleSetupButton({ disabled: apple.loggedIn() && !runtime.isOwner() })}${nativeLocal ? apple.ready ? '<button data-action="apple-logout" class="secondary">Disconnect Music.app</button>' : '' : apple.loggedIn() ? '<button data-action="apple-logout" class="secondary">Remove Apple Music Authorization</button>' : ''}</div>${apple.loggedIn() && !runtime.isOwner() ? '<div class="callout"><strong>Start Receiver before connecting Apple Music.</strong><p>Only the device holding the live receiver lease may become the Apple Music player.</p></div>' : ''}`
           : '<div class="callout"><strong>Apple Music controls live only on the speaker receiver.</strong><p>Remote devices send commands and never authorize or connect an Apple Music account.</p></div>'}
         <div class="policyNote"><strong>Required for live and scheduled playback:</strong> ${nativeContext ? 'Music.app signed in to an active Apple Music subscription, the Mac receiver app running, and its macOS Automation permission allowed.' : 'an active Apple Music subscription, an authorized MusicKit session, and this receiver page kept open on the speaker device.'} Apple pauses before Suno or speech; there is no overlap. ${iphoneApple ? 'This active iPhone receiver uses its physical speaker volume; Apple custom percentage targets are disabled. Suno and voice remain adjustable.' : nativeContext ? 'The Mac receiver applies and reads back the requested 0–100 Music.app volume.' : 'Desktop receivers may verify exact Apple Music volume.'}</div>
       </section>
@@ -1140,12 +1143,16 @@ function selectTab(nextTab, { discardDirty = false } = {}) {
 
 async function setRole(nextRole, { silent = false } = {}) {
   if (!['receiver', 'command'].includes(nextRole)) return;
+  if (apple.nativeEnabled?.() && nextRole !== 'receiver') {
+    if (!silent) setFeedback('The Mac receiver app stays in Speaker Receiver mode. Use the Version X URL on another device for Remote Control.', false);
+    return;
+  }
   if (role === 'receiver' && nextRole === 'command' && runtime.active) await runtime.stop();
   role = nextRole;
   localStorage.setItem(ROLE_KEY, role);
   try {
     const cleanUrl = new URL(location.href);
-    cleanUrl.hash = '';
+    cleanUrl.hash = apple.nativeEnabled?.() && nextRole === 'receiver' ? 'receiver' : '';
     history.replaceState(null, '', cleanUrl);
   } catch {}
   activeTab = role === 'receiver' ? 'receiver' : 'control';
@@ -1159,7 +1166,7 @@ async function setRole(nextRole, { silent = false } = {}) {
     if (!silent) setFeedback('Remote Control mode: this device will never produce receiver audio.', true);
   } else {
     if (!silent) setFeedback('Speaker Receiver mode selected. Tap Start Receiver while connected to the speakers.', true);
-    if (apple.loggedIn()) await restoreStoredAppleAuthorization({ reportSuccess: !silent });
+    if (apple.loggedIn() && !apple.nativeEnabled?.()) await restoreStoredAppleAuthorization({ reportSuccess: !silent });
   }
   renderWhenIdle(true);
 }
@@ -1571,7 +1578,7 @@ root.addEventListener('click', event => {
       return await runAction('Authorizing Apple Music', () => authorization);
     }
     if (action === 'apple-logout') {
-      return await runAction('Removing Apple Music login', async () => {
+      return await runAction(apple.nativeEnabled?.() ? 'Disconnecting Music.app' : 'Removing Apple Music login', async () => {
         const appleCouldBeAudible = apple.ready || runtime.physicalProvider === 'apple' ||
           (store.state.playback.provider === 'apple' && store.state.playback.intent === 'playing');
         if (runtime.isOwner() && appleCouldBeAudible) await runtime.pauseMusic();

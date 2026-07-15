@@ -30,8 +30,10 @@ public final class ReceiverBridgeService {
                 url: request.appleMusicURL(),
                 volume: request.volume("volumePercent", default: 30)
             ).dictionary
-        case "pause", "pauseImmediate":
+        case "pause":
             return try music.pause().dictionary
+        case "pauseImmediate":
+            return try music.silenceAndPause().dictionary
         case "resume":
             return try music.resume(volume: request.volume("volumePercent", default: 30)).dictionary
         case "next":

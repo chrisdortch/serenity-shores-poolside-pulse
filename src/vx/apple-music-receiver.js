@@ -285,6 +285,37 @@ export class AppleMusicReceiver {
     }
   }
 
+  async prepareForReceiverStart() {
+    if (!this.nativeEnabled()) return true;
+    const raw = await this.nativeCall('failSafePause');
+    const state = nativePlaybackState(raw);
+    if (!state.playbackStateVerified || state.isPlaying || !state.volumeVerified || state.volume !== 0) {
+      const message = 'Music.app did not explicitly confirm paused playback at 0% volume, so the receiver stayed offline.';
+      const error = appleError(message, 'APPLE_MUSIC_NATIVE_PAUSE_UNCONFIRMED', 'Music.app receiver start');
+      error.applePauseUnconfirmed = true;
+      this.resetAccessVerification(message);
+      this.revokePlaybackReadiness(message);
+      this.report(message, false, { errorCode: error.code, errorOperation: error.appleOperation });
+      throw error;
+    }
+    this.authorizationPrepared = true;
+    this.authorizedThisSession = true;
+    this.accessState = 'verified';
+    this.accessVerified = true;
+    this.accessVerifiedAt = this.now();
+    this.accessError = '';
+    this.accountProfile = {
+      displayName: 'Authorized macOS Music.app account',
+      accountId: 'music-app@receiver-mac',
+      storefrontId: ''
+    };
+    this.playerPrepared = true;
+    this.prepareError = '';
+    this.applyNativePlayback(raw, true);
+    this.report('Music.app is confirmed silent. The Mac can now claim the speaker receiver.', true, state);
+    return true;
+  }
+
   applyNativePlayback(result = {}, forcePaused = null) {
     const state = nativePlaybackState(result);
     const paused = forcePaused === null ? !state.isPlaying : !!forcePaused;
@@ -1105,6 +1136,9 @@ export class AppleMusicReceiver {
     if (this.nativeEnabled()) {
       const raw = await this.nativeCall('state');
       const state = this.applyNativePlayback(raw);
+      if (!state.playbackStateVerified) {
+        throw appleError('Music.app did not return an explicit, internally consistent player state.', 'APPLE_MUSIC_NATIVE_STATE_UNVERIFIED', 'Music.app state');
+      }
       const verifiedAtTarget = state.supportsVolume && state.volumeVerified && state.volume === this.targetVolumePercent;
       this.supportsVolume = state.supportsVolume;
       this.volumeVerified = verifiedAtTarget;
@@ -1172,6 +1206,19 @@ export class AppleMusicReceiver {
       assertOperation(assertCurrent);
       const volume = await this.enforceVolume();
       assertOperation(assertCurrent);
+      if (!volume.verified) {
+        try {
+          const silenced = nativePlaybackState(await this.nativeCall('failSafePause'));
+          if (!silenced.playbackStateVerified || silenced.isPlaying || !silenced.volumeVerified || silenced.volume !== 0) {
+            throw new Error('Music.app did not confirm paused playback at 0% volume.');
+          }
+        } catch (error) {
+          const failure = appleError(`Music.app volume was not verified and silence could not be confirmed: ${cleanErrorMessage(error)}`, 'APPLE_MUSIC_NATIVE_PAUSE_UNCONFIRMED', 'Music.app fail-safe pause');
+          failure.applePauseUnconfirmed = true;
+          throw failure;
+        }
+        throw appleError(`Music.app started, but ${this.targetVolumePercent}% volume was not verified, so playback was silenced.`, 'APPLE_MUSIC_NATIVE_VOLUME_UNVERIFIED', 'Music.app volume readback');
+      }
       this.report(`Apple Music is playing through Music.app at verified ${this.targetVolumePercent}%.`, true, { playback: state, volume, native: true });
       return { state, volume };
     }
@@ -1341,7 +1388,7 @@ export class AppleMusicReceiver {
       }
       const raw = await this.nativeCall('pauseForAnnouncement', { targetPercent: this.targetVolumePercent });
       const reported = nativePlaybackState(raw.state || raw);
-      if (reported.isPlaying) throw appleError('Music.app could not be confirmed paused.', 'APPLE_MUSIC_PAUSE_UNCONFIRMED', 'Music.app state');
+      if (!reported.playbackStateVerified || reported.isPlaying) throw appleError('Music.app could not be explicitly confirmed paused.', 'APPLE_MUSIC_PAUSE_UNCONFIRMED', 'Music.app state');
       const state = this.applyNativePlayback(raw.state || raw, true);
       this.resetVolumeVerification();
       return {

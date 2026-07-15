@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import { afterEach, beforeEach, describe, test } from 'node:test';
 
 import { AppleMusicReceiver } from '../src/vx/apple-music-receiver.js';
+import { ReceiverRuntime } from '../src/vx/receiver-runtime.js';
+import { createDefaultState } from '../src/vx/core.js';
 import {
   nativeMusicRequest,
   nativePlaybackState
@@ -44,8 +46,13 @@ function installNativeBridge() {
         state.isPlaying = true;
         return Promise.resolve({ ok: true, result: result() });
       case 'pause':
-      case 'pauseImmediate':
       case 'stop':
+        state.playerState = 'paused';
+        state.isPlaying = false;
+        return Promise.resolve({ ok: true, result: result() });
+      case 'pauseImmediate':
+        state.volume = 0;
+        state.verifiedPercent = 0;
         state.playerState = 'paused';
         state.isPlaying = false;
         return Promise.resolve({ ok: true, result: result() });
@@ -98,7 +105,7 @@ function installNativeBridge() {
     configurable: true,
     value: { messageHandlers: { poolsideMusic: { postMessage } } }
   });
-  return { calls, state };
+  return { calls, state, postMessage };
 }
 
 function installBrowser() {
@@ -180,6 +187,7 @@ describe('Version X native macOS Music.app bridge', { concurrency: false }, () =
     const pausing = receiver.pauseImmediately();
     assert.equal(fake.calls.at(-1).method, 'pauseImmediate');
     assert.equal(await pausing, true);
+    assert.equal(fake.state.volume, 0);
   });
 
   test('fails closed on missing native volume readback fields', () => {
@@ -188,6 +196,8 @@ describe('Version X native macOS Music.app bridge', { concurrency: false }, () =
     assert.equal(parsed.volumeVerified, false);
     assert.equal(parsed.volume, null);
     assert.equal(parsed.verifiedPercent, null);
+    assert.equal(parsed.playbackStateVerified, false);
+    assert.equal(parsed.isPlaying, true);
   });
 
   test('queues a fail-safe native pause after an ambiguous mutating timeout', async () => {
@@ -196,15 +206,79 @@ describe('Version X native macOS Music.app bridge', { concurrency: false }, () =
     globalThis.webkit.messageHandlers.poolsideMusic.postMessage = payload => {
       calls.push(payload);
       if (payload.method === 'play') return new Promise(() => {});
-      return Promise.resolve({ ok: true, result: {} });
+      return new Promise(resolve => setTimeout(() => resolve({
+          ok: true,
+          result: {
+            playerState: 'paused', isPlaying: false,
+            volume: 0, verifiedPercent: 0,
+            supportsVolume: true, volumeVerified: true
+          }
+        }), 12));
     };
 
+    const startedAt = Date.now();
     await assert.rejects(
       nativeMusicRequest('play', { url: 'https://music.apple.com/us/album/example/1', volumePercent: 30 }, { timeoutMs: 5 }),
       /timed out/i
     );
+    assert.equal(Date.now() - startedAt >= 12, true);
     await new Promise(resolve => setTimeout(resolve, 0));
     assert.deepEqual(calls.map(call => call.method), ['play', 'failSafePause']);
+  });
+
+  test('rejects a malformed pause response instead of treating missing state as silence', async () => {
+    const fake = installNativeBridge();
+    const original = fake.postMessage;
+    globalThis.webkit.messageHandlers.poolsideMusic.postMessage = payload => payload.method === 'pauseForAnnouncement'
+      ? Promise.resolve({ ok: true, result: {} })
+      : original(payload);
+    const receiver = await connectedReceiver();
+
+    await assert.rejects(receiver.pauseForAnnouncement(), /explicitly confirmed paused/i);
+  });
+
+  test('does not claim a receiver when native start silence cannot be confirmed', async () => {
+    let unlocked = false;
+    let mutated = false;
+    const state = createDefaultState(1_000);
+    const runtime = new ReceiverRuntime({
+      store: {
+        state,
+        now: () => 1_000,
+        durableReady: () => true,
+        async mutate() { mutated = true; }
+      },
+      audio: {
+        async unlock() { unlocked = true; },
+        status: () => ({ unlocked: false })
+      },
+      apple: {
+        nativeEnabled: () => true,
+        async prepareForReceiverStart() { throw new Error('Music.app silence denied'); }
+      }
+    });
+
+    await assert.rejects(runtime.start(), /silence denied/i);
+    assert.equal(unlocked, false);
+    assert.equal(mutated, false);
+    assert.equal(state.receiver, null);
+  });
+
+  test('native receiver start silences a manually playing Music.app before setup can continue', async () => {
+    const fake = installNativeBridge();
+    fake.state.playerState = 'playing';
+    fake.state.isPlaying = true;
+    fake.state.volume = 63;
+    fake.state.verifiedPercent = 63;
+    const receiver = new AppleMusicReceiver();
+
+    await receiver.prepareForReceiverStart();
+
+    assert.equal(fake.calls[0].method, 'failSafePause');
+    assert.equal(fake.state.isPlaying, false);
+    assert.equal(fake.state.volume, 0);
+    assert.equal(receiver.playerPrepared, true);
+    assert.equal(receiver.accessVerified, true);
   });
 
   test('silences Music.app before disconnecting the native receiver', async () => {

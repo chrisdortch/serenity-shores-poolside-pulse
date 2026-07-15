@@ -10,6 +10,7 @@ struct ReceiverWebView: NSViewRepresentable {
     @MainActor
     final class Coordinator: NSObject, WKNavigationDelegate, WKScriptMessageHandlerWithReply {
         private let bridge = ReceiverBridgeService()
+        private var acceptedMainFrameLoad = false
 
         nonisolated func userContentController(
             _ userContentController: WKUserContentController,
@@ -17,10 +18,13 @@ struct ReceiverWebView: NSViewRepresentable {
             replyHandler: @escaping (Any?, String?) -> Void
         ) {
             let origin = message.frameInfo.securityOrigin
+            let frameURL = message.frameInfo.request.url
             let allowed = message.frameInfo.isMainFrame
                 && origin.protocol.lowercased() == "https"
                 && origin.host.lowercased() == allowedHost
                 && (origin.port == 0 || origin.port == 443)
+                && frameURL?.path == "/"
+                && frameURL?.fragment == "receiver"
             let body = message.body
             Task { @MainActor [weak self] in
                 guard allowed, let self else {
@@ -50,8 +54,23 @@ struct ReceiverWebView: NSViewRepresentable {
                 && url.host?.lowercased() == allowedHost
                 && (url.port == nil || url.port == 443)
                 && (url.path.isEmpty || url.path == "/")
-            if scheme == "about" || exactReceiverPage {
+                && url.fragment == "receiver"
+            if scheme == "about" {
                 decisionHandler(.allow)
+                return
+            }
+            if exactReceiverPage {
+                Task { @MainActor [weak self] in
+                    guard let self else {
+                        decisionHandler(.cancel)
+                        return
+                    }
+                    if self.acceptedMainFrameLoad {
+                        MusicAutomation.shared.failSafePause()
+                    }
+                    self.acceptedMainFrameLoad = true
+                    decisionHandler(.allow)
+                }
                 return
             }
             if scheme == "https" && navigationAction.navigationType == .linkActivated {

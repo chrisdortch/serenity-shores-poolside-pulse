@@ -4,6 +4,7 @@ export const NATIVE_MUSIC_BRIDGE_VERSION = 1;
 export const NATIVE_MUSIC_BRIDGE_NAME = 'poolsideMusic';
 
 const REQUEST_TIMEOUT_MS = 15_000;
+const FAIL_SAFE_TIMEOUT_MS = 20_000;
 const MUTATING_METHODS = new Set([
   'play', 'pause', 'pauseImmediate', 'resume', 'next', 'stop', 'setVolume',
   'pauseForAnnouncement', 'resumeAfterAnnouncement'
@@ -44,7 +45,47 @@ export function nativeMusicBridgeInfo() {
   };
 }
 
-export async function nativeMusicRequest(method, params = {}, { timeoutMs = REQUEST_TIMEOUT_MS } = {}) {
+function bridgeError(error, fallback, extra = {}) {
+  return Object.assign(new Error(cleanBridgeError(error, fallback)), extra);
+}
+
+async function confirmFailSafePause(timeoutMs = FAIL_SAFE_TIMEOUT_MS) {
+  let posted;
+  try {
+    posted = handler()?.postMessage?.({
+      v: NATIVE_MUSIC_BRIDGE_VERSION,
+      requestId: `failsafe-${Date.now().toString(36)}-${(++requestSequence).toString(36)}`,
+      method: 'failSafePause',
+      params: {}
+    });
+  } catch (error) {
+    throw bridgeError(error, 'The native Music.app fail-safe pause could not be dispatched.');
+  }
+  let timer = null;
+  try {
+    const response = await Promise.race([
+      Promise.resolve(posted),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error('The native Music.app fail-safe pause timed out.')), timeoutMs);
+      })
+    ]);
+    if (!response || response.ok !== true) {
+      throw new Error(cleanBridgeError(response?.error, 'The native Music.app fail-safe pause failed.'));
+    }
+    const state = nativePlaybackState(response.result);
+    if (!state.playbackStateVerified || state.isPlaying || !state.volumeVerified || state.volume !== 0) {
+      throw new Error('Music.app did not explicitly confirm both paused playback and 0% volume.');
+    }
+    return state;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+export async function nativeMusicRequest(method, params = {}, {
+  timeoutMs = REQUEST_TIMEOUT_MS,
+  failSafeTimeoutMs = timeoutMs < 1_000 ? Math.max(50, timeoutMs * 4) : FAIL_SAFE_TIMEOUT_MS
+} = {}) {
   if (!nativeMusicBridgeAvailable()) throw new Error('The native Apple Music receiver bridge is unavailable.');
   const safeMethod = String(method || '').trim();
   if (!/^[a-z][A-Za-z]{0,39}$/.test(safeMethod)) throw new Error('Invalid native Apple Music request.');
@@ -81,15 +122,20 @@ export async function nativeMusicRequest(method, params = {}, { timeoutMs = REQU
     // cannot become audible after the web runtime has failed the command.
     if (MUTATING_METHODS.has(safeMethod)) {
       try {
-        Promise.resolve(handler()?.postMessage?.({
-          v: NATIVE_MUSIC_BRIDGE_VERSION,
-          requestId: `failsafe-${Date.now().toString(36)}-${(++requestSequence).toString(36)}`,
-          method: 'failSafePause',
-          params: {}
-        })).catch(() => {});
-      } catch {}
+        await confirmFailSafePause(failSafeTimeoutMs);
+      } catch (pauseError) {
+        throw bridgeError(
+          `${cleanBridgeError(error)} ${cleanBridgeError(pauseError)}`,
+          `Native Apple Music ${safeMethod} failed and silence could not be confirmed.`,
+          {
+            code: 'APPLE_MUSIC_NATIVE_PAUSE_UNCONFIRMED',
+            applePauseUnconfirmed: true,
+            appleOperation: 'Music.app fail-safe pause'
+          }
+        );
+      }
     }
-    throw new Error(cleanBridgeError(error, `Native Apple Music ${safeMethod} failed.`));
+    throw bridgeError(error, `Native Apple Music ${safeMethod} failed.`);
   } finally {
     if (timer) clearTimeout(timer);
   }
@@ -103,7 +149,12 @@ export function nativeVolumePercent(value, fallback = 30) {
 
 export function nativePlaybackState(value = {}) {
   const rawState = String(value.playerState || value.state || '').toLowerCase();
-  const isPlaying = value.isPlaying === true || rawState === 'playing';
+  const knownState = ['playing', 'paused', 'stopped'].includes(rawState);
+  const explicitBoolean = typeof value.isPlaying === 'boolean';
+  const statePlaying = rawState === 'playing';
+  const booleanPlaying = value.isPlaying === true;
+  const playbackStateVerified = knownState && explicitBoolean && statePlaying === booleanPlaying;
+  const isPlaying = playbackStateVerified ? statePlaying : true;
   const measuredVolume = Number(value.volume);
   const measuredVerifiedPercent = Number(value.verifiedPercent);
   const volume = Number.isFinite(measuredVolume) ? nativeVolumePercent(measuredVolume, 0) : null;
@@ -114,6 +165,8 @@ export function nativePlaybackState(value = {}) {
   const volumeVerified = supportsVolume && value.volumeVerified === true && volume !== null && verifiedPercent === volume;
   return {
     isPlaying,
+    playerState: rawState,
+    playbackStateVerified,
     deviceId: String(value.deviceId || 'music-app@receiver-mac'),
     volume,
     supportsVolume,

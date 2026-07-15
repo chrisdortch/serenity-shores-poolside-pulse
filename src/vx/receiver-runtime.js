@@ -686,6 +686,7 @@ export class ReceiverRuntime {
       error.takeoverTarget = { id: current.id, sessionId: current.sessionId };
       throw error;
     }
+    await this.apple.prepareForReceiverStart?.();
     this.applyConfiguredMusicTarget({ report: false });
     await this.audio.unlock({ audibleTest: false });
     const startupProvider = this.state.playback.intent === 'stopped'
@@ -1636,6 +1637,13 @@ export class ReceiverRuntime {
           this.physicalProvider = '';
           if (controlledSnapshot) this.carrySafetyRestore({ provider: 'controlled', controlledSnapshot: { ...controlledSnapshot, wasPlaying: true }, musicLevelPercent: previousTarget });
           throw new Error(`Apple Music playback was superseded and stopped: ${error.message}`);
+        }
+        if (error?.applePauseUnconfirmed || error?.code === 'APPLE_MUSIC_NATIVE_PAUSE_UNCONFIRMED') {
+          this.physicalProvider = 'apple';
+          this.physicalRequestId = requestId;
+          const failure = appleErrorWithContext(error, `Apple Music silence could not be confirmed, so no other source was restored: ${error.message}`);
+          failure.applePauseUnconfirmed = true;
+          throw failure;
         }
         let restoreError = '';
         if (error?.code === 'SCHEDULE_RUN_CANCELLED') {
