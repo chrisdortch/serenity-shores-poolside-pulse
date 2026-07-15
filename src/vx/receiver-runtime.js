@@ -580,7 +580,10 @@ export class ReceiverRuntime {
     return {
       appleStatus: String(readiness.status || 'login-required').slice(0, 40),
       appleDetail: String(readiness.detail || '').slice(0, 300),
-      appleVerifiedAt: readiness.ready ? Number(this.apple.accessVerifiedAt || this.now()) : Number(this.apple.accessVerifiedAt || 0)
+      appleVerifiedAt: readiness.ready ? Number(this.apple.accessVerifiedAt || this.now()) : Number(this.apple.accessVerifiedAt || 0),
+      receiverKind: this.apple.nativeEnabled?.() ? 'macos-music-helper' : isIOSLike() ? 'iphone-browser' : 'desktop-browser',
+      appleTransport: this.apple.nativeEnabled?.() ? 'music-app-automation' : 'musickit-js',
+      appleVolumeCapability: this.apple.nativeEnabled?.() ? 'read-write-0-100' : this.apple.supportsVolume ? 'in-page-conditional' : 'physical-only'
     };
   }
 
@@ -704,7 +707,7 @@ export class ReceiverRuntime {
       lease = makeReceiverLease({
         deviceId: this.deviceId,
         sessionId,
-        name: 'Poolside Speaker Receiver',
+        name: this.apple.nativeEnabled?.() ? 'Poolside Pulse X Music Receiver (Mac)' : 'Poolside Speaker Receiver',
         platform: navigator.userAgent,
         audioMode: policy.id,
         ...this.appleLeasePatch()

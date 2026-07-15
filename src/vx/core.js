@@ -621,7 +621,10 @@ export function normalizeState(input, now = Date.now()) {
         detail: String(source.receiver.detail || '').slice(0, 300),
         appleStatus: String(source.receiver.appleStatus || 'login-required').slice(0, 40),
         appleDetail: String(source.receiver.appleDetail || '').slice(0, 300),
-        appleVerifiedAt: Math.max(0, Number(source.receiver.appleVerifiedAt || 0) || 0)
+        appleVerifiedAt: Math.max(0, Number(source.receiver.appleVerifiedAt || 0) || 0),
+        receiverKind: String(source.receiver.receiverKind || '').slice(0, 60),
+        appleTransport: String(source.receiver.appleTransport || '').slice(0, 60),
+        appleVolumeCapability: String(source.receiver.appleVolumeCapability || '').slice(0, 60)
       }
     : null;
 
@@ -692,7 +695,19 @@ export function receiverOnline(receiver, now = Date.now()) {
   return receiver.status === 'online' && lastSeen > 0 && now - lastSeen <= RECEIVER_LEASE_MS && leaseUntil >= now;
 }
 
-export function makeReceiverLease({ deviceId, sessionId, name = 'Speaker Receiver', platform = '', audioMode = '', appleStatus = 'login-required', appleDetail = '', appleVerifiedAt = 0 }, now = Date.now()) {
+export function makeReceiverLease({
+  deviceId,
+  sessionId,
+  name = 'Speaker Receiver',
+  platform = '',
+  audioMode = '',
+  appleStatus = 'login-required',
+  appleDetail = '',
+  appleVerifiedAt = 0,
+  receiverKind = '',
+  appleTransport = '',
+  appleVolumeCapability = ''
+}, now = Date.now()) {
   return {
     id: String(deviceId || ''),
     sessionId: String(sessionId || ''),
@@ -706,7 +721,10 @@ export function makeReceiverLease({ deviceId, sessionId, name = 'Speaker Receive
     detail: 'Receiver audio unlocked and command session active.',
     appleStatus: String(appleStatus || 'login-required').slice(0, 40),
     appleDetail: String(appleDetail || '').slice(0, 300),
-    appleVerifiedAt: Math.max(0, Number(appleVerifiedAt || 0) || 0)
+    appleVerifiedAt: Math.max(0, Number(appleVerifiedAt || 0) || 0),
+    receiverKind: String(receiverKind || '').slice(0, 60),
+    appleTransport: String(appleTransport || '').slice(0, 60),
+    appleVolumeCapability: String(appleVolumeCapability || '').slice(0, 60)
   };
 }
 

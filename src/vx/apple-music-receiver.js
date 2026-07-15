@@ -1,5 +1,11 @@
 import { MUSIC_LEVEL_PERCENT, clamp } from './core.js';
 import { isIOSLike } from './audio-engine.js';
+import {
+  nativeMusicBridgeAvailable,
+  nativeMusicBridgeInfo,
+  nativeMusicRequest,
+  nativePlaybackState
+} from './native-music-bridge.js';
 
 export const APPLE_MUSIC_SDK_URL = 'https://js-cdn.music.apple.com/musickit/v3/musickit.js';
 export const APPLE_MUSIC_TOKEN_URL = '/api/apple-music-token?v=x';
@@ -163,6 +169,7 @@ export class AppleMusicReceiver {
     this.now = now;
     this.fetchImpl = fetchImpl;
     this.musicKitOverride = musicKit;
+    this.nativeBridge = nativeMusicBridgeInfo();
     this.music = null;
     this.sdkPromise = null;
     this.configurePromise = null;
@@ -205,10 +212,24 @@ export class AppleMusicReceiver {
 
     // Preload only Apple's public SDK. The protected developer-token endpoint
     // is not called until setup or login, after the Poolside session exists.
-    if (!this.musicKitOverride && globalThis.document) this.ensureSdk().catch(() => {});
+    if (!this.musicKitOverride && !this.nativeBridge && globalThis.document) this.ensureSdk().catch(() => {});
   }
 
   readiness() {
+    if (this.nativeEnabled()) {
+      if (this.accessState === 'checking') return { status: 'checking-access', ready: false, detail: 'Checking permission to control Music.app on this Mac.' };
+      if (!this.accessVerified) return { status: 'access-blocked', ready: false, detail: this.accessError || 'On this Mac, allow Poolside Pulse X Music Receiver to control Music.app.' };
+      if (!this.playerPrepared) return { status: 'preparing-native', ready: false, detail: this.prepareError || 'The Music.app receiver is preparing.' };
+      if (this.activationState !== 'active') return { status: 'needs-local-tap', ready: false, detail: this.activationError || 'Tap Connect Music.app Receiver on this Mac.' };
+      if (!this.ready || !this.deviceId || !this.deviceUsable) return { status: 'connecting-device', ready: false, detail: 'Music.app is not connected. Tap Connect Music.app Receiver on this Mac.' };
+      return {
+        status: 'ready',
+        ready: true,
+        detail: this.volumeVerified
+          ? `Music.app is connected and read back ${this.verifiedPercent}% volume.`
+          : `Music.app is connected with 0–100 volume control; ${this.targetVolumePercent}% will be read back when playback starts.`
+      };
+    }
     if (!this.loggedIn()) {
       return this.authorizationPrepared
         ? { status: 'authorization-required', ready: false, detail: 'Apple Music setup is ready. Tap Authorize Apple Music in a separate tap.' }
@@ -244,6 +265,40 @@ export class AppleMusicReceiver {
       accessVerified: this.accessVerified,
       ...extra
     });
+  }
+
+  nativeEnabled() {
+    return Boolean(this.nativeBridge && nativeMusicBridgeAvailable());
+  }
+
+  async nativeCall(method, params = {}, { revokeOnFailure = true } = {}) {
+    try {
+      return await nativeMusicRequest(method, params);
+    } catch (error) {
+      if (revokeOnFailure) {
+        const message = `Music.app control failed: ${cleanErrorMessage(error)} On this Mac, open System Settings > Privacy & Security > Automation, allow Poolside Pulse X Music Receiver to control Music, then reconnect.`;
+        this.resetAccessVerification(message);
+        this.revokePlaybackReadiness(message);
+        this.report(message, false, { errorCode: 'APPLE_MUSIC_NATIVE_AUTOMATION', errorOperation: `Music.app ${method}` });
+      }
+      throw error;
+    }
+  }
+
+  applyNativePlayback(result = {}, forcePaused = null) {
+    const state = nativePlaybackState(result);
+    const paused = forcePaused === null ? !state.isPlaying : !!forcePaused;
+    this.current = {
+      paused,
+      position: Math.max(0, Math.round(Number(state.position || 0) * 1000)),
+      duration: 0,
+      uri: state.uri || this.sourceUrl || this.current?.uri || '',
+      name: state.name || this.current?.name || '',
+      artists: state.artists || this.current?.artists || '',
+      persistentId: state.persistentId || this.current?.persistentId || ''
+    };
+    this.onState(this.current);
+    return { ...state, isPlaying: !paused, position: this.current.position };
   }
 
   resetAccessVerification(message = '') {
@@ -296,10 +351,12 @@ export class AppleMusicReceiver {
   }
 
   loggedIn() {
+    if (this.nativeEnabled()) return true;
     return this.authorizedThisSession || authorizedBySdk(this.music) || storageGet(AUTHORIZATION_HINT_KEY) === '1';
   }
 
   async ensureSdk() {
+    if (this.nativeEnabled()) return null;
     if (this.musicKitOverride) return this.musicKitOverride;
     if (musicKitGlobal()) return musicKitGlobal();
     if (this.sdkPromise) return await this.sdkPromise;
@@ -488,6 +545,14 @@ export class AppleMusicReceiver {
   }
 
   async prepareAuthorization() {
+    if (this.nativeEnabled()) {
+      const capability = await this.nativeCall('capabilities', {}, { revokeOnFailure: false });
+      this.authorizationPrepared = true;
+      this.authorizationPrepareError = '';
+      this.authorizedThisSession = true;
+      this.report('Music.app automation is available. No separate Apple web login is required.', true, capability);
+      return true;
+    }
     if (this.authorizationPrepared && this.music) return true;
     if (this.authorizationPreparePromise) return await this.authorizationPreparePromise;
     this.authorizationPrepareError = '';
@@ -521,6 +586,19 @@ export class AppleMusicReceiver {
   // Intentionally not async: MusicKit authorize must be invoked before this
   // dedicated click handler yields or awaits any other work.
   authorizeFromUserGesture() {
+    if (this.nativeEnabled()) {
+      this.loginPromise ||= this.nativeCall('activate', {}, { revokeOnFailure: false }).then(async result => {
+        this.authorizedThisSession = true;
+        this.authorizationPrepared = true;
+        await this.verifyAccess({ force: true });
+        await this.preparePlayer();
+        this.report('Music.app receiver permission passed. Tap Connect Music.app Receiver.', true, result);
+        return true;
+      }).finally(() => {
+        this.loginPromise = null;
+      });
+      return this.loginPromise;
+    }
     if (this.loggedIn()) return Promise.resolve(true);
     if (!this.authorizationPrepared || !this.music) {
       throw new Error('Apple Music is not prepared. Tap Prepare Apple Music first, wait for it to finish, then tap Authorize Apple Music.');
@@ -565,10 +643,20 @@ export class AppleMusicReceiver {
     return false;
   }
 
-  clearLogin() {
+  async clearLogin() {
+    if (this.nativeEnabled()) {
+      try {
+        await this.nativeCall('failSafePause');
+      } finally {
+        this.disconnect();
+      }
+      this.authorizedThisSession = true;
+      this.report('Music.app was silenced and disconnected. macOS Automation permission was not removed.', true);
+      return;
+    }
     storageRemove(AUTHORIZATION_HINT_KEY);
     this.authorizedThisSession = false;
-    try { Promise.resolve(this.music?.unauthorize?.()).catch(() => {}); } catch {}
+    try { await Promise.resolve(this.music?.unauthorize?.()); } catch {}
     this.resetAccessVerification();
     this.disconnect();
     this.playerPrepared = false;
@@ -577,6 +665,33 @@ export class AppleMusicReceiver {
   }
 
   async verifyAccess({ force = false } = {}) {
+    if (this.nativeEnabled()) {
+      if (!force && this.accessVerified && this.now() - this.accessVerifiedAt <= ACCESS_CACHE_MS) {
+        return { verified: true, profile: this.accountProfile };
+      }
+      this.accessState = 'checking';
+      try {
+        const capability = await this.nativeCall('capabilities', {}, { revokeOnFailure: false });
+        if (capability.supportsVolume !== true) throw new Error('Music.app did not expose verified volume control.');
+        this.authorizedThisSession = true;
+        this.accountProfile = {
+          displayName: 'Authorized macOS Music.app account',
+          accountId: 'music-app@receiver-mac',
+          storefrontId: ''
+        };
+        this.accessVerified = true;
+        this.accessVerifiedAt = this.now();
+        this.accessState = 'verified';
+        this.accessError = '';
+        this.report('Music.app automation and numeric volume control are available. Subscription playback is confirmed when a track starts.', true, capability);
+        return { verified: true, profile: this.accountProfile };
+      } catch (error) {
+        const message = cleanErrorMessage(error, 'Music.app automation is unavailable.');
+        this.resetAccessVerification(message);
+        this.report(message, false, { errorCode: 'APPLE_MUSIC_NATIVE_ACCESS_BLOCKED', errorOperation: 'Music.app Automation' });
+        throw error;
+      }
+    }
     if (!force && this.accessVerified && this.now() - this.accessVerifiedAt <= ACCESS_CACHE_MS) {
       return { verified: true, profile: this.accountProfile };
     }
@@ -635,6 +750,13 @@ export class AppleMusicReceiver {
   }
 
   async preparePlayer() {
+    if (this.nativeEnabled()) {
+      await this.verifyAccess();
+      this.playerPrepared = true;
+      this.prepareError = '';
+      this.onState(this.current);
+      return true;
+    }
     if (!this.loggedIn()) return false;
     try {
       await this.ensureMusicKit();
@@ -658,7 +780,9 @@ export class AppleMusicReceiver {
     if (restored) {
       this.authorizationPrepared = true;
       this.authorizationPrepareError = '';
-      this.report('Previous Apple Music authorization restored. Tap Connect Apple Music Receiver on this speaker device.', true);
+      this.report(this.nativeEnabled()
+        ? 'Music.app control permission is available. Start the receiver, then tap Connect Music.app Receiver.'
+        : 'Previous Apple Music authorization restored. Tap Connect Apple Music Receiver on this speaker device.', true);
     }
     return restored;
   }
@@ -666,6 +790,24 @@ export class AppleMusicReceiver {
   // Intentionally not async. MusicKit v3 deferPlayback must be invoked directly
   // inside this dedicated receiver click before the handler awaits other work.
   activateFromUserGesture() {
+    if (this.nativeEnabled()) {
+      if (this.activationState === 'active') return Promise.resolve(true);
+      if (this.activationState === 'activating' && this.activationPromise) return this.activationPromise;
+      this.activationState = 'activating';
+      this.activationError = '';
+      this.activationPromise = this.nativeCall('activate', {}, { revokeOnFailure: false }).then(result => {
+        this.activationState = 'active';
+        this.activationPromise = null;
+        this.report('Music.app receiver activation is ready.', true, result);
+        return true;
+      }).catch(error => {
+        const message = cleanErrorMessage(error, 'Music.app receiver activation failed.');
+        this.failActivation(message);
+        this.report(message, false);
+        throw error;
+      });
+      return this.activationPromise;
+    }
     if (!this.loggedIn()) throw new Error('Authorize Apple Music on this receiver first.');
     if (!this.playerPrepared || !this.music) throw new Error('Apple Music is still preparing. Wait, then tap Connect Apple Music Receiver.');
     if (this.activationState === 'active') return Promise.resolve(true);
@@ -704,6 +846,19 @@ export class AppleMusicReceiver {
   }
 
   async connectFromUserGesture() {
+    if (this.nativeEnabled()) {
+      if (this.activationState === 'activating' && this.activationPromise) await this.activationPromise;
+      if (this.activationState !== 'active') throw new Error('Tap Connect Apple Music Receiver on this Mac.');
+      await this.verifyAccess({ force: true });
+      const capability = await this.nativeCall('capabilities', {}, { revokeOnFailure: false });
+      this.deviceId = String(capability.deviceId || 'music-app@receiver-mac');
+      this.ready = true;
+      this.deviceUsable = true;
+      this.supportsVolume = capability.supportsVolume === true;
+      this.resetVolumeVerification();
+      this.report('Music.app receiver connected with verified 0–100 volume control.', true, capability);
+      return this.deviceId;
+    }
     if (!this.loggedIn()) throw new Error('Authorize Apple Music on this receiver first.');
     if (!this.playerPrepared || !this.music) throw new Error('Apple Music is still preparing.');
     if (this.activationState === 'activating' && this.activationPromise) await this.activationPromise;
@@ -732,6 +887,33 @@ export class AppleMusicReceiver {
   }
 
   async refreshCapabilities({ strict = false } = {}) {
+    if (this.nativeEnabled()) {
+      try {
+        const capability = await this.nativeCall('capabilities');
+        this.deviceUsable = true;
+        this.supportsVolume = capability.supportsVolume === true;
+        this.resetVolumeVerification();
+        return {
+          supportsVolume: this.supportsVolume,
+          volumeVerified: false,
+          verifiedPercent: null,
+          device: {
+            id: String(capability.deviceId || this.deviceId || 'music-app@receiver-mac'),
+            name: String(capability.deviceName || this.nativeBridge?.deviceName || 'macOS Music.app receiver')
+          },
+          native: true,
+          reason: this.supportsVolume
+            ? 'macOS Music.app exposes a read/write 0–100 volume and Poolside Pulse verifies every change.'
+            : 'macOS Music.app volume control is unavailable.'
+        };
+      } catch (error) {
+        this.deviceUsable = false;
+        this.supportsVolume = false;
+        this.resetVolumeVerification();
+        if (strict) throw error;
+        return { supportsVolume: false, volumeVerified: false, verifiedPercent: null, device: null, native: true, reason: error.message };
+      }
+    }
     if (!this.music || !this.ready || !this.deviceId) {
       this.deviceUsable = false;
       this.supportsVolume = false;
@@ -780,6 +962,18 @@ export class AppleMusicReceiver {
   }
 
   async readLocalVolume(expected = this.targetVolumePercent) {
+    if (this.nativeEnabled()) {
+      const rawState = await this.nativeCall('state');
+      const state = nativePlaybackState(rawState);
+      const targetPercent = clamp(expected, 0, 100, this.targetVolumePercent);
+      const actual = Number.isFinite(Number(state.volume)) ? clamp(state.volume, 0, 100, targetPercent) : null;
+      return {
+        matches: state.supportsVolume && state.volumeVerified && actual === targetPercent,
+        actual,
+        raw: actual / 100,
+        reason: `Music.app reports ${actual}% volume.`
+      };
+    }
     if (!this.music || !this.supportsVolume || isIOSLike()) {
       return { matches: false, actual: null, raw: null, reason: 'In-page Apple Music volume is not software-controllable on this receiver.' };
     }
@@ -809,7 +1003,7 @@ export class AppleMusicReceiver {
     if (targetPercent !== this.targetVolumePercent) {
       return stale(`A newer ${this.targetVolumePercent}% Apple Music target replaced this request.`);
     }
-    if (!this.music || !this.ready || !this.deviceId) throw new Error('Apple Music receiver is not connected.');
+    if ((!this.nativeEnabled() && !this.music) || !this.ready || !this.deviceId) throw new Error('Apple Music receiver is not connected.');
     const generation = this.volumeGeneration;
     const deviceId = this.deviceId;
     const operationCurrent = () => generation === this.volumeGeneration
@@ -819,6 +1013,29 @@ export class AppleMusicReceiver {
     const work = async () => {
       if (!operationCurrent()) return stale('A newer Apple Music target or receiver replaced this volume request.');
       this.resetVolumeVerification();
+      if (this.nativeEnabled()) {
+        const raw = await this.nativeCall('setVolume', { percent: targetPercent });
+        if (!operationCurrent()) return stale('A newer Apple Music target replaced this native volume request.');
+        const state = nativePlaybackState(raw);
+        const actual = Number.isFinite(Number(state.volume)) ? clamp(state.volume, 0, 100, targetPercent) : null;
+        this.supportsVolume = state.supportsVolume === true;
+        this.volumeVerified = this.supportsVolume && state.volumeVerified === true && actual === targetPercent;
+        this.verifiedPercent = this.volumeVerified ? targetPercent : null;
+        this.verifiedDeviceId = this.volumeVerified ? deviceId : '';
+        const result = {
+          supportsVolume: this.supportsVolume,
+          volumeVerified: this.volumeVerified,
+          verifiedPercent: this.verifiedPercent,
+          verified: this.volumeVerified,
+          actual,
+          native: true,
+          reason: this.volumeVerified
+            ? `Music.app read back ${actual}% after the manager change.`
+            : `Music.app did not verify the requested ${targetPercent}% volume.`
+        };
+        this.report(result.reason, result.verified, result);
+        return result;
+      }
       if (isIOSLike() || !this.supportsVolume) {
         return {
           supportsVolume: false,
@@ -885,6 +1102,21 @@ export class AppleMusicReceiver {
   }
 
   async playbackState() {
+    if (this.nativeEnabled()) {
+      const raw = await this.nativeCall('state');
+      const state = this.applyNativePlayback(raw);
+      const verifiedAtTarget = state.supportsVolume && state.volumeVerified && state.volume === this.targetVolumePercent;
+      this.supportsVolume = state.supportsVolume;
+      this.volumeVerified = verifiedAtTarget;
+      this.verifiedPercent = verifiedAtTarget ? state.volume : null;
+      this.verifiedDeviceId = verifiedAtTarget ? (this.deviceId || state.deviceId) : '';
+      return {
+        ...state,
+        volumeVerified: verifiedAtTarget,
+        verifiedPercent: verifiedAtTarget ? state.volume : null,
+        contextUri: this.sourceUrl
+      };
+    }
     if (!this.music) throw new Error('Apple Music receiver is not prepared.');
     const raw = rawPlaybackState(this.music);
     const current = this.syncCurrent();
@@ -919,7 +1151,7 @@ export class AppleMusicReceiver {
     throw appleError(
       message,
       'APPLE_MUSIC_PLAYBACK_NOT_CONFIRMED',
-      'MusicKit playbackState'
+      this.nativeEnabled() ? 'Music.app player state' : 'MusicKit playbackState'
     );
   }
 
@@ -931,6 +1163,18 @@ export class AppleMusicReceiver {
     assertOperation(assertCurrent);
     if (!this.ready || !this.deviceId) throw new Error('Apple Music needs a local tap on Connect Apple Music Receiver before playback.');
     if (this.activationState !== 'active') throw new Error('Apple Music needs a fresh local receiver tap before scheduled or remote playback.');
+    if (this.nativeEnabled()) {
+      const raw = await this.nativeCall('play', { url: source.url, volumePercent: this.targetVolumePercent });
+      this.sourceUrl = source.url;
+      this.applyNativePlayback({ ...raw, sourceUrl: source.url });
+      assertOperation(assertCurrent);
+      const state = await this.waitForPlayback(true, 8_000);
+      assertOperation(assertCurrent);
+      const volume = await this.enforceVolume();
+      assertOperation(assertCurrent);
+      this.report(`Apple Music is playing through Music.app at verified ${this.targetVolumePercent}%.`, true, { playback: state, volume, native: true });
+      return { state, volume };
+    }
     await this.fetchDeveloperToken();
     assertOperation(assertCurrent);
     if (this.supportsVolume) await this.enforceVolume();
@@ -963,6 +1207,13 @@ export class AppleMusicReceiver {
   }
 
   async pause() {
+    if (this.nativeEnabled()) {
+      if (!this.ready || !this.deviceId) return false;
+      const raw = await this.nativeCall('pause');
+      this.applyNativePlayback(raw, true);
+      await this.waitForPlayback(false, 5_000);
+      return true;
+    }
     if (!this.music || !this.ready || !this.deviceId) return false;
     await this.callPlayer('pause');
     this.syncCurrent(true);
@@ -973,6 +1224,13 @@ export class AppleMusicReceiver {
   // Intentionally not async. Lifecycle handlers call this before their first
   // await so iPhone Safari receives a direct pause request before suspension.
   pauseImmediately() {
+    if (this.nativeEnabled()) {
+      if (!this.ready || !this.deviceId) return Promise.resolve(false);
+      return this.nativeCall('pauseImmediate').then(raw => {
+        this.applyNativePlayback(raw, true);
+        return true;
+      });
+    }
     const target = typeof this.music?.pause === 'function' ? this.music : this.music?.player;
     if (!target || typeof target.pause !== 'function') return Promise.resolve(false);
     const result = target.pause();
@@ -981,6 +1239,17 @@ export class AppleMusicReceiver {
   }
 
   async resume({ assertCurrent = null } = {}) {
+    if (this.nativeEnabled()) {
+      if (!this.ready || !this.deviceId) return false;
+      assertOperation(assertCurrent);
+      const raw = await this.nativeCall('resume', { volumePercent: this.targetVolumePercent });
+      this.applyNativePlayback(raw, false);
+      assertOperation(assertCurrent);
+      await this.waitForPlayback(true);
+      assertOperation(assertCurrent);
+      await this.enforceVolume(this.targetVolumePercent);
+      return true;
+    }
     if (!this.music || !this.ready || !this.deviceId) return false;
     assertOperation(assertCurrent);
     if (this.supportsVolume) await this.enforceVolume();
@@ -1001,6 +1270,18 @@ export class AppleMusicReceiver {
   }
 
   async next({ assertCurrent = null } = {}) {
+    if (this.nativeEnabled()) {
+      if (!this.ready || !this.deviceId) throw new Error('Apple Music receiver is not connected.');
+      assertOperation(assertCurrent);
+      const raw = await this.nativeCall('next', { volumePercent: this.targetVolumePercent });
+      this.applyNativePlayback(raw);
+      assertOperation(assertCurrent);
+      const state = await this.waitForPlayback(true, 6_000);
+      assertOperation(assertCurrent);
+      await this.enforceVolume(this.targetVolumePercent);
+      assertOperation(assertCurrent);
+      return state;
+    }
     if (!this.music || !this.ready || !this.deviceId) throw new Error('Apple Music receiver is not connected.');
     assertOperation(assertCurrent);
     await this.callPlayer('skipToNextItem');
@@ -1019,6 +1300,23 @@ export class AppleMusicReceiver {
   }
 
   async fadeRawVolume(toPercent, durationMs = 240) {
+    if (this.nativeEnabled()) {
+      if (!this.supportsVolume) return false;
+      const target = clamp(toPercent, 0, 100, 0);
+      const before = await this.readLocalVolume(this.targetVolumePercent);
+      const from = Number.isFinite(Number(before.actual)) ? Number(before.actual) : this.targetVolumePercent;
+      const steps = Math.max(1, Math.min(8, Math.round(durationMs / 40)));
+      let last = null;
+      for (let step = 1; step <= steps; step += 1) {
+        const percent = Math.round(from + (target - from) * (step / steps));
+        last = await this.nativeCall('setVolume', { percent });
+        await wait(Math.max(10, Math.round(durationMs / steps)));
+      }
+      const state = nativePlaybackState(last || await this.nativeCall('state'));
+      if (!state.volumeVerified || state.volume !== target) throw new Error('Music.app did not confirm the temporary announcement fade.');
+      this.resetVolumeVerification();
+      return true;
+    }
     if (!this.music || !this.supportsVolume || isIOSLike()) return false;
     const to = clamp(toPercent, 0, 100, 0) / 100;
     const measured = Number(this.music.volume);
@@ -1037,6 +1335,26 @@ export class AppleMusicReceiver {
   }
 
   async pauseForAnnouncement() {
+    if (this.nativeEnabled()) {
+      if (!this.ready || !this.deviceId) {
+        throw appleError('Music.app is not connected, so silence cannot be confirmed.', 'APPLE_MUSIC_PAUSE_UNCONFIRMED', 'Music.app pause');
+      }
+      const raw = await this.nativeCall('pauseForAnnouncement', { targetPercent: this.targetVolumePercent });
+      const reported = nativePlaybackState(raw.state || raw);
+      if (reported.isPlaying) throw appleError('Music.app could not be confirmed paused.', 'APPLE_MUSIC_PAUSE_UNCONFIRMED', 'Music.app state');
+      const state = this.applyNativePlayback(raw.state || raw, true);
+      this.resetVolumeVerification();
+      return {
+        wasPlaying: raw.wasPlaying === true,
+        position: Math.max(0, Number(state.position || 0) || 0),
+        uri: String(raw.uri || this.current?.uri || ''),
+        sourceUrl: String(raw.sourceUrl || this.sourceUrl || ''),
+        deviceId: this.deviceId,
+        targetPercent: this.targetVolumePercent,
+        volumeLowered: raw.volumeLowered !== false,
+        persistentId: String(raw.persistentId || '')
+      };
+    }
     let stateKnown = false;
     let state = null;
     try {
@@ -1074,6 +1392,22 @@ export class AppleMusicReceiver {
 
   async resumeAfterAnnouncement(snapshot, { assertCurrent = null } = {}) {
     if (!snapshot?.wasPlaying) return false;
+    if (this.nativeEnabled()) {
+      if (!this.ready || !this.deviceId) throw new Error('Music.app receiver is not connected.');
+      assertOperation(assertCurrent);
+      const raw = await this.nativeCall('resumeAfterAnnouncement', {
+        snapshot,
+        volumePercent: this.targetVolumePercent
+      });
+      this.applyNativePlayback(raw, false);
+      assertOperation(assertCurrent);
+      await this.waitForPlayback(true);
+      assertOperation(assertCurrent);
+      const volume = await this.enforceVolume(this.targetVolumePercent);
+      if (!volume.verified) throw new Error('Music.app resumed, but its music volume was not verified.');
+      this.report(`Music.app resumed after the announcement at verified ${this.targetVolumePercent}%.`, true, { native: true, volume });
+      return true;
+    }
     if (!this.music || !this.ready || !this.deviceId) throw new Error('Apple Music receiver is not connected.');
     assertOperation(assertCurrent);
     if (this.supportsVolume) {

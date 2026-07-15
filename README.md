@@ -16,12 +16,13 @@ No other Serenity Shores repository, Vercel project, database namespace, domain,
 ## What Version X does
 
 - Plays Suno shares/playlists and direct HTTPS audio through the receiver-owned Web Audio mixer.
-- Plays Apple Music URLs inside the same open, signed-in MusicKit receiver page.
+- Plays Apple Music URLs through either the compatibility MusicKit web receiver or the recommended Poolside Pulse X Music Receiver Mac app.
 - Provides independent 0–100 global Suno/direct-music and spoken-announcement controls.
 - Lets every scheduled Suno/direct music or announcement item inherit its global level or use a custom 0–100 level.
 - Fully silences Suno/direct music during speech, then continues the same track.
 - Fades and pauses Apple Music before Suno or speech. Apple Music and the interruption do not overlap. It resumes only after the interruption finishes and only if it was playing beforehand.
-- Shows Apple Music volume as exact only when a desktop-class receiver sets and reads back the same MusicKit value. iPhone/iPad is honestly labeled pause-only because browser code cannot control physical output volume there.
+- With the Mac receiver app, sets Music.app volume from 0–100 and reads the value back after every manager or schedule change. The app confirms Music.app is silent before spoken audio and restores the requested music target afterward.
+- iPhone/iPad Apple Music remains honestly labeled physical-volume compatibility because Apple does not let a web page control protected media output volume there.
 - Supports foreground schedules on an iPhone receiver. A suspended iPhone browser cannot be treated as an unattended audio appliance; hiding the page intentionally stops audio and stops lease renewal so cloud ownership expires safely.
 
 Apple Music playback also requires an active Apple Music subscription on the Apple Account authorized on the speaker receiver. Apple Developer Program membership alone does not supply playback entitlement.
@@ -30,7 +31,7 @@ Apple Music playback also requires an active Apple Music subscription on the App
 
 The dedicated Apple configuration is ready: Team ID `HHX689967A`, Key ID `8G28BYBZT2`, and Media ID `media.com.serenityshores.poolsidepulsex`. The `.p8` private key stays outside this repository and is used only as a protected server environment variable.
 
-The remaining owner inputs are the exact `https://music.apple.com/...` song, album, or playlist URLs to save and an active Apple Music subscription on the receiver iPhone's Apple Account.
+The remaining owner inputs are the exact `https://music.apple.com/...` song, album, or playlist URLs to save and an active Apple Music subscription in Music.app on the receiver Mac.
 
 Apple’s detailed setup reference is [Create a media identifier and private key](https://developer.apple.com/help/account/capabilities/create-a-media-identifier-and-private-key). Poolside Pulse generates short-lived MusicKit developer tokens on the server; the `.p8` private key is never sent to the browser.
 
@@ -46,7 +47,7 @@ APPLE_MUSIC_TEAM_ID=
 APPLE_MUSIC_KEY_ID=
 APPLE_MUSIC_MEDIA_ID=
 APPLE_MUSIC_PRIVATE_KEY=
-APPLE_MUSIC_ALLOWED_ORIGINS=https://serenity-shores-poolside-pulse.vercel.app
+APPLE_MUSIC_ALLOWED_ORIGINS=https://poolside-pulse-x.vercel.app
 ```
 
 `APPLE_MUSIC_PRIVATE_KEY` is the secret PEM content from the dedicated `.p8` key. Configure it only as a protected server environment variable. `APPLE_MUSIC_ALLOWED_ORIGINS` is a comma-separated allowlist and must include each exact preview/production origin that will request a developer token.
@@ -58,7 +59,20 @@ Also supported:
 
 Production requires durable KV, a dedicated session secret, and a valid access code. The receiver refuses to claim operational ownership without durable synchronization.
 
-## Two-iPhone operation
+## Recommended exact-volume operation
+
+Use the dedicated Mac receiver for Apple Music, Suno/direct audio, spoken announcements, and schedules. Use the same Version X URL from any phone, tablet, or computer for commands.
+
+1. Build once with `native/PoolsidePulseXMusicReceiver/scripts/build-app.sh`, then open `native/PoolsidePulseXMusicReceiver/dist/Poolside Pulse X Music Receiver.app`.
+2. In macOS **Control Center → Sound**, choose the pool speaker as the Mac system output. Do not select a Music.app-only AirPlay destination because Music.app and announcement audio must share the same output.
+3. In the receiver app, enter `7900`, tap **Start Receiver**, then **Allow Music.app Control / Connect Music.app Receiver**. Click **Allow** on the one-time macOS Automation prompt. Music.app must be signed in to the active Apple Music subscription.
+4. On any command device, open [Poolside Pulse X](https://poolside-pulse-x.vercel.app/#command), enter `7900`, and choose **Remote Control**. The music and voice sliders apply to live commands and schedules.
+
+Leave the Mac receiver app open. It prevents idle system sleep while running and silences Music.app if the window closes, the web receiver crashes, its page fails, or the app quits. Closing the last receiver window quits the app.
+
+The checked-in build script creates a personal, ad-hoc signed app for this Mac. Set `POOLSIDE_CODE_SIGN_IDENTITY` to a Developer ID Application certificate when a stable notarized distribution build is needed for other Macs.
+
+## Two-iPhone compatibility operation
 
 Use two separate iPhones:
 
@@ -69,7 +83,7 @@ Do not switch apps, lock, or hide the receiver page during a schedule. Version X
 
 On an iPhone receiver, Apple Music playback level is set with the receiver iPhone or connected speaker's physical volume controls. MusicKit for the web cannot set or verify that physical output level, so Version X does not claim that Apple Music live or scheduled percentages were applied. Suno/direct audio and generated announcement audio remain adjustable from 0–100 in Version X. If generated speech is unavailable and iPhone device speech is used as a fallback, its percentage is a requested target rather than verified speaker loudness.
 
-For genuinely unattended schedules, use an always-on desktop receiver or build a native iOS receiver with the required background-audio behavior; a foreground browser page is not an unattended service.
+For genuinely unattended schedules and exact Apple Music volume, use the Poolside Pulse X Music Receiver Mac app; a foreground iPhone browser page is not an unattended service.
 
 ## Local verification
 
@@ -77,6 +91,7 @@ For genuinely unattended schedules, use an always-on desktop receiver or build a
 npm install
 npm run dev
 npm run verify
+native/PoolsidePulseXMusicReceiver/scripts/build-app.sh
 ```
 
 Vercel settings remain Vite framework, `npm install`, `npm run build`, output directory `dist`.
