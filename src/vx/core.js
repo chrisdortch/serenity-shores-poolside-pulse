@@ -832,6 +832,29 @@ export function audioPolicy({
   };
 }
 
+export function managerVolumePlan({
+  selectedProvider = 'controlled',
+  receiverIsIOS = false,
+  playbackProvider = '',
+  playbackIntent = 'stopped',
+  controlledSource = '',
+  startControlled = false
+} = {}) {
+  const switchToControlled = selectedProvider === 'apple' && receiverIsIOS === true;
+  const applePlaybackPlaying = playbackProvider === 'apple' && playbackIntent === 'playing';
+  const applePlaybackActive = playbackProvider === 'apple' && playbackIntent !== 'stopped';
+  const hasControlledSource = String(controlledSource || '').trim().length > 0;
+  return {
+    switchToControlled,
+    nextProvider: switchToControlled ? 'controlled' : selectedProvider === 'apple' ? 'apple' : 'controlled',
+    command: switchToControlled && hasControlledSource && (applePlaybackPlaying || startControlled === true)
+      ? 'play-controlled'
+      : switchToControlled && applePlaybackActive
+        ? 'stop-music'
+      : 'set-music-level'
+  };
+}
+
 export function safetyAnnouncementText(id, fallbackText, config = {}) {
   const radius = clamp(config.lightningRadiusMiles, 1, 25, 10);
   const hold = clamp(config.lightningHoldMinutes, 5, 90, 30);

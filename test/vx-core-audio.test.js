@@ -10,6 +10,7 @@ import {
   createDefaultState,
   effectiveScheduleItemVolume,
   isAppleMusicUrl,
+  managerVolumePlan,
   normalizeScheduleItem,
   normalizeState,
   weatherRequestUrl
@@ -69,6 +70,52 @@ describe('Poolside Pulse Version X state isolation and volume model', () => {
     assert.equal(policy.musicPercent, null);
     assert.match(policy.detail, /receiver iPhone or connected speaker controls/i);
     assert.doesNotMatch(policy.detail, /41% slider/i);
+  });
+
+  test('routes an iPhone manager-volume change to the controlled Suno path', () => {
+    assert.deepEqual(managerVolumePlan({
+      selectedProvider: 'apple',
+      receiverIsIOS: true,
+      playbackProvider: 'apple',
+      playbackIntent: 'playing',
+      controlledSource: 'https://suno.com/s/example'
+    }), {
+      switchToControlled: true,
+      nextProvider: 'controlled',
+      command: 'play-controlled'
+    });
+
+    assert.equal(managerVolumePlan({
+      selectedProvider: 'apple',
+      receiverIsIOS: true,
+      playbackProvider: 'apple',
+      playbackIntent: 'playing'
+    }).command, 'stop-music');
+
+    assert.equal(managerVolumePlan({
+      selectedProvider: 'apple',
+      receiverIsIOS: true,
+      playbackProvider: 'apple',
+      playbackIntent: 'paused',
+      controlledSource: 'https://suno.com/s/example'
+    }).command, 'stop-music');
+
+    assert.equal(managerVolumePlan({
+      selectedProvider: 'apple',
+      receiverIsIOS: true,
+      playbackProvider: 'apple',
+      playbackIntent: 'paused',
+      controlledSource: 'https://suno.com/s/example',
+      startControlled: true
+    }).command, 'play-controlled');
+
+    assert.equal(managerVolumePlan({
+      selectedProvider: 'apple',
+      receiverIsIOS: false,
+      playbackProvider: 'apple',
+      playbackIntent: 'playing',
+      controlledSource: 'https://suno.com/s/example'
+    }).command, 'set-music-level');
   });
 });
 

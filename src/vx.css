@@ -1383,6 +1383,37 @@ select:focus-visible {
   font-size: 0.84rem;
 }
 
+.managedVolumePrompt {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 16px;
+  margin-top: 16px;
+  border: 1px solid #78aaa6;
+  border-radius: 10px;
+  padding: 14px;
+  background: var(--paper);
+}
+
+.managedVolumePrompt div {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+
+.managedVolumePrompt strong {
+  color: var(--navy-950);
+}
+
+.managedVolumePrompt span {
+  color: var(--muted-strong);
+  font-size: 0.78rem;
+}
+
+.managedVolumePrompt button {
+  white-space: nowrap;
+}
+
 .voiceVolumeControl {
   border-color: #e8a2ae;
   background: linear-gradient(145deg, #fff3f5, #ffffff 72%);
@@ -2797,6 +2828,15 @@ select:focus-visible {
 
   .providerSelector {
     grid-template-columns: 1fr;
+  }
+
+  .managedVolumePrompt {
+    grid-template-columns: 1fr;
+  }
+
+  .managedVolumePrompt button {
+    width: 100%;
+    white-space: normal;
   }
 
   .providerSelector button {

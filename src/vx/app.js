@@ -9,6 +9,7 @@ import {
   effectiveScheduleItemVolume,
   getActiveSchedule,
   isAppleMusicUrl,
+  managerVolumePlan,
   makeId,
   makeLog,
   normalizeSequenceRun,
@@ -161,6 +162,7 @@ function platformIsIOS(userAgent = '') {
 function activeReceiverIsIOS(state = store?.state) {
   const receiver = state?.receiver;
   if (receiverOnline(receiver, store.now())) return platformIsIOS(receiver?.platform);
+  if (platformIsIOS(receiver?.platform)) return true;
   return role === 'receiver' && isIOSLike();
 }
 
@@ -586,7 +588,7 @@ function providerSelector() {
   const iphoneApple = activeReceiverIsIOS();
   return `
     <div class="providerSelector" role="group" aria-label="Music source">
-      <button aria-pressed="${provider === 'controlled'}" data-action="provider" data-provider="controlled" class="${provider === 'controlled' ? 'active' : ''}"><strong>Suno / Direct</strong><small>Exact ${target}/${audibleVoiceTarget()} mix</small></button>
+      <button aria-pressed="${provider === 'controlled'}" data-action="provider" data-provider="controlled" class="${provider === 'controlled' ? 'active' : ''}"><strong>Manager Volume · Suno / Direct</strong><small>Exact ${target}% music / ${audibleVoiceTarget()}% announcements</small></button>
       <button aria-pressed="${provider === 'apple'}" data-action="provider" data-provider="apple" class="${provider === 'apple' ? 'active' : ''}"><strong>Apple Music</strong><small>${cloudAppleMusicVerified() ? `Verified ${target}%` : iphoneApple ? 'Physical iPhone volume' : `${target}% target`}</small></button>
     </div>`;
 }
@@ -597,11 +599,12 @@ function musicLevelControl() {
   const iphoneApple = store.state.config.musicProvider === 'apple' && activeReceiverIsIOS();
   return `
     <section class="volumeControl" aria-labelledby="musicLevelLabel">
-      <div class="volumeHeading"><div><p class="kicker">${iphoneApple ? 'iPhone Apple Music' : 'Shared music target'}</p><h2 id="musicLevelLabel">${iphoneApple ? 'Use physical speaker volume' : 'Music volume'}</h2></div><output for="musicLevel" data-music-level-output>${iphoneApple ? 'Physical' : `${target}%`}</output></div>
-      <input id="musicLevel" type="range" min="0" max="100" step="1" value="${target}" aria-labelledby="musicLevelLabel" aria-describedby="musicLevelHelp" aria-valuetext="${iphoneApple ? 'Apple Music volume uses the iPhone or connected speaker controls' : `${target}% music; announcements ${audibleVoiceTarget()}%`}" style="--level:${iphoneApple ? 0 : target / 100}" ${iphoneApple ? 'disabled' : ''} />
+      <div class="volumeHeading"><div><p class="kicker">${iphoneApple ? 'Remote volume available' : 'Shared music target'}</p><h2 id="musicLevelLabel">${iphoneApple ? 'Manager-controlled music volume' : 'Music volume'}</h2></div><output for="musicLevel" data-music-level-output>${target}%</output></div>
+      <input id="musicLevel" type="range" min="0" max="100" step="1" value="${target}" aria-labelledby="musicLevelLabel" aria-describedby="musicLevelHelp" aria-valuetext="${iphoneApple ? `${target}% manager-volume target; releasing switches music to Suno or Direct` : `${target}% music; announcements ${audibleVoiceTarget()}%`}" style="--level:${target / 100}" />
       <div class="volumeScale" aria-hidden="true"><span>0%</span><span>Default 30%</span><span>100%</span></div>
+      ${iphoneApple ? `<div class="managedVolumePrompt"><div><strong>Use a volume the manager can actually control</strong><span data-managed-volume-description>iPhone cannot lower protected Apple Music in a web page. This starts the saved Suno / Direct bed at ${target}%; Apple stays authorized for later.</span></div><button type="button" data-action="enable-managed-volume" data-managed-volume-button class="primary">Start Manager Volume · ${target}%</button></div>` : ''}
       <p id="musicLevelHelp">${iphoneApple
-        ? `Poolside Pulse cannot apply an Apple Music percentage on the active iPhone receiver. Set loudness with the iPhone or connected speaker controls. Suno music and announcement voice remain adjustable; shared Suno music is currently ${target}%.`
+        ? `Move and release the slider to save the target without unexpectedly starting paused music. Tap Start Manager Volume to safely pause Apple Music and start the saved Suno source at ${target}%. Announcements then silence music to ${DUCK_LEVEL_PERCENT}% and play at ${audibleVoiceTarget()}%.`
         : `${customTarget === null ? 'Applies immediately' : `Saves the shared target for later; the current schedule item remains at its custom ${customTarget}%`} for Suno/direct on the receiver and to Apple Music only when that desktop receiver verifies volume control. Apple Music always pauses before Suno or speech; it never overlaps an announcement.`}</p>
     </section>`;
 }
@@ -1128,16 +1131,77 @@ async function setRole(nextRole, { silent = false } = {}) {
 
 async function setProvider(provider) {
   const target = clamp(store.state.config.musicLevel, 0, 100, 30);
+  const iphoneApple = provider === 'apple' && activeReceiverIsIOS();
   await store.mutate(draft => {
     draft.config.musicProvider = provider === 'apple' ? 'apple' : 'controlled';
-    draft.activityLog = [makeLog('settings', 'Music source selected', draft.config.musicProvider === 'apple' ? `Apple Music ${target}% target` : `Suno/direct exact ${target}/${draft.config.voiceLevel} mode`), ...(draft.activityLog || [])];
+    draft.activityLog = [makeLog('settings', 'Music source selected', draft.config.musicProvider === 'apple' ? iphoneApple ? 'Apple Music with physical iPhone volume' : `Apple Music ${target}% target` : `Manager Volume: Suno/direct exact ${target}/${draft.config.voiceLevel} mode`), ...(draft.activityLog || [])];
     return draft;
   }, 'Music source selected');
-  setFeedback(provider === 'apple' ? `Apple Music selected with a ${target}% target. It will pause for announcements.` : `Suno/direct selected for guaranteed ${target}/${audibleVoiceTarget()} mixing.`, true);
+  setFeedback(provider === 'apple'
+    ? iphoneApple
+      ? 'Apple Music selected. On this iPhone its loudness uses the physical output control; it will still pause completely for announcements.'
+      : `Apple Music selected with a ${target}% target. It will pause for announcements.`
+    : `Manager Volume selected for guaranteed ${target}% music / ${audibleVoiceTarget()}% announcements.`, true);
 }
 
-async function saveMusicLevel(percent) {
+async function saveManagedMusicLevel(percent, { startSource = false } = {}) {
   const target = clamp(percent, 0, 100, 30);
+  const stateBefore = store.state;
+  const sourceUrl = String(stateBefore.config.musicUrl || '').trim();
+  const online = receiverOnline(stateBefore.receiver, store.now());
+  const plan = managerVolumePlan({
+    selectedProvider: 'apple',
+    receiverIsIOS: true,
+    playbackProvider: stateBefore.playback?.provider,
+    playbackIntent: stateBefore.playback?.intent,
+    controlledSource: sourceUrl,
+    startControlled: startSource
+  });
+  audio.setMusicLevelPercent(target, { report: false });
+  await store.mutate(draft => {
+    draft.config.musicProvider = plan.nextProvider;
+    draft.config.musicLevel = target;
+    if (draft.playback?.provider === 'apple') {
+      draft.playback.volumeVerified = false;
+      draft.playback.volumeVerifiedPercent = null;
+      draft.playback.volumeVerifiedAt = 0;
+      if (!online) {
+        draft.playback.intent = 'stopped';
+        draft.playback.label = 'Ready for Manager Volume';
+        draft.playback.updatedAt = store.now();
+      }
+    }
+    draft.activityLog = [makeLog('settings', 'Manager Volume enabled', `${target}% Suno/direct music; ${audibleVoiceTarget(draft)}% announcements. Apple authorization preserved.`), ...(draft.activityLog || [])];
+    return draft;
+  }, `Manager Volume ${target}% saved`);
+  if (!online) {
+    setFeedback(`Manager Volume is saved at ${target}%. Start the speaker receiver, then play the saved Suno source. Apple authorization was not removed.`, true);
+    return target;
+  }
+  if (plan.command === 'play-controlled') {
+    await runtime.sendCommand('play-controlled', {
+      url: sourceUrl,
+      label: 'Manager Volume · Suno / Direct',
+      volumePercent: target,
+      volumeMode: 'global'
+    }, `Switch to Manager Volume at ${target}% sent to receiver.`);
+    setFeedback(`Manager Volume is active: music ${target}%, announcements ${audibleVoiceTarget()}%. Apple remains authorized.`, true);
+    return target;
+  }
+  if (plan.command === 'stop-music') {
+    await runtime.sendCommand('stop-music', { label: 'Switch to Manager Volume' }, 'Apple Music stop sent before Manager Volume setup.');
+    setFeedback(`Apple Music stopped safely. Manager Volume is ${target}%; choose a Suno / Direct source and tap Play. Apple remains authorized.`, true);
+    return target;
+  }
+  await runtime.sendCommand('set-music-level', { percent: target, label: `${target}% Manager Volume` }, `Manager Volume ${target}% sent to receiver.`);
+  setFeedback(`Manager Volume is ready at ${target}% music / ${audibleVoiceTarget()}% announcements.`, true);
+  return target;
+}
+
+async function saveMusicLevel(percent, { forceManaged = false, startManagedSource = false } = {}) {
+  const target = clamp(percent, 0, 100, 30);
+  const switchToManaged = forceManaged || (store.state.config.musicProvider === 'apple' && activeReceiverIsIOS());
+  if (switchToManaged) return await saveManagedMusicLevel(target, { startSource: startManagedSource });
   if (customPlaybackMusicTarget(store.state) === null) {
     audio.setMusicLevelPercent(target, { report: false });
     apple.setTargetVolumePercent(target);
@@ -1176,7 +1240,9 @@ function queueMusicLevelSave(percent) {
         await saveMusicLevel(target);
         if (sequence === musicLevelSaveSequence && queuedMusicLevel === null) {
           musicLevelDraft = null;
-          setFeedback(`Music target saved at ${target}%. Announcements silence music to ${DUCK_LEVEL_PERCENT}%.`, true);
+          setFeedback(store.state.config.musicProvider === 'controlled'
+            ? `Manager Volume is active at ${target}% music / ${audibleVoiceTarget()}% announcements. Music silences to ${DUCK_LEVEL_PERCENT}% during speech.`
+            : `Music target saved at ${target}%. Announcements silence music to ${DUCK_LEVEL_PERCENT}%.`, true);
           renderWhenIdle(true);
         }
       } catch (error) {
@@ -1408,6 +1474,10 @@ root.addEventListener('click', event => {
       });
     }
     if (action === 'stop-receiver') return await runAction('Stopping receiver', () => runtime.stop());
+    if (action === 'enable-managed-volume') {
+      const target = clamp(musicLevelDraft === null ? store.state.config.musicLevel : musicLevelDraft, 0, 100, 30);
+      return await runAction('Starting Manager Volume', () => saveMusicLevel(target, { forceManaged: true, startManagedSource: true }));
+    }
     if (action === 'provider') return await runAction('Changing music source', () => setProvider(button.dataset.provider));
     if (action === 'transport') return await runAction('Sending music command', () => sendTransport(button.dataset.command));
     if (action === 'saved-announcement' || action === 'safety-announcement') {
@@ -1757,6 +1827,10 @@ root.addEventListener('input', event => {
     output.value = `${target}%`;
     output.textContent = `${target}%`;
   }
+  const managedButton = root.querySelector('[data-managed-volume-button]');
+  if (managedButton) managedButton.textContent = `Start Manager Volume · ${target}%`;
+  const managedDescription = root.querySelector('[data-managed-volume-description]');
+  if (managedDescription) managedDescription.textContent = `iPhone cannot lower protected Apple Music in a web page. This starts the saved Suno / Direct bed at ${target}%; Apple stays authorized for later.`;
 });
 
 root.addEventListener('change', event => {
