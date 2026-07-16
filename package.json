@@ -11,7 +11,7 @@
     "build": "vite build",
     "preview": "vite preview --host 0.0.0.0",
     "test": "node --test",
-    "check": "node --check src/v30/core.js && node --check src/v30/audio-engine.js && node --check src/v30/cloud.js && node --check src/v30/spotify-receiver.js && node --check src/v30/receiver-runtime.js && node --check src/v30/app.js && node --check src/vx/core.js && node --check src/vx/audio-engine.js && node --check src/vx/cloud.js && node --check src/vx/native-music-bridge.js && node --check src/vx/apple-music-receiver.js && node --check src/vx/receiver-runtime.js && node --check src/vx/app.js && node --check api/state.js && node --check api/state-x.js && node --check api/session.js && node --check api/apple-music-token.js && node --check api/tts.js && node --check api/weather.js && node --check api/suno-playlist.js",
+    "check": "node --check src/v30/core.js && node --check src/v30/audio-engine.js && node --check src/v30/cloud.js && node --check src/v30/spotify-receiver.js && node --check src/v30/receiver-runtime.js && node --check src/v30/app.js && node --check src/vx/core.js && node --check src/vx/audio-engine.js && node --check src/vx/cloud.js && node --check src/vx/pushcut-client.js && node --check src/vx/native-music-bridge.js && node --check src/vx/apple-music-receiver.js && node --check src/vx/receiver-runtime.js && node --check src/vx/app.js && node --check api/state.js && node --check api/state-x.js && node --check api/session.js && node --check api/apple-music-token.js && node --check api/_pushcut-x.js && node --check api/pushcut-x.js && node --check api/tts.js && node --check api/weather.js && node --check api/suno-playlist.js",
     "verify": "npm run check && npm test && npm run build"
   },
   "dependencies": {

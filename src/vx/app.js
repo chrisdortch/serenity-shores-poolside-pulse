@@ -21,6 +21,11 @@ import {
 import { AudioEngine, isIOSLike } from './audio-engine.js';
 import { CloudStore, loginSession, logoutSession, sessionStatus } from './cloud.js';
 import { AppleMusicReceiver } from './apple-music-receiver.js';
+import {
+  PUSHCUT_MAX_ANNOUNCEMENT_CHARACTERS,
+  getPushcutAnnouncementStatus,
+  sendPushcutAnnouncement
+} from './pushcut-client.js';
 import { ReceiverRuntime } from './receiver-runtime.js';
 
 const root = document.getElementById('app');
@@ -68,6 +73,12 @@ let selectedScheduleId = localStorage.getItem(SCHEDULE_SELECTION_KEY) || '';
 let scheduleDeletePending = '';
 let draggedScheduleItemId = '';
 let draggedScheduleTargetId = '';
+let pushcutStatus = {
+  checked: false,
+  ready: false,
+  readyActions: {},
+  note: ''
+};
 
 function escapeHtml(value) {
   return String(value ?? '')
@@ -163,6 +174,30 @@ function activeReceiverIsIOS(state = store?.state) {
   const receiver = state?.receiver;
   if (receiverOnline(receiver, store.now())) return platformIsIOS(receiver?.platform);
   return role === 'receiver' && isIOSLike();
+}
+
+function pushcutAnnouncementReady() {
+  return pushcutStatus.ready === true && pushcutStatus.readyActions?.announce === true;
+}
+
+async function refreshPushcutStatus() {
+  try {
+    const status = await getPushcutAnnouncementStatus();
+    pushcutStatus = {
+      checked: true,
+      ready: status.ready === true,
+      readyActions: status.readyActions && typeof status.readyActions === 'object' ? status.readyActions : {},
+      note: String(status.note || '')
+    };
+  } catch (error) {
+    pushcutStatus = {
+      checked: true,
+      ready: false,
+      readyActions: {},
+      note: error.message || String(error)
+    };
+  }
+  return pushcutStatus;
 }
 
 function liveReceiverIsNative(state = store?.state) {
@@ -300,8 +335,9 @@ function updateLiveStatus() {
   const receiverBadge = document.querySelector('[data-live-receiver]');
   if (receiverBadge) {
     const online = receiverOnline(store.state.receiver, store.now());
-    receiverBadge.textContent = online ? 'Receiver online' : 'Receiver offline';
-    receiverBadge.className = `statusPill ${online ? 'online' : 'offline'}`;
+    const pushcutReady = pushcutAnnouncementReady();
+    receiverBadge.textContent = pushcutReady ? 'Pushcut configured' : online ? 'Receiver online' : 'Receiver offline';
+    receiverBadge.className = `statusPill ${pushcutReady || online ? 'online' : 'offline'}`;
   }
 }
 
@@ -344,6 +380,7 @@ async function restoreStoredAppleAuthorization({ reportSuccess = false } = {}) {
 
 async function bootstrapAuthenticatedApp() {
   await store.load();
+  await refreshPushcutStatus();
   const requestedRole = location.hash === '#receiver' ? 'receiver' : location.hash === '#command' ? 'command' : '';
   if (requestedRole) await setRole(requestedRole, { silent: true });
   if (role === 'command') apple.disconnect();
@@ -430,12 +467,13 @@ function renderRolePicker() {
 function shellStatus() {
   const state = store.state;
   const online = receiverOnline(state.receiver, store.now());
+  const pushcutReady = pushcutAnnouncementReady();
   const syncGood = store.syncMode === 'kv' || store.syncMode === 'local';
   const policy = displayAudioPolicy();
   return `
     <div class="shellStatus">
       <span class="statusPill ${syncGood ? 'online' : 'warn'}">${store.syncMode === 'kv' ? 'Cloud synced' : store.syncMode === 'local' ? 'Local preview' : escapeHtml(store.syncMode)}</span>
-      <span class="statusPill ${online ? 'online' : 'offline'}" data-live-receiver>${online ? 'Receiver online' : 'Receiver offline'}</span>
+      <span class="statusPill ${pushcutReady || online ? 'online' : 'offline'}" data-live-receiver>${pushcutReady ? 'Pushcut configured' : online ? 'Receiver online' : 'Receiver offline'}</span>
       <span class="statusPill mix">${policy.exact ? `${policy.musicPercent}% music / ${audibleVoiceTarget()}% voice` : activeReceiverIsIOS() && effectiveProvider() === 'apple' ? `Apple physical / ${audibleVoiceTarget()}% voice` : `Apple Music ${store.state.config.musicLevel}%?`}</span>
     </div>`;
 }
@@ -476,6 +514,7 @@ function feedbackBanner() {
 function receiverSummary() {
   const receiver = store.state.receiver;
   const online = receiverOnline(receiver, store.now());
+  if (pushcutAnnouncementReady()) return '<strong>Pushcut announcement receiver configured</strong><span>The receiver iPhone must remain on Ready For Requests.</span>';
   if (!online) return '<strong>No receiver online</strong><span>Open Version X on the speaker device and tap Start Receiver.</span>';
   return `<strong>${escapeHtml(receiver.name || 'Speaker Receiver')}</strong><span>${escapeHtml(receiver.detail || 'Ready')} · seen ${escapeHtml(relativeTime(receiver.lastSeen))}</span>`;
 }
@@ -680,13 +719,15 @@ function renderControl() {
 function renderAnnounce() {
   const announcements = store.state.announcements;
   const renderedText = item => safetyAnnouncementText(item.id, item.text, store.state.config);
+  const pushcutReady = pushcutAnnouncementReady();
   return `
     <section class="pageHeading"><p class="kicker">Announcements</p><h1>Clear voice, without music fighting it.</h1><p>Voice is prepared first, music is safely ducked or paused, and restoration waits until speech has ended.</p></section>
+    ${pushcutReady ? `<div class="callout"><strong>Pushcut iPhone receiver configured</strong><p>Keep the receiver iPhone on <em>Ready For Requests</em>. Live and saved announcements use Pushcut: Apple Music pauses, voice plays at ${audibleVoiceTarget()}%, volume returns to ${audibleMusicTarget(store.state)}%, then music resumes. “Accepted” means Pushcut queued the request; Version X does not yet claim device completion.</p><button type="button" data-action="pushcut-test" class="secondary">Run Short Receiver Test</button></div>` : ''}
     <section class="announcementComposer">
       ${voiceLevelControl()}
       <form data-form="announce">
         <label for="announcementText">Speak now</label>
-        <textarea id="announcementText" name="text" maxlength="900" placeholder="Type the announcement exactly as guests should hear it." required></textarea>
+        <textarea id="announcementText" name="text" maxlength="${pushcutReady ? PUSHCUT_MAX_ANNOUNCEMENT_CHARACTERS : 900}" placeholder="Type the announcement exactly as guests should hear it." required></textarea>
         <div class="composerFooter"><span>AI voice with device-voice fallback · ${audibleVoiceTarget()}% shared voice</span><button type="submit" class="primary">Speak Now</button></div>
       </form>
     </section>
@@ -859,6 +900,7 @@ function renderScheduleRow(item, schedule, index) {
 
 function renderSchedule() {
   const schedules = Array.isArray(store.state.schedules) ? store.state.schedules : [];
+  const pushcutReady = pushcutAnnouncementReady();
   const schedule = activeSavedSchedule();
   const items = Array.isArray(schedule.items) ? schedule.items : [];
   const enabledItems = items.filter(item => item.enabled !== false);
@@ -888,6 +930,7 @@ function renderSchedule() {
   const deleteArmed = scheduleDeletePending === schedule.id;
   return `
     <section class="pageHeading"><p class="kicker">Saved schedules</p><h1>Build the day in seconds.</h1><p>Create as many schedules as you need. Time schedules run automatically; Order schedules are fast, numbered cue lists controlled with Play Next.</p></section>
+    ${pushcutReady ? '<div class="callout warning"><strong>Pushcut live bridge is active; automatic schedule sync is not active yet.</strong><p>Play Now announcements use Pushcut, but do not rely on timed iPhone schedules until Version X has created and verified the Pushcut server schedules. This prevents the app from pretending a background Safari timer will run.</p></div>' : ''}
     <section class="scheduleWorkspace">
       <div class="schedulePickerBar">
         <label>Schedule to edit<select id="schedulePicker" aria-label="Schedule to edit">${schedules.map(candidate => `<option value="${escapeAttr(candidate.id)}" ${candidate.id === schedule.id ? 'selected' : ''}>${escapeHtml(candidate.name)}${candidate.id === store.state.activeScheduleId && candidate.enabled !== false ? ' (live)' : candidate.enabled ? '' : ' (off)'}</option>`).join('')}</select></label>
@@ -1351,6 +1394,48 @@ function queueVoiceLevelSave(percent) {
   return voiceLevelDrain;
 }
 
+async function sendLiveAnnouncement({
+  text,
+  label = 'Speak Now',
+  safety = false,
+  volumePercent = audibleVoiceTarget(store.state)
+} = {}) {
+  if (!pushcutAnnouncementReady()) {
+    return await runtime.sendCommand(safety ? 'announce-safety' : 'announce', {
+      text,
+      label,
+      volumePercent
+    }, `${label} sent to receiver.`);
+  }
+
+  const result = await sendPushcutAnnouncement({
+    text,
+    label,
+    safety,
+    voicePercent: volumePercent,
+    musicPercent: audibleMusicTarget(store.state)
+  });
+
+  // Pushcut's nowait response proves acceptance only. Save that exact fact, but
+  // never turn a later state-save problem into a retryable announcement error.
+  await store.mutate(draft => {
+    draft.activityLog = [
+      makeLog(
+        'command',
+        `${label} accepted by Pushcut`,
+        'The receiver request was accepted; completion is not yet verified by a device receipt.',
+        store.now(),
+        { eventId: result.eventId, commandType: safety ? 'announce-safety' : 'announce', pushcutStatus: 'accepted' }
+      ),
+      ...(draft.activityLog || [])
+    ];
+    return draft;
+  }, 'Pushcut acceptance recorded').catch(() => {});
+
+  setFeedback(`${label} was accepted by Pushcut. Watch the receiver: music should pause, speech should play louder, then music should return at ${audibleMusicTarget(store.state)}%.`, true);
+  return result;
+}
+
 async function sendTransport(command) {
   const labels = { 'pause-music': 'Pause sent to receiver.', 'resume-music': 'Resume sent to receiver.', 'next-music': 'Next sent to receiver.', 'stop-music': 'Stop sent to receiver.' };
   await runtime.sendCommand(command, { label: labels[command] || command }, labels[command] || 'Music command sent.');
@@ -1368,13 +1453,11 @@ async function playScheduleItem(id, scheduleId = activeSavedSchedule().id) {
     const text = item.action?.announcementSource === 'inline'
       ? rawText
       : safetyAnnouncementText(announcementId, rawText, store.state.config);
-    await runtime.sendCommand('announce', {
+    await sendLiveAnnouncement({
       text,
       label: item.label,
-      volumePercent: effectiveScheduleItemVolume(item, store.state.config),
-      volumeMode: item.volume?.mode,
-      scheduledItemId: item.id
-    }, `Play Now sent: ${item.label}.`);
+      volumePercent: effectiveScheduleItemVolume(item, store.state.config)
+    });
   } else if (kind === 'apple') {
     await runtime.sendCommand('play-apple', {
       url: item.action?.url || item.url || store.state.config.appleUrl,
@@ -1522,15 +1605,23 @@ root.addEventListener('click', event => {
     }
     if (action === 'provider') return await runAction('Changing music source', () => setProvider(button.dataset.provider));
     if (action === 'transport') return await runAction('Sending music command', () => sendTransport(button.dataset.command));
+    if (action === 'pushcut-test') {
+      return await runAction('Sending Pushcut receiver test', () => sendLiveAnnouncement({
+        text: 'Poolside Pulse receiver test. The announcement is louder than the music, and the music should now return quietly.',
+        label: 'Pushcut Receiver Test',
+        volumePercent: audibleVoiceTarget(store.state)
+      }));
+    }
     if (action === 'saved-announcement' || action === 'safety-announcement') {
       const item = store.state.announcements.find(entry => entry.id === button.dataset.id);
       if (!item) throw new Error('Saved announcement was not found.');
       const text = safetyAnnouncementText(item.id, item.text, store.state.config);
-      return await runAction('Sending announcement', () => runtime.sendCommand(action === 'safety-announcement' ? 'announce-safety' : 'announce', {
+      return await runAction('Sending announcement', () => sendLiveAnnouncement({
         text,
         label: item.label,
+        safety: action === 'safety-announcement',
         volumePercent: audibleVoiceTarget(store.state)
-      }, `${item.label} sent to receiver.`));
+      }));
     }
     if (action === 'weather-check') return await runAction('Sending weather check', () => runtime.sendCommand('weather-check', { announce: true, label: 'Manual weather check' }, 'Weather check sent to receiver.'));
     if (action === 'calibration') {
@@ -1969,11 +2060,11 @@ root.addEventListener('submit', event => {
     }
     if (kind === 'announce') {
       const text = String(data.get('text') || '').trim();
-      await runAction('Sending announcement', () => runtime.sendCommand('announce', {
+      await runAction('Sending announcement', () => sendLiveAnnouncement({
         text,
         label: 'Speak Now',
         volumePercent: audibleVoiceTarget(store.state)
-      }, 'Speak Now sent to receiver.'));
+      }));
       form.reset();
       return;
     }
