@@ -19,6 +19,8 @@
   --amber-100: #f8ecd3;
   --apple: #fa2d48;
   --apple-dark: #c81d43;
+  --spotify: #1db954;
+  --spotify-dark: #137f3c;
   --paper: #ffffff;
   --canvas: #f3f6f4;
   --canvas-deep: #e9efec;
@@ -137,6 +139,18 @@ button.appleButton,
 button.appleButton:focus-visible,
 .appleButton:focus-visible {
   box-shadow: 0 0 0 3px rgba(250, 45, 72, 0.24);
+}
+
+button.spotifyButton,
+.spotifyButton {
+  border-color: var(--spotify-dark);
+  background: linear-gradient(135deg, var(--spotify), var(--spotify-dark));
+  color: #fff;
+}
+
+button.spotifyButton:focus-visible,
+.spotifyButton:focus-visible {
+  box-shadow: 0 0 0 3px rgba(29, 185, 84, 0.24);
 }
 
 button.warningButton,
@@ -930,6 +944,17 @@ select:focus-visible {
   color: #64461f;
 }
 
+.scheduleSyncWarnings {
+  margin: 0.65rem 0 0.8rem;
+  padding-left: 1.25rem;
+  display: grid;
+  gap: 0.35rem;
+}
+
+.callout > [data-action="sync-pushcut-schedule"] {
+  margin-top: 0.8rem;
+}
+
 .textLink {
   min-height: 44px;
   display: inline-flex;
@@ -1414,6 +1439,31 @@ select:focus-visible {
   white-space: nowrap;
 }
 
+.pushcutVolumePrompt {
+  border-color: var(--green-700);
+  background: #f4faf6;
+}
+
+.pushcutVolumeResult {
+  margin-top: 4px;
+  color: var(--muted-strong);
+  font-size: 0.76rem;
+  font-weight: 750;
+}
+
+.pushcutVolumeResult.completed {
+  color: var(--green-700);
+}
+
+.pushcutVolumeResult.accepted,
+.pushcutVolumeResult.working {
+  color: var(--amber-800);
+}
+
+.pushcutVolumeResult.failed {
+  color: var(--coral-700);
+}
+
 .voiceVolumeControl {
   border-color: #e8a2ae;
   background: linear-gradient(145deg, #fff3f5, #ffffff 72%);
@@ -1425,7 +1475,7 @@ select:focus-visible {
 
 .providerSelector {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 8px;
   border: 1px solid var(--line);
   border-radius: 10px;
@@ -1529,6 +1579,85 @@ select:focus-visible {
   gap: 10px;
 }
 
+.announcementSourcesPanel {
+  margin-bottom: 18px;
+}
+
+.announcementSourceStatus {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.sourceCapability {
+  display: grid;
+  align-content: start;
+  gap: 5px;
+  min-height: 150px;
+  border: 1px solid var(--line);
+  border-top: 4px solid var(--teal-700);
+  border-radius: 8px;
+  padding: 14px;
+  background: var(--paper);
+}
+
+.sourceCapability.verified {
+  border-top-color: var(--green-700);
+  background: #f4faf6;
+}
+
+.sourceCapability.unavailable {
+  border-top-color: var(--amber-800);
+  background: #fffaf1;
+}
+
+.sourceCapability strong {
+  color: var(--navy-950);
+}
+
+.sourceCapability span {
+  color: var(--teal-700);
+  font-size: 0.73rem;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.sourceCapability.unavailable span {
+  color: var(--amber-800);
+}
+
+.sourceCapability p,
+.sourceEditorHelp {
+  margin: 0;
+  color: var(--muted-strong);
+  font-size: 0.82rem;
+}
+
+.announcementSourceEditorRow {
+  grid-template-columns: minmax(135px, 0.7fr) minmax(130px, 0.6fr) minmax(240px, 1.5fr) minmax(100px, 0.45fr) auto;
+}
+
+.announcementSourceEditorRow .rowActions {
+  flex-wrap: nowrap;
+}
+
+.sourceEditorHelp {
+  margin-top: 10px;
+}
+
+.receiverShortcutSetup ol {
+  margin: 0.9rem 0 0;
+  padding-left: 1.35rem;
+  display: grid;
+  gap: 0.65rem;
+  color: var(--muted-strong);
+}
+
+.receiverShortcutSetup li strong,
+.receiverShortcutSetup li code {
+  color: var(--navy-950);
+}
+
 .announcementComposer textarea {
   min-height: 164px;
 }
@@ -1578,6 +1707,14 @@ select:focus-visible {
 
 .announcementButton strong {
   color: var(--navy-950);
+}
+
+.announcementButton > span {
+  color: var(--teal-700);
+  font-size: 0.68rem;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
 }
 
 .announcementButton small {
@@ -1652,7 +1789,7 @@ select:focus-visible {
 
 .savedEditorRow {
   display: grid;
-  grid-template-columns: minmax(150px, 0.7fr) minmax(280px, 1.7fr) auto;
+  grid-template-columns: minmax(150px, 0.6fr) minmax(250px, 1.4fr) minmax(180px, 0.8fr) auto;
   align-items: end;
   gap: 14px;
   padding: 16px;
@@ -2392,6 +2529,11 @@ select:focus-visible {
     background: linear-gradient(135deg, #e52645, #ab1737);
   }
 
+  button.spotifyButton:hover:not(:disabled) {
+    border-color: #0f6d33;
+    background: linear-gradient(135deg, #19a94d, #0f6d33);
+  }
+
   button.textDanger:hover:not(:disabled) {
     background: var(--coral-100);
     box-shadow: none;
@@ -2453,6 +2595,15 @@ select:focus-visible {
 
   .safetyActions {
     justify-content: start;
+  }
+
+  .announcementSourceEditorRow {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .announcementSourceEditorRow .rowActions,
+  .announcementSourceEditorRow > button {
+    width: 100%;
   }
 }
 
@@ -2967,6 +3118,10 @@ select:focus-visible {
     width: 72%;
     transform: none;
   }
+
+  .announcementSourceStatus {
+    grid-template-columns: 1fr;
+  }
 }
 
 @media (prefers-contrast: more) {
@@ -3025,6 +3180,10 @@ select:focus-visible {
   .scheduleSettings,
   .scheduleFormGrid,
   .conditionalFields {
+    grid-template-columns: 1fr;
+  }
+
+  .announcementSourceEditorRow {
     grid-template-columns: 1fr;
   }
 

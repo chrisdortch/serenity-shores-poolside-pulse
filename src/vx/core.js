@@ -5,6 +5,7 @@ export const STATE_VERSION = 'x';
 export const MUSIC_LEVEL_PERCENT = 30;
 export const VOICE_LEVEL_PERCENT = 100;
 export const DUCK_LEVEL_PERCENT = 0;
+export const ANNOUNCEMENT_FINITE_AUDIO_MAX_SECONDS = 45;
 export const MAX_SCHEDULE_ITEMS = 100;
 export const SCHEDULE_DURATION_MIN_SECONDS = 1;
 export const SCHEDULE_DURATION_MAX_SECONDS = 24 * 60 * 60;
@@ -21,6 +22,8 @@ export const WEATHER_TIME_ZONE = 'America/Chicago';
 // Apple Music sources are intentionally user supplied. MusicKit configuration
 // and its short-lived developer token come from the Version X server route.
 export const DEFAULT_APPLE_MUSIC_PLAYLIST = '';
+export const DEFAULT_SPOTIFY_CLIENT_ID = '7e086716aaea4ce98051287b552a676c';
+export const DEFAULT_SPOTIFY_PLAYLIST = 'https://open.spotify.com/track/11dFghVXANMlKmJXsNCbNl';
 export const DEFAULT_SUNO_SOURCE = 'https://suno.com/s/mmRHZLjTTkACvgBW';
 export const DEFAULT_ADDRESS = '615 Serenity Shores Ln, Kimberling City, MO 65686';
 
@@ -102,6 +105,19 @@ export const DEFAULT_ANNOUNCEMENTS = [
   }
 ];
 
+export const DEFAULT_ANNOUNCEMENT_SOURCES = [
+  {
+    id: 'natural-voice',
+    label: 'Natural Voice',
+    kind: 'natural-voice',
+    provider: 'openai-tts',
+    voice: 'marin',
+    finite: true,
+    playbackSupport: 'supported',
+    verification: 'unverified'
+  }
+];
+
 export const DEFAULT_SCHEDULE = [
   { id: 'open-welcome', label: 'Pool Open Welcome', type: 'announcement', time: '09:05', announcementId: 'welcome', enabled: true, days: [0, 1, 2, 3, 4, 5, 6] },
   { id: 'ten-welcome', label: '10am Welcome', type: 'announcement', time: '10:00', announcementId: 'welcome', enabled: true, days: [0, 1, 2, 3, 4, 5, 6] },
@@ -159,6 +175,8 @@ export function createDefaultState(now = Date.now()) {
       musicUrl: DEFAULT_SUNO_SOURCE,
       musicLabel: 'Serenity Shores Suno playlist',
       appleUrl: DEFAULT_APPLE_MUSIC_PLAYLIST,
+      spotifyUrl: DEFAULT_SPOTIFY_PLAYLIST,
+      spotifyClientId: DEFAULT_SPOTIFY_CLIENT_ID,
       musicLevel: MUSIC_LEVEL_PERCENT,
       voiceLevel: VOICE_LEVEL_PERCENT,
       duckLevel: DUCK_LEVEL_PERCENT,
@@ -181,7 +199,8 @@ export function createDefaultState(now = Date.now()) {
       trackIndex: 0,
       updatedAt: now
     },
-    announcements: clone(DEFAULT_ANNOUNCEMENTS),
+    announcementSources: clone(DEFAULT_ANNOUNCEMENT_SOURCES),
+    announcements: clone(DEFAULT_ANNOUNCEMENTS).map(item => ({ ...item, sourceId: 'natural-voice' })),
     schedules: [clone(defaultNamedSchedule)],
     activeScheduleId: DEFAULT_SCHEDULE_ID,
     // Compatibility projection for older time-only clients and receivers.
@@ -217,12 +236,92 @@ function normalizeAnnouncement(item) {
   return {
     id: String(item?.id || makeId('announcement')),
     label: String(item?.label || 'Announcement').slice(0, 80),
-    text: String(item?.text || '').slice(0, 900)
+    text: String(item?.text || '').slice(0, 900),
+    sourceId: boundedString(item?.sourceId ?? item?.announcementSourceId, 120, 'natural-voice') || 'natural-voice'
   };
 }
 
 function boundedString(value, maxLength, fallback = '') {
   return String(value ?? fallback).trim().slice(0, maxLength);
+}
+
+export function isHttpsUrl(value) {
+  try {
+    return new URL(String(value || '').trim()).protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
+function announcementProvider(value) {
+  const requested = boundedString(value, 40).toLowerCase();
+  if (['ai', 'natural-voice', 'openai', 'openai-tts', 'voice'].includes(requested)) return 'openai-tts';
+  return ['direct', 'suno', 'apple', 'spotify'].includes(requested) ? requested : '';
+}
+
+export function normalizeAnnouncementSource(item) {
+  if (!item || typeof item !== 'object') return null;
+  const id = boundedString(item.id, 120);
+  const provider = announcementProvider(item.provider ?? item.type ?? item.kind);
+  if (!id || !provider) return null;
+  const naturalVoice = provider === 'openai-tts';
+  const providerTakeover = provider === 'apple' || provider === 'spotify';
+  const requestedDuration = Number(item.durationSeconds ?? item.expectedDurationSeconds);
+  const durationSeconds = !naturalVoice && Number.isInteger(requestedDuration)
+    && requestedDuration >= 1 && requestedDuration <= ANNOUNCEMENT_FINITE_AUDIO_MAX_SECONDS
+    ? requestedDuration
+    : 0;
+  const url = naturalVoice ? '' : boundedString(item.url ?? item.locator?.url, 2000);
+  const finite = naturalVoice || item.finite === true;
+  const finiteAudio = (provider === 'direct' || provider === 'suno')
+    && finite
+    && isHttpsUrl(url)
+    && durationSeconds > 0;
+  const playbackSupport = naturalVoice || finiteAudio
+    ? 'supported'
+    : providerTakeover
+      ? 'experimental'
+      : 'unsupported';
+  const note = providerTakeover
+    ? 'Apple Music and Spotify catalog playback cannot report reliable completion or restore the prior queue on one iPhone.'
+    : playbackSupport === 'unsupported'
+      ? `Use a finite HTTPS Suno/direct clip with an explicit expected duration of 1-${ANNOUNCEMENT_FINITE_AUDIO_MAX_SECONDS} seconds.`
+      : boundedString(item.note, 300);
+  return {
+    id,
+    label: boundedString(item.label, 100, naturalVoice ? 'Natural Voice' : 'Announcement clip') || (naturalVoice ? 'Natural Voice' : 'Announcement clip'),
+    kind: naturalVoice ? 'natural-voice' : 'finite-audio',
+    provider,
+    url,
+    finite,
+    durationSeconds,
+    playbackSupport,
+    verification: item.verification === 'verified' ? 'verified' : 'unverified',
+    voice: naturalVoice ? (boundedString(item.voice, 40, 'marin') || 'marin') : '',
+    instructions: naturalVoice ? boundedString(item.instructions, 700) : '',
+    note
+  };
+}
+
+export function announcementDeliveryForSource(source) {
+  const normalized = normalizeAnnouncementSource(source);
+  if (!normalized || normalized.playbackSupport !== 'supported') {
+    throw new Error('Choose Natural Voice or a supported short Suno/direct announcement clip.');
+  }
+  if (normalized.kind === 'natural-voice') {
+    return {
+      announcementMode: 'natural-voice',
+      announcementProvider: '',
+      announcementAudioUrl: '',
+      announcementDurationSeconds: 0
+    };
+  }
+  return {
+    announcementMode: 'finite-audio',
+    announcementProvider: normalized.provider,
+    announcementAudioUrl: normalized.url,
+    announcementDurationSeconds: normalized.durationSeconds
+  };
 }
 
 function normalizeTime(value, fallback = '12:00') {
@@ -237,6 +336,7 @@ function normalizeTime(value, fallback = '12:00') {
 function scheduleActionKind(item) {
   const requested = String(item?.action?.kind ?? item?.kind ?? item?.type ?? '').toLowerCase();
   if (requested === 'apple') return 'apple';
+  if (requested === 'spotify') return 'spotify';
   if (['controlled', 'suno', 'direct', 'audio'].includes(requested)) return 'controlled';
   return 'announcement';
 }
@@ -271,6 +371,7 @@ export function normalizeScheduleItem(item, index = 0) {
   const time = normalizeTime(source.position?.time ?? source.time);
   const order = scheduleItemOrder(source, index);
   const announcementId = boundedString(actionSource.announcementId ?? source.announcementId, 120);
+  const sourceId = boundedString(actionSource.sourceId ?? source.sourceId, 120);
   const url = boundedString(actionSource.url ?? source.url, 2000);
   const normalized = {
     id: boundedString(source.id, 120) || makeId('schedule-item'),
@@ -284,6 +385,7 @@ export function normalizeScheduleItem(item, index = 0) {
       kind,
       announcementSource,
       announcementId,
+      sourceId,
       text: boundedString(inferredInlineText, 900),
       url
     },
@@ -491,7 +593,7 @@ function normalizeSequenceActive(active) {
     claimedAt: boundedTimestamp(source.claimedAt),
     startedAt: boundedTimestamp(source.startedAt),
     dueAt: boundedTimestamp(source.dueAt),
-    expectedProvider: ['controlled', 'apple'].includes(requestedProvider) ? requestedProvider : '',
+    expectedProvider: ['controlled', 'apple', 'spotify'].includes(requestedProvider) ? requestedProvider : '',
     expectedUrl: boundedString(source.expectedUrl, 2000)
   };
 }
@@ -595,7 +697,7 @@ export function normalizeState(input, now = Date.now()) {
   const defaults = createDefaultState(now);
   const source = input && typeof input === 'object' ? input : {};
   const config = { ...defaults.config, ...(source.config || {}) };
-  config.musicProvider = config.musicProvider === 'apple' ? 'apple' : 'controlled';
+  config.musicProvider = ['apple', 'spotify'].includes(config.musicProvider) ? config.musicProvider : 'controlled';
   config.musicLevel = clamp(config.musicLevel, 0, 100, MUSIC_LEVEL_PERCENT);
   config.voiceLevel = clamp(config.voiceLevel, 0, 100, VOICE_LEVEL_PERCENT);
   config.duckLevel = DUCK_LEVEL_PERCENT;
@@ -624,7 +726,10 @@ export function normalizeState(input, now = Date.now()) {
         appleVerifiedAt: Math.max(0, Number(source.receiver.appleVerifiedAt || 0) || 0),
         receiverKind: String(source.receiver.receiverKind || '').slice(0, 60),
         appleTransport: String(source.receiver.appleTransport || '').slice(0, 60),
-        appleVolumeCapability: String(source.receiver.appleVolumeCapability || '').slice(0, 60)
+        appleVolumeCapability: String(source.receiver.appleVolumeCapability || '').slice(0, 60),
+        spotifyStatus: String(source.receiver.spotifyStatus || 'login-required').slice(0, 40),
+        spotifyDetail: String(source.receiver.spotifyDetail || '').slice(0, 300),
+        spotifyVerifiedAt: Math.max(0, Number(source.receiver.spotifyVerifiedAt || 0) || 0)
       }
     : null;
 
@@ -645,6 +750,21 @@ export function normalizeState(input, now = Date.now()) {
     const fixed = defaults.announcements.find(item => item.id === fixedId);
     announcementMap.set(fixedId, normalizeAnnouncement(fixed));
   }
+  const announcementSourceMap = new Map(defaults.announcementSources
+    .map(normalizeAnnouncementSource)
+    .filter(Boolean)
+    .map(item => [item.id, item]));
+  for (const item of (Array.isArray(source.announcementSources) ? source.announcementSources : []).slice(0, 40)) {
+    const normalized = normalizeAnnouncementSource(item);
+    if (normalized) announcementSourceMap.set(normalized.id, normalized);
+  }
+  const announcementSources = [...announcementSourceMap.values()].slice(0, 40);
+  const validAnnouncementSourceIds = new Set(announcementSources.map(item => item.id));
+  for (const [id, item] of announcementMap) {
+    if (!item.sourceId || !validAnnouncementSourceIds.has(item.sourceId)) {
+      announcementMap.set(id, { ...item, sourceId: 'natural-voice' });
+    }
+  }
 
   let schedules = normalizeScheduleCollection(source, defaults);
   const requestedActiveScheduleId = boundedString(source.activeScheduleId, 120);
@@ -660,6 +780,21 @@ export function normalizeState(input, now = Date.now()) {
       : schedule);
     activeSchedule = schedules[activeIndex];
   }
+  schedules = schedules.map(savedSchedule => ({
+    ...savedSchedule,
+    items: savedSchedule.items.map(item => scheduleActionKind(item) === 'announcement'
+      ? {
+          ...item,
+          action: {
+            ...item.action,
+            sourceId: validAnnouncementSourceIds.has(item.action?.sourceId)
+              ? item.action.sourceId
+              : 'natural-voice'
+          }
+        }
+      : item)
+  }));
+  activeSchedule = schedules.find(savedSchedule => savedSchedule.id === activeSchedule?.id) || schedules[0];
   const activeScheduleId = activeSchedule?.id || '';
   // Existing receivers only understand time-triggered items. An Order schedule
   // must never leak into that timer path and accidentally run at placeholder times.
@@ -676,6 +811,7 @@ export function normalizeState(input, now = Date.now()) {
     receiver,
     playback: { ...defaults.playback, ...(source.playback || {}) },
     weather: { ...defaults.weather, ...(source.weather || {}) },
+    announcementSources,
     announcements: [...announcementMap.values()],
     schedules,
     activeScheduleId,
@@ -706,7 +842,10 @@ export function makeReceiverLease({
   appleVerifiedAt = 0,
   receiverKind = '',
   appleTransport = '',
-  appleVolumeCapability = ''
+  appleVolumeCapability = '',
+  spotifyStatus = 'login-required',
+  spotifyDetail = '',
+  spotifyVerifiedAt = 0
 }, now = Date.now()) {
   return {
     id: String(deviceId || ''),
@@ -724,7 +863,10 @@ export function makeReceiverLease({
     appleVerifiedAt: Math.max(0, Number(appleVerifiedAt || 0) || 0),
     receiverKind: String(receiverKind || '').slice(0, 60),
     appleTransport: String(appleTransport || '').slice(0, 60),
-    appleVolumeCapability: String(appleVolumeCapability || '').slice(0, 60)
+    appleVolumeCapability: String(appleVolumeCapability || '').slice(0, 60),
+    spotifyStatus: String(spotifyStatus || 'login-required').slice(0, 40),
+    spotifyDetail: String(spotifyDetail || '').slice(0, 300),
+    spotifyVerifiedAt: Math.max(0, Number(spotifyVerifiedAt || 0) || 0)
   };
 }
 
@@ -812,7 +954,7 @@ export function audioPolicy({
   const target = clamp(musicPercent, 0, 100, MUSIC_LEVEL_PERCENT);
   const voiceTarget = clamp(voicePercent, 0, 100, VOICE_LEVEL_PERCENT);
   const verifiedAtTarget = volumeVerified === true && Number(verifiedPercent) === target;
-  if (provider !== 'apple') {
+  if (provider === 'controlled') {
     return {
       id: 'controlled-adjustable-duck',
       exact: true,
@@ -824,29 +966,31 @@ export function audioPolicy({
       detail: `Receiver-owned Suno/direct audio is routed through one Web Audio mixer: music ${target}%, announcements ${voiceTarget}%, music ${Math.min(DUCK_LEVEL_PERCENT, target)}% during speech.`
     };
   }
+  const externalName = provider === 'spotify' ? 'Spotify' : 'Apple Music';
+  const providerId = provider === 'spotify' ? 'spotify' : 'apple';
   if (!isIOS && supportsVolume && verifiedAtTarget) {
     return {
-      id: 'apple-verified-volume-pause',
+      id: `${providerId}-verified-volume-pause`,
       exact: true,
       musicPercent: target,
       voicePercent: voiceTarget,
       duringVoicePercent: 0,
       action: 'pause',
-      label: `Verified Apple Music ${target}% + voice takeover`,
-      detail: `This receiver reports Apple Music volume support. Apple Music is verified at ${target}%, paused for announcements, then resumed without restarting the track.`
+      label: `Verified ${externalName} ${target}% + voice takeover`,
+      detail: `This receiver reports ${externalName} volume support. ${externalName} is verified at ${target}%, paused for announcements, then resumed without restarting the track.`
     };
   }
   return {
-    id: isIOS ? 'apple-ios-pause-only' : 'apple-unverified-pause-only',
+    id: isIOS ? `${providerId}-ios-pause-only` : `${providerId}-unverified-pause-only`,
     exact: false,
     musicPercent: null,
     voicePercent: voiceTarget,
     duringVoicePercent: 0,
     action: 'pause',
-    label: 'Apple Music pause-for-voice compatibility',
+    label: `${externalName} pause-for-voice compatibility`,
     detail: isIOS
-      ? 'iPhone/iPad browsers cannot set Apple Music playback volume. Use the receiver iPhone or connected speaker controls; Apple Music will pause for announcements and resume afterward.'
-      : `Apple Music volume has not been verified at ${target}% on this receiver. Apple Music will pause for announcements and resume afterward.`
+      ? `iPhone/iPad browsers cannot set ${externalName} playback volume directly. Use the receiver iPhone or connected speaker controls; when Pushcut is configured, the Poolside Pulse Shortcut sets the shared device output to ${target}% for music and ${voiceTarget}% for announcements. ${externalName} pauses during speech and resumes afterward.`
+      : `${externalName} volume has not been verified at ${target}% on this receiver. ${externalName} will pause for announcements and resume afterward.`
   };
 }
 
@@ -858,16 +1002,18 @@ export function managerVolumePlan({
   controlledSource = '',
   startControlled = false
 } = {}) {
-  const switchToControlled = selectedProvider === 'apple' && receiverIsIOS === true;
-  const applePlaybackPlaying = playbackProvider === 'apple' && playbackIntent === 'playing';
-  const applePlaybackActive = playbackProvider === 'apple' && playbackIntent !== 'stopped';
+  const externalSelected = selectedProvider === 'apple' || selectedProvider === 'spotify';
+  const externalPlayback = playbackProvider === 'apple' || playbackProvider === 'spotify';
+  const switchToControlled = externalSelected && receiverIsIOS === true;
+  const externalPlaybackPlaying = externalPlayback && playbackIntent === 'playing';
+  const externalPlaybackActive = externalPlayback && playbackIntent !== 'stopped';
   const hasControlledSource = String(controlledSource || '').trim().length > 0;
   return {
     switchToControlled,
-    nextProvider: switchToControlled ? 'controlled' : selectedProvider === 'apple' ? 'apple' : 'controlled',
-    command: switchToControlled && hasControlledSource && (applePlaybackPlaying || startControlled === true)
+    nextProvider: switchToControlled ? 'controlled' : externalSelected ? selectedProvider : 'controlled',
+    command: switchToControlled && hasControlledSource && (externalPlaybackPlaying || startControlled === true)
       ? 'play-controlled'
-      : switchToControlled && applePlaybackActive
+      : switchToControlled && externalPlaybackActive
         ? 'stop-music'
       : 'set-music-level'
   };
@@ -896,6 +1042,10 @@ export function isAppleMusicUrl(value) {
   } catch {
     return false;
   }
+}
+
+export function isSpotifyUrl(value) {
+  return /^(?:spotify:|https?:\/\/(?:open\.)?spotify\.com\/)/i.test(String(value || '').trim());
 }
 
 export function isSunoUrl(value) {

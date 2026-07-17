@@ -5,6 +5,33 @@ const X_STATE_KEY = 'serenity-shores-poolside-radio-vx-20260714';
 const KV_REQUEST_TIMEOUT_MS = 8_000;
 const MAX_REQUEST_BYTES = 1_100_000;
 const MAX_STATE_BYTES = 1_000_000;
+const MAX_ANNOUNCEMENT_SOURCES = 200;
+const MAX_FINITE_ANNOUNCEMENT_SECONDS = 45;
+const X_BED_PROVIDER_ALIASES = new Map([
+  ['apple', 'apple'],
+  ['audio', 'controlled'],
+  ['controlled', 'controlled'],
+  ['direct', 'controlled'],
+  ['spotify', 'spotify'],
+  ['suno', 'controlled']
+]);
+const X_ANNOUNCEMENT_MEDIA_PROVIDERS = new Set(['apple', 'direct', 'spotify', 'suno']);
+const CONFIG_SECRET_KEYS = Object.freeze([
+  'appleMusicPrivateKey',
+  'applePrivateKey',
+  'privateKey',
+  'APPLE_MUSIC_PRIVATE_KEY',
+  'spotifyAccessToken',
+  'spotifyRefreshToken',
+  'spotifyClientSecret',
+  'SPOTIFY_ACCESS_TOKEN',
+  'SPOTIFY_REFRESH_TOKEN',
+  'SPOTIFY_CLIENT_SECRET',
+  'openAIApiKey',
+  'OPENAI_API_KEY',
+  'pushcutApiKey',
+  'PUSHCUT_API_KEY_X'
+]);
 const X_COMPARE_AND_SET_SCRIPT = `
 local current = redis.call("GET", KEYS[1])
 local currentRevision = 0
@@ -64,29 +91,303 @@ function safeClone(value, depth = 0) {
   return clean;
 }
 
+function boundedString(value, maxLength, fallback = '') {
+  return String(value ?? fallback).trim().slice(0, maxLength);
+}
+
+function normalizeBedProvider(value, fallback = 'controlled') {
+  const requested = boundedString(value, 40).toLowerCase();
+  if (X_BED_PROVIDER_ALIASES.has(requested)) return X_BED_PROVIDER_ALIASES.get(requested);
+  const safeFallback = boundedString(fallback, 40).toLowerCase();
+  return X_BED_PROVIDER_ALIASES.get(safeFallback) || 'controlled';
+}
+
+function safeHttpsUrl(value) {
+  const text = boundedString(value, 2_000);
+  if (!text) return '';
+  try {
+    const parsed = new URL(text);
+    if (parsed.protocol !== 'https:' || parsed.username || parsed.password) return '';
+    return text;
+  } catch {
+    return '';
+  }
+}
+
 function sanitizeConfig(value) {
   const source = isRecord(value) ? safeClone(value) : {};
   const clean = {
     ...source,
-    musicProvider: source.musicProvider === 'apple' ? 'apple' : 'controlled',
+    // `controlled` remains the compatibility identifier for the existing
+    // Suno/direct Web Audio bed. Apple and Spotify are separate provider beds.
+    musicProvider: normalizeBedProvider(source.musicProvider),
     musicLevel: clamp(source.musicLevel, 0, 100, 30),
     voiceLevel: clamp(source.voiceLevel, 0, 100, 100),
     // Version X guarantees no music/voice overlap. A spoken announcement fully
     // silences the music path, while music and voice levels remain adjustable.
     duckLevel: 0
   };
-  for (const key of [
-    'appleMusicPrivateKey',
-    'applePrivateKey',
-    'privateKey',
-    'APPLE_MUSIC_PRIVATE_KEY'
-  ]) delete clean[key];
+  for (const key of CONFIG_SECRET_KEYS) delete clean[key];
   return clean;
+}
+
+function sanitizePlayback(value, fallbackProvider = 'controlled') {
+  const source = isRecord(value) ? safeClone(value) : {};
+  const clean = {
+    ...source,
+    provider: normalizeBedProvider(source.provider, fallbackProvider)
+  };
+  for (const key of CONFIG_SECRET_KEYS) delete clean[key];
+  return clean;
+}
+
+function normalizeAnnouncementProvider(value) {
+  const requested = boundedString(value, 40).toLowerCase();
+  if (['ai', 'natural-voice', 'openai', 'openai-tts'].includes(requested)) return 'openai-tts';
+  return X_ANNOUNCEMENT_MEDIA_PROVIDERS.has(requested) ? requested : '';
+}
+
+function sanitizeAnnouncementSource(value) {
+  if (!isRecord(value)) return null;
+  const source = safeClone(value);
+  const id = boundedString(source.id, 120);
+  const provider = normalizeAnnouncementProvider(source.provider ?? source.type ?? source.kind);
+  if (!id || !provider) return null;
+
+  const naturalVoice = provider === 'openai-tts';
+  const requestedKind = boundedString(source.kind ?? source.type, 40).toLowerCase();
+  if (naturalVoice && requestedKind && !['ai', 'natural-voice', 'openai', 'openai-tts', 'speech', 'voice'].includes(requestedKind)) {
+    return null;
+  }
+  if (!naturalVoice && requestedKind && !['apple', 'audio', 'direct', 'media', 'spotify', 'suno'].includes(requestedKind)) {
+    return null;
+  }
+
+  const kind = naturalVoice ? 'natural-voice' : 'media';
+  const url = naturalVoice ? '' : safeHttpsUrl(source.url ?? source.locator?.url);
+  const finite = naturalVoice ? true : source.finite === true;
+  const requestedDuration = Number(source.durationSeconds ?? source.expectedDurationSeconds);
+  const durationSeconds = !naturalVoice && Number.isInteger(requestedDuration)
+    && requestedDuration >= 1 && requestedDuration <= MAX_FINITE_ANNOUNCEMENT_SECONDS
+    ? requestedDuration
+    : 0;
+  const providerTakeover = provider === 'apple' || provider === 'spotify';
+  const finiteDirectMedia = (provider === 'direct' || provider === 'suno')
+    && finite
+    && Boolean(url)
+    && durationSeconds > 0;
+  const playbackSupport = naturalVoice || finiteDirectMedia
+    ? 'supported'
+    : providerTakeover
+      ? 'experimental'
+      : 'unsupported';
+  const note = providerTakeover
+    ? 'Catalog playback completion and prior queue restoration are unverified on iPhone.'
+    : playbackSupport === 'unsupported'
+      ? 'Only finite HTTPS direct or Suno media can be used as a supported announcement.'
+      : '';
+
+  // Capability and verification are deliberately server-derived. Persisting a
+  // browser-supplied "verified" flag would turn a saved catalog URL into a
+  // false playback receipt.
+  return {
+    id,
+    label: boundedString(source.label, 100, naturalVoice ? 'Natural voice' : 'Announcement media')
+      || (naturalVoice ? 'Natural voice' : 'Announcement media'),
+    kind,
+    provider,
+    url,
+    finite,
+    durationSeconds,
+    playbackSupport,
+    verification: 'unverified',
+    ...(naturalVoice ? {
+      voice: boundedString(source.voice, 40, 'marin') || 'marin',
+      instructions: boundedString(source.instructions, 700)
+    } : {}),
+    ...(note ? { note } : {})
+  };
+}
+
+function sanitizeAnnouncementSources(value) {
+  const sources = new Map();
+  for (const item of Array.isArray(value) ? value.slice(0, MAX_ANNOUNCEMENT_SOURCES) : []) {
+    const clean = sanitizeAnnouncementSource(item);
+    if (clean) sources.set(clean.id, clean);
+  }
+  return [...sources.values()];
+}
+
+function sanitizeAnnouncements(value, original, validSourceIds) {
+  const originalById = new Map((Array.isArray(original) ? original : [])
+    .filter(isRecord)
+    .map(item => [boundedString(item.id, 120), item]));
+  return (Array.isArray(value) ? value : []).map(item => {
+    const clean = isRecord(item) ? safeClone(item) : {};
+    const source = originalById.get(boundedString(clean.id, 120));
+    const sourceId = boundedString(source?.sourceId ?? source?.announcementSourceId, 120);
+    if (!sourceId || !validSourceIds.has(sourceId)) return clean;
+    return { ...clean, sourceId };
+  });
+}
+
+function requestedScheduleBedProvider(value) {
+  if (!isRecord(value)) return null;
+  const action = isRecord(value.action) ? value.action : {};
+  const requested = boundedString(action.kind ?? value.kind ?? value.type, 40).toLowerCase();
+  return X_BED_PROVIDER_ALIASES.has(requested) ? X_BED_PROVIDER_ALIASES.get(requested) : null;
+}
+
+function sanitizeScheduleItem(value, original, validSourceIds) {
+  const clean = isRecord(value) ? safeClone(value) : {};
+  const source = isRecord(original) ? original : clean;
+  const bedProvider = requestedScheduleBedProvider(source);
+  const action = isRecord(clean.action) ? clean.action : {};
+  const originalAction = isRecord(source.action) ? source.action : {};
+  const sourceId = boundedString(originalAction.sourceId ?? source.sourceId, 120);
+  const nextAction = {
+    ...action,
+    ...(bedProvider ? { kind: bedProvider } : {}),
+    ...(!bedProvider && sourceId && validSourceIds.has(sourceId) ? { sourceId } : {})
+  };
+  if (bedProvider) {
+    delete nextAction.announcementSource;
+    delete nextAction.announcementId;
+    delete nextAction.text;
+    delete nextAction.sourceId;
+  }
+  const originalVolume = isRecord(source.volume) ? source.volume : {};
+  const originalAdvance = isRecord(source.advance) ? source.advance : {};
+  const requestedAdvanceMode = boundedString(originalAdvance.mode ?? source.advanceMode, 40).toLowerCase();
+  const bedAdvanceMode = ['complete', 'track-end', 'duration', 'manual'].includes(requestedAdvanceMode)
+    ? requestedAdvanceMode
+    : 'manual';
+  return {
+    ...clean,
+    action: nextAction,
+    ...(bedProvider ? {
+      type: bedProvider,
+      volume: {
+        mode: boundedString(originalVolume.mode ?? source.volumeMode, 40).toLowerCase() === 'custom'
+          ? 'custom'
+          : 'global',
+        percent: clamp(originalVolume.percent ?? source.volumePercent, 0, 100, 30)
+      },
+      advance: {
+        mode: bedAdvanceMode,
+        durationSeconds: clamp(
+          originalAdvance.durationSeconds ?? source.durationSeconds,
+          1,
+          24 * 60 * 60,
+          5 * 60
+        )
+      }
+    } : {})
+  };
+}
+
+function sanitizeSchedules(value, original, validSourceIds) {
+  const originalSchedules = Array.isArray(original) ? original : [];
+  const originalById = new Map(originalSchedules
+    .filter(isRecord)
+    .map(schedule => [boundedString(schedule.id, 120), schedule]));
+  return (Array.isArray(value) ? value : []).map((schedule, scheduleIndex) => {
+    const clean = isRecord(schedule) ? safeClone(schedule) : {};
+    const source = originalById.get(boundedString(clean.id, 120)) || originalSchedules[scheduleIndex] || {};
+    const sourceItems = Array.isArray(source.items) ? source.items : Array.isArray(source.schedule) ? source.schedule : [];
+    const sourceItemsById = new Map(sourceItems
+      .filter(isRecord)
+      .map(item => [boundedString(item.id, 120), item]));
+    return {
+      ...clean,
+      items: (Array.isArray(clean.items) ? clean.items : []).map((item, itemIndex) => sanitizeScheduleItem(
+        item,
+        sourceItemsById.get(boundedString(item?.id, 120)) || sourceItems[itemIndex],
+        validSourceIds
+      ))
+    };
+  });
+}
+
+function sanitizeLegacySchedule(value, schedules, activeScheduleId) {
+  const active = (Array.isArray(schedules) ? schedules : [])
+    .find(schedule => boundedString(schedule?.id, 120) === boundedString(activeScheduleId, 120));
+  const fullItemsById = new Map((Array.isArray(active?.items) ? active.items : [])
+    .filter(isRecord)
+    .map(item => [boundedString(item.id, 120), item]));
+  return (Array.isArray(value) ? value : []).map(item => {
+    const clean = isRecord(item) ? safeClone(item) : {};
+    const full = fullItemsById.get(boundedString(clean.id, 120));
+    if (!full) return clean;
+    const sourceId = boundedString(full.action?.sourceId, 120);
+    return {
+      ...clean,
+      type: boundedString(full.action?.kind ?? full.type, 40, clean.type),
+      ...(sourceId ? { sourceId } : {})
+    };
+  });
+}
+
+function sanitizeReceiver(value, original) {
+  if (!isRecord(value)) return null;
+  const clean = safeClone(value);
+  const source = isRecord(original) ? original : {};
+  const textFields = {
+    spotifyStatus: 40,
+    spotifyDetail: 300,
+    spotifyDeviceId: 160,
+    spotifyDeviceName: 160,
+    spotifyTransport: 60,
+    spotifyVolumeCapability: 60
+  };
+  for (const [key, limit] of Object.entries(textFields)) {
+    if (source[key] != null) clean[key] = boundedString(source[key], limit);
+  }
+  if (source.spotifyVerifiedAt != null) {
+    clean.spotifyVerifiedAt = Math.max(0, Number(source.spotifyVerifiedAt) || 0);
+  }
+  if (source.spotifyNeedsTap != null) clean.spotifyNeedsTap = source.spotifyNeedsTap !== false;
+  for (const key of CONFIG_SECRET_KEYS) delete clean[key];
+  return clean;
+}
+
+function sanitizeStateSchema(value, original) {
+  const clean = isRecord(value) ? safeClone(value) : {};
+  const source = isRecord(original) ? original : {};
+  const config = sanitizeConfig({
+    ...(isRecord(clean.config) ? clean.config : {}),
+    ...(isRecord(source.config) ? source.config : {})
+  });
+  const announcementSources = sanitizeAnnouncementSources(source.announcementSources ?? clean.announcementSources);
+  const validSourceIds = new Set(announcementSources.map(item => item.id));
+  const sourceSchedules = Array.isArray(source.schedules)
+    ? source.schedules
+    : Array.isArray(source.schedule)
+      ? [{
+          id: clean.schedules?.[0]?.id,
+          items: source.schedule
+        }]
+      : [];
+  const schedules = sanitizeSchedules(clean.schedules, sourceSchedules, validSourceIds);
+  const schedule = sanitizeLegacySchedule(clean.schedule, schedules, clean.activeScheduleId);
+  return {
+    ...clean,
+    config,
+    playback: sanitizePlayback({
+      ...(isRecord(clean.playback) ? clean.playback : {}),
+      ...(isRecord(source.playback) ? source.playback : {})
+    }, config.musicProvider),
+    receiver: sanitizeReceiver(clean.receiver, source.receiver),
+    announcementSources,
+    announcements: sanitizeAnnouncements(clean.announcements, source.announcements, validSourceIds),
+    schedules,
+    schedule
+  };
 }
 
 function fallbackNormalizeState(value, now = Date.now()) {
   const source = isRecord(value) ? safeClone(value) : {};
-  return {
+  return sanitizeStateSchema({
     ...source,
     version: X_STATE_VERSION,
     config: sanitizeConfig(source.config),
@@ -99,7 +400,7 @@ function fallbackNormalizeState(value, now = Date.now()) {
       .slice(0, 180),
     savedAt: Math.max(0, Number(source.savedAt || now) || now),
     revision: stateRevision(source)
-  };
+  }, source);
 }
 
 async function coreNormalizer() {
@@ -116,14 +417,10 @@ async function sanitizeXState(value, now = Date.now()) {
     try {
       const normalized = normalizeState(source, now);
       if (isRecord(normalized)) {
-        const clean = safeClone(normalized);
+        const clean = sanitizeStateSchema(normalized, source);
         return {
           ...clean,
           version: X_STATE_VERSION,
-          config: sanitizeConfig({
-            ...(isRecord(clean.config) ? clean.config : {}),
-            ...(isRecord(source.config) ? source.config : {})
-          }),
           savedAt: Math.max(0, Number(clean.savedAt || now) || now),
           revision: stateRevision(clean)
         };
@@ -254,18 +551,31 @@ async function readBody(req) {
   });
 }
 
-function kvReady() {
-  return Boolean(process.env.KV_REST_API_URL && process.env.KV_REST_API_TOKEN);
+function kvReady(env = process.env) {
+  return Boolean(env?.KV_REST_API_URL && env?.KV_REST_API_TOKEN);
 }
 
-async function kv(command) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), KV_REQUEST_TIMEOUT_MS);
+async function kv(command, {
+  env = process.env,
+  fetchImpl = globalThis.fetch,
+  AbortControllerImpl = globalThis.AbortController,
+  setTimeoutImpl = globalThis.setTimeout,
+  clearTimeoutImpl = globalThis.clearTimeout
+} = {}) {
+  if (
+    !kvReady(env)
+    || typeof fetchImpl !== 'function'
+    || typeof AbortControllerImpl !== 'function'
+  ) {
+    throw new Error('Version X state storage is unavailable.');
+  }
+  const controller = new AbortControllerImpl();
+  const timer = setTimeoutImpl(() => controller.abort(), KV_REQUEST_TIMEOUT_MS);
   try {
-    const response = await fetch(process.env.KV_REST_API_URL, {
+    const response = await fetchImpl(env.KV_REST_API_URL, {
       method: 'POST',
       headers: {
-        Authorization: `Bearer ${process.env.KV_REST_API_TOKEN}`,
+        Authorization: `Bearer ${env.KV_REST_API_TOKEN}`,
         'Content-Type': 'application/json'
       },
       body: JSON.stringify(command),
@@ -278,7 +588,7 @@ async function kv(command) {
     if (error?.name === 'AbortError') throw new Error('Version X state storage timed out.');
     throw new Error('Version X state storage is unavailable.');
   } finally {
-    clearTimeout(timer);
+    clearTimeoutImpl(timer);
   }
 }
 
@@ -306,6 +616,31 @@ async function withMemoryLock(operation) {
     release();
     if (locks.get(X_STATE_KEY) === tail) locks.delete(X_STATE_KEY);
   }
+}
+
+/**
+ * Returns the server's canonical Version X state. Schedule synchronization
+ * uses this instead of trusting a potentially stale browser projection.
+ */
+export async function readCanonicalVersionXState({
+  env = process.env,
+  fetchImpl = globalThis.fetch,
+  now = Date.now,
+  requireDurable = true
+} = {}) {
+  const durable = kvReady(env);
+  if (requireDurable && !durable) {
+    throw new Error('Durable Version X state storage is unavailable.');
+  }
+  const stored = durable
+    ? parseState(await kv(['GET', X_STATE_KEY], { env, fetchImpl }))
+    : memoryStates()[X_STATE_KEY] || null;
+  const state = await sanitizeStoredState(stored, Number(now()));
+  return Object.freeze({
+    durable,
+    revision: stateRevision(state),
+    state
+  });
 }
 
 function versionXRequired(req, res) {

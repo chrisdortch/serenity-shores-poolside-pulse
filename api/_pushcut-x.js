@@ -1,9 +1,14 @@
 import { randomUUID } from 'node:crypto';
+import { normalizeFiniteAudioReference } from './_finite-audio-x.js';
 
 export const PUSHCUT_X_ACTIONS = Object.freeze(['announce', 'test']);
 export const PUSHCUT_X_API_URL = 'https://api.pushcut.io/v1/execute';
-export const PUSHCUT_X_UPSTREAM_TIMEOUT_MS = 8_000;
+export const PUSHCUT_X_DEVICES_URL = 'https://api.pushcut.io/v1/devices';
+export const PUSHCUT_X_UPSTREAM_TIMEOUT_MS = 12_000;
+export const PUSHCUT_X_HEALTH_TIMEOUT_MS = 5_000;
 export const PUSHCUT_X_DEFAULT_SHORTCUT = 'Poolside Pulse Announcement';
+export const PUSHCUT_X_DEFAULT_RECOVERY_SHORTCUT = 'Volume Down';
+export const PUSHCUT_X_TEST_WAIT_SECONDS = 10;
 
 // Pushcut recommends that server shortcuts finish within 60 seconds. Keeping
 // live speech below 500 characters leaves time for voice rendering, the pause,
@@ -15,6 +20,10 @@ const ACTION_SET = new Set(PUSHCUT_X_ACTIONS);
 const ACTION_FIELDS = Object.freeze({
   announce: new Set([
     'action',
+    'announcementAudioUrl',
+    'announcementDurationSeconds',
+    'announcementMode',
+    'announcementProvider',
     'announcementVolume',
     'commandId',
     'musicVolume',
@@ -24,6 +33,10 @@ const ACTION_FIELDS = Object.freeze({
   test: new Set(['action', 'commandId'])
 });
 const LIVE_ANNOUNCEMENT_FIELDS = new Set([
+  'announcementAudioUrl',
+  'announcementDurationSeconds',
+  'announcementMode',
+  'announcementProvider',
   'eventId',
   'label',
   'musicPercent',
@@ -85,8 +98,10 @@ function configuration(env) {
     announce: cleanConfigurationValue(source.PUSHCUT_ANNOUNCE_SHORTCUT_X, 160) || sharedShortcut,
     test: cleanConfigurationValue(source.PUSHCUT_TEST_SHORTCUT_X, 160) || sharedShortcut
   });
+  const recoveryShortcut = cleanConfigurationValue(source.PUSHCUT_RECOVERY_SHORTCUT_X, 160)
+    || PUSHCUT_X_DEFAULT_RECOVERY_SHORTCUT;
   const serverId = cleanConfigurationValue(source.PUSHCUT_SERVER_ID_X, 160);
-  return { apiKey, serverId, shortcuts };
+  return { apiKey, recoveryShortcut, serverId, shortcuts };
 }
 
 export function pushcutXHealth(env = process.env) {
@@ -98,8 +113,175 @@ export function pushcutXHealth(env = process.env) {
   return Object.freeze({
     ready: PUSHCUT_X_ACTIONS.every(action => actions[action]),
     actions: Object.freeze(actions),
-    mode: 'nowait'
+    actionModes: Object.freeze({
+      announce: 'nowait',
+      test: 'wait'
+    }),
+    recoveryReady: Boolean(configured.apiKey && configured.recoveryShortcut),
+    mode: 'hybrid'
   });
+}
+
+function responseOk(response) {
+  const status = Number(response?.status);
+  return status >= 200 && status < 300;
+}
+
+function deviceRecords(value) {
+  if (Array.isArray(value)) return value.filter(isRecord);
+  if (!isRecord(value)) return [];
+  for (const key of ['devices', 'items', 'results', 'data']) {
+    if (Array.isArray(value[key])) return value[key].filter(isRecord);
+  }
+  return [];
+}
+
+function firstString(record, fields) {
+  for (const field of fields) {
+    const value = cleanConfigurationValue(record?.[field], 200);
+    if (value) return value;
+  }
+  return '';
+}
+
+function explicitBoolean(record, fields) {
+  for (const field of fields) {
+    if (!Object.hasOwn(record || {}, field)) continue;
+    const value = record[field];
+    if (typeof value === 'boolean') return value;
+    if (value === 1 || String(value).trim().toLowerCase() === 'true') return true;
+    if (value === 0 || String(value).trim().toLowerCase() === 'false') return false;
+  }
+  return null;
+}
+
+function summarizeDevices(payload, configuredServerId) {
+  const devices = deviceRecords(payload);
+  let relevant = [];
+  if (configuredServerId) {
+    relevant = devices.filter(device => firstString(device, [
+      'id',
+      'deviceId',
+      'deviceID',
+      'uuid'
+    ]) === configuredServerId);
+  } else {
+    relevant = devices.filter(device => {
+      const connected = explicitBoolean(device, [
+        'isConnectedAutomationServer',
+        'is_connected_automation_server',
+        'connectedAutomationServer',
+        'automationServerConnected',
+        'automation_server_connected',
+        'serverConnected',
+        'isConnectedServer'
+      ]);
+      const server = explicitBoolean(device, [
+        'isAutomationServer',
+        'is_automation_server',
+        'automationServer',
+        'isServer'
+      ]);
+      return connected === true || server === true;
+    });
+  }
+
+  const connectionValues = relevant
+    .map(device => explicitBoolean(device, [
+      'isConnectedAutomationServer',
+      'is_connected_automation_server',
+      'connectedAutomationServer',
+      'automationServerConnected',
+      'automation_server_connected',
+      'serverConnected',
+      'isConnectedServer'
+    ]))
+    .filter(value => value !== null);
+  const connected = connectionValues.includes(true)
+    ? true
+    : connectionValues.length > 0
+      ? false
+      : null;
+  return Object.freeze({
+    connected,
+    deviceCount: devices.length,
+    serverMatched: relevant.length > 0
+  });
+}
+
+/**
+ * Queries Pushcut's authenticated device list without returning device names,
+ * identifiers, or any account metadata to the browser.
+ */
+export async function inspectPushcutXServerHealth({
+  env = process.env,
+  fetchImpl = globalThis.fetch,
+  devicesUrl = PUSHCUT_X_DEVICES_URL,
+  upstreamTimeoutMs = PUSHCUT_X_HEALTH_TIMEOUT_MS,
+  AbortControllerImpl = globalThis.AbortController,
+  setTimeoutImpl = globalThis.setTimeout,
+  clearTimeoutImpl = globalThis.clearTimeout
+} = {}) {
+  const configured = configuration(env);
+  if (!configured.apiKey) {
+    return Object.freeze({
+      configured: false,
+      providerReachable: false,
+      serverMatched: false,
+      connected: false,
+      deviceCount: 0
+    });
+  }
+  if (typeof fetchImpl !== 'function' || typeof AbortControllerImpl !== 'function') {
+    return Object.freeze({
+      configured: true,
+      providerReachable: false,
+      serverMatched: false,
+      connected: null,
+      deviceCount: 0
+    });
+  }
+
+  const controller = new AbortControllerImpl();
+  const timer = setTimeoutImpl(() => controller.abort(), upstreamTimeoutMs);
+  try {
+    const endpoint = new URL(String(devicesUrl));
+    endpoint.search = '';
+    const response = await fetchImpl(endpoint, {
+      method: 'GET',
+      signal: controller.signal,
+      headers: {
+        'API-Key': configured.apiKey,
+        'Accept': 'application/json'
+      }
+    });
+    if (!responseOk(response)) {
+      return Object.freeze({
+        configured: true,
+        providerReachable: false,
+        serverMatched: false,
+        connected: null,
+        deviceCount: 0
+      });
+    }
+    const payload = await response.json().catch(() => null);
+    const summary = summarizeDevices(payload, configured.serverId);
+    return Object.freeze({
+      configured: true,
+      providerReachable: true,
+      ...summary
+    });
+  } catch {
+    return Object.freeze({
+      configured: true,
+      providerReachable: false,
+      serverMatched: false,
+      connected: null,
+      deviceCount: 0
+    });
+  } finally {
+    clearTimeoutImpl(timer);
+  }
 }
 
 function invalid() {
@@ -148,6 +330,39 @@ function announcementLabel(value, fallback = 'Speak Now') {
   return label;
 }
 
+function announcementSource(body) {
+  const mode = body.announcementMode == null || body.announcementMode === ''
+    ? 'natural-voice'
+    : String(body.announcementMode).trim().toLowerCase();
+  const provider = String(body.announcementProvider || '').trim().toLowerCase();
+  const sourceUrl = String(body.announcementAudioUrl || '').trim();
+  const rawDuration = body.announcementDurationSeconds;
+
+  if (mode === 'natural-voice') {
+    if (provider || sourceUrl || (rawDuration != null && rawDuration !== '')) invalid();
+    return Object.freeze({
+      announcementMode: 'natural-voice',
+      announcementProvider: '',
+      announcementAudioUrl: '',
+      announcementDurationSeconds: 0
+    });
+  }
+  if (mode !== 'finite-audio') invalid();
+  if (!Number.isInteger(rawDuration) || rawDuration < 1 || rawDuration > 45) invalid();
+  let reference;
+  try {
+    reference = normalizeFiniteAudioReference(provider, sourceUrl);
+  } catch {
+    invalid();
+  }
+  return Object.freeze({
+    announcementMode: 'finite-audio',
+    announcementProvider: reference.provider,
+    announcementAudioUrl: reference.sourceUrl,
+    announcementDurationSeconds: rawDuration
+  });
+}
+
 function commandBase(action, commandId, issuedAt) {
   return {
     schemaVersion: 1,
@@ -167,9 +382,11 @@ function normalizeLiveAnnouncement(body, { idFactory, issuedAt }) {
   const voicePercent = percent(body.voicePercent, 100);
   const musicPercent = percent(body.musicPercent, 30);
   if (voicePercent <= musicPercent) invalid();
+  const source = announcementSource(body);
   return Object.freeze({
     ...commandBase('announce', eventId, issuedAt),
     source: 'live',
+    ...source,
     text: announcementText(body.text),
     label: announcementLabel(body.label),
     safety: body.safety,
@@ -209,6 +426,10 @@ export function normalizePushcutXCommand(body, {
     return Object.freeze({
       ...base,
       source: 'test',
+      announcementMode: 'natural-voice',
+      announcementProvider: '',
+      announcementAudioUrl: '',
+      announcementDurationSeconds: 0,
       text: 'Poolside Pulse X receiver test.',
       label: 'Receiver Test',
       safety: false,
@@ -223,10 +444,12 @@ export function normalizePushcutXCommand(body, {
   if (voicePercent <= musicPercent) invalid();
   const resumeMusic = body.resumeMusic == null ? true : body.resumeMusic;
   if (typeof resumeMusic !== 'boolean') invalid();
+  const source = announcementSource(body);
 
   return Object.freeze({
     ...base,
     source: 'live',
+    ...source,
     text: announcementText(body.text),
     label: 'Speak Now',
     safety: false,
@@ -244,6 +467,99 @@ function shortcutFor(command, configured) {
   return shortcut;
 }
 
+async function executeShortcut({
+  apiKey,
+  apiUrl,
+  fetchImpl,
+  input,
+  serverId,
+  shortcut,
+  timeout,
+  upstreamTimeoutMs,
+  AbortControllerImpl,
+  setTimeoutImpl,
+  clearTimeoutImpl
+}) {
+  const endpoint = new URL(String(apiUrl));
+  endpoint.search = '';
+  endpoint.searchParams.set('timeout', String(timeout));
+  const controller = new AbortControllerImpl();
+  const timer = setTimeoutImpl(() => controller.abort(), upstreamTimeoutMs);
+  try {
+    return await fetchImpl(endpoint, {
+      method: 'POST',
+      signal: controller.signal,
+      headers: {
+        'API-Key': apiKey,
+        'Accept': 'application/json',
+        'Content-Type': 'application/json; charset=utf-8'
+      },
+      body: JSON.stringify({
+        shortcut,
+        input: JSON.stringify(input),
+        ...(serverId ? { serverId } : {})
+      })
+    });
+  } catch (error) {
+    if (controller.signal?.aborted && error?.name !== 'AbortError') {
+      const timeoutError = new Error('Pushcut request timed out.');
+      timeoutError.name = 'AbortError';
+      throw timeoutError;
+    }
+    throw error;
+  } finally {
+    clearTimeoutImpl(timer);
+  }
+}
+
+async function queueRecovery(command, configured, dependencies) {
+  if (!configured.apiKey || !configured.recoveryShortcut) {
+    return Object.freeze({ queued: false, acceptedAt: 0 });
+  }
+  const recoveryCommand = Object.freeze({
+    schemaVersion: 1,
+    version: 'x',
+    action: 'recover-volume',
+    commandId: `${String(command.commandId || '').slice(0, 150)}:recovery`,
+    eventId: command.eventId,
+    issuedAt: Number(dependencies.now()),
+    musicPercent: Number.isInteger(command.musicPercent) ? command.musicPercent : 30,
+    reason: 'post-announcement-recovery'
+  });
+  try {
+    const response = await executeShortcut({
+      apiKey: configured.apiKey,
+      apiUrl: dependencies.apiUrl,
+      fetchImpl: dependencies.fetchImpl,
+      input: recoveryCommand,
+      serverId: configured.serverId,
+      shortcut: configured.recoveryShortcut,
+      timeout: 'nowait',
+      upstreamTimeoutMs: Math.min(dependencies.upstreamTimeoutMs, 8_000),
+      AbortControllerImpl: dependencies.AbortControllerImpl,
+      setTimeoutImpl: dependencies.setTimeoutImpl,
+      clearTimeoutImpl: dependencies.clearTimeoutImpl
+    });
+    if (!responseOk(response)) {
+      return Object.freeze({ queued: false, acceptedAt: 0 });
+    }
+    return Object.freeze({
+      queued: true,
+      acceptedAt: Number(dependencies.now())
+    });
+  } catch {
+    return Object.freeze({ queued: false, acceptedAt: 0 });
+  }
+}
+
+function dispatchError(code, recovery, providerStatus = 0) {
+  const error = new PushcutXError(code);
+  error.recoveryQueued = recovery?.queued === true;
+  error.recoveryAcceptedAt = Number(recovery?.acceptedAt || 0);
+  error.providerStatus = Number(providerStatus || 0);
+  return error;
+}
+
 /**
  * Submits a validated Version X command. The public route always uses the
  * fixed Pushcut host; injectable dependencies exist only for deterministic
@@ -256,7 +572,8 @@ export async function dispatchPushcutXCommand(command, {
   upstreamTimeoutMs = PUSHCUT_X_UPSTREAM_TIMEOUT_MS,
   AbortControllerImpl = globalThis.AbortController,
   setTimeoutImpl = globalThis.setTimeout,
-  clearTimeoutImpl = globalThis.clearTimeout
+  clearTimeoutImpl = globalThis.clearTimeout,
+  now = Date.now
 } = {}) {
   if (!isRecord(command) || !ACTION_SET.has(command.action)) throw new PushcutXError('invalid');
   const configured = configuration(env);
@@ -265,46 +582,62 @@ export async function dispatchPushcutXCommand(command, {
     throw new PushcutXError('providerRejected');
   }
 
-  const endpoint = new URL(String(apiUrl));
-  endpoint.search = '';
-  endpoint.searchParams.set('timeout', 'nowait');
-  const controller = new AbortControllerImpl();
-  const timer = setTimeoutImpl(() => controller.abort(), upstreamTimeoutMs);
-
+  const dependencies = {
+    apiUrl,
+    fetchImpl,
+    upstreamTimeoutMs,
+    AbortControllerImpl,
+    setTimeoutImpl,
+    clearTimeoutImpl,
+    now
+  };
+  const waitForResult = command.action === 'test';
+  let response;
   try {
-    const response = await fetchImpl(endpoint, {
-      method: 'POST',
-      signal: controller.signal,
-      headers: {
-        'API-Key': configured.apiKey,
-        'Accept': 'application/json',
-        'Content-Type': 'application/json; charset=utf-8'
-      },
-      body: JSON.stringify({
-        shortcut,
-        input: JSON.stringify(command),
-        ...(configured.serverId ? { serverId: configured.serverId } : {})
-      })
+    response = await executeShortcut({
+      apiKey: configured.apiKey,
+      apiUrl,
+      fetchImpl,
+      input: command,
+      serverId: configured.serverId,
+      shortcut,
+      timeout: waitForResult ? PUSHCUT_X_TEST_WAIT_SECONDS : 'nowait',
+      upstreamTimeoutMs,
+      AbortControllerImpl,
+      setTimeoutImpl,
+      clearTimeoutImpl
     });
-    const status = Number(response?.status);
-    if (status >= 200 && status < 300) {
-      return Object.freeze({
-        accepted: true,
-        action: command.action,
-        commandId: command.commandId,
-        eventId: command.eventId,
-        mode: 'nowait'
-      });
-    }
-    if (status === 429) throw new PushcutXError('providerBusy');
-    throw new PushcutXError('providerRejected');
   } catch (error) {
-    if (error instanceof PushcutXError) throw error;
-    if (controller.signal?.aborted || error?.name === 'AbortError') {
-      throw new PushcutXError('timeout');
-    }
-    throw new PushcutXError('providerRejected');
-  } finally {
-    clearTimeoutImpl(timer);
+    const recovery = await queueRecovery(command, configured, dependencies);
+    throw dispatchError(
+      error?.name === 'AbortError' ? 'timeout' : 'providerRejected',
+      recovery
+    );
   }
+
+  const status = Number(response?.status);
+  if (responseOk(response)) {
+    const recovery = await queueRecovery(command, configured, dependencies);
+    return Object.freeze({
+      accepted: true,
+      completed: waitForResult && status === 200,
+      action: command.action,
+      commandId: command.commandId,
+      eventId: command.eventId,
+      mode: waitForResult ? 'wait' : 'nowait',
+      providerStatus: status,
+      recoveryQueued: recovery.queued,
+      recoveryAcceptedAt: recovery.acceptedAt
+    });
+  }
+  if (status === 504) {
+    const recovery = await queueRecovery(command, configured, dependencies);
+    throw dispatchError('timeout', recovery, status);
+  }
+  if (status === 429) throw dispatchError('providerBusy', null, status);
+  if (status === 401 || status === 403) {
+    throw dispatchError('providerRejected', null, status);
+  }
+  const recovery = await queueRecovery(command, configured, dependencies);
+  throw dispatchError('providerRejected', recovery, status);
 }

@@ -1,6 +1,6 @@
 # Serenity Shores Poolside Pulse — Version X
 
-Version X replaces the Spotify path with Apple Music while preserving the proven Suno/direct mixer, spoken announcements, weather safety checks, receiver leases, stale-command protection, and Time/Order schedules.
+Version X supports Suno/direct audio, Apple Music, and Spotify music beds while preserving spoken announcements, weather safety checks, receiver leases, stale-command protection, and Time/Order schedules.
 
 It is isolated from the current V30 app:
 
@@ -17,6 +17,10 @@ No other Serenity Shores repository, Vercel project, database namespace, domain,
 
 - Plays Suno shares/playlists and direct HTTPS audio through the receiver-owned Web Audio mixer.
 - Plays Apple Music URLs through either the compatibility MusicKit web receiver or the recommended Poolside Pulse X Music Receiver Mac app.
+- Plays Spotify URLs through an isolated Version X PKCE receiver after the exact Version X redirect URI is registered.
+- Generates natural resort-style announcement audio on the server and delivers it to the Receiver through one-time signed URLs.
+- Supports short, downloadable Suno/direct announcement clips only when their actual media duration is no longer than 45 seconds.
+- On the two-iPhone Pushcut path, runs the existing Volume Up and Volume Down Shortcuts for a fixed 100% announcement / 30% music sequence and records a signed final-Shortcut receipt.
 - Provides independent 0–100 global Suno/direct-music and spoken-announcement controls.
 - Lets every scheduled Suno/direct music or announcement item inherit its global level or use a custom 0–100 level.
 - Fully silences Suno/direct music during speech, then continues the same track.
@@ -55,6 +59,9 @@ APPLE_MUSIC_ALLOWED_ORIGINS=https://poolside-pulse-x.vercel.app
 Also supported:
 
 - `OPENAI_API_KEY` for the natural announcement voice; bounded device speech is the fallback.
+- `PUSHCUT_API_KEY_X` for the Version X Receiver automation.
+- `PUSHCUT_PUBLIC_BASE_URL_X=https://poolside-pulse-x.vercel.app` so signed Receiver links always use the stable Version X alias.
+- `PUSHCUT_RECOVERY_SHORTCUT_X=Volume Down` when the recovery Shortcut uses a non-default name.
 - `XWEATHER_CLIENT_ID` and `XWEATHER_CLIENT_SECRET` as an optional weather supplement.
 
 Production requires durable KV, a dedicated session secret, and a valid access code. The receiver refuses to claim operational ownership without durable synchronization.
@@ -72,18 +79,48 @@ Leave the Mac receiver app open. It prevents idle system sleep while running and
 
 The checked-in build script creates a personal, ad-hoc signed app for this Mac. Set `POOLSIDE_CODE_SIGN_IDENTITY` to a Developer ID Application certificate when a stable notarized distribution build is needed for other Macs.
 
-## Two-iPhone compatibility operation
+## Two-iPhone operating modes
 
 Use two separate iPhones:
 
-1. **Receiver iPhone:** connect it to the pool speakers and power, turn off Low Power Mode, set **Settings → Display & Brightness → Auto-Lock → Never**, and keep the Version X receiver page visible in Safari or its Home Screen web app. Choose **Speaker Receiver**, tap **Prepare Apple Music**, then tap **Authorize Apple Music**. After Apple accepts the account, tap **Start Receiver**, followed by **Connect Apple Music Receiver**.
-2. **Command iPhone:** open Version X in Remote Control mode and send live or scheduled Apple Music, Suno, and announcement commands from this second phone.
+Choose one Receiver mode at a time. iOS cannot keep both Version X’s Browser Receiver and Pushcut’s Automation Server in the foreground.
 
-Do not switch apps, lock, or hide the receiver page during a schedule. Version X fails closed when the iPhone receiver leaves the foreground: it stops its audio paths immediately, stops renewing cloud ownership so the 45-second lease expires, and requires fresh Start/Connect taps when reopened.
+### A. Browser Receiver mode
+
+Use this for app-controlled Suno/direct, Apple Music, or Spotify playback and browser-owned schedules.
+
+1. **Receiver iPhone:** connect it to the speakers and power, turn off Low Power Mode, set **Settings → Display & Brightness → Auto-Lock → Never**, and keep Version X visible. Choose **Speaker Receiver**, prepare the selected provider, then tap **Start Receiver** and its Connect action.
+2. **Command iPhone:** use Version X in **Remote Control** mode.
+
+Do not switch apps, lock, or hide Version X. It intentionally stops every audio path and releases cloud ownership when an iPhone Browser Receiver leaves the foreground. Pushcut announcements are not available while Pushcut is backgrounded.
+
+### B. Pushcut announcement mode
+
+Use this for dependable remote natural-voice or short finite-audio announcements over a background-capable music session at fixed 30% music / 100% announcement volume.
+
+1. **Receiver iPhone:** stop Browser Receiver if it is running. Start the music directly in the Apple Music, Spotify, or background-capable Suno app—not in Version X.
+2. Return to **Pushcut → Server → Ready For Requests** and leave Pushcut foreground.
+3. **Command iPhone:** open Version X in **Remote Control**, choose **Apply Music 30% Now**, then use **Speak Now**, a saved announcement, or a synced timed announcement.
+
+While Pushcut is foreground, Version X cannot start, stop, or change the native music bed from the Command phone. The announcement Shortcut pauses the current media session, applies 100%, plays the downloaded natural voice or finite clip, restores 30%, then resumes that session.
 
 On an iPhone receiver, Apple Music playback level is set with the receiver iPhone or connected speaker's physical volume controls. MusicKit for the web cannot set or verify that physical output level, so Version X does not claim that Apple Music live or scheduled percentages were applied. Suno/direct audio and generated announcement audio remain adjustable from 0–100 in Version X. If generated speech is unavailable and iPhone device speech is used as a fallback, its percentage is a requested target rather than verified speaker loudness.
 
-For genuinely unattended schedules and exact Apple Music volume, use the Poolside Pulse X Music Receiver Mac app; a foreground iPhone browser page is not an unattended service.
+### One-time Pushcut announcement Shortcut update
+
+On the Receiver iPhone, edit **Poolside Pulse Announcement**:
+
+1. Keep **Get Dictionary from Input**.
+2. Change the next key from `text` to `audioUrl`.
+3. Add **Get Contents of URL** using that Dictionary Value.
+4. Delete **Make Spoken Audio** and set **Play Sound** to the new Contents of URL.
+5. Keep this exact order: Pause → Wait 1 second → Volume Up → Play Sound → Volume Down → Play.
+6. At the bottom, add **Get Value for `receiptUrl`** from the original Dictionary, followed by **Get Contents of URL** using that value.
+7. Return to Pushcut → Server → **Ready For Requests**, then use **Run Verified Receiver Test** in Version X.
+
+The signed receipt proves that the Shortcut reached its final step after playing the downloaded audio and running its recovery actions. It is not a microphone or physical-volume measurement.
+
+Timed Pushcut announcements require Automation Server Extended and are synchronized as a rolling window of up to 29 days whenever Remote Control opens or the active Time schedule changes. Pushcut must stay on **Ready For Requests**. For app-controlled unattended music schedules and exact Apple Music volume, use the Poolside Pulse X Music Receiver Mac app.
 
 ## Local verification
 

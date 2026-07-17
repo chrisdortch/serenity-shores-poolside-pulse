@@ -3,14 +3,18 @@ import { describe, test } from 'node:test';
 
 import { AudioEngine } from '../src/vx/audio-engine.js';
 import {
+  ANNOUNCEMENT_FINITE_AUDIO_MAX_SECONDS,
   DUCK_LEVEL_PERCENT,
   STATE_VERSION,
   VERSION,
+  announcementDeliveryForSource,
   audioPolicy,
   createDefaultState,
   effectiveScheduleItemVolume,
   isAppleMusicUrl,
+  isSpotifyUrl,
   managerVolumePlan,
+  normalizeAnnouncementSource,
   normalizeScheduleItem,
   normalizeState,
   weatherRequestUrl
@@ -54,6 +58,82 @@ describe('Poolside Pulse Version X state isolation and volume model', () => {
     assert.equal(isAppleMusicUrl('https://example.com/song'), false);
   });
 
+  test('keeps Spotify isolated as a third bed provider with its own URL rules', () => {
+    const state = normalizeState({
+      config: {
+        musicProvider: 'spotify',
+        spotifyUrl: 'https://open.spotify.com/playlist/example'
+      }
+    });
+    assert.equal(state.config.musicProvider, 'spotify');
+    assert.equal(isSpotifyUrl('https://open.spotify.com/track/example'), true);
+    assert.equal(isSpotifyUrl('spotify:playlist:example'), true);
+    assert.equal(isSpotifyUrl('https://music.apple.com/us/album/example/123'), false);
+    assert.equal(normalizeScheduleItem({ type: 'spotify' }).action.kind, 'spotify');
+  });
+
+  test('defaults saved and scheduled announcements to Natural Voice', () => {
+    const state = createDefaultState(1);
+    assert.equal(state.announcements.every(item => item.sourceId === 'natural-voice'), true);
+    const normalized = normalizeState({
+      announcements: [{ id: 'custom', label: 'Custom', text: 'Hello' }],
+      schedules: [{ id: 'schedule', mode: 'time', items: [{ id: 'item', type: 'announcement', announcementId: 'custom' }] }]
+    }, 2);
+    assert.equal(normalized.announcements.find(item => item.id === 'custom').sourceId, 'natural-voice');
+    assert.equal(normalized.schedules[0].items[0].action.sourceId, 'natural-voice');
+  });
+
+  test('preserves a supported finite announcement clip and its source references', () => {
+    const source = normalizeAnnouncementSource({
+      id: 'pool-chime',
+      label: 'Pool chime',
+      kind: 'finite-audio',
+      provider: 'suno',
+      url: 'https://media.example/pool-chime.mp3',
+      finite: true,
+      durationSeconds: 18
+    });
+    assert.equal(source.playbackSupport, 'supported');
+    assert.deepEqual(announcementDeliveryForSource(source), {
+      announcementMode: 'finite-audio',
+      announcementProvider: 'suno',
+      announcementAudioUrl: 'https://media.example/pool-chime.mp3',
+      announcementDurationSeconds: 18
+    });
+
+    const state = normalizeState({
+      announcementSources: [source],
+      announcements: [{ id: 'custom', label: 'Custom', text: 'Recorded message', sourceId: source.id }],
+      schedules: [{
+        id: 'schedule',
+        mode: 'time',
+        items: [{ id: 'item', action: { kind: 'announcement', announcementId: 'custom', sourceId: source.id } }]
+      }]
+    }, 2);
+    assert.equal(state.announcements.find(item => item.id === 'custom').sourceId, source.id);
+    assert.equal(state.schedules[0].items[0].action.sourceId, source.id);
+  });
+
+  test('rejects unsafe or overlong finite clips and keeps catalog announcement sources experimental', () => {
+    assert.equal(ANNOUNCEMENT_FINITE_AUDIO_MAX_SECONDS, 45);
+    const tooLong = normalizeAnnouncementSource({
+      id: 'too-long', provider: 'direct', kind: 'finite-audio', finite: true,
+      url: 'https://media.example/long.mp3', durationSeconds: 46
+    });
+    const insecure = normalizeAnnouncementSource({
+      id: 'insecure', provider: 'direct', kind: 'finite-audio', finite: true,
+      url: 'http://media.example/clip.mp3', durationSeconds: 10
+    });
+    const apple = normalizeAnnouncementSource({
+      id: 'apple-catalog', provider: 'apple', kind: 'media', finite: true,
+      url: 'https://music.apple.com/us/song/example/123', durationSeconds: 10
+    });
+    assert.equal(tooLong.playbackSupport, 'unsupported');
+    assert.equal(insecure.playbackSupport, 'unsupported');
+    assert.equal(apple.playbackSupport, 'experimental');
+    assert.throws(() => announcementDeliveryForSource(apple), /Natural Voice or a supported short/i);
+  });
+
   test('reports the selected voice level in both controlled and Apple policies', () => {
     const controlled = audioPolicy({ provider: 'controlled', musicPercent: 30, voicePercent: 72 });
     const apple = audioPolicy({ provider: 'apple', musicPercent: 30, voicePercent: 72 });
@@ -61,6 +141,7 @@ describe('Poolside Pulse Version X state isolation and volume model', () => {
     assert.equal(apple.voicePercent, 72);
     assert.equal(controlled.duringVoicePercent, 0);
     assert.equal(apple.duringVoicePercent, 0);
+    assert.equal(audioPolicy({ provider: 'spotify', musicPercent: 30, voicePercent: 72 }).voicePercent, 72);
   });
 
   test('labels iPhone Apple Music as physical-volume pause compatibility', () => {

@@ -1,6 +1,9 @@
 const PUSHCUT_X_ENDPOINT = '/api/pushcut-x?v=x';
+const PUSHCUT_VOLUME_X_ENDPOINT = '/api/pushcut-volume-x?v=x';
 const REQUEST_TIMEOUT_MS = 20_000;
+const COMPLETION_TIMEOUT_MS = 90_000;
 export const PUSHCUT_MAX_ANNOUNCEMENT_CHARACTERS = 500;
+export const PUSHCUT_MAX_FINITE_AUDIO_SECONDS = 45;
 
 function cleanText(value, maximum, field) {
   const text = String(value || '').trim();
@@ -12,6 +15,33 @@ function cleanText(value, maximum, field) {
 function clampPercent(value, fallback) {
   const number = Number(value);
   return Math.max(0, Math.min(100, Number.isFinite(number) ? Math.round(number) : fallback));
+}
+
+function finiteAnnouncementFields(mode, provider, audioUrl, durationSeconds) {
+  const requestedMode = String(mode || 'natural-voice').trim().toLowerCase();
+  if (requestedMode === 'natural-voice') return { announcementMode: 'natural-voice' };
+  if (requestedMode !== 'finite-audio') throw new Error('The announcement source type is invalid.');
+  const normalizedProvider = String(provider || '').trim().toLowerCase();
+  if (!['direct', 'suno'].includes(normalizedProvider)) {
+    throw new Error('Short announcement clips must use the Direct or Suno provider.');
+  }
+  let normalizedUrl;
+  try {
+    normalizedUrl = new URL(String(audioUrl || '').trim());
+  } catch {
+    throw new Error('Paste a valid HTTPS URL for the announcement clip.');
+  }
+  if (normalizedUrl.protocol !== 'https:') throw new Error('Announcement clips require an HTTPS URL.');
+  const duration = Number(durationSeconds);
+  if (!Number.isInteger(duration) || duration < 1 || duration > PUSHCUT_MAX_FINITE_AUDIO_SECONDS) {
+    throw new Error(`Announcement clips must have an expected duration from 1 to ${PUSHCUT_MAX_FINITE_AUDIO_SECONDS} seconds.`);
+  }
+  return {
+    announcementMode: 'finite-audio',
+    announcementProvider: normalizedProvider,
+    announcementAudioUrl: normalizedUrl.toString(),
+    announcementDurationSeconds: duration
+  };
 }
 
 function newEventId() {
@@ -78,6 +108,10 @@ export async function sendPushcutAnnouncement({
   safety = false,
   voicePercent = 100,
   musicPercent = 30,
+  announcementMode = 'natural-voice',
+  announcementProvider = '',
+  announcementAudioUrl = '',
+  announcementDurationSeconds = 0,
   eventId = '',
   fetchImpl = globalThis.fetch,
   timeoutMs = REQUEST_TIMEOUT_MS
@@ -97,7 +131,13 @@ export async function sendPushcutAnnouncement({
     label: cleanText(label, 80, 'Announcement label'),
     safety: safety === true,
     voicePercent: normalizedVoicePercent,
-    musicPercent: normalizedMusicPercent
+    musicPercent: normalizedMusicPercent,
+    ...finiteAnnouncementFields(
+      announcementMode,
+      announcementProvider,
+      announcementAudioUrl,
+      announcementDurationSeconds
+    )
   };
 
   const controller = new AbortController();
@@ -152,6 +192,92 @@ export async function getPushcutAnnouncementStatus(eventId = '', {
   } catch (error) {
     if (error?.name === 'AbortError') throw new Error('Announcement status check timed out.');
     throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function wait(milliseconds) {
+  return new Promise(resolve => setTimeout(resolve, milliseconds));
+}
+
+/**
+ * Waits for the signed receiver receipt without ever redispatching the
+ * announcement. A timeout is deliberately reported as uncertain rather than
+ * as a playback failure because the receiver may still be finishing speech.
+ */
+export async function waitForPushcutAnnouncementCompletion(eventId, {
+  fetchImpl = globalThis.fetch,
+  timeoutMs = COMPLETION_TIMEOUT_MS,
+  pollMs = 1_500,
+  onUpdate = () => {}
+} = {}) {
+  const stableEventId = validEventId(eventId);
+  const deadline = Date.now() + Math.max(10_000, Number(timeoutMs) || COMPLETION_TIMEOUT_MS);
+  let latest = null;
+  while (Date.now() < deadline) {
+    latest = await getPushcutAnnouncementStatus(stableEventId, {
+      fetchImpl,
+      timeoutMs: Math.min(12_000, Math.max(2_000, deadline - Date.now()))
+    });
+    const receipt = latest?.receipt && typeof latest.receipt === 'object' ? latest.receipt : latest;
+    const status = String(receipt?.status || latest?.status || '').toLowerCase();
+    onUpdate({ ...latest, receipt, status });
+    if (status === 'completed' && receipt?.completed === false) {
+      throw new Error('The receiver returned an inconsistent completion receipt.');
+    }
+    if (status === 'completed') return { ...latest, receipt, status, completed: true };
+    if (status === 'failed' || status === 'expired') {
+      const error = new Error(String(receipt?.message || latest?.error || 'The receiver reported that the announcement failed.').slice(0, 500));
+      error.eventId = stableEventId;
+      error.status = status;
+      error.receipt = receipt;
+      throw error;
+    }
+    await wait(Math.min(Math.max(500, Number(pollMs) || 1_500), Math.max(0, deadline - Date.now())));
+  }
+  const error = new Error('The receiver has not reported completion yet. Do not send the announcement again; keep Pushcut on Ready For Requests and check Monitor Requests.');
+  error.name = 'PushcutCompletionUncertainError';
+  error.eventId = stableEventId;
+  error.uncertain = true;
+  error.receipt = latest?.receipt || latest;
+  throw error;
+}
+
+/**
+ * Runs the receiver's existing Volume Down Shortcut once. A completed result
+ * confirms Shortcut completion only; it is not a physical-volume measurement.
+ */
+export async function applyPushcutMusic30Now({
+  fetchImpl = globalThis.fetch,
+  timeoutMs = REQUEST_TIMEOUT_MS
+} = {}) {
+  if (typeof fetchImpl !== 'function') throw new Error('Pushcut volume control is unavailable in this browser.');
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), Math.max(1_000, Number(timeoutMs) || REQUEST_TIMEOUT_MS));
+  try {
+    const response = await fetchImpl(PUSHCUT_VOLUME_X_ENDPOINT, {
+      method: 'POST',
+      credentials: 'same-origin',
+      cache: 'no-store',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ version: 'x', musicPercent: 30 }),
+      signal: controller.signal
+    });
+    const data = await jsonResponse(response);
+    return {
+      ...data,
+      accepted: data.accepted === true,
+      completed: data.completed === true,
+      musicPercent: 30
+    };
+  } catch (error) {
+    if (error?.status) throw error;
+    const uncertain = new Error('The volume request may have reached Pushcut, but completion could not be confirmed. Check that the Receiver is on Ready For Requests before trying again.');
+    uncertain.name = 'PushcutVolumeUncertainError';
+    uncertain.uncertain = true;
+    uncertain.cause = error;
+    throw uncertain;
   } finally {
     clearTimeout(timer);
   }

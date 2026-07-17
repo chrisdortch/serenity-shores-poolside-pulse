@@ -233,6 +233,243 @@ describe('Version X API isolation', { concurrency: false }, () => {
     assert.equal(read.json().state.revision, 2);
   });
 
+  test('stores Spotify as a Version X bed and derives honest announcement-source capabilities', async () => {
+    const result = await invoke(stateXHandler, request('POST', '/api/state-x?v=x', {
+      cookie: cookieFor('x'),
+      body: {
+        version: 'x',
+        expectedRevision: 0,
+        state: {
+          version: 'x',
+          config: {
+            musicProvider: 'spotify',
+            spotifyUrl: 'https://open.spotify.com/playlist/example',
+            spotifyAccessToken: 'must-not-persist',
+            spotifyRefreshToken: 'must-not-persist',
+            spotifyClientSecret: 'must-not-persist',
+            appleMusicPrivateKey: 'must-not-persist'
+          },
+          playback: {
+            provider: 'spotify',
+            intent: 'playing',
+            spotifyAccessToken: 'must-not-persist'
+          },
+          receiver: {
+            id: 'receiver-x',
+            sessionId: 'session-x',
+            status: 'online',
+            spotifyStatus: 'ready',
+            spotifyDetail: 'Premium receiver is active.',
+            spotifyDeviceId: 'device-x',
+            spotifyDeviceName: 'Pool iPhone',
+            spotifyVerifiedAt: 1_234,
+            spotifyAccessToken: 'must-not-persist'
+          },
+          announcementSources: [
+            {
+              id: 'natural',
+              label: 'Natural voice',
+              kind: 'natural-voice',
+              provider: 'openai-tts',
+              voice: 'marin',
+              instructions: 'Speak warmly.',
+              playbackSupport: 'verified',
+              verification: 'verified',
+              privateKey: 'must-not-persist'
+            },
+            {
+              id: 'direct-finite',
+              label: 'Direct clip',
+              kind: 'media',
+              provider: 'direct',
+              url: 'https://media.example/pool-message.mp3',
+              finite: true,
+              durationSeconds: 12,
+              verification: 'verified'
+            },
+            {
+              id: 'suno-finite',
+              label: 'Suno clip',
+              kind: 'media',
+              provider: 'suno',
+              url: 'https://suno.com/s/example',
+              finite: true,
+              durationSeconds: 30
+            },
+            {
+              id: 'apple-catalog',
+              label: 'Apple catalog item',
+              kind: 'media',
+              provider: 'apple',
+              url: 'https://music.apple.com/us/song/example/123',
+              finite: true,
+              playbackSupport: 'supported',
+              verification: 'verified'
+            },
+            {
+              id: 'spotify-catalog',
+              label: 'Spotify catalog item',
+              kind: 'media',
+              provider: 'spotify',
+              url: 'https://open.spotify.com/track/example',
+              finite: true,
+              playbackSupport: 'supported',
+              verification: 'verified'
+            },
+            {
+              id: 'direct-stream',
+              label: 'Unbounded stream',
+              kind: 'media',
+              provider: 'direct',
+              url: 'https://media.example/live',
+              finite: false,
+              durationSeconds: 20
+            },
+            {
+              id: 'direct-too-long',
+              label: 'Long clip',
+              kind: 'media',
+              provider: 'direct',
+              url: 'https://media.example/long.mp3',
+              finite: true,
+              durationSeconds: 46
+            },
+            {
+              id: 'unknown-source',
+              kind: 'media',
+              provider: 'unknown',
+              url: 'https://media.example/unknown.mp3',
+              finite: true
+            }
+          ],
+          announcements: [{
+            id: 'catalog-message',
+            label: 'Catalog message',
+            text: 'Fallback spoken text.',
+            sourceId: 'spotify-catalog'
+          }],
+          schedules: [{
+            id: 'provider-schedule',
+            name: 'Provider schedule',
+            mode: 'time',
+            enabled: true,
+            items: [
+              {
+                id: 'spotify-bed',
+                label: 'Spotify bed',
+                type: 'spotify',
+                position: { time: '09:00', order: 1 },
+                action: {
+                  kind: 'spotify',
+                  url: 'https://open.spotify.com/playlist/example'
+                },
+                volume: { mode: 'custom', percent: 30 },
+                advance: { mode: 'track-end', durationSeconds: 300 }
+              },
+              {
+                id: 'suno-bed',
+                label: 'Suno bed',
+                type: 'suno',
+                position: { time: '09:30', order: 2 },
+                action: {
+                  kind: 'suno',
+                  url: 'https://suno.com/s/example'
+                },
+                volume: { mode: 'global', percent: 30 },
+                advance: { mode: 'manual', durationSeconds: 300 }
+              },
+              {
+                id: 'catalog-announcement',
+                label: 'Experimental catalog announcement',
+                type: 'announcement',
+                position: { time: '10:00', order: 3 },
+                action: {
+                  kind: 'announcement',
+                  announcementSource: 'saved',
+                  announcementId: 'catalog-message',
+                  sourceId: 'spotify-catalog'
+                }
+              }
+            ]
+          }],
+          activeScheduleId: 'provider-schedule'
+        }
+      }
+    }));
+
+    assert.equal(result.statusCode, 200);
+    const state = result.json().state;
+    assert.equal(state.config.musicProvider, 'spotify');
+    assert.equal(state.config.spotifyUrl, 'https://open.spotify.com/playlist/example');
+    for (const key of ['spotifyAccessToken', 'spotifyRefreshToken', 'spotifyClientSecret', 'appleMusicPrivateKey']) {
+      assert.equal(key in state.config, false);
+    }
+    assert.equal(state.playback.provider, 'spotify');
+    assert.equal('spotifyAccessToken' in state.playback, false);
+    assert.equal(state.receiver.spotifyStatus, 'ready');
+    assert.equal(state.receiver.spotifyDeviceId, 'device-x');
+    assert.equal(state.receiver.spotifyVerifiedAt, 1_234);
+    assert.equal('spotifyAccessToken' in state.receiver, false);
+
+    const sources = Object.fromEntries(state.announcementSources.map(source => [source.id, source]));
+    assert.equal(Object.hasOwn(sources, 'unknown-source'), false);
+    assert.deepEqual(
+      ['natural', 'direct-finite', 'suno-finite'].map(id => [
+        sources[id].playbackSupport,
+        sources[id].verification
+      ]),
+      [
+        ['supported', 'unverified'],
+        ['supported', 'unverified'],
+        ['supported', 'unverified']
+      ]
+    );
+    assert.equal(sources.natural.privateKey, undefined);
+    assert.equal(sources['direct-finite'].durationSeconds, 12);
+    assert.equal(sources['suno-finite'].durationSeconds, 30);
+    assert.equal(sources['apple-catalog'].playbackSupport, 'experimental');
+    assert.equal(sources['apple-catalog'].verification, 'unverified');
+    assert.match(sources['apple-catalog'].note, /unverified on iPhone/i);
+    assert.equal(sources['spotify-catalog'].playbackSupport, 'experimental');
+    assert.equal(sources['spotify-catalog'].verification, 'unverified');
+    assert.equal(sources['direct-stream'].playbackSupport, 'unsupported');
+    assert.equal(sources['direct-stream'].verification, 'unverified');
+    assert.equal(sources['direct-too-long'].durationSeconds, 0);
+    assert.equal(sources['direct-too-long'].playbackSupport, 'unsupported');
+
+    const announcement = state.announcements.find(item => item.id === 'catalog-message');
+    assert.equal(announcement.sourceId, 'spotify-catalog');
+    const schedule = state.schedules.find(item => item.id === 'provider-schedule');
+    const spotifyBed = schedule.items.find(item => item.id === 'spotify-bed');
+    assert.equal(spotifyBed.type, 'spotify');
+    assert.equal(spotifyBed.action.kind, 'spotify');
+    assert.equal(spotifyBed.volume.percent, 30);
+    assert.equal(spotifyBed.advance.mode, 'track-end');
+    assert.equal('announcementSource' in spotifyBed.action, false);
+    const sunoBed = schedule.items.find(item => item.id === 'suno-bed');
+    assert.equal(sunoBed.type, 'controlled');
+    assert.equal(sunoBed.action.kind, 'controlled');
+    const catalogAnnouncement = schedule.items.find(item => item.id === 'catalog-announcement');
+    assert.equal(catalogAnnouncement.action.sourceId, 'spotify-catalog');
+    assert.equal(state.schedule.find(item => item.id === 'spotify-bed').type, 'spotify');
+    assert.deepEqual(globalThis.__POOL_SIDE_MEMORY_STATES__, { untouchedFinalSentinel: { revision: 77 } });
+    assert.equal(Object.keys(globalThis.__POOL_SIDE_X_MEMORY_STATES__).length, 1);
+
+    const reread = await invoke(stateXHandler, request('GET', '/api/state-x?v=x', {
+      cookie: cookieFor('x')
+    }));
+    assert.equal(reread.statusCode, 200);
+    assert.equal(reread.json().state.config.musicProvider, 'spotify');
+    assert.equal(
+      reread.json().state.announcementSources.find(source => source.id === 'spotify-catalog').verification,
+      'unverified'
+    );
+    assert.equal(
+      reread.json().state.schedules[0].items.find(item => item.id === 'spotify-bed').action.kind,
+      'spotify'
+    );
+  });
+
   test('uses the isolated Version X KV key for GET and compare-and-set only', async () => {
     process.env.KV_REST_API_URL = 'https://kv.test.invalid';
     process.env.KV_REST_API_TOKEN = 'test-kv-token';

@@ -36,6 +36,7 @@ const SCHEDULE_TICK_MS = 15_000;
 const EXTERNAL_AUDIO_INTENT_TYPES = new Map([
   ['play-controlled', 'play'],
   ['play-apple', 'play'],
+  ['play-spotify', 'play'],
   ['pause-music', 'terminal'],
   ['resume-music', 'play'],
   ['stop-music', 'terminal'],
@@ -111,6 +112,38 @@ function appleErrorWithContext(error, message) {
     if (error?.[key] !== undefined && error?.[key] !== null && error?.[key] !== '') contextual[key] = error[key];
   }
   return contextual;
+}
+
+function spotifyErrorWithContext(error, message) {
+  const contextual = new Error(String(message || error?.message || error || 'Spotify playback failed.'));
+  for (const key of ['code', 'status', 'spotifyOperation', 'spotifyReason', 'retryAfter']) {
+    if (error?.[key] !== undefined && error?.[key] !== null && error?.[key] !== '') contextual[key] = error[key];
+  }
+  return contextual;
+}
+
+function inactiveSpotifyReceiver() {
+  return {
+    ready: false,
+    current: null,
+    supportsVolume: false,
+    volumeVerified: false,
+    verifiedPercent: null,
+    accessVerifiedAt: 0,
+    loggedIn: () => false,
+    readiness: () => ({
+      status: 'login-required',
+      ready: false,
+      detail: 'Spotify is not configured on this Version X receiver.'
+    }),
+    setTargetVolumePercent() {},
+    resetVolumeVerification() {},
+    async pauseForAnnouncement() { return { wasPlaying: false }; },
+    async pause() { return false; },
+    async resume() { return false; },
+    async resumeAfterAnnouncement() { return false; },
+    disconnect() {}
+  };
 }
 
 async function fetchJson(url, options = {}, timeoutMs = 12_000) {
@@ -237,10 +270,11 @@ function pendingWeatherCoverageKnown(ids, payload) {
 }
 
 export class ReceiverRuntime {
-  constructor({ store, audio, apple, onStatus = () => {}, onChange = () => {} }) {
+  constructor({ store, audio, apple, spotify = null, onStatus = () => {}, onChange = () => {} }) {
     this.store = store;
     this.audio = audio;
     this.apple = apple;
+    this.spotify = spotify || inactiveSpotifyReceiver();
     this.onStatus = onStatus;
     this.onChange = onChange;
     this.deviceId = getDeviceId();
@@ -273,10 +307,13 @@ export class ReceiverRuntime {
     this.physicalProvider = '';
     this.temporaryAppleMusicPauseDepth = 0;
     this.applePauseGeneration = 0;
+    this.temporarySpotifyPauseDepth = 0;
+    this.spotifyPauseGeneration = 0;
     this.announcementQueue = [];
     this.announcementRunning = false;
     this.currentAnnouncement = null;
     this.preemptedAppleMusicSnapshot = null;
+    this.preemptedSpotifySnapshot = null;
     this.safetyRestoreSnapshot = null;
     this.voiceCache = new Map();
     this.voicePrepareController = null;
@@ -425,6 +462,34 @@ export class ReceiverRuntime {
     throw failure;
   }
 
+  async confirmSpotifyPaused(context = 'Spotify silence is required.') {
+    let primaryError = null;
+    try {
+      await this.spotify.pauseForAnnouncement();
+      return true;
+    } catch (error) {
+      primaryError = error;
+    }
+    let fallbackError = null;
+    try {
+      const paused = await this.spotify.pause?.();
+      if (paused === true) return true;
+      fallbackError = new Error('Spotify did not positively confirm the fallback pause.');
+    } catch (error) {
+      fallbackError = error;
+    }
+    const source = fallbackError || primaryError;
+    const failure = spotifyErrorWithContext(
+      source,
+      `${context} Spotify may still be audible because neither pause path confirmed silence. ${source?.message || ''}`.trim()
+    );
+    failure.code = failure.code || 'SPOTIFY_PAUSE_UNCONFIRMED';
+    failure.spotifyOperation = failure.spotifyOperation || 'PUT /me/player/pause + paused-state confirmation';
+    failure.spotifyReason = failure.spotifyReason || 'Spotify silence was not confirmed';
+    failure.spotifyPauseUnconfirmed = true;
+    throw failure;
+  }
+
   currentPhysicalCustomTarget() {
     const target = this.physicalMusicTarget;
     if (!target || target.mode !== 'custom' || target.requestId !== this.audioRequestId) return null;
@@ -433,7 +498,10 @@ export class ReceiverRuntime {
 
   invalidateAudioRestores({ preservePreempted = false, preserveSafetyRestore = false } = {}) {
     this.audioEpoch += 1;
-    if (!preservePreempted) this.preemptedAppleMusicSnapshot = null;
+    if (!preservePreempted) {
+      this.preemptedAppleMusicSnapshot = null;
+      this.preemptedSpotifySnapshot = null;
+    }
     if (!preserveSafetyRestore) this.safetyRestoreSnapshot = null;
     return this.audioEpoch;
   }
@@ -443,6 +511,9 @@ export class ReceiverRuntime {
     this.safetyRestoreSnapshot = { ...snapshot, epoch: this.audioEpoch };
     if (snapshot.provider === 'apple' && snapshot.appleSnapshot?.wasPlaying) {
       this.preemptedAppleMusicSnapshot = snapshot.appleSnapshot;
+    }
+    if (snapshot.provider === 'spotify' && snapshot.spotifySnapshot?.wasPlaying) {
+      this.preemptedSpotifySnapshot = snapshot.spotifySnapshot;
     }
     return true;
   }
@@ -455,6 +526,16 @@ export class ReceiverRuntime {
   endTemporaryAppleMusicPause() {
     this.temporaryAppleMusicPauseDepth = Math.max(0, this.temporaryAppleMusicPauseDepth - 1);
     this.applePauseGeneration += 1;
+  }
+
+  beginTemporarySpotifyPause() {
+    this.temporarySpotifyPauseDepth += 1;
+    this.spotifyPauseGeneration += 1;
+  }
+
+  endTemporarySpotifyPause() {
+    this.temporarySpotifyPauseDepth = Math.max(0, this.temporarySpotifyPauseDepth - 1);
+    this.spotifyPauseGeneration += 1;
   }
 
   assertNoSafetyPending() {
@@ -497,7 +578,7 @@ export class ReceiverRuntime {
         unavailableReason: 'Playback stayed quiet because an urgent safety announcement superseded its start.',
         updatedAt: this.now()
       };
-      for (const key of ['musicProvider', 'musicUrl', 'musicLabel', 'appleUrl']) {
+      for (const key of ['musicProvider', 'musicUrl', 'musicLabel', 'appleUrl', 'spotifyUrl']) {
         if (Object.prototype.hasOwnProperty.call(previousSourceConfig, key)) draft.config[key] = previousSourceConfig[key];
       }
       draft.activityLog = [makeLog('safety', 'Superseded playback stayed quiet', 'A late playback receipt was corrected after an urgent safety announcement.'), ...(draft.activityLog || [])];
@@ -508,7 +589,7 @@ export class ReceiverRuntime {
   rememberCommittedPlayback(requestId) {
     if (this.physicalRequestId !== requestId || this.physicalCommittedRequestId !== requestId) return;
     this.committedPlaybackSnapshot = structuredClone(this.state.playback || {});
-    this.committedSourceConfig = Object.fromEntries(['musicProvider', 'musicUrl', 'musicLabel', 'appleUrl'].map(key => [key, this.state.config[key]]));
+    this.committedSourceConfig = Object.fromEntries(['musicProvider', 'musicUrl', 'musicLabel', 'appleUrl', 'spotifyUrl'].map(key => [key, this.state.config[key]]));
   }
 
   async repairCurrentCommittedReceipt() {
@@ -560,12 +641,13 @@ export class ReceiverRuntime {
     const musicPercent = requestedPercent === null || requestedPercent === undefined
       ? this.currentMusicTarget()
       : clamp(requestedPercent, 0, 100, this.state.config.musicLevel);
+    const external = provider === 'spotify' ? this.spotify : this.apple;
     return audioPolicy({
       provider,
       isIOS: isIOSLike(),
-      supportsVolume: !!this.apple.supportsVolume,
-      volumeVerified: !!this.apple.volumeVerified,
-      verifiedPercent: this.apple.verifiedPercent,
+      supportsVolume: provider === 'controlled' ? false : !!external.supportsVolume,
+      volumeVerified: provider === 'controlled' ? false : !!external.volumeVerified,
+      verifiedPercent: provider === 'controlled' ? null : external.verifiedPercent,
       musicPercent,
       voicePercent: this.state.config.voiceLevel
     });
@@ -587,6 +669,26 @@ export class ReceiverRuntime {
     };
   }
 
+  spotifyLeasePatch() {
+    const readiness = this.spotify.readiness?.() || {
+      status: this.spotify.ready ? 'ready' : 'login-required',
+      ready: !!this.spotify.ready,
+      detail: this.spotify.ready ? 'Spotify receiver connected.' : 'Spotify receiver is not connected.'
+    };
+    return {
+      spotifyStatus: String(readiness.status || 'login-required').slice(0, 40),
+      spotifyDetail: String(readiness.detail || '').slice(0, 300),
+      spotifyVerifiedAt: readiness.ready ? Number(this.spotify.accessVerifiedAt || this.now()) : Number(this.spotify.accessVerifiedAt || 0)
+    };
+  }
+
+  receiverLeasePatch() {
+    return {
+      ...this.appleLeasePatch(),
+      ...this.spotifyLeasePatch()
+    };
+  }
+
   currentMusicTarget(playback = this.state.playback) {
     const physicalTarget = this.currentPhysicalCustomTarget();
     if (physicalTarget !== null) return physicalTarget;
@@ -601,6 +703,7 @@ export class ReceiverRuntime {
       : clamp(percent, 0, 100, this.state.config.musicLevel);
     this.audio.setMusicLevelPercent?.(target, { report });
     this.apple.setTargetVolumePercent?.(target);
+    this.spotify.setTargetVolumePercent?.(target);
     return target;
   }
 
@@ -620,10 +723,16 @@ export class ReceiverRuntime {
       const audibleTarget = customPlaybackTarget === null ? target : customPlaybackTarget;
       this.audio.setMusicLevelPercent?.(audibleTarget, { report: false });
       this.apple.setTargetVolumePercent?.(audibleTarget);
+      this.spotify.setTargetVolumePercent?.(audibleTarget);
       let verification = null;
-      const appleActive = this.physicalProvider === 'apple' ||
-        (this.state.playback.provider === 'apple' && this.state.playback.intent === 'playing');
-      if (appleActive && this.apple.ready) verification = await this.apple.enforceVolume(audibleTarget);
+      const externalProvider = ['apple', 'spotify'].includes(this.physicalProvider)
+        ? this.physicalProvider
+        : ['apple', 'spotify'].includes(this.state.playback.provider) && this.state.playback.intent === 'playing'
+          ? this.state.playback.provider
+          : '';
+      const external = externalProvider === 'spotify' ? this.spotify : this.apple;
+      const externalActive = !!externalProvider;
+      if (externalActive && external.ready) verification = await external.enforceVolume(audibleTarget);
       await this.store.mutate(draft => {
         if (draft.receiver?.id !== this.deviceId || draft.receiver?.sessionId !== this.sessionId) {
           throw new Error('Receiver ownership changed before the music level could be recorded.');
@@ -632,7 +741,7 @@ export class ReceiverRuntime {
         if (draft.playback?.intent !== 'stopped' && draft.playback?.volumeMode !== 'custom') {
           draft.playback.musicLevelPercent = target;
         }
-        if (draft.playback?.provider === 'apple') {
+        if (['apple', 'spotify'].includes(draft.playback?.provider)) {
           draft.playback = {
             ...draft.playback,
             volumeVerified: verification?.verified === true,
@@ -649,10 +758,10 @@ export class ReceiverRuntime {
       this.status(
         customPlaybackTarget !== null
           ? `Global music target saved at ${target}%. The current scheduled item remains at its custom ${customPlaybackTarget}% level.`
-          : appleActive && verification?.verified !== true
-            ? `Music target is ${target}%. Apple Music could not verify that level on this receiver; announcements will still pause Apple Music.`
+          : externalActive && verification?.verified !== true
+            ? `Music target is ${target}%. ${externalProvider === 'spotify' ? 'Spotify' : 'Apple Music'} could not verify that level on this receiver; announcements will still pause it.`
             : `Music level is ${target}%. Announcements are ${this.state.config.voiceLevel}%.`,
-        !appleActive || verification?.verified === true,
+        !externalActive || verification?.verified === true,
         { policy, verification }
       );
       return target;
@@ -711,7 +820,7 @@ export class ReceiverRuntime {
         name: this.apple.nativeEnabled?.() ? 'Poolside Pulse X Music Receiver (Mac)' : 'Poolside Speaker Receiver',
         platform: navigator.userAgent,
         audioMode: policy.id,
-        ...this.appleLeasePatch()
+        ...this.receiverLeasePatch()
       }, claimNow);
       draft.receiver = lease;
       draft.activityLog = [
@@ -763,6 +872,7 @@ export class ReceiverRuntime {
           this.physicalProvider = '';
           this.physicalRequestId = 0;
           await this.apple.pauseForAnnouncement().catch(() => {});
+          await this.spotify.pauseForAnnouncement?.().catch(() => {});
           await this.store.mutate(draft => {
             if (draft.receiver?.id !== this.deviceId || draft.receiver?.sessionId !== this.sessionId) {
               throw new Error('Receiver ownership changed while a failed playback restore was being recorded.');
@@ -809,7 +919,7 @@ export class ReceiverRuntime {
     if (!this.active) return;
     await this.store.mutate(draft => {
       if (draft.receiver?.id !== this.deviceId || draft.receiver?.sessionId !== this.sessionId) return draft;
-      draft.receiver = renewReceiverLease(draft.receiver, this.now(), { detail, audioMode: audioMode || draft.receiver.audioMode, ...this.appleLeasePatch() });
+      draft.receiver = renewReceiverLease(draft.receiver, this.now(), { detail, audioMode: audioMode || draft.receiver.audioMode, ...this.receiverLeasePatch() });
       return draft;
     }, 'Receiver capability', { requireDurable: true });
     const savedReceiver = this.state.receiver;
@@ -913,6 +1023,21 @@ export class ReceiverRuntime {
         return;
       }
     }
+    const spotifyCouldBePlaying = this.spotify.ready ||
+      stoppingProvider === 'spotify' ||
+      this.spotify.current?.paused === false ||
+      (this.state.playback.provider === 'spotify' && this.state.playback.intent === 'playing');
+    if (this.active && spotifyCouldBePlaying) {
+      try {
+        await this.spotify.pauseForAnnouncement();
+      } catch (error) {
+        if (release) {
+          throw new Error(`Receiver was not stopped because Spotify could not be confirmed paused: ${error.message}`);
+        }
+        await this.failSafeStop(`Session ended, and Spotify pause could not be confirmed: ${error.message}`);
+        return;
+      }
+    }
     this.stopLoops();
     this.active = false;
     this.cancelPendingAnnouncements('Receiver stopped before the announcement could play.');
@@ -922,6 +1047,7 @@ export class ReceiverRuntime {
     this.physicalProvider = '';
     this.physicalRequestId = 0;
     this.apple.disconnect();
+    this.spotify.disconnect();
     if (this.wakeLock) {
       try { await this.wakeLock.release(); } catch {}
       this.wakeLock = null;
@@ -1065,6 +1191,63 @@ export class ReceiverRuntime {
         this.status(`Apple Music ${musicTarget}% verification will retry: ${error.message}`, false);
       }
     }
+    let spotifyPlayback = null;
+    let spotifyUnavailableReason = '';
+    let spotifyCheckSuperseded = false;
+    const spotifyCheckEpoch = this.audioEpoch;
+    const spotifyCheckPauseGeneration = this.spotifyPauseGeneration;
+    const cloudSpotifyExpected = this.state.playback.provider === 'spotify' &&
+      this.state.playback.intent === 'playing' &&
+      this.physicalProvider !== 'controlled' &&
+      this.physicalProvider !== 'apple';
+    if (cloudSpotifyExpected && !this.spotify.ready) {
+      this.spotify.resetVolumeVerification?.();
+      spotifyUnavailableReason = 'The local Spotify receiver went offline and must be reconnected with a fresh tap.';
+      if (this.physicalProvider === 'spotify') {
+        this.physicalProvider = '';
+        this.physicalRequestId = 0;
+        this.physicalCommittedRequestId = 0;
+      }
+    }
+    if (this.spotify.ready && this.temporarySpotifyPauseDepth === 0) {
+      try {
+        spotifyPlayback = await this.spotify.playbackState();
+        if (this.temporarySpotifyPauseDepth > 0 || this.audioEpoch !== spotifyCheckEpoch || this.spotifyPauseGeneration !== spotifyCheckPauseGeneration) {
+          spotifyCheckSuperseded = true;
+          spotifyPlayback = null;
+        } else {
+          const localPlayback = spotifyPlayback.isPlaying && String(spotifyPlayback.deviceId || '') === String(this.spotify.deviceId || '');
+          if (!cloudSpotifyExpected && localPlayback) {
+            try {
+              await this.spotify.pauseForAnnouncement();
+              spotifyPlayback = null;
+              this.status('Unexpected Spotify playback on the receiver was paused to preserve the single-source mix.', false);
+            } catch (pauseError) {
+              this.audio.stopMusic();
+              this.physicalProvider = 'spotify';
+              this.physicalRequestId = 0;
+              throw new Error(`Unexpected Spotify playback overlapped the selected source and could not be confirmed paused: ${pauseError.message}`);
+            }
+          } else if (cloudSpotifyExpected && !localPlayback) {
+            this.spotify.resetVolumeVerification();
+            spotifyUnavailableReason = spotifyPlayback.deviceId && spotifyPlayback.deviceId !== this.spotify.deviceId
+              ? 'Spotify playback moved to another device.'
+              : 'The local Spotify receiver is not reporting active playback.';
+            this.physicalProvider = '';
+            this.physicalRequestId = 0;
+            throw new Error(spotifyUnavailableReason);
+          } else if (cloudSpotifyExpected && localPlayback) {
+            const measured = await this.spotify.readLocalVolume(musicTarget);
+            if (!measured.matches || !this.spotify.volumeVerified || this.spotify.verifiedPercent !== musicTarget) {
+              await this.spotify.enforceVolume(musicTarget);
+            }
+          }
+        }
+      } catch (error) {
+        this.spotify.resetVolumeVerification();
+        this.status(`Spotify ${musicTarget}% verification will retry: ${error.message}`, false);
+      }
+    }
     const policy = this.currentPolicy(this.state.playback.provider || this.state.config.musicProvider);
     try {
       await this.store.mutate(draft => {
@@ -1074,7 +1257,7 @@ export class ReceiverRuntime {
         draft.receiver = renewReceiverLease(current, heartbeatNow, {
           detail: policy.detail,
           audioMode: policy.id,
-          ...this.appleLeasePatch()
+          ...this.receiverLeasePatch()
         });
         if (draft.playback?.provider === 'apple' && !appleCheckSuperseded && this.temporaryAppleMusicPauseDepth === 0 && this.applePauseGeneration === appleCheckPauseGeneration) {
           const appleLabel = !appleUnavailableReason && applePlayback?.name
@@ -1091,6 +1274,24 @@ export class ReceiverRuntime {
             volumeVerified: !!this.apple.volumeVerified,
             volumeVerifiedPercent: this.apple.volumeVerified ? this.apple.verifiedPercent : null,
             volumeVerifiedAt: this.apple.volumeVerified ? heartbeatNow : 0,
+            audioPolicy: policy.id,
+            updatedAt: heartbeatNow
+          };
+        } else if (draft.playback?.provider === 'spotify' && !spotifyCheckSuperseded && this.temporarySpotifyPauseDepth === 0 && this.spotifyPauseGeneration === spotifyCheckPauseGeneration) {
+          const spotifyLabel = !spotifyUnavailableReason && spotifyPlayback?.name
+            ? `${spotifyPlayback.name}${spotifyPlayback.artists ? ` - ${spotifyPlayback.artists}` : ''}`
+            : (this.spotify.current?.name
+                ? `${this.spotify.current.name}${this.spotify.current.artists ? ` - ${this.spotify.current.artists}` : ''}`
+                : draft.playback.label);
+          draft.playback = {
+            ...draft.playback,
+            intent: spotifyUnavailableReason ? 'paused' : draft.playback.intent,
+            label: spotifyLabel,
+            positionMs: Number(spotifyPlayback?.position || draft.playback.positionMs || 0),
+            unavailableReason: spotifyUnavailableReason,
+            volumeVerified: !!this.spotify.volumeVerified,
+            volumeVerifiedPercent: this.spotify.volumeVerified ? this.spotify.verifiedPercent : null,
+            volumeVerifiedAt: this.spotify.volumeVerified ? heartbeatNow : 0,
             audioPolicy: policy.id,
             updatedAt: heartbeatNow
           };
@@ -1161,19 +1362,36 @@ export class ReceiverRuntime {
         applePauseError = error.message || String(error);
       });
     }
+    let spotifyPauseError = '';
+    const spotifyCouldBePlaying = this.spotify.ready ||
+      this.physicalProvider === 'spotify' ||
+      (this.state.playback.provider === 'spotify' && this.state.playback.intent === 'playing');
+    if (spotifyCouldBePlaying) {
+      await this.spotify.pauseForAnnouncement().catch(error => {
+        spotifyPauseError = error.message || String(error);
+      });
+    }
     if (!settleError) {
       this.apple.disconnect();
+      this.spotify.disconnect();
     } else {
       this.audioTail.finally(async () => {
         await this.apple.pauseForAnnouncement().catch(() => {});
         this.apple.disconnect();
+        await this.spotify.pauseForAnnouncement?.().catch(() => {});
+        this.spotify.disconnect();
       });
     }
     if (this.wakeLock) {
       try { await this.wakeLock.release(); } catch {}
       this.wakeLock = null;
     }
-    const stopDetail = [settleError ? `Older audio action still settling: ${settleError}` : '', immediateApplePauseError ? `Immediate Apple Music pause failed: ${immediateApplePauseError}` : '', applePauseError ? `Apple Music could not be confirmed paused: ${applePauseError}` : ''].filter(Boolean).join(' ');
+    const stopDetail = [
+      settleError ? `Older audio action still settling: ${settleError}` : '',
+      immediateApplePauseError ? `Immediate Apple Music pause failed: ${immediateApplePauseError}` : '',
+      applePauseError ? `Apple Music could not be confirmed paused: ${applePauseError}` : '',
+      spotifyPauseError ? `Spotify could not be confirmed paused: ${spotifyPauseError}` : ''
+    ].filter(Boolean).join(' ');
     this.status(stopDetail ? `${message} ${stopDetail}` : message, false);
     this.onChange();
   }
@@ -1185,6 +1403,10 @@ export class ReceiverRuntime {
       if (type === 'play-apple' && draft.receiver?.appleStatus !== 'ready') {
         const detail = draft.receiver?.appleDetail || 'Open Version X on the speaker device, authorize Apple Music, and tap Connect Apple Music Receiver.';
         throw new Error(`Apple Music command was not sent because the live receiver is not Apple Music-ready: ${detail}`);
+      }
+      if (type === 'play-spotify' && draft.receiver?.spotifyStatus !== 'ready') {
+        const detail = draft.receiver?.spotifyDetail || 'Open Version X on the speaker device, log in to Spotify, and tap Connect Spotify Receiver.';
+        throw new Error(`Spotify command was not sent because the live receiver is not Spotify-ready: ${detail}`);
       }
       created = createTargetedEvent(type, payload, draft.receiver, now);
       draft.events = mergeById([...(draft.events || []), created]).slice(-120);
@@ -1234,9 +1456,11 @@ export class ReceiverRuntime {
         failureMeta = {
           errorCode: String(caught?.code || '').slice(0, 80),
           errorStatus: Number(caught?.status || 0) || null,
-          errorOperation: String(caught?.appleOperation || '').slice(0, 120),
+          errorOperation: String(caught?.appleOperation || caught?.spotifyOperation || '').slice(0, 120),
           appleReason: String(caught?.appleReason || '').slice(0, 180),
-          receiverAppleMusicStatus: String(this.apple.readiness?.().status || '').slice(0, 40)
+          spotifyReason: String(caught?.spotifyReason || '').slice(0, 180),
+          receiverAppleMusicStatus: String(this.apple.readiness?.().status || '').slice(0, 40),
+          receiverSpotifyStatus: String(this.spotify.readiness?.().status || '').slice(0, 40)
         };
         this.status(`Command failed: ${error}`, false, { event });
       }
@@ -1247,8 +1471,8 @@ export class ReceiverRuntime {
       const completed = { ...completeEvent(event, this.deviceId, completedAt, error), ...failureMeta };
       await this.store.mutate(draft => {
         draft.events = mergeById([...(draft.events || []), completed]).slice(-120);
-        if (event.type === 'play-apple' && draft.receiver?.id === this.deviceId && draft.receiver?.sessionId === this.sessionId) {
-          draft.receiver = renewReceiverLease(draft.receiver, completedAt, this.appleLeasePatch());
+        if (['play-apple', 'play-spotify'].includes(event.type) && draft.receiver?.id === this.deviceId && draft.receiver?.sessionId === this.sessionId) {
+          draft.receiver = renewReceiverLease(draft.receiver, completedAt, this.receiverLeasePatch());
         }
         draft.activityLog = [
           makeLog(error ? 'error' : 'receiver', error ? 'Receiver command failed' : 'Receiver command completed', error || event.payload?.label || event.type, completedAt, { eventId: event.id, commandType: event.type, ...failureMeta }),
@@ -1278,6 +1502,14 @@ export class ReceiverRuntime {
         });
       case 'play-apple':
         return await this.playAppleMusic(payload.url, {
+          volumePercent: payload.volumePercent,
+          volumeMode: payload.volumeMode,
+          scheduledItemId: payload.scheduledItemId,
+          scheduledRunToken: payload.scheduledRunToken,
+          persistSource: payload.persistSource !== false
+        });
+      case 'play-spotify':
+        return await this.playSpotify(payload.url, {
           volumePercent: payload.volumePercent,
           volumeMode: payload.volumeMode,
           scheduledItemId: payload.scheduledItemId,
@@ -1339,7 +1571,7 @@ export class ReceiverRuntime {
     const previousTarget = this.currentMusicTarget(previousPlayback);
     const previousPhysicalTarget = this.physicalMusicTarget ? { ...this.physicalMusicTarget } : null;
     const requestId = this.nextAudioRequest();
-    const previousSourceConfig = Object.fromEntries(['musicProvider', 'musicUrl', 'musicLabel', 'appleUrl'].map(key => [key, this.state.config[key]]));
+    const previousSourceConfig = Object.fromEntries(['musicProvider', 'musicUrl', 'musicLabel', 'appleUrl', 'spotifyUrl'].map(key => [key, this.state.config[key]]));
     const resolved = await this.resolveControlledTracks(url);
     if (requestId !== this.audioRequestId) throw new Error('A newer audio command replaced this music request while its source was loading.');
     if (!this.isOwner()) throw new Error('Receiver ownership changed while the music source was loading. Nothing was played.');
@@ -1373,8 +1605,14 @@ export class ReceiverRuntime {
         this.apple.ready ||
         this.apple.current?.paused === false ||
         (this.state.playback.provider === 'apple' && this.state.playback.intent === 'playing');
+      const spotifyCouldBePlaying = this.physicalProvider === 'spotify' ||
+        this.spotify.ready ||
+        this.spotify.current?.paused === false ||
+        (this.state.playback.provider === 'spotify' && this.state.playback.intent === 'playing');
       if (appleCouldBePlaying) this.beginTemporaryAppleMusicPause();
+      if (spotifyCouldBePlaying) this.beginTemporarySpotifyPause();
       let appleSnapshot = null;
+      let spotifySnapshot = null;
       try {
         if (appleCouldBePlaying) {
           try {
@@ -1383,14 +1621,27 @@ export class ReceiverRuntime {
             throw new Error(`Controlled music was not started because Apple Music could not be confirmed paused: ${error.message}`);
           }
         }
+        if (spotifyCouldBePlaying) {
+          try {
+            spotifySnapshot = await this.spotify.pauseForAnnouncement();
+          } catch (error) {
+            if (appleSnapshot?.wasPlaying && this.isOwner() && requestId === this.audioRequestId && epoch === this.audioEpoch) {
+              await this.apple.resumeAfterAnnouncement(appleSnapshot, {
+                assertCurrent: () => this.assertAudioRequest(requestId, epoch)
+              }).catch(() => {});
+            }
+            throw new Error(`Controlled music was not started because Spotify could not be confirmed paused: ${error.message}`);
+          }
+        }
         try {
-          this.assertAudioRequest(requestId, epoch, 'Controlled music was superseded while Apple Music was pausing.');
+          this.assertAudioRequest(requestId, epoch, 'Controlled music was superseded while external music was pausing.');
         } catch (error) {
           this.applyConfiguredMusicTarget({ report: false, percent: previousTarget });
           if (appleSnapshot?.wasPlaying) this.carrySafetyRestore({ provider: 'apple', appleSnapshot, musicLevelPercent: previousTarget });
+          if (spotifySnapshot?.wasPlaying) this.carrySafetyRestore({ provider: 'spotify', spotifySnapshot, musicLevelPercent: previousTarget });
           throw error;
         }
-        if (appleCouldBePlaying) this.physicalProvider = '';
+        if (appleCouldBePlaying || spotifyCouldBePlaying) this.physicalProvider = '';
         const safeIndex = Math.max(0, Math.min(resolved.tracks.length - 1, Number(index) || 0));
         const track = resolved.tracks[safeIndex];
         this.assertAudioRequest(requestId, epoch, 'Controlled music was superseded before its media could start.');
@@ -1442,6 +1693,12 @@ export class ReceiverRuntime {
               assertCurrent: () => this.assertAudioRequest(requestId, epoch)
             }).then(() => { this.physicalProvider = 'apple'; }).catch(caught => { restoreError = caught.message || String(caught); });
           }
+          const carriedSpotifyToSafety = spotifySnapshot?.wasPlaying && this.carrySafetyRestore({ provider: 'spotify', spotifySnapshot, musicLevelPercent: previousTarget });
+          if (!this.physicalProvider && !carriedSpotifyToSafety && spotifySnapshot?.wasPlaying && this.isOwner() && requestId === this.audioRequestId && epoch === this.audioEpoch) {
+            await this.spotify.resumeAfterAnnouncement(spotifySnapshot, {
+              assertCurrent: () => this.assertAudioRequest(requestId, epoch)
+            }).then(() => { this.physicalProvider = 'spotify'; }).catch(caught => { restoreError = caught.message || String(caught); });
+          }
           throw new Error(restoreError ? `${error.message} The prior controlled track also could not be restored: ${restoreError}` : error.message);
         }
         if (requestId !== this.audioRequestId || epoch !== this.audioEpoch) {
@@ -1449,6 +1706,7 @@ export class ReceiverRuntime {
           if (this.physicalMusicTarget?.requestId === requestId) this.physicalMusicTarget = null;
           this.applyConfiguredMusicTarget({ report: false, percent: previousTarget });
           if (appleSnapshot?.wasPlaying) this.carrySafetyRestore({ provider: 'apple', appleSnapshot, musicLevelPercent: previousTarget });
+          if (spotifySnapshot?.wasPlaying) this.carrySafetyRestore({ provider: 'spotify', spotifySnapshot, musicLevelPercent: previousTarget });
           throw new Error('A newer audio command replaced this controlled-music start.');
         }
         if (!this.isOwner()) {
@@ -1459,9 +1717,10 @@ export class ReceiverRuntime {
         }
         this.physicalProvider = 'controlled';
         this.physicalRequestId = requestId;
-        return { appleSnapshot, controlledSnapshot, safeIndex, track };
+        return { appleSnapshot, spotifySnapshot, controlledSnapshot, safeIndex, track };
       } finally {
         if (appleCouldBePlaying) this.endTemporaryAppleMusicPause();
+        if (spotifyCouldBePlaying) this.endTemporarySpotifyPause();
       }
     }).catch(error => {
       if (this.pendingScheduledPlayback?.requestId === requestId) this.pendingScheduledPlayback = null;
@@ -1550,6 +1809,17 @@ export class ReceiverRuntime {
             restoreError = caught.message || String(caught);
           }
         }
+        const carriedSpotifyToSafety = physical.spotifySnapshot?.wasPlaying && this.carrySafetyRestore({ provider: 'spotify', spotifySnapshot: physical.spotifySnapshot, musicLevelPercent: previousTarget });
+        if (!this.physicalProvider && !carriedSpotifyToSafety && physical.spotifySnapshot?.wasPlaying && this.isOwner() && requestId === this.audioRequestId && epoch === this.audioEpoch) {
+          try {
+            await this.spotify.resumeAfterAnnouncement(physical.spotifySnapshot, {
+              assertCurrent: () => this.assertAudioRequest(requestId, epoch)
+            });
+            this.physicalProvider = 'spotify';
+          } catch (caught) {
+            restoreError = caught.message || String(caught);
+          }
+        }
       });
       if (error.code === 'AUDIO_RECEIPT_SUPERSEDED' && this.audioRequestKind === 'safety' && this.isOwner()) {
         await this.compensateSafetyReceipt(previousPlayback, previousSourceConfig);
@@ -1557,7 +1827,7 @@ export class ReceiverRuntime {
         await this.repairCurrentCommittedReceipt();
       }
       throw new Error(restoreError
-        ? `Controlled music was stopped because its cloud state could not be saved: ${error.message}. Apple Music restore also failed: ${restoreError}`
+        ? `Controlled music was stopped because its cloud state could not be saved: ${error.message}. Prior external music restore also failed: ${restoreError}`
         : `Controlled music was stopped because its cloud state could not be saved: ${error.message}`);
     }
     if (this.pendingScheduledPlayback?.requestId === requestId) this.pendingScheduledPlayback = null;
@@ -1583,7 +1853,7 @@ export class ReceiverRuntime {
     const epoch = this.invalidateAudioRestores();
     const previousPlayback = structuredClone(this.state.playback || {});
     const previousTarget = this.currentMusicTarget(previousPlayback);
-    const previousSourceConfig = Object.fromEntries(['musicProvider', 'musicUrl', 'musicLabel', 'appleUrl'].map(key => [key, this.state.config[key]]));
+    const previousSourceConfig = Object.fromEntries(['musicProvider', 'musicUrl', 'musicLabel', 'appleUrl', 'spotifyUrl'].map(key => [key, this.state.config[key]]));
     if (scheduledRunToken) {
       this.pendingScheduledPlayback = {
         token: String(scheduledRunToken),
@@ -1604,18 +1874,33 @@ export class ReceiverRuntime {
             scheduledRunToken: String(this.audio.currentRunToken || this.state.playback.scheduledRunToken || '')
           }
         : null;
-      this.audio.pauseMusic();
-      this.physicalMusicTarget = { requestId, mode: targetMode, percent: targetPercent, provider: 'apple' };
-      this.applyConfiguredMusicTarget({ report: false, percent: targetPercent });
-      let result;
+      const spotifyCouldBePlaying = this.physicalProvider === 'spotify' ||
+        this.spotify.ready ||
+        this.spotify.current?.paused === false ||
+        (this.state.playback.provider === 'spotify' && this.state.playback.intent === 'playing');
+      if (spotifyCouldBePlaying) this.beginTemporarySpotifyPause();
+      let spotifySnapshot = null;
       try {
-        result = await this.apple.play(url || this.state.config.appleUrl, {
+        if (spotifyCouldBePlaying) {
+          try {
+            spotifySnapshot = await this.spotify.pauseForAnnouncement();
+          } catch (error) {
+            throw new Error(`Apple Music was not started because Spotify could not be confirmed paused: ${error.message}`);
+          }
+          this.assertAudioRequest(requestId, epoch, 'Apple Music was superseded while Spotify was pausing.');
+        }
+        this.audio.pauseMusic();
+        this.physicalMusicTarget = { requestId, mode: targetMode, percent: targetPercent, provider: 'apple' };
+        this.applyConfiguredMusicTarget({ report: false, percent: targetPercent });
+        let result;
+        try {
+          result = await this.apple.play(url || this.state.config.appleUrl, {
           assertCurrent: () => {
             this.assertAudioRequest(requestId, epoch);
             this.assertScheduledRunAuthorization(this.state, scheduledRunToken, scheduledItemId);
           }
         });
-      } catch (error) {
+        } catch (error) {
         const superseded = requestId !== this.audioRequestId || epoch !== this.audioEpoch || !this.isOwner();
         if (superseded) {
           try {
@@ -1636,6 +1921,7 @@ export class ReceiverRuntime {
           if (this.physicalMusicTarget?.requestId === requestId) this.physicalMusicTarget = null;
           this.physicalProvider = '';
           if (controlledSnapshot) this.carrySafetyRestore({ provider: 'controlled', controlledSnapshot: { ...controlledSnapshot, wasPlaying: true }, musicLevelPercent: previousTarget });
+          if (spotifySnapshot?.wasPlaying) this.carrySafetyRestore({ provider: 'spotify', spotifySnapshot, musicLevelPercent: previousTarget });
           throw new Error(`Apple Music playback was superseded and stopped: ${error.message}`);
         }
         if (error?.applePauseUnconfirmed || error?.code === 'APPLE_MUSIC_NATIVE_PAUSE_UNCONFIRMED') {
@@ -1679,12 +1965,22 @@ export class ReceiverRuntime {
             restoreError = caught.message || String(caught);
           }
         }
+        if (!restoreError && spotifySnapshot?.wasPlaying && this.isOwner() && requestId === this.audioRequestId && epoch === this.audioEpoch) {
+          try {
+            await this.spotify.resumeAfterAnnouncement(spotifySnapshot, {
+              assertCurrent: () => this.assertAudioRequest(requestId, epoch)
+            });
+            this.physicalProvider = 'spotify';
+          } catch (caught) {
+            restoreError = caught.message || String(caught);
+          }
+        }
         if (restoreError) {
-          throw appleErrorWithContext(error, `${error.message} Controlled music also could not be restored: ${restoreError}`);
+          throw appleErrorWithContext(error, `${error.message} Prior music also could not be restored: ${restoreError}`);
         }
         throw error;
-      }
-      if (requestId !== this.audioRequestId || epoch !== this.audioEpoch || !this.isOwner()) {
+        }
+        if (requestId !== this.audioRequestId || epoch !== this.audioEpoch || !this.isOwner()) {
         try {
           await this.confirmAppleMusicPaused('Apple Music was superseded after its start command completed.');
         } catch (pauseError) {
@@ -1701,12 +1997,16 @@ export class ReceiverRuntime {
         if (this.physicalMusicTarget?.requestId === requestId) this.physicalMusicTarget = null;
         this.physicalProvider = '';
         if (controlledSnapshot) this.carrySafetyRestore({ provider: 'controlled', controlledSnapshot: { ...controlledSnapshot, wasPlaying: true }, musicLevelPercent: previousTarget });
+        if (spotifySnapshot?.wasPlaying) this.carrySafetyRestore({ provider: 'spotify', spotifySnapshot, musicLevelPercent: previousTarget });
         throw new Error('Apple Music was superseded while starting, so playback was stopped.');
+        }
+        this.audio.stopMusic();
+        this.physicalProvider = 'apple';
+        this.physicalRequestId = requestId;
+        return { controlledSnapshot, spotifySnapshot, result };
+      } finally {
+        if (spotifyCouldBePlaying) this.endTemporarySpotifyPause();
       }
-      this.audio.stopMusic();
-      this.physicalProvider = 'apple';
-      this.physicalRequestId = requestId;
-      return { controlledSnapshot, result };
     }).catch(error => {
       if (!error?.applePauseUnconfirmed && this.pendingScheduledPlayback?.requestId === requestId) this.pendingScheduledPlayback = null;
       throw error;
@@ -1780,16 +2080,289 @@ export class ReceiverRuntime {
             restoreError = caught.message || String(caught);
           }
         }
+        const carriedSpotifyToSafety = !pauseError && physical.spotifySnapshot?.wasPlaying && this.carrySafetyRestore({ provider: 'spotify', spotifySnapshot: physical.spotifySnapshot, musicLevelPercent: previousTarget });
+        if (!pauseError && !this.physicalProvider && !carriedSpotifyToSafety && physical.spotifySnapshot?.wasPlaying && this.isOwner() && requestId === this.audioRequestId && epoch === this.audioEpoch) {
+          try {
+            await this.spotify.resumeAfterAnnouncement(physical.spotifySnapshot, {
+              assertCurrent: () => this.assertAudioRequest(requestId, epoch)
+            });
+            this.physicalProvider = 'spotify';
+          } catch (caught) {
+            restoreError = caught.message || String(caught);
+          }
+        }
       });
       if (error.code === 'AUDIO_RECEIPT_SUPERSEDED' && this.audioRequestKind === 'safety' && this.isOwner()) {
         await this.compensateSafetyReceipt(previousPlayback, previousSourceConfig);
       } else if (error.code === 'AUDIO_RECEIPT_SUPERSEDED' && this.audioRequestKind === 'normal' && this.isOwner()) {
         await this.repairCurrentCommittedReceipt();
       }
-      throw new Error(`Apple Music was stopped because its cloud state could not be saved: ${error.message}${pauseError ? ` Apple Music pause confirmation failed: ${pauseError}` : ''}${restoreError ? ` Controlled music restore failed: ${restoreError}` : ''}`);
+      throw new Error(`Apple Music was stopped because its cloud state could not be saved: ${error.message}${pauseError ? ` Apple Music pause confirmation failed: ${pauseError}` : ''}${restoreError ? ` Prior music restore failed: ${restoreError}` : ''}`);
     }
     if (this.pendingScheduledPlayback?.requestId === requestId) this.pendingScheduledPlayback = null;
     await this.updateReceiverDetail(policy.detail, policy.id).catch(error => this.status(`Apple Music is playing, but receiver capability detail could not be saved: ${error.message}`, false));
+    return true;
+  }
+
+  async playSpotify(url, { volumePercent = null, volumeMode = 'global', scheduledItemId = '', scheduledRunToken = '', persistSource = true } = {}) {
+    if (!this.isOwner()) throw new Error('This device is not the active speaker receiver.');
+    this.assertNoSafetyPending();
+    this.assertScheduledRunAuthorization(this.state, scheduledRunToken, scheduledItemId);
+    if (!this.spotify.loggedIn()) throw new Error('Spotify is not logged in on the speaker receiver. Open Settings on that device and choose Login Spotify.');
+    if (!this.spotify.ready) throw new Error('Spotify needs a local receiver tap. On the speaker device, open Receiver and choose Connect Spotify Receiver.');
+    if (!this.isOwner()) throw new Error('Receiver ownership changed before Spotify could start.');
+    const targetPercent = clamp(
+      volumePercent === null || volumePercent === undefined ? this.state.config.musicLevel : volumePercent,
+      0,
+      100,
+      this.state.config.musicLevel
+    );
+    const targetMode = volumeMode === 'custom' ? 'custom' : 'global';
+    const requestId = this.nextAudioRequest();
+    const epoch = this.invalidateAudioRestores();
+    const previousPlayback = structuredClone(this.state.playback || {});
+    const previousTarget = this.currentMusicTarget(previousPlayback);
+    const previousSourceConfig = Object.fromEntries(['musicProvider', 'musicUrl', 'musicLabel', 'appleUrl', 'spotifyUrl'].map(key => [key, this.state.config[key]]));
+    if (scheduledRunToken) {
+      this.pendingScheduledPlayback = {
+        token: String(scheduledRunToken),
+        itemId: String(scheduledItemId || ''),
+        provider: 'spotify',
+        requestId
+      };
+    }
+    const physical = await this.serializeAudio(async () => {
+      this.assertAudioRequest(requestId, epoch);
+      this.assertScheduledRunAuthorization(this.state, scheduledRunToken, scheduledItemId);
+      const controlledAudible = this.physicalProvider === 'controlled' || !!this.audio.musicPlaying?.();
+      const controlledSnapshot = controlledAudible
+        ? {
+            audioUrl: String(this.audio.currentUrl || this.state.playback.audioUrl || ''),
+            label: String(this.audio.currentLabel || this.state.playback.label || 'Suno / direct audio'),
+            position: Number(this.audio.musicElement?.currentTime || 0),
+            scheduledRunToken: String(this.audio.currentRunToken || this.state.playback.scheduledRunToken || '')
+          }
+        : null;
+      const appleCouldBePlaying = this.physicalProvider === 'apple' ||
+        this.apple.ready ||
+        this.apple.current?.paused === false ||
+        (this.state.playback.provider === 'apple' && this.state.playback.intent === 'playing');
+      if (appleCouldBePlaying) this.beginTemporaryAppleMusicPause();
+      let appleSnapshot = null;
+      try {
+        if (appleCouldBePlaying) {
+          try {
+            appleSnapshot = await this.apple.pauseForAnnouncement();
+          } catch (error) {
+            throw new Error(`Spotify was not started because Apple Music could not be confirmed paused: ${error.message}`);
+          }
+          this.assertAudioRequest(requestId, epoch, 'Spotify was superseded while Apple Music was pausing.');
+        }
+        this.audio.pauseMusic();
+        this.physicalMusicTarget = { requestId, mode: targetMode, percent: targetPercent, provider: 'spotify' };
+        this.applyConfiguredMusicTarget({ report: false, percent: targetPercent });
+        let result;
+        try {
+          result = await this.spotify.play(url || this.state.config.spotifyUrl, {
+          assertCurrent: () => {
+            this.assertAudioRequest(requestId, epoch);
+            this.assertScheduledRunAuthorization(this.state, scheduledRunToken, scheduledItemId);
+          }
+        });
+        } catch (error) {
+        const superseded = requestId !== this.audioRequestId || epoch !== this.audioEpoch || !this.isOwner();
+        if (superseded) {
+          try {
+            await this.confirmSpotifyPaused('The superseded Spotify start could not be declared stopped.');
+          } catch (pauseError) {
+            this.physicalProvider = 'spotify';
+            this.physicalRequestId = requestId;
+            const failure = spotifyErrorWithContext(
+              error,
+              `Superseded Spotify playback may still be audible, so no other source was restored: ${pauseError.message}`
+            );
+            failure.spotifyOperation = pauseError.spotifyOperation || failure.spotifyOperation;
+            failure.spotifyReason = pauseError.spotifyReason || failure.spotifyReason;
+            failure.spotifyPauseUnconfirmed = true;
+            throw failure;
+          }
+          this.applyConfiguredMusicTarget({ report: false, percent: previousTarget });
+          if (this.physicalMusicTarget?.requestId === requestId) this.physicalMusicTarget = null;
+          this.physicalProvider = '';
+          if (controlledSnapshot) this.carrySafetyRestore({ provider: 'controlled', controlledSnapshot: { ...controlledSnapshot, wasPlaying: true }, musicLevelPercent: previousTarget });
+          if (appleSnapshot?.wasPlaying) this.carrySafetyRestore({ provider: 'apple', appleSnapshot, musicLevelPercent: previousTarget });
+          throw new Error(`Spotify playback was superseded and stopped: ${error.message}`);
+        }
+        let restoreError = '';
+        if (error?.code === 'SCHEDULE_RUN_CANCELLED') {
+          try {
+            await this.confirmSpotifyPaused('The cancelled scheduled Spotify start could not be declared stopped.');
+          } catch (pauseError) {
+            this.physicalProvider = 'spotify';
+            this.physicalRequestId = requestId;
+            const failure = spotifyErrorWithContext(
+              error,
+              `${error.message} Another music source was not restored because Spotify silence could not be confirmed: ${pauseError.message}`
+            );
+            failure.spotifyOperation = pauseError.spotifyOperation || failure.spotifyOperation;
+            failure.spotifyReason = pauseError.spotifyReason || failure.spotifyReason;
+            failure.spotifyPauseUnconfirmed = true;
+            this.status(failure.message, false, {
+              errorCode: failure.code || 'SCHEDULE_RUN_CANCELLED',
+              errorOperation: failure.spotifyOperation || '',
+              spotifyReason: failure.spotifyReason || ''
+            });
+            throw failure;
+          }
+        }
+        this.applyConfiguredMusicTarget({ report: false, percent: previousTarget });
+        if (this.physicalMusicTarget?.requestId === requestId) this.physicalMusicTarget = null;
+        if (controlledSnapshot && this.isOwner() && requestId === this.audioRequestId && epoch === this.audioEpoch) {
+          try {
+            const resumed = await this.audio.resumeMusic();
+            if (!resumed && controlledSnapshot.audioUrl) {
+              await this.audio.playMusicUrl(controlledSnapshot.audioUrl, { label: controlledSnapshot.label, startAt: controlledSnapshot.position, scheduledRunToken: controlledSnapshot.scheduledRunToken });
+            }
+          } catch (caught) {
+            restoreError = caught.message || String(caught);
+          }
+        }
+        if (!restoreError && appleSnapshot?.wasPlaying && this.isOwner() && requestId === this.audioRequestId && epoch === this.audioEpoch) {
+          try {
+            await this.apple.resumeAfterAnnouncement(appleSnapshot, {
+              assertCurrent: () => this.assertAudioRequest(requestId, epoch)
+            });
+            this.physicalProvider = 'apple';
+          } catch (caught) {
+            restoreError = caught.message || String(caught);
+          }
+        }
+        if (restoreError) {
+          throw spotifyErrorWithContext(error, `${error.message} Prior music also could not be restored: ${restoreError}`);
+        }
+        throw error;
+        }
+        if (requestId !== this.audioRequestId || epoch !== this.audioEpoch || !this.isOwner()) {
+        try {
+          await this.confirmSpotifyPaused('Spotify was superseded after its start command completed.');
+        } catch (pauseError) {
+          this.physicalProvider = 'spotify';
+          this.physicalRequestId = requestId;
+          const failure = spotifyErrorWithContext(
+            pauseError,
+            `Spotify was superseded while starting but may still be audible, so no other source was restored: ${pauseError.message}`
+          );
+          failure.spotifyPauseUnconfirmed = true;
+          throw failure;
+        }
+        this.applyConfiguredMusicTarget({ report: false, percent: previousTarget });
+        if (this.physicalMusicTarget?.requestId === requestId) this.physicalMusicTarget = null;
+        this.physicalProvider = '';
+        if (controlledSnapshot) this.carrySafetyRestore({ provider: 'controlled', controlledSnapshot: { ...controlledSnapshot, wasPlaying: true }, musicLevelPercent: previousTarget });
+        if (appleSnapshot?.wasPlaying) this.carrySafetyRestore({ provider: 'apple', appleSnapshot, musicLevelPercent: previousTarget });
+        throw new Error('Spotify was superseded while starting, so playback was stopped.');
+        }
+        this.audio.stopMusic();
+        this.physicalProvider = 'spotify';
+        this.physicalRequestId = requestId;
+        return { controlledSnapshot, appleSnapshot, result };
+      } finally {
+        if (appleCouldBePlaying) this.endTemporaryAppleMusicPause();
+      }
+    }).catch(error => {
+      if (!error?.spotifyPauseUnconfirmed && this.pendingScheduledPlayback?.requestId === requestId) this.pendingScheduledPlayback = null;
+      throw error;
+    });
+    const policy = this.currentPolicy('spotify', targetPercent);
+    try {
+      await this.store.mutate(draft => {
+        this.assertReceiptCurrent(requestId, epoch, 'Spotify playback was superseded before its cloud receipt could commit.');
+        this.assertScheduledRunAuthorization(draft, scheduledRunToken, scheduledItemId);
+        if (draft.receiver?.id !== this.deviceId || draft.receiver?.sessionId !== this.sessionId) {
+          throw new Error('Receiver ownership changed before Spotify playback could be recorded.');
+        }
+        if (persistSource) {
+          draft.config.musicProvider = 'spotify';
+          draft.config.spotifyUrl = String(url || draft.config.spotifyUrl || '');
+        }
+        const playedSourceUrl = String(url || draft.config.spotifyUrl || '');
+        draft.playback = {
+          provider: 'spotify',
+          intent: 'playing',
+          label: this.spotify.current?.name || 'Spotify playlist',
+          sourceUrl: playedSourceUrl,
+          trackIndex: 0,
+          musicLevelPercent: targetPercent,
+          volumeMode: targetMode,
+          scheduledItemId: String(scheduledItemId || ''),
+          scheduledRunToken: String(scheduledRunToken || ''),
+          scheduledFingerprint: scheduledRunToken
+            ? scheduleItemFingerprint((getActiveSchedule(draft)?.items || []).find(item => String(item.id || '') === String(scheduledItemId || '')))
+            : '',
+          updatedAt: this.now(),
+          volumeVerified: !!physical.result.volume?.verified,
+          volumeVerifiedPercent: physical.result.volume?.verified ? physical.result.volume.verifiedPercent : null,
+          volumeVerifiedAt: physical.result.volume?.verified ? this.now() : 0,
+          audioPolicy: policy.id
+        };
+        draft.activityLog = [makeLog('play', physical.result.volume?.verified ? `Spotify playing at verified ${targetPercent}%` : 'Spotify playing in compatibility mode', policy.detail, this.now(), { provider: 'spotify', scheduledItemId: String(scheduledItemId || '') }), ...(draft.activityLog || [])];
+        return draft;
+      }, 'Spotify playback started', { requireDurable: true });
+      this.assertReceiptCurrent(requestId, epoch, 'Spotify playback was superseded while its cloud receipt was committing.');
+      this.physicalCommittedRequestId = requestId;
+      this.rememberCommittedPlayback(requestId);
+    } catch (error) {
+      if (this.pendingScheduledPlayback?.requestId === requestId) this.pendingScheduledPlayback = null;
+      let pauseError = '';
+      let restoreError = '';
+      await this.serializeAudio(async () => {
+        const mustQuiet = this.physicalRequestId === requestId || this.audioRequestKind === 'safety' || this.audioRequestKind === 'terminal' || !this.isOwner();
+        if (!mustQuiet) return;
+        await this.spotify.pauseForAnnouncement().catch(caught => { pauseError = caught.message || String(caught); });
+        this.applyConfiguredMusicTarget({ report: false, percent: previousTarget });
+        if (this.physicalMusicTarget?.requestId === requestId) this.physicalMusicTarget = null;
+        this.physicalProvider = pauseError ? 'spotify' : '';
+        if (!pauseError) {
+          this.physicalRequestId = 0;
+          this.physicalCommittedRequestId = 0;
+        }
+        const carriedToSafety = !pauseError && physical.controlledSnapshot && this.carrySafetyRestore({ provider: 'controlled', controlledSnapshot: { ...physical.controlledSnapshot, wasPlaying: true }, musicLevelPercent: previousTarget });
+        if (!pauseError && !carriedToSafety && physical.controlledSnapshot && this.isOwner() && requestId === this.audioRequestId && epoch === this.audioEpoch) {
+          try {
+            const resumed = await this.audio.resumeMusic();
+            if (!resumed && physical.controlledSnapshot.audioUrl) {
+              await this.audio.playMusicUrl(physical.controlledSnapshot.audioUrl, {
+                label: physical.controlledSnapshot.label,
+                startAt: physical.controlledSnapshot.position,
+                scheduledRunToken: physical.controlledSnapshot.scheduledRunToken
+              });
+            }
+            this.physicalProvider = 'controlled';
+          } catch (caught) {
+            restoreError = caught.message || String(caught);
+          }
+        }
+        const carriedAppleToSafety = !pauseError && physical.appleSnapshot?.wasPlaying && this.carrySafetyRestore({ provider: 'apple', appleSnapshot: physical.appleSnapshot, musicLevelPercent: previousTarget });
+        if (!pauseError && !this.physicalProvider && !carriedAppleToSafety && physical.appleSnapshot?.wasPlaying && this.isOwner() && requestId === this.audioRequestId && epoch === this.audioEpoch) {
+          try {
+            await this.apple.resumeAfterAnnouncement(physical.appleSnapshot, {
+              assertCurrent: () => this.assertAudioRequest(requestId, epoch)
+            });
+            this.physicalProvider = 'apple';
+          } catch (caught) {
+            restoreError = caught.message || String(caught);
+          }
+        }
+      });
+      if (error.code === 'AUDIO_RECEIPT_SUPERSEDED' && this.audioRequestKind === 'safety' && this.isOwner()) {
+        await this.compensateSafetyReceipt(previousPlayback, previousSourceConfig);
+      } else if (error.code === 'AUDIO_RECEIPT_SUPERSEDED' && this.audioRequestKind === 'normal' && this.isOwner()) {
+        await this.repairCurrentCommittedReceipt();
+      }
+      throw new Error(`Spotify was stopped because its cloud state could not be saved: ${error.message}${pauseError ? ` Spotify pause confirmation failed: ${pauseError}` : ''}${restoreError ? ` Prior music restore failed: ${restoreError}` : ''}`);
+    }
+    if (this.pendingScheduledPlayback?.requestId === requestId) this.pendingScheduledPlayback = null;
+    await this.updateReceiverDetail(policy.detail, policy.id).catch(error => this.status(`Spotify is playing, but receiver capability detail could not be saved: ${error.message}`, false));
     return true;
   }
 
@@ -1804,11 +2377,14 @@ export class ReceiverRuntime {
         : Number(this.state.playback.positionMs || 0);
       const appleMayBeAudible = provider === 'apple' || this.apple.ready || this.apple.current?.paused === false;
       if (appleMayBeAudible) await this.apple.pauseForAnnouncement();
+      const spotifyMayBeAudible = provider === 'spotify' || this.spotify.ready || this.spotify.current?.paused === false;
+      if (spotifyMayBeAudible) await this.spotify.pauseForAnnouncement();
       this.audio.pauseMusic();
       this.physicalMusicTarget = null;
       this.physicalRequestId = 0;
       this.physicalCommittedRequestId = 0;
       this.preemptedAppleMusicSnapshot = null;
+      this.preemptedSpotifySnapshot = null;
       this.safetyRestoreSnapshot = null;
       this.assertTerminalRequest(requestId, 'A newer audio command replaced this pause after the source became quiet.');
       return { provider, positionMs };
@@ -1829,6 +2405,10 @@ export class ReceiverRuntime {
       const activeProvider = this.physicalProvider || this.state.playback.provider || this.state.config.musicProvider;
       let resumed;
       if (activeProvider === 'apple') {
+        if (this.spotify.ready || this.spotify.current?.paused === false) {
+          await this.spotify.pauseForAnnouncement();
+          this.assertAudioRequest(requestId, epoch, 'Apple Music resume was superseded while Spotify was being silenced.');
+        }
         this.audio.pauseMusic();
         try {
           resumed = await this.apple.resume({ assertCurrent: () => this.assertAudioRequest(requestId, epoch) });
@@ -1842,10 +2422,32 @@ export class ReceiverRuntime {
           }
           throw error;
         }
+      } else if (activeProvider === 'spotify') {
+        if (this.apple.ready || this.apple.current?.paused === false) {
+          await this.apple.pauseForAnnouncement();
+          this.assertAudioRequest(requestId, epoch, 'Spotify resume was superseded while Apple Music was being silenced.');
+        }
+        this.audio.pauseMusic();
+        try {
+          resumed = await this.spotify.resume({ assertCurrent: () => this.assertAudioRequest(requestId, epoch) });
+        } catch (error) {
+          if (requestId !== this.audioRequestId || epoch !== this.audioEpoch || !this.isOwner()) {
+            try {
+              await this.spotify.pauseForAnnouncement();
+            } catch (pauseError) {
+              throw new Error(`Superseded Spotify resume could not be confirmed paused: ${pauseError.message}`);
+            }
+          }
+          throw error;
+        }
       } else {
         if (this.apple.ready || this.apple.current?.paused === false) {
           await this.apple.pauseForAnnouncement();
           this.assertAudioRequest(requestId, epoch, 'Controlled resume was superseded while Apple Music was being silenced.');
+        }
+        if (this.spotify.ready || this.spotify.current?.paused === false) {
+          await this.spotify.pauseForAnnouncement();
+          this.assertAudioRequest(requestId, epoch, 'Controlled resume was superseded while Spotify was being silenced.');
         }
         this.applyConfiguredMusicTarget({ report: false });
         resumed = await this.audio.resumeMusic();
@@ -1860,9 +2462,11 @@ export class ReceiverRuntime {
       }
       if (!resumed) throw new Error('There is no paused track to resume.');
       if (requestId !== this.audioRequestId || epoch !== this.audioEpoch || !this.isOwner()) {
-        if (activeProvider === 'apple') {
-          await this.apple.pauseForAnnouncement().catch(error => {
-            throw new Error(`Receiver ownership changed while Apple Music was resuming, and Apple Music could not be confirmed paused: ${error.message}`);
+        if (['apple', 'spotify'].includes(activeProvider)) {
+          const player = activeProvider === 'spotify' ? this.spotify : this.apple;
+          const name = activeProvider === 'spotify' ? 'Spotify' : 'Apple Music';
+          await player.pauseForAnnouncement().catch(error => {
+            throw new Error(`Receiver ownership changed while ${name} was resuming, and ${name} could not be confirmed paused: ${error.message}`);
           });
         } else this.audio.stopMusic();
         throw new Error('Music resume was superseded, so playback was stopped.');
@@ -1886,8 +2490,10 @@ export class ReceiverRuntime {
       await this.serializeAudio(async () => {
         const rollback = !this.isOwner() || this.physicalRequestId === requestId || this.safetyPendingCount > 0 || this.audioRequestKind === 'safety' || this.audioRequestKind === 'terminal';
         if (!rollback) return;
-        if (provider === 'apple') await this.apple.pauseForAnnouncement().catch(caught => { pauseError = caught.message || String(caught); });
-        else this.audio.pauseMusic();
+        if (['apple', 'spotify'].includes(provider)) {
+          const player = provider === 'spotify' ? this.spotify : this.apple;
+          await player.pauseForAnnouncement().catch(caught => { pauseError = caught.message || String(caught); });
+        } else this.audio.pauseMusic();
         if (!pauseError) {
           this.physicalProvider = provider;
           this.physicalRequestId = 0;
@@ -1900,7 +2506,7 @@ export class ReceiverRuntime {
       } else if (error.code === 'AUDIO_RECEIPT_SUPERSEDED' && this.audioRequestKind === 'normal' && this.isOwner()) {
         await this.repairCurrentCommittedReceipt();
       }
-      throw new Error(`Music was paused because its resume receipt could not be saved: ${error.message}${pauseError ? ` Apple Music pause confirmation failed: ${pauseError}` : ''}`);
+      throw new Error(`Music was paused because its resume receipt could not be saved: ${error.message}${pauseError ? ` External-player pause confirmation failed: ${pauseError}` : ''}`);
     }
     return true;
   }
@@ -1911,6 +2517,16 @@ export class ReceiverRuntime {
     if (playback.provider === 'apple') {
       if (!this.apple.ready) throw new Error('Apple Music receiver is not connected.');
       await this.playAppleMusic(playback.sourceUrl || this.state.config.appleUrl, {
+        volumePercent: playback.musicLevelPercent,
+        volumeMode: playback.volumeMode,
+        scheduledItemId: playback.scheduledItemId,
+        scheduledRunToken: playback.scheduledRunToken
+      });
+      return true;
+    }
+    if (playback.provider === 'spotify') {
+      if (!this.spotify.ready) throw new Error('Spotify receiver is not connected.');
+      await this.playSpotify(playback.sourceUrl || this.state.config.spotifyUrl, {
         volumePercent: playback.musicLevelPercent,
         volumeMode: playback.volumeMode,
         scheduledItemId: playback.scheduledItemId,
@@ -1944,12 +2560,15 @@ export class ReceiverRuntime {
       const activeProvider = this.physicalProvider || this.state.playback.provider || this.state.config.musicProvider;
       const appleMayBeAudible = activeProvider === 'apple' || this.apple.ready || this.apple.current?.paused === false;
       if (appleMayBeAudible) await this.apple.pauseForAnnouncement();
+      const spotifyMayBeAudible = activeProvider === 'spotify' || this.spotify.ready || this.spotify.current?.paused === false;
+      if (spotifyMayBeAudible) await this.spotify.pauseForAnnouncement();
       this.audio.stopMusic();
       this.physicalMusicTarget = null;
       this.physicalProvider = '';
       this.physicalRequestId = 0;
       this.physicalCommittedRequestId = 0;
       this.preemptedAppleMusicSnapshot = null;
+      this.preemptedSpotifySnapshot = null;
       this.safetyRestoreSnapshot = null;
       this.assertTerminalRequest(requestId, 'A newer audio command replaced this stop after the source became quiet.');
       return activeProvider;
@@ -2033,6 +2652,43 @@ export class ReceiverRuntime {
           this.physicalCommittedRequestId = 0;
           this.physicalMusicTarget = null;
         }
+        if (pending.provider === 'spotify') {
+          try {
+            await this.confirmSpotifyPaused('The invalid scheduled Spotify start could not be declared stopped.');
+          } catch (error) {
+            this.physicalProvider = 'spotify';
+            this.physicalRequestId = pending.requestId;
+            const detail = String(error?.message || error || 'Spotify silence was not confirmed.').slice(0, 700);
+            await this.store.mutate(draft => {
+              if (draft.receiver?.id !== this.deviceId || draft.receiver?.sessionId !== this.sessionId) return draft;
+              draft.activityLog = [makeLog(
+                'error',
+                'Scheduled Spotify cancellation could not confirm silence',
+                detail,
+                this.now(),
+                {
+                  scheduledItemId: pending.itemId,
+                  errorCode: error?.code || 'SPOTIFY_PAUSE_UNCONFIRMED',
+                  errorOperation: error?.spotifyOperation || '',
+                  spotifyReason: error?.spotifyReason || 'Spotify silence was not confirmed'
+                }
+              ), ...(draft.activityLog || [])];
+              return draft;
+            }, 'Scheduled Spotify pause failure recorded', { requireDurable: true }).catch(recordError => {
+              this.status(`Spotify silence was not confirmed, and the failure receipt could not be saved: ${recordError.message}`, false);
+            });
+            this.status(detail, false, {
+              errorCode: error?.code || 'SPOTIFY_PAUSE_UNCONFIRMED',
+              errorOperation: error?.spotifyOperation || '',
+              spotifyReason: error?.spotifyReason || ''
+            });
+            throw error;
+          }
+          this.physicalProvider = '';
+          this.physicalRequestId = 0;
+          this.physicalCommittedRequestId = 0;
+          this.physicalMusicTarget = null;
+        }
         this.pendingScheduledPlayback = null;
         this.status('A pending scheduled start was stopped because its live schedule changed.', true);
         reconciled = true;
@@ -2077,6 +2733,10 @@ export class ReceiverRuntime {
       const provider = this.physicalProvider || playback.provider || this.state.config.musicProvider;
       if (automatic && (provider !== 'controlled' || playback.intent !== 'playing' || (expectedUrl && playback.audioUrl !== expectedUrl))) return null;
       if (provider === 'apple') {
+      if (this.spotify.ready || this.spotify.current?.paused === false) {
+        await this.spotify.pauseForAnnouncement();
+        this.assertAudioRequest(requestId, epoch, 'Apple Music skip was superseded while Spotify was being silenced.');
+      }
       this.audio.pauseMusic();
       let state;
       try {
@@ -2106,11 +2766,49 @@ export class ReceiverRuntime {
       this.physicalRequestId = requestId;
         return { provider, patch: { provider: 'apple', intent: 'playing', label, positionMs: Number(state?.position || 0), unavailableReason: '' }, title: 'Apple Music skipped' };
       }
+      if (provider === 'spotify') {
+      if (this.apple.ready || this.apple.current?.paused === false) {
+        await this.apple.pauseForAnnouncement();
+        this.assertAudioRequest(requestId, epoch, 'Spotify skip was superseded while Apple Music was being silenced.');
+      }
+      this.audio.pauseMusic();
+      let state;
+      try {
+        state = await this.spotify.next({ assertCurrent: () => this.assertAudioRequest(requestId, epoch) });
+      } catch (error) {
+        if (requestId !== this.audioRequestId || epoch !== this.audioEpoch || !this.isOwner()) {
+          try {
+            await this.spotify.pauseForAnnouncement();
+          } catch (pauseError) {
+            throw new Error(`Superseded Spotify skip could not be confirmed paused: ${pauseError.message}`);
+          }
+        }
+        throw error;
+      }
+      if (requestId !== this.audioRequestId || epoch !== this.audioEpoch || !this.isOwner()) {
+        try {
+          await this.spotify.pauseForAnnouncement();
+        } catch (pauseError) {
+          throw new Error(`Superseded Spotify skip could not be confirmed paused: ${pauseError.message}`);
+        }
+        throw new Error('A newer audio command replaced this Spotify skip.');
+      }
+      const label = state?.name
+        ? `${state.name}${state.artists ? ` - ${state.artists}` : ''}`
+        : (this.spotify.current?.name || 'Spotify next track');
+      this.physicalProvider = 'spotify';
+      this.physicalRequestId = requestId;
+        return { provider, patch: { provider: 'spotify', intent: 'playing', label, positionMs: Number(state?.position || 0), unavailableReason: '' }, title: 'Spotify skipped' };
+      }
       const tracks = Array.isArray(playback.tracks) ? playback.tracks : [];
       if (!tracks.length) throw new Error('No controlled playlist is loaded.');
       if (this.apple.ready || this.apple.current?.paused === false) {
         await this.apple.pauseForAnnouncement();
         this.assertAudioRequest(requestId, epoch, 'Controlled skip was superseded while Apple Music was being silenced.');
+      }
+      if (this.spotify.ready || this.spotify.current?.paused === false) {
+        await this.spotify.pauseForAnnouncement();
+        this.assertAudioRequest(requestId, epoch, 'Controlled skip was superseded while Spotify was being silenced.');
       }
       this.applyConfiguredMusicTarget({ report: false });
       const nextIndex = (Number(playback.trackIndex || 0) + 1) % tracks.length;
@@ -2134,8 +2832,10 @@ export class ReceiverRuntime {
       await this.serializeAudio(async () => {
         const rollback = !this.isOwner() || this.physicalRequestId === requestId || this.safetyPendingCount > 0 || this.audioRequestKind === 'safety' || this.audioRequestKind === 'terminal';
         if (!rollback) return;
-        if (physical.provider === 'apple') await this.apple.pauseForAnnouncement().catch(caught => { pauseError = caught.message || String(caught); });
-        else this.audio.pauseMusic();
+        if (['apple', 'spotify'].includes(physical.provider)) {
+          const player = physical.provider === 'spotify' ? this.spotify : this.apple;
+          await player.pauseForAnnouncement().catch(caught => { pauseError = caught.message || String(caught); });
+        } else this.audio.pauseMusic();
         if (!pauseError) {
           this.physicalRequestId = 0;
           this.physicalCommittedRequestId = 0;
@@ -2146,7 +2846,7 @@ export class ReceiverRuntime {
       } else if (error.code === 'AUDIO_RECEIPT_SUPERSEDED' && this.audioRequestKind === 'normal' && this.isOwner()) {
         await this.repairCurrentCommittedReceipt();
       }
-      throw new Error(`The skipped track was paused because its cloud receipt could not be saved: ${error.message}${pauseError ? ` Apple Music pause confirmation failed: ${pauseError}` : ''}`);
+      throw new Error(`The skipped track was paused because its cloud receipt could not be saved: ${error.message}${pauseError ? ` External-player pause confirmation failed: ${pauseError}` : ''}`);
     }
     return true;
   }
@@ -2354,6 +3054,7 @@ export class ReceiverRuntime {
   cancelPendingAnnouncements(reason = 'Announcement cancelled.') {
     this.voicePrepareController?.abort('cancel');
     this.preemptedAppleMusicSnapshot = null;
+    this.preemptedSpotifySnapshot = null;
     this.safetyRestoreSnapshot = null;
     const error = new Error(reason);
     for (const job of this.announcementQueue.splice(0)) {
@@ -2390,13 +3091,26 @@ export class ReceiverRuntime {
       ? this.state.playback.intent === 'playing' && this.state.playback.provider === provider
       : this.physicalCommittedRequestId === this.physicalRequestId;
     let appleSnapshot = null;
+    let spotifySnapshot = null;
     let controlledDucked = false;
     const previousVoicePercent = clamp(this.audio.status?.().voiceLevelPercent, 0, 100, this.state.config.voiceLevel);
     let voiceTargetApplied = false;
     const applePauseHeld = provider === 'apple' || !!this.apple.ready;
+    const spotifyPauseHeld = provider === 'spotify' || !!this.spotify.ready;
     if (applePauseHeld) this.beginTemporaryAppleMusicPause();
+    if (spotifyPauseHeld) this.beginTemporarySpotifyPause();
     try {
       if (provider === 'apple') {
+        if (this.spotify.ready) {
+          try {
+            const unexpected = await this.spotify.pauseForAnnouncement();
+            if (unexpected.wasPlaying) this.status('Unexpected local Spotify playback was paused before the announcement and will not be resumed.', false);
+          } catch (error) {
+            await this.spotify.pause().catch(() => {});
+            throw new Error(`Announcement was not played because local Spotify silence could not be confirmed: ${error.message || String(error)}`);
+          }
+          this.assertAnnouncementActive(options, 'Announcement was preempted while checking the local Spotify receiver.');
+        }
         try {
           appleSnapshot = await this.apple.pauseForAnnouncement();
         } catch (error) {
@@ -2404,6 +3118,24 @@ export class ReceiverRuntime {
           throw new Error(`Announcement was not played because Apple Music could not be confirmed paused: ${error.message || String(error)}`);
         }
         this.assertAnnouncementActive(options, 'Announcement was preempted while Apple Music was pausing.');
+      } else if (provider === 'spotify') {
+        if (this.apple.ready) {
+          try {
+            const unexpected = await this.apple.pauseForAnnouncement();
+            if (unexpected.wasPlaying) this.status('Unexpected local Apple Music playback was paused before the announcement and will not be resumed.', false);
+          } catch (error) {
+            await this.apple.pause().catch(() => {});
+            throw new Error(`Announcement was not played because local Apple Music silence could not be confirmed: ${error.message || String(error)}`);
+          }
+          this.assertAnnouncementActive(options, 'Announcement was preempted while checking the local Apple Music receiver.');
+        }
+        try {
+          spotifySnapshot = await this.spotify.pauseForAnnouncement();
+        } catch (error) {
+          await this.spotify.pause().catch(() => {});
+          throw new Error(`Announcement was not played because Spotify could not be confirmed paused: ${error.message || String(error)}`);
+        }
+        this.assertAnnouncementActive(options, 'Announcement was preempted while Spotify was pausing.');
       } else {
         if (this.apple.ready) {
           try {
@@ -2414,6 +3146,16 @@ export class ReceiverRuntime {
             throw new Error(`Announcement was not played because local Apple Music silence could not be confirmed: ${error.message || String(error)}`);
           }
           this.assertAnnouncementActive(options, 'Announcement was preempted while checking the local Apple Music receiver.');
+        }
+        if (this.spotify.ready) {
+          try {
+            const unexpected = await this.spotify.pauseForAnnouncement();
+            if (unexpected.wasPlaying) this.status('Unexpected local Spotify playback was paused before the announcement and will not be resumed.', false);
+          } catch (error) {
+            await this.spotify.pause().catch(() => {});
+            throw new Error(`Announcement was not played because local Spotify silence could not be confirmed: ${error.message || String(error)}`);
+          }
+          this.assertAnnouncementActive(options, 'Announcement was preempted while checking the local Spotify receiver.');
         }
         await this.audio.beginAnnouncement();
         controlledDucked = true;
@@ -2462,6 +3204,36 @@ export class ReceiverRuntime {
             }).then(() => { this.physicalProvider = 'apple'; }).catch(error => this.status(`Announcement finished; Apple Music resume failed: ${error.message}`, false));
           }
         }
+      } else if (provider === 'spotify') {
+        const safetyPreemptionCurrent = options?.cancellation?.preemptedBySafety &&
+          (announcementEpoch === this.audioEpoch || options.cancellation.safetyEpoch === this.audioEpoch);
+        if (safetyPreemptionCurrent && this.active && this.isOwner() && spotifySnapshot?.wasPlaying) {
+          this.preemptedSpotifySnapshot = spotifySnapshot;
+        } else {
+          if (chainedSafety && spotifySnapshot?.wasPlaying) this.preemptedSpotifySnapshot = spotifySnapshot;
+          const currentSnapshot = (!options.safety || bedCommitted) && spotifySnapshot?.wasPlaying ? spotifySnapshot : null;
+          const resumeSnapshot = currentSnapshot
+            ? currentSnapshot
+            : (options.safety
+                ? (carriedSafetyRestore?.provider === 'spotify'
+                    ? carriedSafetyRestore.spotifySnapshot
+                    : this.preemptedSpotifySnapshot)
+                : null);
+          if (options.safety && !chainedSafety) this.preemptedSpotifySnapshot = null;
+          const mayResume = announcementEpoch === this.audioEpoch && !options?.cancellation?.cancelled && this.active && this.isOwner();
+          if (mayResume && resumeSnapshot?.wasPlaying) {
+            if (Number.isFinite(Number(carriedSafetyRestore?.musicLevelPercent))) {
+              this.applyConfiguredMusicTarget({ report: false, percent: carriedSafetyRestore.musicLevelPercent });
+            }
+            await this.spotify.resumeAfterAnnouncement(resumeSnapshot, {
+              assertCurrent: () => {
+                if (announcementEpoch !== this.audioEpoch || !this.active || !this.isOwner()) {
+                  throw new Error('Announcement restore was superseded.');
+                }
+              }
+            }).then(() => { this.physicalProvider = 'spotify'; }).catch(error => this.status(`Announcement finished; Spotify resume failed: ${error.message}`, false));
+          }
+        }
       } else if (controlledDucked) {
         const restoreAllowed = announcementEpoch === this.audioEpoch && !options?.cancellation?.cancelled && this.active && this.isOwner();
         const restoreCurrentBed = restoreAllowed && (!options.safety || bedCommitted);
@@ -2480,6 +3252,7 @@ export class ReceiverRuntime {
       }
       if (options.safety && !chainedSafety && this.safetyRestoreSnapshot?.epoch === announcementEpoch) this.safetyRestoreSnapshot = null;
       if (applePauseHeld) this.endTemporaryAppleMusicPause();
+      if (spotifyPauseHeld) this.endTemporarySpotifyPause();
     }
     });
     this.store.mutate(draft => {
@@ -2958,13 +3731,20 @@ export class ReceiverRuntime {
 
     const url = String(item.action?.url || item.url || '').trim();
     if (!url) throw new Error('This Order music item has no source URL.');
-    if (kind === 'apple' && advanceMode === 'track-end') {
-      throw new Error('Apple Music does not provide a schedule-safe track-end event. Choose Manual, Duration, or Immediately after start.');
+    if (['apple', 'spotify'].includes(kind) && advanceMode === 'track-end') {
+      throw new Error(`${kind === 'spotify' ? 'Spotify' : 'Apple Music'} does not provide a schedule-safe track-end event. Choose Manual, Duration, or Immediately after start.`);
     }
     const volumePercent = effectiveScheduleItemVolume(item, this.state.config);
     this.assertExternalAudioIntent(externalIntentGeneration);
     if (kind === 'apple') {
       await this.playAppleMusic(url, {
+        volumePercent,
+        volumeMode: item.volume?.mode,
+        scheduledItemId: item.id,
+        scheduledRunToken: token
+      });
+    } else if (kind === 'spotify') {
+      await this.playSpotify(url, {
         volumePercent,
         volumeMode: item.volume?.mode,
         scheduledItemId: item.id,
@@ -3264,6 +4044,13 @@ export class ReceiverRuntime {
             scheduledItemId: item.id,
             scheduledRunToken: timeRunToken
           });
+        } else if (item.type === 'spotify') {
+          await this.playSpotify(item.url || item.action?.url || this.state.config.spotifyUrl, {
+            volumePercent: effectiveScheduleItemVolume(item, this.state.config),
+            volumeMode: item.volume?.mode,
+            scheduledItemId: item.id,
+            scheduledRunToken: timeRunToken
+          });
         } else {
           await this.playControlled(item.url || item.action?.url || this.state.config.musicUrl, {
             label: item.label,
@@ -3393,13 +4180,25 @@ export class ReceiverRuntime {
         }
       : null;
     let appleSnapshot = null;
+    let spotifySnapshot = null;
     const applePauseHeld = provider === 'apple' || this.apple.ready || this.apple.current?.paused === false;
+    const spotifyPauseHeld = provider === 'spotify' || this.spotify.ready || this.spotify.current?.paused === false;
     if (applePauseHeld) {
       this.beginTemporaryAppleMusicPause();
       try {
         appleSnapshot = await this.apple.pauseForAnnouncement();
       } catch (error) {
         this.endTemporaryAppleMusicPause();
+        throw error;
+      }
+    }
+    if (spotifyPauseHeld) {
+      this.beginTemporarySpotifyPause();
+      try {
+        spotifySnapshot = await this.spotify.pauseForAnnouncement();
+      } catch (error) {
+        if (applePauseHeld) this.endTemporaryAppleMusicPause();
+        this.endTemporarySpotifyPause();
         throw error;
       }
     }
@@ -3424,10 +4223,15 @@ export class ReceiverRuntime {
         this.audio.stopMusic();
         const carried = appleSnapshot?.wasPlaying
           ? this.carrySafetyRestore({ provider: 'apple', appleSnapshot })
+          : spotifySnapshot?.wasPlaying
+            ? this.carrySafetyRestore({ provider: 'spotify', spotifySnapshot })
           : controlledSnapshot?.wasPlaying
             ? this.carrySafetyRestore({ provider: 'controlled', controlledSnapshot })
             : false;
-        if (!carried) await this.apple.pauseForAnnouncement().catch(() => {});
+        if (!carried) {
+          await this.apple.pauseForAnnouncement().catch(() => {});
+          await this.spotify.pauseForAnnouncement().catch(() => {});
+        }
       } else if (provider === 'apple' && appleSnapshot?.wasPlaying) {
         await this.apple.resumeAfterAnnouncement(appleSnapshot, {
           assertCurrent: () => this.assertAudioRequest(requestId, epoch)
@@ -3443,6 +4247,21 @@ export class ReceiverRuntime {
           };
           this.rememberCommittedPlayback(requestId);
         }).catch(error => this.status(`Sound check finished; Apple Music resume failed: ${error.message}`, false));
+      } else if (provider === 'spotify' && spotifySnapshot?.wasPlaying) {
+        await this.spotify.resumeAfterAnnouncement(spotifySnapshot, {
+          assertCurrent: () => this.assertAudioRequest(requestId, epoch)
+        }).then(() => {
+          this.physicalProvider = 'spotify';
+          this.physicalRequestId = requestId;
+          this.physicalCommittedRequestId = requestId;
+          this.physicalMusicTarget = {
+            requestId,
+            mode: this.state.playback.volumeMode === 'custom' ? 'custom' : 'global',
+            percent: this.currentMusicTarget(),
+            provider: 'spotify'
+          };
+          this.rememberCommittedPlayback(requestId);
+        }).catch(error => this.status(`Sound check finished; Spotify resume failed: ${error.message}`, false));
       } else if (controlledSnapshot?.wasPlaying && controlledSnapshot.audioUrl && this.scheduledRunAuthorized(this.state, controlledSnapshot.scheduledRunToken, controlledSnapshot.scheduledItemId)) {
         await this.audio.playMusicUrl(controlledSnapshot.audioUrl, {
           label: controlledSnapshot.label,
@@ -3467,6 +4286,7 @@ export class ReceiverRuntime {
         this.physicalMusicTarget = null;
       }
       if (applePauseHeld) this.endTemporaryAppleMusicPause();
+      if (spotifyPauseHeld) this.endTemporarySpotifyPause();
     }
     return soundCheckCompleted;
     });
