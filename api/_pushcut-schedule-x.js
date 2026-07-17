@@ -34,7 +34,10 @@ const PUSHCUT_X_EXECUTE_URL = 'https://api.pushcut.io/v1/execute';
 const PUSHCUT_X_DEFAULT_SHORTCUT = 'Poolside Pulse Announcement';
 const PUSHCUT_X_DEFAULT_RECOVERY_SHORTCUT = 'Volume Down';
 const PUSHCUT_X_SCHEDULE_SCHEMA_VERSION = 1;
-const MANIFEST_LOCK_SECONDS = 90;
+// Keep the distributed lock beyond the route's 300-second execution ceiling.
+// Large rolling plans make sequential Pushcut and KV calls, so a shorter lock
+// could expire while the original sync is still mutating the manifest.
+const MANIFEST_LOCK_SECONDS = 360;
 const KV_TIMEOUT_MS = 8_000;
 const PROVIDER_TIMEOUT_MS = 12_000;
 const MAX_PLAN_OCCURRENCES = 1_000;
@@ -109,8 +112,7 @@ function configuration(env) {
     apiKey,
     shortcut: bounded(env?.PUSHCUT_ANNOUNCE_SHORTCUT_X, 160) || sharedShortcut,
     recoveryShortcut: bounded(env?.PUSHCUT_RECOVERY_SHORTCUT_X, 160)
-      || PUSHCUT_X_DEFAULT_RECOVERY_SHORTCUT,
-    serverId: bounded(env?.PUSHCUT_SERVER_ID_X, 160)
+      || PUSHCUT_X_DEFAULT_RECOVERY_SHORTCUT
   });
 }
 
@@ -576,6 +578,7 @@ export async function schedulePushcutXExecution({
   ) fail('invalid');
   const endpoint = new URL(executeUrl);
   endpoint.search = '';
+  endpoint.searchParams.set('shortcut', shortcut);
   endpoint.searchParams.set('timeout', 'nowait');
   endpoint.searchParams.set('delay', `${seconds}s`);
   endpoint.searchParams.set('identifier', identifier);
@@ -583,9 +586,7 @@ export async function schedulePushcutXExecution({
     apiKey: configured.apiKey,
     fetchImpl,
     body: {
-      shortcut,
-      input: JSON.stringify(input),
-      ...(configured.serverId ? { serverId: configured.serverId } : {})
+      input
     }
   });
   if (!(response.status >= 200 && response.status < 300)) {
@@ -660,7 +661,8 @@ export async function readPushcutXScheduleStatus({
 
 export async function synchronizePushcutXSchedule({
   state,
-  request
+  request,
+  pushcutEnabled = true
 }, {
   env = process.env,
   fetchImpl = globalThis.fetch,
@@ -677,10 +679,20 @@ export async function synchronizePushcutXSchedule({
   if (!manifestStore?.durable || typeof manifestStore.withLock !== 'function') fail('durableUnavailable');
   return await manifestStore.withLock(async () => {
     const syncNow = Number(now());
-    const plan = planPushcutXSchedule(state, {
+    const requestedPlan = planPushcutXSchedule(state, {
       now: syncNow,
       horizonDays
     });
+    const plan = pushcutEnabled === false
+      ? Object.freeze({
+          ...requestedPlan,
+          occurrences: Object.freeze([]),
+          warnings: Object.freeze([
+            ...requestedPlan.warnings,
+            'Pushcut timed announcements are paused while Browser Receiver mode owns the speaker.'
+          ])
+        })
+      : requestedPlan;
     if (
       plan.occurrences.some(item => item.announcementMode === 'natural-voice')
       && !bounded(env?.OPENAI_API_KEY, 4_096)

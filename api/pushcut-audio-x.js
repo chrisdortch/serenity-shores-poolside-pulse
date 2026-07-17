@@ -18,6 +18,7 @@ import {
   FiniteAudioXError,
   loadFiniteAnnouncementAudio
 } from './_finite-audio-x.js';
+import { logPushcutXEvent } from './_pushcut-x.js';
 
 function json(res, status, body) {
   res.statusCode = status;
@@ -46,6 +47,9 @@ export function createPushcutAudioXHandler({
     if (!verifyPushcutXCapability(capability, 'audio')) {
       return json(res, 403, { ok: false, error: 'The announcement audio link is invalid or expired.' });
     }
+    logPushcutXEvent('receiver_audio_requested', {
+      eventId: capability.eventId
+    });
 
     let receipt;
     try {
@@ -113,6 +117,12 @@ export function createPushcutAudioXHandler({
       res.setHeader('Pragma', 'no-cache');
       res.setHeader('X-Content-Type-Options', 'nosniff');
       res.setHeader('Referrer-Policy', 'no-referrer');
+      logPushcutXEvent('receiver_audio_served', {
+        eventId: receipt.eventId,
+        speechMode: finite ? 'finite-audio' : 'natural-audio',
+        audioFetched: true,
+        receiptStatus: receipt.status
+      });
       res.end(audio.buffer);
     } catch (error) {
       const naturalError = error instanceof NaturalSpeechError ? error : null;
@@ -145,6 +155,12 @@ export function createPushcutAudioXHandler({
         || (finite
           ? 'Finite announcement audio is temporarily unavailable.'
           : 'Natural announcement audio is temporarily unavailable.');
+      logPushcutXEvent('receiver_audio_failed', {
+        eventId: capability.eventId,
+        providerCategory: failureCode,
+        audioFetched: false,
+        receiptStatus: receipt?.status
+      });
       return json(res, statusCode, {
         ok: false,
         error: message,

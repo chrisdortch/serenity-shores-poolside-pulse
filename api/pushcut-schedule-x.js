@@ -110,6 +110,7 @@ export function createPushcutScheduleXHandler({
       });
     }
     const expectedRevision = Number(body?.expectedRevision ?? body?.state?.revision);
+    const pushcutEnabled = body?.pushcutEnabled !== false;
     if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0) {
       return json(res, 400, {
         ok: false,
@@ -145,7 +146,8 @@ export function createPushcutScheduleXHandler({
     try {
       const result = await synchronizer({
         state: canonical.state,
-        request: req
+        request: req,
+        pushcutEnabled
       }, {
         manifestStore
       });

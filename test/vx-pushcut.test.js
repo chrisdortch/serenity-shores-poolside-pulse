@@ -302,19 +302,47 @@ describe('Version X Pushcut provider transport', { concurrency: false }, () => {
     assert.equal(calls.length, 2);
     const sentUrl = new URL(calls[0].url);
     assert.equal(`${sentUrl.origin}${sentUrl.pathname}`, PUSHCUT_X_API_URL);
+    assert.equal(sentUrl.searchParams.get('shortcut'), PUSHCUT_X_DEFAULT_SHORTCUT);
     assert.equal(sentUrl.searchParams.get('timeout'), '10');
     assert.equal(calls[0].options.headers['API-Key'], 'pushcut-test-secret');
     const body = JSON.parse(calls[0].options.body);
-    assert.equal(body.shortcut, PUSHCUT_X_DEFAULT_SHORTCUT);
-    assert.equal(JSON.parse(body.input).commandId, 'pushcut-provider-test-0001');
+    assert.equal(Object.hasOwn(body, 'shortcut'), false);
+    assert.equal(body.input.commandId, 'pushcut-provider-test-0001');
     const recoveryUrl = new URL(calls[1].url);
+    assert.equal(recoveryUrl.searchParams.get('shortcut'), 'Volume Down');
     assert.equal(recoveryUrl.searchParams.get('timeout'), 'nowait');
     const recoveryBody = JSON.parse(calls[1].options.body);
-    assert.equal(recoveryBody.shortcut, 'Volume Down');
-    assert.equal(JSON.parse(recoveryBody.input).action, 'recover-volume');
+    assert.equal(Object.hasOwn(recoveryBody, 'shortcut'), false);
+    assert.equal(recoveryBody.input.action, 'recover-volume');
     assert.equal(result.completed, true);
     assert.equal(result.recoveryQueued, true);
     assert.equal(JSON.stringify(result).includes('pushcut-test-secret'), false);
+  });
+
+  test('uses the documented query shortcut and native dictionary input for live announcements', async () => {
+    const calls = [];
+    const command = normalizePushcutXCommand({
+      action: 'announce',
+      commandId: 'pushcut-provider-live-0001',
+      text: 'Live transport contract.',
+      announcementVolume: 100,
+      musicVolume: 30
+    });
+    const result = await dispatchPushcutXCommand(command, {
+      env: { PUSHCUT_API_KEY_X: 'pushcut-test-secret' },
+      fetchImpl: async (url, options) => {
+        calls.push({ url: new URL(String(url)), body: JSON.parse(options.body) });
+        return { status: calls.length === 1 ? 200 : 202 };
+      }
+    });
+
+    assert.equal(calls[0].url.searchParams.get('shortcut'), PUSHCUT_X_DEFAULT_SHORTCUT);
+    assert.equal(calls[0].url.searchParams.get('timeout'), '10');
+    assert.equal(Object.hasOwn(calls[0].body, 'shortcut'), false);
+    assert.equal(typeof calls[0].body.input, 'object');
+    assert.equal(calls[0].body.input.eventId, command.eventId);
+    assert.equal(result.mode, 'wait');
+    assert.equal(result.completed, true);
   });
 
   test('maps provider rejection to a generic safe error', async () => {
@@ -1061,6 +1089,17 @@ describe('Version X Pushcut route and browser adapter', { concurrency: false }, 
     const calls = [];
     globalThis.fetch = async (url, options) => {
       calls.push({ url: String(url), options });
+      if (calls.length === 1) {
+        const input = JSON.parse(options.body).input;
+        await updatePushcutXReceipt(input.eventId, {
+          status: 'started',
+          providerStatus: 'receiver_fetching_audio',
+          startedAt: Date.now(),
+          audioFetchedAt: Date.now(),
+          audioContentType: 'audio/mpeg'
+        });
+        return { status: 504 };
+      }
       return { status: 202 };
     };
     const eventId = 'pushcut-route-event-0001';
@@ -1083,15 +1122,19 @@ describe('Version X Pushcut route and browser adapter', { concurrency: false }, 
     assert.equal(result.json().accepted, true);
     assert.equal(result.json().completed, false);
     assert.equal(result.json().eventId, eventId);
-    assert.equal(result.json().receipt.status, 'accepted');
+    assert.equal(result.json().receipt.status, 'started');
     assert.equal(result.json().receipt.recoveryQueued, true);
     assert.equal(calls.length, 2);
-    const input = JSON.parse(JSON.parse(calls[0].options.body).input);
+    const executeUrl = new URL(calls[0].url);
+    assert.equal(executeUrl.searchParams.get('shortcut'), PUSHCUT_X_DEFAULT_SHORTCUT);
+    assert.equal(executeUrl.searchParams.get('timeout'), '10');
+    const input = JSON.parse(calls[0].options.body).input;
     assert.equal(input.eventId, eventId);
     assert.equal(input.text, 'This is a live receiver test.');
     assert.equal(input.speechMode, 'natural-audio');
     assert.match(input.audioUrl, /^https:\/\/poolside\.test\/api\/pushcut-audio-x\?v=x&/);
     assert.match(input.receiptUrl, /^https:\/\/poolside\.test\/api\/pushcut-receipt-x\?v=x&/);
+    assert.equal(input.receiverContract, 'poolside-pulse-x-audio-v1');
     assert.equal(input.audioUrl.includes('openai-route-secret'), false);
     assert.equal(input.receiptUrl.includes('pushcut-route-secret'), false);
     assert.equal(Object.hasOwn(input, 'secret'), false);
@@ -1115,12 +1158,55 @@ describe('Version X Pushcut route and browser adapter', { concurrency: false }, 
     assert.equal(calls.length, 2);
   });
 
+  test('keeps a 504 execution race eligible for the signed receiver receipt', async () => {
+    process.env.PUSHCUT_API_KEY_X = 'pushcut-route-secret';
+    process.env.OPENAI_API_KEY = 'openai-route-secret';
+    let calls = 0;
+    globalThis.fetch = async () => {
+      calls += 1;
+      return { status: calls === 1 ? 504 : 202 };
+    };
+    const eventId = 'pushcut-route-timeout-race-0001';
+    const result = await invoke(pushcutXHandler, request('POST', '/api/pushcut-x?v=x', {
+      cookie: xCookie(),
+      headers: { 'idempotency-key': eventId },
+      body: {
+        version: 'x',
+        eventId,
+        source: 'live',
+        text: 'This receiver may still be starting.',
+        label: 'Timeout Race',
+        safety: false,
+        voicePercent: 100,
+        musicPercent: 30
+      }
+    }));
+
+    assert.equal(result.statusCode, 202);
+    assert.equal(result.json().accepted, true);
+    assert.equal(result.json().completed, false);
+    assert.equal(result.json().mode, 'wait-timeout');
+    assert.notEqual(result.json().receipt.status, 'timed_out');
+    assert.equal(calls, 2);
+  });
+
   test('queues finite audio without OpenAI and forwards only the signed proxy URL', async () => {
     process.env.PUSHCUT_API_KEY_X = 'pushcut-route-secret';
     delete process.env.OPENAI_API_KEY;
     const calls = [];
     globalThis.fetch = async (url, options) => {
       calls.push({ url: String(url), options });
+      if (calls.length === 1) {
+        const input = JSON.parse(options.body).input;
+        await updatePushcutXReceipt(input.eventId, {
+          status: 'started',
+          providerStatus: 'receiver_fetching_audio',
+          startedAt: Date.now(),
+          audioFetchedAt: Date.now(),
+          audioContentType: 'audio/mpeg'
+        });
+        return { status: 504 };
+      }
       return { status: 202 };
     };
     const eventId = 'pushcut-route-finite-0001';
@@ -1144,7 +1230,7 @@ describe('Version X Pushcut route and browser adapter', { concurrency: false }, 
       }
     }));
     assert.equal(result.statusCode, 202);
-    const input = JSON.parse(JSON.parse(calls[0].options.body).input);
+    const input = JSON.parse(calls[0].options.body).input;
     assert.equal(input.speechMode, 'finite-audio');
     assert.equal(input.announcementMode, 'finite-audio');
     assert.equal(input.announcementProvider, 'direct');
@@ -1155,7 +1241,7 @@ describe('Version X Pushcut route and browser adapter', { concurrency: false }, 
     assert.equal(JSON.stringify(result.json()).includes('private-source-token'), false);
   });
 
-  test('a synchronous Pushcut test is not called complete without the signed receiver receipt', async () => {
+  test('fails closed when Pushcut completes but the receiver never enters the signed audio contract', async () => {
     process.env.PUSHCUT_API_KEY_X = 'pushcut-route-secret';
     process.env.OPENAI_API_KEY = 'openai-route-secret';
     const calls = [];
@@ -1170,10 +1256,50 @@ describe('Version X Pushcut route and browser adapter', { concurrency: false }, 
       body: { action: 'test', commandId: eventId }
     }));
 
-    assert.equal(result.statusCode, 202);
+    assert.equal(result.statusCode, 502);
+    assert.match(result.json().error, /Receiver Shortcut is outdated or incomplete/i);
+    const receipt = await readPushcutXReceipt(eventId);
+    assert.equal(receipt.status, 'failed');
+    assert.equal(receipt.failureCode, 'receiver_contract_missing');
+  });
+
+  test('returns verified completion only after audio fetch and the signed receiver receipt', async () => {
+    process.env.PUSHCUT_API_KEY_X = 'pushcut-route-secret';
+    process.env.OPENAI_API_KEY = 'openai-route-secret';
+    const calls = [];
+    globalThis.fetch = async (url, options) => {
+      calls.push({ url: String(url), options });
+      if (calls.length === 1) {
+        const input = JSON.parse(options.body).input;
+        await updatePushcutXReceipt(input.eventId, {
+          status: 'started',
+          providerStatus: 'natural_audio_ready',
+          startedAt: Date.now(),
+          audioFetchedAt: Date.now(),
+          audioContentType: 'audio/mpeg'
+        });
+        await updatePushcutXReceipt(input.eventId, {
+          status: 'completed',
+          providerStatus: 'receiver_completed',
+          completedAt: Date.now(),
+          volumeRestored: true,
+          musicResumed: true
+        });
+        return { status: 200 };
+      }
+      return { status: 202 };
+    };
+    const eventId = 'pushcut-route-verified-0001';
+    const result = await invoke(pushcutXHandler, request('POST', '/api/pushcut-x?v=x', {
+      cookie: xCookie(),
+      headers: { 'idempotency-key': eventId },
+      body: { action: 'test', commandId: eventId }
+    }));
+
+    assert.equal(result.statusCode, 200);
     assert.equal(result.json().providerCompleted, true);
-    assert.equal(result.json().completed, false);
-    assert.equal(result.json().receipt.status, 'accepted');
+    assert.equal(result.json().completed, true);
+    assert.equal(result.json().receipt.status, 'completed');
   });
 
   test('browser adapter sends a stable event once and treats a lost response as uncertain', async () => {

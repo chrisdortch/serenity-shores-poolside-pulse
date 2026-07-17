@@ -31,7 +31,6 @@ function configuration(env) {
   const source = env && typeof env === 'object' ? env : {};
   return {
     apiKey: cleanConfigurationValue(source.PUSHCUT_API_KEY_X, 1_024),
-    serverId: cleanConfigurationValue(source.PUSHCUT_SERVER_ID_X, 160),
     shortcut: cleanConfigurationValue(source.PUSHCUT_RECOVERY_SHORTCUT_X, 160)
       || PUSHCUT_VOLUME_X_DEFAULT_SHORTCUT
   };
@@ -76,6 +75,7 @@ export async function applyPushcutXMusicVolume({
   try {
     const endpoint = new URL(String(apiUrl));
     endpoint.search = '';
+    endpoint.searchParams.set('shortcut', configured.shortcut);
     endpoint.searchParams.set('timeout', String(PUSHCUT_VOLUME_X_WAIT_SECONDS));
     const response = await fetchImpl(endpoint, {
       method: 'POST',
@@ -86,8 +86,7 @@ export async function applyPushcutXMusicVolume({
         'Content-Type': 'application/json; charset=utf-8'
       },
       body: JSON.stringify({
-        shortcut: configured.shortcut,
-        input: JSON.stringify({
+        input: {
           schemaVersion: 1,
           version: 'x',
           action: 'recover-volume',
@@ -96,8 +95,7 @@ export async function applyPushcutXMusicVolume({
           issuedAt,
           musicPercent: PUSHCUT_VOLUME_X_PERCENT,
           reason: 'manual-manager-volume'
-        }),
-        ...(configured.serverId ? { serverId: configured.serverId } : {})
+        }
       })
     });
     const status = Number(response?.status);

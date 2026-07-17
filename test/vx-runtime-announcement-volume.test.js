@@ -112,6 +112,35 @@ describe('Version X announcement-volume delivery', { concurrency: false }, () =>
     assert.match(store.state.activityLog[0].detail, /Version X mixer voice 64%/i);
   });
 
+  test('plays a finite announcement clip through the voice mixer without synthesizing its text', async () => {
+    const { runtime, store, calls } = harness({ voiceLevel: 72 });
+    let requested = null;
+    runtime.prepareVoice = async () => {
+      throw new Error('Natural speech must not be requested for a finite clip.');
+    };
+    runtime.prepareFiniteAnnouncementAudio = async delivery => {
+      requested = delivery;
+      return new Blob(['finite'], { type: 'audio/mpeg' });
+    };
+
+    await runtime.announce('Recorded pool update', {
+      announcementMode: 'finite-audio',
+      announcementProvider: 'direct',
+      announcementAudioUrl: 'https://audio.example.test/pool-update.mp3',
+      announcementDurationSeconds: 12
+    });
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    assert.equal(requested.announcementMode, 'finite-audio');
+    assert.equal(requested.announcementProvider, 'direct');
+    assert.equal(requested.announcementAudioUrl, 'https://audio.example.test/pool-update.mp3');
+    assert.equal(requested.announcementDurationSeconds, 12);
+    assert.equal(calls.includes('blob-at-72'), true);
+    assert.equal(calls.some(call => call.startsWith('speech-at-')), false);
+    assert.equal(store.state.activityLog[0].voiceOutput, 'finite-audio-mixer');
+    assert.match(store.state.activityLog[0].detail, /finite clip 72%/i);
+  });
+
   test('passes a live command volume through event dispatch', async () => {
     const { runtime } = harness();
     let received = null;
@@ -126,6 +155,31 @@ describe('Version X announcement-volume delivery', { concurrency: false }, () =>
     assert.equal(received.text, 'Testing');
     assert.equal(received.options.volumePercent, 61);
     assert.equal(received.options.eventId, 'event-1');
+  });
+
+  test('passes a validated finite source through live event dispatch', async () => {
+    const { runtime } = harness();
+    let received = null;
+    runtime.announce = async (text, options) => { received = { text, options }; };
+
+    await runtime.handleEvent({
+      id: 'event-finite-1',
+      type: 'announce',
+      payload: {
+        text: 'Recorded pool update',
+        label: 'Recorded',
+        volumePercent: 100,
+        announcementMode: 'finite-audio',
+        announcementProvider: 'suno',
+        announcementAudioUrl: 'https://suno.com/s/AbCd1234',
+        announcementDurationSeconds: 18
+      }
+    });
+
+    assert.equal(received.options.announcementMode, 'finite-audio');
+    assert.equal(received.options.announcementProvider, 'suno');
+    assert.equal(received.options.announcementAudioUrl, 'https://suno.com/s/AbCd1234');
+    assert.equal(received.options.announcementDurationSeconds, 18);
   });
 
   test('does not play voice when Apple Music cannot be confirmed paused', async () => {

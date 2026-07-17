@@ -89,10 +89,11 @@ describe('Version X manual Pushcut music-volume action', () => {
     });
 
     assert.equal(sent.url.origin + sent.url.pathname, PUSHCUT_VOLUME_X_API_URL);
+    assert.equal(sent.url.searchParams.get('shortcut'), 'Volume Down');
     assert.equal(sent.url.searchParams.get('timeout'), '10');
-    assert.equal(sent.body.shortcut, 'Volume Down');
+    assert.equal(Object.hasOwn(sent.body, 'shortcut'), false);
     assert.equal(sent.options.headers['API-Key'], 'pushcut-api-key-test');
-    const input = JSON.parse(sent.body.input);
+    const input = sent.body.input;
     assert.equal(input.version, 'x');
     assert.equal(input.action, 'recover-volume');
     assert.equal(input.musicPercent, 30);
@@ -109,8 +110,8 @@ describe('Version X manual Pushcut music-volume action', () => {
     process.env.PUSHCUT_RECOVERY_SHORTCUT_X = 'Pool Music Quiet';
     let shortcut;
     const result = await applyPushcutXMusicVolume({
-      fetchImpl: async (_url, options) => {
-        shortcut = JSON.parse(options.body).shortcut;
+      fetchImpl: async (url) => {
+        shortcut = new URL(String(url)).searchParams.get('shortcut');
         return { status: 202 };
       }
     });

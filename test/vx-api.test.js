@@ -297,6 +297,15 @@ describe('Version X API isolation', { concurrency: false }, () => {
               durationSeconds: 30
             },
             {
+              id: 'finite-kind-direct',
+              label: 'Finite-kind direct clip',
+              kind: 'finite-audio',
+              provider: 'direct',
+              url: 'https://media.example/finite-kind.mp3',
+              finite: true,
+              durationSeconds: 14
+            },
+            {
               id: 'apple-catalog',
               label: 'Apple catalog item',
               kind: 'media',
@@ -414,11 +423,12 @@ describe('Version X API isolation', { concurrency: false }, () => {
     const sources = Object.fromEntries(state.announcementSources.map(source => [source.id, source]));
     assert.equal(Object.hasOwn(sources, 'unknown-source'), false);
     assert.deepEqual(
-      ['natural', 'direct-finite', 'suno-finite'].map(id => [
+      ['natural', 'direct-finite', 'suno-finite', 'finite-kind-direct'].map(id => [
         sources[id].playbackSupport,
         sources[id].verification
       ]),
       [
+        ['supported', 'unverified'],
         ['supported', 'unverified'],
         ['supported', 'unverified'],
         ['supported', 'unverified']
@@ -427,6 +437,7 @@ describe('Version X API isolation', { concurrency: false }, () => {
     assert.equal(sources.natural.privateKey, undefined);
     assert.equal(sources['direct-finite'].durationSeconds, 12);
     assert.equal(sources['suno-finite'].durationSeconds, 30);
+    assert.equal(sources['finite-kind-direct'].durationSeconds, 14);
     assert.equal(sources['apple-catalog'].playbackSupport, 'experimental');
     assert.equal(sources['apple-catalog'].verification, 'unverified');
     assert.match(sources['apple-catalog'].note, /unverified on iPhone/i);

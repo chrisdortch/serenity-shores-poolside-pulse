@@ -15,6 +15,7 @@ export class PushcutScheduleSyncError extends Error {
 
 async function requestJson(method, {
   state,
+  pushcutEnabled = true,
   fetchImpl = globalThis.fetch,
   timeoutMs = REQUEST_TIMEOUT_MS
 } = {}) {
@@ -39,7 +40,8 @@ async function requestJson(method, {
         body: JSON.stringify({
           expectedRevision: Number.isSafeInteger(Number(state?.revision))
             ? Number(state.revision)
-            : 0
+            : 0,
+          pushcutEnabled: pushcutEnabled !== false
         })
       } : {})
     });

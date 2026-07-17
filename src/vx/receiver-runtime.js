@@ -4,6 +4,7 @@ import {
   SAFETY_EVENT_TTL_MS,
   VOICE_LEVEL_PERCENT,
   WEATHER_INTERVAL_MS,
+  announcementDeliveryForSource,
   audioPolicy,
   clamp,
   completeEvent,
@@ -1532,7 +1533,8 @@ export class ReceiverRuntime {
           safety: event.type === 'announce-safety',
           label: payload.label,
           eventId: event.id,
-          volumePercent: payload.volumePercent
+          volumePercent: payload.volumePercent,
+          ...this.normalizeAnnouncementDelivery(payload)
         });
       case 'weather-check':
         return await this.checkWeather({ announce: payload.announce !== false, reason: 'remote command' });
@@ -2732,6 +2734,13 @@ export class ReceiverRuntime {
       const playback = this.state.playback || {};
       const provider = this.physicalProvider || playback.provider || this.state.config.musicProvider;
       if (automatic && (provider !== 'controlled' || playback.intent !== 'playing' || (expectedUrl && playback.audioUrl !== expectedUrl))) return null;
+      if (automatic && playback.scheduledRunToken) {
+        this.assertScheduledRunAuthorization(
+          this.state,
+          playback.scheduledRunToken,
+          playback.scheduledItemId
+        );
+      }
       if (provider === 'apple') {
       if (this.spotify.ready || this.spotify.current?.paused === false) {
         await this.spotify.pauseForAnnouncement();
@@ -2814,6 +2823,13 @@ export class ReceiverRuntime {
       const nextIndex = (Number(playback.trackIndex || 0) + 1) % tracks.length;
       const track = tracks[nextIndex];
       await this.audio.playMusicUrl(track.audioUrl, { label: track.title, loop: tracks.length === 1, scheduledRunToken: playback.scheduledRunToken });
+      if (automatic && playback.scheduledRunToken) {
+        this.assertScheduledRunAuthorization(
+          this.state,
+          playback.scheduledRunToken,
+          playback.scheduledItemId
+        );
+      }
       if (requestId !== this.audioRequestId || epoch !== this.audioEpoch || !this.isOwner()) {
         this.audio.stopMusic();
         throw new Error('A newer audio command replaced this controlled-track skip.');
@@ -2891,6 +2907,39 @@ export class ReceiverRuntime {
     return safetyAnnouncementText(id, item?.text, this.state.config);
   }
 
+  normalizeAnnouncementDelivery(value = {}) {
+    const requestedMode = String(value?.announcementMode || '').trim();
+    if (requestedMode && requestedMode !== 'natural-voice' && requestedMode !== 'finite-audio') {
+      throw new Error('The announcement source type is invalid.');
+    }
+    if (requestedMode !== 'finite-audio') {
+      return announcementDeliveryForSource({
+        id: 'natural-voice',
+        provider: 'openai-tts',
+        kind: 'natural-voice',
+        finite: true,
+        voice: this.state.config.aiVoice || 'marin'
+      });
+    }
+    return announcementDeliveryForSource({
+      id: 'finite-announcement',
+      label: 'Finite announcement',
+      provider: value.announcementProvider,
+      kind: 'finite-audio',
+      url: value.announcementAudioUrl,
+      finite: true,
+      durationSeconds: value.announcementDurationSeconds
+    });
+  }
+
+  announcementDeliveryForScheduleItem(item = {}) {
+    const announcementId = String(item.action?.announcementId || item.announcementId || '');
+    const saved = (this.state.announcements || []).find(entry => entry.id === announcementId);
+    const sourceId = String(item.action?.sourceId || saved?.sourceId || 'natural-voice');
+    const source = (this.state.announcementSources || []).find(entry => entry.id === sourceId);
+    return announcementDeliveryForSource(source);
+  }
+
   async prepareVoice(text, { cacheOnly = false, signal = null } = {}) {
     const message = String(text || '').trim().slice(0, 900);
     if (!message || this.state.config.voiceMode !== 'ai') return null;
@@ -2933,6 +2982,56 @@ export class ReceiverRuntime {
       const detail = controller.signal.aborted ? 'the natural voice request timed out' : (error.message || String(error));
       this.status(`AI voice unavailable; device voice will be used: ${detail}`, false);
       return null;
+    } finally {
+      clearTimeout(timer);
+      signal?.removeEventListener?.('abort', abortFromSignal);
+      if (this.voicePrepareController === controller) this.voicePrepareController = null;
+    }
+  }
+
+  async prepareFiniteAnnouncementAudio(delivery, { signal = null } = {}) {
+    const normalized = this.normalizeAnnouncementDelivery(delivery);
+    if (normalized.announcementMode !== 'finite-audio') {
+      throw new Error('The selected announcement source is not a finite audio clip.');
+    }
+    const controller = new AbortController();
+    const abortFromSignal = () => {
+      if (!controller.signal.aborted) controller.abort(signal?.reason || 'cancel');
+    };
+    if (signal?.aborted) abortFromSignal();
+    else signal?.addEventListener?.('abort', abortFromSignal, { once: true });
+    this.voicePrepareController = controller;
+    const timer = setTimeout(() => controller.abort('timeout'), 22_000);
+    try {
+      const response = await fetch('/api/finite-audio-x?v=x', {
+        method: 'POST',
+        credentials: 'same-origin',
+        cache: 'no-store',
+        headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal,
+        body: JSON.stringify({
+          provider: normalized.announcementProvider,
+          sourceUrl: normalized.announcementAudioUrl,
+          maxDurationSeconds: normalized.announcementDurationSeconds
+        })
+      });
+      if (!response.ok) {
+        const data = await response.json().catch(() => ({}));
+        throw responseError(data, response.status);
+      }
+      const blob = await response.blob();
+      if (!blob.size || (!/^audio\//i.test(blob.type || '') && blob.type !== 'application/octet-stream')) {
+        throw new Error('The finite announcement source did not return playable audio.');
+      }
+      return blob;
+    } catch (error) {
+      if (controller.signal.aborted && controller.signal.reason !== 'timeout') {
+        throw new Error('Announcement preparation was cancelled for a higher-priority safety action.');
+      }
+      if (controller.signal.aborted) {
+        throw new Error('The finite announcement audio request timed out.');
+      }
+      throw error;
     } finally {
       clearTimeout(timer);
       signal?.removeEventListener?.('abort', abortFromSignal);
@@ -3076,8 +3175,15 @@ export class ReceiverRuntime {
 
   async performAnnouncement(message, options = {}) {
     this.assertAnnouncementActive(options, 'Announcement was cancelled before voice preparation.');
-    const voiceBlob = await this.prepareVoice(message, { cacheOnly: !!options.safety });
-    const voiceOutput = voiceBlob ? 'ai-mixer' : 'device-speech-fallback';
+    const delivery = this.normalizeAnnouncementDelivery(options);
+    const voiceBlob = delivery.announcementMode === 'finite-audio'
+      ? await this.prepareFiniteAnnouncementAudio(delivery)
+      : await this.prepareVoice(message, { cacheOnly: !!options.safety });
+    const voiceOutput = delivery.announcementMode === 'finite-audio'
+      ? 'finite-audio-mixer'
+      : voiceBlob
+        ? 'ai-mixer'
+        : 'device-speech-fallback';
     const voicePercent = clamp(options.volumePercent, 0, 100, this.state.config.voiceLevel);
     this.assertAnnouncementActive(options, 'Announcement was preempted while its voice was preparing.');
     const completed = await this.serializeAudio(async () => {
@@ -3259,14 +3365,16 @@ export class ReceiverRuntime {
         if (draft.receiver?.id !== this.deviceId || draft.receiver?.sessionId !== this.sessionId) {
           throw new Error('Receiver ownership changed before the announcement receipt could be saved.');
         }
-        const voiceReceipt = voiceOutput === 'ai-mixer'
-          ? `Version X mixer voice ${voicePercent}%`
-          : `device speech requested target ${voicePercent}%`;
+        const voiceReceipt = voiceOutput === 'finite-audio-mixer'
+          ? `Version X mixer finite clip ${voicePercent}%`
+          : voiceOutput === 'ai-mixer'
+            ? `Version X mixer voice ${voicePercent}%`
+            : `device speech requested target ${voicePercent}%`;
         draft.activityLog = [makeLog(options.safety ? 'safety' : 'announcement', options.label || (options.safety ? 'Safety announcement played' : 'Announcement played'), `${message} [${voiceReceipt}]`, this.now(), { eventId: options.eventId || '', voicePercent, voiceOutput }), ...(draft.activityLog || [])];
         return draft;
       }, 'Announcement completed', { requireDurable: true })
       .then(() => this.status(
-        voiceOutput === 'ai-mixer'
+        voiceOutput === 'ai-mixer' || voiceOutput === 'finite-audio-mixer'
           ? `Announcement completed through the Version X mixer at the ${voicePercent}% voice setting.`
           : `Announcement completed through device speech with a requested ${voicePercent}% target; iPhone speaker loudness cannot be verified in browser code.`,
         true
@@ -3722,7 +3830,8 @@ export class ReceiverRuntime {
         label: item.label,
         scheduledItemId: item.id,
         scheduledRunToken: token,
-        volumePercent: effectiveScheduleItemVolume(item, this.state.config)
+        volumePercent: effectiveScheduleItemVolume(item, this.state.config),
+        ...this.announcementDeliveryForScheduleItem(item)
       });
       this.assertExternalAudioIntent(externalIntentGeneration, 'A newer audio command cancelled this Order announcement before its position could advance.');
       const status = await this.completeOrderGate(scheduleId, token, 'auto-pending', 'announcement completed', externalIntentGeneration);
@@ -4035,7 +4144,8 @@ export class ReceiverRuntime {
             label: item.label,
             scheduledItemId: item.id,
             scheduledRunToken: timeRunToken,
-            volumePercent: effectiveScheduleItemVolume(item, this.state.config)
+            volumePercent: effectiveScheduleItemVolume(item, this.state.config),
+            ...this.announcementDeliveryForScheduleItem(item)
           });
         } else if (item.type === 'apple') {
           await this.playAppleMusic(item.url || item.action?.url || this.state.config.appleUrl, {

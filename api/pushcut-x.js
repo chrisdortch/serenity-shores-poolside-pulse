@@ -8,9 +8,11 @@ import {
 import {
   dispatchPushcutXCommand,
   inspectPushcutXServerHealth,
+  logPushcutXEvent,
   normalizePushcutXCommand,
   PUSHCUT_X_ACTIONS,
   PUSHCUT_X_DEFAULT_RECOVERY_SHORTCUT,
+  PUSHCUT_X_RECEIVER_CONTRACT,
   PushcutXError,
   pushcutXHealth,
   validPushcutXEventId
@@ -187,6 +189,7 @@ export default async function handler(req, res) {
       signedDeliveryReady,
       receiptStorageReady,
       durableReceipts: receiptStorage.durable,
+      receiverContract: PUSHCUT_X_RECEIVER_CONTRACT,
       latestVerifiedAt,
       note
     });
@@ -279,28 +282,70 @@ export default async function handler(req, res) {
       audioExpiresAt: audioCapability.expiresAt,
       receiptUrl: receiptCapability.url,
       receiptExpiresAt: receiptCapability.expiresAt,
-      recoveryShortcut: PUSHCUT_X_DEFAULT_RECOVERY_SHORTCUT
+      recoveryShortcut: PUSHCUT_X_DEFAULT_RECOVERY_SHORTCUT,
+      receiverContract: PUSHCUT_X_RECEIVER_CONTRACT
     });
     let accepted;
+    logPushcutXEvent('route_dispatch_started', {
+      action: command.action,
+      eventId: command.eventId,
+      speechMode: receiverCommand.speechMode
+    });
     try {
       accepted = await dispatchPushcutXCommand(receiverCommand);
     } catch (error) {
       if (error instanceof PushcutXError) {
         const timedOut = error.code === 'timeout';
-        await updatePushcutXReceipt(command.eventId, {
-          status: timedOut ? 'timed_out' : 'failed',
-          providerStatus: timedOut ? 'pushcut_timeout' : `pushcut_${error.code}`,
-          ...(timedOut ? {} : {
+        const observed = timedOut
+          ? await readPushcutXReceipt(command.eventId).catch(() => null)
+          : null;
+        // Pushcut documents that a 504 can race a queued or still-running
+        // Shortcut. Keep the signed receipt eligible for the browser's
+        // bounded poll instead of declaring failure during that race.
+        if (timedOut) {
+          accepted = Object.freeze({
+            accepted: true,
+            completed: false,
+            action: command.action,
+            commandId: command.commandId,
+            eventId: command.eventId,
+            mode: 'wait-timeout',
+            providerStatus: Number(error.providerStatus || 504),
+            recoveryQueued: error.recoveryQueued === true,
+            recoveryAcceptedAt: Number(error.recoveryAcceptedAt || 0)
+          });
+          logPushcutXEvent('route_dispatch_timeout_pending_receipt', {
+            action: command.action,
+            eventId: command.eventId,
+            mode: accepted.mode,
+            providerStatus: accepted.providerStatus,
+            audioFetched: Number(observed?.audioFetchedAt || 0) > 0,
+            recoveryQueued: accepted.recoveryQueued,
+            receiptStatus: observed?.status
+          });
+        } else {
+          await updatePushcutXReceipt(command.eventId, {
+            status: 'failed',
+            providerStatus: `pushcut_${error.code}`,
             failedAt: Date.now(),
-            failureCode: `pushcut_${error.code}`
-          }),
-          recoveryQueued: error.recoveryQueued === true,
-          ...(error.recoveryAcceptedAt ? {
-            recoveryAcceptedAt: error.recoveryAcceptedAt
-          } : {})
-        }).catch(() => {});
+            failureCode: `pushcut_${error.code}`,
+            recoveryQueued: error.recoveryQueued === true,
+            ...(error.recoveryAcceptedAt ? {
+              recoveryAcceptedAt: error.recoveryAcceptedAt
+            } : {})
+          }).catch(() => {});
+          logPushcutXEvent('route_dispatch_failed', {
+            action: command.action,
+            eventId: command.eventId,
+            providerCategory: error.code,
+            providerStatus: error.providerStatus,
+            audioFetched: false,
+            recoveryQueued: error.recoveryQueued === true
+          });
+          throw error;
+        }
       }
-      throw error;
+      if (!accepted) throw error;
     }
 
     const now = Date.now();
@@ -317,8 +362,57 @@ export default async function handler(req, res) {
       } : {})
     });
     const receipt = await readPushcutXReceipt(command.eventId);
+    if (accepted.completed && !receipt?.completedAt) {
+      const audioFetched = Number(receipt?.audioFetchedAt || 0) > 0;
+      const failureCode = audioFetched
+        ? 'receiver_completion_missing'
+        : 'receiver_contract_missing';
+      await updatePushcutXReceipt(command.eventId, {
+        status: 'failed',
+        providerStatus: failureCode,
+        failedAt: Date.now(),
+        failureCode
+      }).catch(() => {});
+      logPushcutXEvent('route_receiver_contract_missing', {
+        action: command.action,
+        eventId: command.eventId,
+        mode: accepted.mode,
+        providerStatus: accepted.providerStatus,
+        audioFetched,
+        completed: false,
+        receiptStatus: receipt?.status
+      });
+      throw new PushcutXError('receiverContract');
+    }
+    if (!accepted.completed && accepted.providerStatus >= 200 && accepted.providerStatus < 300) {
+      await updatePushcutXReceipt(command.eventId, {
+        status: 'failed',
+        providerStatus: 'pushcut_unverified_acceptance',
+        failedAt: Date.now(),
+        failureCode: 'pushcut_unverified_acceptance'
+      }).catch(() => {});
+      logPushcutXEvent('route_provider_unverified_acceptance', {
+        action: command.action,
+        eventId: command.eventId,
+        mode: accepted.mode,
+        providerStatus: accepted.providerStatus,
+        audioFetched: Number(receipt?.audioFetchedAt || 0) > 0,
+        receiptStatus: receipt?.status
+      });
+      throw new PushcutXError('providerRejected');
+    }
     const publicReceipt = publicPushcutXReceipt(receipt, {
       durable: dispatchClaim.durable
+    });
+    logPushcutXEvent('route_dispatch_verified', {
+      action: command.action,
+      eventId: command.eventId,
+      mode: accepted.mode,
+      providerStatus: accepted.providerStatus,
+      audioFetched: publicReceipt.audioReady,
+      completed: publicReceipt.completed,
+      recoveryQueued: accepted.recoveryQueued,
+      receiptStatus: publicReceipt.status
     });
     return json(res, publicReceipt.completed ? 200 : 202, {
       ok: true,
@@ -327,6 +421,7 @@ export default async function handler(req, res) {
       completed: publicReceipt.completed,
       status: publicReceipt.status,
       mode: accepted.mode,
+      providerStatus: accepted.providerStatus,
       providerCompleted: accepted.completed,
       action: accepted.action,
       commandId: accepted.commandId,

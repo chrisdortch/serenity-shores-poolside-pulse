@@ -9,6 +9,7 @@ export const PUSHCUT_X_HEALTH_TIMEOUT_MS = 5_000;
 export const PUSHCUT_X_DEFAULT_SHORTCUT = 'Poolside Pulse Announcement';
 export const PUSHCUT_X_DEFAULT_RECOVERY_SHORTCUT = 'Volume Down';
 export const PUSHCUT_X_TEST_WAIT_SECONDS = 10;
+export const PUSHCUT_X_RECEIVER_CONTRACT = 'poolside-pulse-x-audio-v1';
 
 // Pushcut recommends that server shortcuts finish within 60 seconds. Keeping
 // live speech below 500 characters leaves time for voice rendering, the pause,
@@ -67,6 +68,10 @@ const SAFE_ERRORS = Object.freeze({
   timeout: Object.freeze({
     statusCode: 504,
     message: 'The Pushcut receiver did not accept the command in time.'
+  }),
+  receiverContract: Object.freeze({
+    statusCode: 502,
+    message: 'The Receiver Shortcut is outdated or incomplete. Install the current Poolside Pulse X receiver Shortcut.'
   })
 });
 
@@ -114,12 +119,47 @@ export function pushcutXHealth(env = process.env) {
     ready: PUSHCUT_X_ACTIONS.every(action => actions[action]),
     actions: Object.freeze(actions),
     actionModes: Object.freeze({
-      announce: 'nowait',
+      announce: 'wait',
       test: 'wait'
     }),
     recoveryReady: Boolean(configured.apiKey && configured.recoveryShortcut),
     mode: 'hybrid'
   });
+}
+
+/**
+ * Emits only allow-listed operational metadata. Announcement text, signed
+ * URLs, API keys, Shortcut names, and device identifiers are never logged.
+ */
+export function logPushcutXEvent(event, details = {}, env = process.env) {
+  if (!String(env?.VERCEL || '').trim()) return;
+  const safe = {
+    service: 'pushcut-x',
+    event: String(event || '').slice(0, 80)
+  };
+  for (const key of [
+    'action',
+    'eventId',
+    'mode',
+    'providerCategory',
+    'providerStatus',
+    'receiptStatus',
+    'speechMode'
+  ]) {
+    const value = details?.[key];
+    if (value == null || value === '') continue;
+    safe[key] = typeof value === 'number'
+      ? value
+      : String(value).slice(0, 180);
+  }
+  for (const key of [
+    'audioFetched',
+    'completed',
+    'recoveryQueued'
+  ]) {
+    if (typeof details?.[key] === 'boolean') safe[key] = details[key];
+  }
+  console.info(JSON.stringify(safe));
 }
 
 function responseOk(response) {
@@ -472,7 +512,6 @@ async function executeShortcut({
   apiUrl,
   fetchImpl,
   input,
-  serverId,
   shortcut,
   timeout,
   upstreamTimeoutMs,
@@ -482,6 +521,7 @@ async function executeShortcut({
 }) {
   const endpoint = new URL(String(apiUrl));
   endpoint.search = '';
+  endpoint.searchParams.set('shortcut', shortcut);
   endpoint.searchParams.set('timeout', String(timeout));
   const controller = new AbortControllerImpl();
   const timer = setTimeoutImpl(() => controller.abort(), upstreamTimeoutMs);
@@ -495,9 +535,7 @@ async function executeShortcut({
         'Content-Type': 'application/json; charset=utf-8'
       },
       body: JSON.stringify({
-        shortcut,
-        input: JSON.stringify(input),
-        ...(serverId ? { serverId } : {})
+        input
       })
     });
   } catch (error) {
@@ -532,7 +570,6 @@ async function queueRecovery(command, configured, dependencies) {
       apiUrl: dependencies.apiUrl,
       fetchImpl: dependencies.fetchImpl,
       input: recoveryCommand,
-      serverId: configured.serverId,
       shortcut: configured.recoveryShortcut,
       timeout: 'nowait',
       upstreamTimeoutMs: Math.min(dependencies.upstreamTimeoutMs, 8_000),
@@ -591,17 +628,24 @@ export async function dispatchPushcutXCommand(command, {
     clearTimeoutImpl,
     now
   };
-  const waitForResult = command.action === 'test';
+  // A nowait response is always 202, even when the Shortcut later fails.
+  // Waiting the standard ten seconds makes Pushcut expose missing/disabled
+  // Shortcuts and disconnected receivers while remaining plan-compatible.
+  const waitForResult = true;
   let response;
+  logPushcutXEvent('provider_dispatch_started', {
+    action: command.action,
+    eventId: command.eventId,
+    mode: 'wait'
+  }, env);
   try {
     response = await executeShortcut({
       apiKey: configured.apiKey,
       apiUrl,
       fetchImpl,
       input: command,
-      serverId: configured.serverId,
       shortcut,
-      timeout: waitForResult ? PUSHCUT_X_TEST_WAIT_SECONDS : 'nowait',
+      timeout: String(PUSHCUT_X_TEST_WAIT_SECONDS),
       upstreamTimeoutMs,
       AbortControllerImpl,
       setTimeoutImpl,
@@ -609,6 +653,13 @@ export async function dispatchPushcutXCommand(command, {
     });
   } catch (error) {
     const recovery = await queueRecovery(command, configured, dependencies);
+    logPushcutXEvent('provider_dispatch_transport_failed', {
+      action: command.action,
+      eventId: command.eventId,
+      mode: 'wait',
+      providerCategory: error?.name === 'AbortError' ? 'timeout' : 'transport',
+      recoveryQueued: recovery.queued
+    }, env);
     throw dispatchError(
       error?.name === 'AbortError' ? 'timeout' : 'providerRejected',
       recovery
@@ -616,6 +667,12 @@ export async function dispatchPushcutXCommand(command, {
   }
 
   const status = Number(response?.status);
+  logPushcutXEvent('provider_dispatch_response', {
+    action: command.action,
+    eventId: command.eventId,
+    mode: 'wait',
+    providerStatus: status
+  }, env);
   if (responseOk(response)) {
     const recovery = await queueRecovery(command, configured, dependencies);
     return Object.freeze({
@@ -624,7 +681,7 @@ export async function dispatchPushcutXCommand(command, {
       action: command.action,
       commandId: command.commandId,
       eventId: command.eventId,
-      mode: waitForResult ? 'wait' : 'nowait',
+      mode: 'wait',
       providerStatus: status,
       recoveryQueued: recovery.queued,
       recoveryAcceptedAt: recovery.acceptedAt

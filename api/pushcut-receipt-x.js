@@ -14,6 +14,7 @@ import {
   readPushcutXCapability,
   verifyPushcutXCapability
 } from './_pushcut-security-x.js';
+import { logPushcutXEvent } from './_pushcut-x.js';
 
 const MAX_RECEIPT_BYTES = 4_000;
 const RECEIPT_STATUSES = new Set(['started', 'completed', 'failed']);
@@ -55,6 +56,10 @@ export default async function handler(req, res) {
   if (requestedEventId !== capability.eventId || !RECEIPT_STATUSES.has(status)) {
     return json(res, 400, { ok: false, error: 'The announcement receipt is invalid.' });
   }
+  logPushcutXEvent('receiver_receipt_requested', {
+    eventId: capability.eventId,
+    receiptStatus: status
+  });
 
   try {
     const existing = await readPushcutXReceipt(capability.eventId);
@@ -70,6 +75,11 @@ export default async function handler(req, res) {
         await repairLatestCompletedPushcutXReceipt(capability.eventId);
       }
       const health = pushcutXReceiptStorageHealth();
+      logPushcutXEvent('receiver_receipt_replayed', {
+        eventId: capability.eventId,
+        completed: status === 'completed',
+        receiptStatus: status
+      });
       return json(res, 200, {
         ok: true,
         version: 'x',
@@ -101,6 +111,11 @@ export default async function handler(req, res) {
           };
     const updated = await updatePushcutXReceipt(capability.eventId, patch);
     const health = pushcutXReceiptStorageHealth();
+    logPushcutXEvent('receiver_receipt_updated', {
+      eventId: capability.eventId,
+      completed: status === 'completed',
+      receiptStatus: updated.status
+    });
     return json(res, 200, {
       ok: true,
       version: 'x',
@@ -110,6 +125,11 @@ export default async function handler(req, res) {
     const safe = error instanceof PushcutXReceiptError
       ? error
       : new PushcutXReceiptError('unavailable');
+    logPushcutXEvent('receiver_receipt_failed', {
+      eventId: capability.eventId,
+      providerCategory: safe.code,
+      receiptStatus: status
+    });
     return json(res, safe.statusCode, { ok: false, error: safe.message });
   }
 }

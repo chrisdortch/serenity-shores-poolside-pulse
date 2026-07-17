@@ -4,6 +4,7 @@ import { beforeEach, describe, test } from 'node:test';
 import { createSessionToken } from '../api/_auth.js';
 import {
   cancelPushcutXExecution,
+  createPushcutScheduleManifestStore,
   planPushcutXSchedule,
   PushcutScheduleXError,
   readPushcutXScheduleStatus,
@@ -279,6 +280,35 @@ describe('Version X future signed capabilities', { concurrency: false }, () => {
 });
 
 describe('Version X Pushcut schedule synchronization', { concurrency: false }, () => {
+  test('holds the distributed manifest lock beyond the route execution ceiling', async () => {
+    const commands = [];
+    const manifestStore = createPushcutScheduleManifestStore({
+      env: {
+        KV_REST_API_URL: 'https://kv.example.test',
+        KV_REST_API_TOKEN: 'kv-token'
+      },
+      fetchImpl: async (_url, options) => {
+        const command = JSON.parse(options.body);
+        commands.push(command);
+        return {
+          ok: true,
+          async json() {
+            return {
+              result: command[0] === 'SET' ? 'OK' : 1
+            };
+          }
+        };
+      }
+    });
+
+    const result = await manifestStore.withLock(async () => 'locked result');
+    assert.equal(result, 'locked result');
+    assert.equal(commands[0][0], 'SET');
+    assert.equal(commands[0][4], 'EX');
+    assert.ok(Number(commands[0][5]) > 300);
+    assert.equal(commands[1][0], 'EVAL');
+  });
+
   test('writes intent, arms recovery first, replaces changes, and cancels removals', async () => {
     const manifestStore = memoryManifestStore();
     const scheduled = [];
@@ -358,6 +388,49 @@ describe('Version X Pushcut schedule synchronization', { concurrency: false }, (
     assert.equal(manifestStore.inspect().occurrences && Object.keys(manifestStore.inspect().occurrences).length, 0);
   });
 
+  test('Browser Receiver mode cancels delayed Pushcut copies instead of duplicating announcements', async () => {
+    const manifestStore = memoryManifestStore();
+    const scheduled = [];
+    const cancelled = [];
+    const options = {
+      env: {
+        PUSHCUT_API_KEY_X: 'pushcut-api-key',
+        OPENAI_API_KEY: 'openai-key',
+        POOL_SIDE_SESSION_SECRET: SESSION_SECRET,
+        POOL_SIDE_PIN: '7900'
+      },
+      now: () => NOW,
+      horizonDays: 7,
+      manifestStore,
+      scheduleExecution: async payload => {
+        scheduled.push(payload);
+        return { accepted: true, status: 202 };
+      },
+      cancelExecution: async identifier => {
+        cancelled.push(identifier);
+        return { cancelled: true, status: 200 };
+      },
+      createReceipt: async command => ({ receipt: command, created: true, durable: true }),
+      updateReceipt: async () => ({})
+    };
+    await synchronizePushcutXSchedule({
+      state: scheduleState(),
+      request: request('POST', '/api/pushcut-schedule-x?v=x'),
+      pushcutEnabled: true
+    }, options);
+    assert.equal(scheduled.length, 2);
+
+    const paused = await synchronizePushcutXSchedule({
+      state: scheduleState(),
+      request: request('POST', '/api/pushcut-schedule-x?v=x'),
+      pushcutEnabled: false
+    }, options);
+    assert.equal(paused.scheduledCount, 0);
+    assert.equal(paused.cancelled, 1);
+    assert.equal(cancelled.length, 2);
+    assert.match(paused.warnings.join(' '), /Browser Receiver mode/i);
+  });
+
   test('surfaces an explicit Extended requirement when Pushcut rejects a delayed plan', async () => {
     const manifestStore = memoryManifestStore();
     await assert.rejects(
@@ -431,10 +504,14 @@ describe('Version X Pushcut delayed API and session route', { concurrency: false
     await cancelPushcutXExecution('ppx-a-1234567890abcdef', { env, fetchImpl });
     const execute = new URL(calls[0].url);
     assert.equal(`${execute.origin}${execute.pathname}`, 'https://api.pushcut.io/v1/execute');
+    assert.equal(execute.searchParams.get('shortcut'), 'Poolside Pulse Announcement');
+    assert.equal(execute.searchParams.get('timeout'), 'nowait');
     assert.equal(execute.searchParams.get('delay'), '600s');
     assert.equal(execute.searchParams.get('identifier'), 'ppx-a-1234567890abcdef');
     assert.equal(calls[0].options.headers['API-Key'], 'pushcut-secret');
-    assert.equal(JSON.parse(calls[0].options.body).shortcut, 'Poolside Pulse Announcement');
+    const executeBody = JSON.parse(calls[0].options.body);
+    assert.equal(Object.hasOwn(executeBody, 'shortcut'), false);
+    assert.deepEqual(executeBody.input, { eventId: 'scheduled-event' });
     assert.equal(calls[1].url, 'https://api.pushcut.io/v1/cancelExecution?identifier=ppx-a-1234567890abcdef');
   });
 
@@ -493,8 +570,49 @@ describe('Version X Pushcut delayed API and session route', { concurrency: false
     );
     assert.equal(sent.url, '/api/pushcut-schedule-x?v=x');
     const body = JSON.parse(sent.options.body);
-    assert.deepEqual(body, { expectedRevision: 12 });
+    assert.deepEqual(body, { expectedRevision: 12, pushcutEnabled: true });
     assert.equal(Object.hasOwn(body, 'state'), false);
+  });
+
+  test('browser client and route preserve the explicit Pushcut-mode switch', async () => {
+    let browserBody;
+    await syncPushcutSchedule(scheduleState(), {
+      pushcutEnabled: false,
+      fetchImpl: async (_url, options) => {
+        browserBody = JSON.parse(options.body);
+        return {
+          ok: true,
+          status: 200,
+          async json() {
+            return { ok: true, scheduledCount: 0 };
+          }
+        };
+      }
+    });
+    assert.equal(browserBody.pushcutEnabled, false);
+
+    let synchronizedInput;
+    const handler = createPushcutScheduleXHandler({
+      manifestStoreFactory: () => memoryManifestStore(),
+      stateReader: async () => ({
+        durable: true,
+        revision: 12,
+        state: scheduleState()
+      }),
+      synchronizer: async input => {
+        synchronizedInput = input;
+        return { scheduledCount: 0 };
+      }
+    });
+    const response = await invoke(
+      handler,
+      request('POST', '/api/pushcut-schedule-x?v=x', {
+        cookie: xCookie(),
+        body: { expectedRevision: 12, pushcutEnabled: false }
+      })
+    );
+    assert.equal(response.statusCode, 200);
+    assert.equal(synchronizedInput.pushcutEnabled, false);
   });
 
   test('rejects a stale browser revision before canonical schedule synchronization', async () => {

@@ -344,4 +344,153 @@ describe('Version X Apple and Spotify runtime integration', { concurrency: false
     );
     assert.equal(received, null);
   });
+
+  test('passes the selected finite source through both Order and Time announcements', async () => {
+    const { runtime, store } = harness();
+    const source = {
+      id: 'finite-pool-clip',
+      label: 'Finite pool clip',
+      kind: 'finite-audio',
+      provider: 'direct',
+      url: 'https://audio.example.test/finite-pool-clip.mp3',
+      finite: true,
+      durationSeconds: 11,
+      playbackSupport: 'supported',
+      verification: 'unverified'
+    };
+    store.state.announcementSources.push(source);
+    const welcome = store.state.announcements.find(item => item.id === 'welcome');
+    welcome.sourceId = source.id;
+    runtime.assertExternalAudioIntent = () => true;
+    runtime.completeOrderGate = async () => 'auto-pending';
+    const deliveries = [];
+    runtime.announce = async (text, options) => {
+      deliveries.push({ text, options });
+      return true;
+    };
+
+    await runtime.executeOrderItem({
+      scheduleId: 'finite-order',
+      token: 'finite-order-token',
+      item: {
+        id: 'finite-order-item',
+        label: 'Finite Order',
+        type: 'announcement',
+        action: {
+          kind: 'announcement',
+          announcementSource: 'saved',
+          announcementId: 'welcome',
+          sourceId: source.id
+        },
+        volume: { mode: 'custom', percent: 100 }
+      }
+    });
+
+    const parts = new Intl.DateTimeFormat('en-US', {
+      timeZone: 'America/Chicago',
+      hour: '2-digit',
+      minute: '2-digit',
+      hourCycle: 'h23'
+    }).formatToParts(new Date(NOW));
+    const values = Object.fromEntries(parts.map(part => [part.type, part.value]));
+    const time = `${values.hour}:${values.minute}`;
+    store.state.schedules = [{
+      id: 'finite-time',
+      name: 'Finite Time',
+      mode: 'time',
+      enabled: true,
+      items: [{
+        id: 'finite-time-item',
+        label: 'Finite Time',
+        enabled: true,
+        type: 'announcement',
+        time,
+        position: { time },
+        action: {
+          kind: 'announcement',
+          announcementSource: 'saved',
+          announcementId: 'welcome',
+          sourceId: source.id
+        },
+        volume: { mode: 'custom', percent: 100 }
+      }]
+    }];
+    store.state.activeScheduleId = 'finite-time';
+    store.state.scheduleRuns = {};
+    await runtime.tickSchedule();
+
+    assert.equal(deliveries.length, 2);
+    for (const delivery of deliveries) {
+      assert.equal(delivery.options.announcementMode, 'finite-audio');
+      assert.equal(delivery.options.announcementProvider, 'direct');
+      assert.equal(delivery.options.announcementAudioUrl, source.url);
+      assert.equal(delivery.options.announcementDurationSeconds, 11);
+    }
+    assert.equal(deliveries[0].options.scheduledRunToken, 'finite-order-token');
+    assert.match(deliveries[1].options.scheduledRunToken, /^time-run-/);
+    assert.equal(store.state.scheduleRuns['finite-time-item'].status, 'completed');
+  });
+
+  test('continues a scheduled Suno playlist only while its Time token remains authorized', async () => {
+    const { runtime, store, audioState } = harness();
+    const parts = new Intl.DateTimeFormat('en-US', {
+      timeZone: 'America/Chicago',
+      hour: '2-digit',
+      minute: '2-digit',
+      hourCycle: 'h23'
+    }).formatToParts(new Date(NOW));
+    const values = Object.fromEntries(parts.map(part => [part.type, part.value]));
+    const time = `${values.hour}:${values.minute}`;
+    const item = {
+      id: 'suno-time-item',
+      label: 'Scheduled Suno playlist',
+      enabled: true,
+      type: 'controlled',
+      time,
+      position: { time },
+      action: { kind: 'controlled', url: 'https://suno.com/playlist/scheduled' },
+      volume: { mode: 'custom', percent: 30 }
+    };
+    store.state.schedules = [{
+      id: 'suno-time',
+      name: 'Suno Time',
+      mode: 'time',
+      enabled: true,
+      items: [item]
+    }];
+    store.state.activeScheduleId = 'suno-time';
+    store.state.scheduleRuns = {};
+    const starts = [];
+    runtime.resolveControlledTracks = async () => ({
+      playlistName: 'Scheduled playlist',
+      tracks: [
+        { id: 'one', title: 'One', artist: 'Suno', audioUrl: 'https://audio.example.test/one.mp3' },
+        { id: 'two', title: 'Two', artist: 'Suno', audioUrl: 'https://audio.example.test/two.mp3' }
+      ]
+    });
+    const realPlayMusicUrl = runtime.audio.playMusicUrl;
+    runtime.audio.playMusicUrl = async (url, options) => {
+      starts.push(String(url));
+      return await realPlayMusicUrl(url, options);
+    };
+
+    await runtime.tickSchedule();
+    const endedUrl = store.state.playback.audioUrl;
+    audioState.controlledAudible = false;
+    await runtime.nextMusic({ automatic: true, expectedUrl: endedUrl });
+
+    assert.deepEqual(starts, [
+      'https://audio.example.test/one.mp3',
+      'https://audio.example.test/two.mp3'
+    ]);
+    assert.equal(store.state.playback.trackIndex, 1);
+
+    store.state.schedules[0].items[0].enabled = false;
+    audioState.controlledAudible = false;
+    await assert.rejects(
+      runtime.nextMusic({ automatic: true, expectedUrl: store.state.playback.audioUrl }),
+      /scheduled playback claim was cancelled/i
+    );
+    assert.equal(starts.length, 2);
+  });
 });

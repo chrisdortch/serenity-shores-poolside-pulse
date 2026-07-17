@@ -159,7 +159,7 @@ function sanitizeAnnouncementSource(value) {
   if (naturalVoice && requestedKind && !['ai', 'natural-voice', 'openai', 'openai-tts', 'speech', 'voice'].includes(requestedKind)) {
     return null;
   }
-  if (!naturalVoice && requestedKind && !['apple', 'audio', 'direct', 'media', 'spotify', 'suno'].includes(requestedKind)) {
+  if (!naturalVoice && requestedKind && !['apple', 'audio', 'direct', 'finite-audio', 'media', 'spotify', 'suno'].includes(requestedKind)) {
     return null;
   }
 

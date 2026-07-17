@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { describe, test } from 'node:test';
 
 import {
@@ -13,6 +14,7 @@ const VX_TOKEN_KEY = 'poolside-pulse-vx-spotify-token';
 const V30_PKCE_KEY = 'poolside-pulse-v30-spotify-pkce';
 const V30_TOKEN_KEY = 'poolside-pulse-v30-spotify-token';
 const VFINAL_TOKEN_KEY = 'poolside-pulse-vfinal-spotify-token';
+const VX_APP_SOURCE = readFileSync(new URL('../src/vx/app.js', import.meta.url), 'utf8');
 
 class MemoryStorage {
   constructor() {
@@ -109,6 +111,72 @@ function assertOtherVersionStorageUnchanged(env, values) {
 }
 
 describe('Version X Spotify receiver isolation', { concurrency: false }, () => {
+  test('shows Spotify login in the iPhone Receiver setup before receiver ownership', () => {
+    const panelStart = VX_APP_SOURCE.indexOf('function iphoneReceiverModePanel');
+    const panelEnd = VX_APP_SOURCE.indexOf('function updateLiveStatus', panelStart);
+    const panelSource = VX_APP_SOURCE.slice(panelStart, panelEnd);
+
+    assert.ok(panelStart > 0 && panelEnd > panelStart);
+    assert.match(panelSource, /spotifySetupButton\(\{ disabled: spotify\.loggedIn\(\) && !owned \}\)/);
+    assert.match(panelSource, /Spotify login is available before Start Receiver/);
+    assert.match(panelSource, /Mode 1 · remote music control/);
+    assert.match(panelSource, /Mode 2 · remote Pushcut announcements/);
+  });
+
+  test('keeps Browser Receiver status ahead of configured Pushcut and exposes the official mode switch', () => {
+    const modeStart = VX_APP_SOURCE.indexOf('function receiverOperatingMode');
+    const modeEnd = VX_APP_SOURCE.indexOf('async function refreshPushcutStatus', modeStart);
+    const modeSource = VX_APP_SOURCE.slice(modeStart, modeEnd);
+
+    assert.ok(modeStart > 0 && modeEnd > modeStart);
+    assert.ok(modeSource.indexOf("return 'browser'") < modeSource.indexOf("return 'pushcut'"));
+    assert.match(VX_APP_SOURCE, /const PUSHCUT_RUN_SERVER_URL = 'pushcut:\/\/open\/runServer'/);
+    assert.match(VX_APP_SOURCE, /The Remote can apply Music 30% and send announcements, but it cannot start, change, pause, or stop that native music bed while Pushcut is foreground/);
+    assert.match(VX_APP_SOURCE, /operatingMode === 'pushcut'[\s\S]*Version X intentionally hides browser Play controls in Pushcut mode/);
+  });
+
+  test('routes live voice to Browser first and keeps Browser-mode sliders usable', () => {
+    const sendStart = VX_APP_SOURCE.indexOf('async function sendLiveAnnouncement');
+    const sendEnd = VX_APP_SOURCE.indexOf('async function runImmediateWeatherCheck', sendStart);
+    const sendSource = VX_APP_SOURCE.slice(sendStart, sendEnd);
+    const musicStart = VX_APP_SOURCE.indexOf('function musicLevelControl');
+    const musicEnd = VX_APP_SOURCE.indexOf('function voiceLevelControl', musicStart);
+    const voiceStart = musicEnd;
+    const voiceEnd = VX_APP_SOURCE.indexOf('function musicSourceForm', voiceStart);
+
+    assert.match(sendSource, /preferredAnnouncementTransport/);
+    assert.match(sendSource, /browserReceiverOnline: receiverOnline/);
+    assert.ok(sendSource.indexOf("transport === 'browser'") < sendSource.indexOf('sendPushcutAnnouncement'));
+    assert.match(sendSource, /volumePercent,[\s\S]*\.\.\.delivery/);
+    assert.doesNotMatch(sendSource, /Short Suno\/direct announcement clips use Pushcut mode/);
+    assert.match(sendSource, /forcePushcut = false/);
+    assert.match(VX_APP_SOURCE, /label: 'Pushcut Receiver Test'[\s\S]*forcePushcut: true/);
+    assert.match(VX_APP_SOURCE.slice(musicStart, musicEnd), /receiverOperatingMode\(\) === 'pushcut'/);
+    assert.match(VX_APP_SOURCE.slice(voiceStart, voiceEnd), /receiverOperatingMode\(\) === 'pushcut'/);
+  });
+
+  test('keeps Pushcut timed copies separate from the live Browser schedule', () => {
+    assert.match(VX_APP_SOURCE, /pushcutEnabled: requestedPushcutEnabled/);
+    assert.match(VX_APP_SOURCE, /browserReceiverOnline: receiverOnline/);
+    assert.match(VX_APP_SOURCE, /Pending Pushcut timed copies were cancelled/);
+    assert.match(VX_APP_SOURCE, /Version X automatically cancels Pushcut timed copies/);
+    assert.match(VX_APP_SOURCE, /runtime\.start[\s\S]*pushcutEnabledOverride: false/);
+    assert.match(VX_APP_SOURCE, /runtime\.stop\(\)[\s\S]*pushcutEnabledOverride: true/);
+    assert.match(VX_APP_SOURCE, /Stop Receiver &amp; Prepare Pushcut/);
+    assert.match(VX_APP_SOURCE, /browserActive[\s\S]*data-action="stop-receiver"[\s\S]*PUSHCUT_RUN_SERVER_URL/);
+  });
+
+  test('continues scheduled controlled playlists without bypassing track-end schedule gates', () => {
+    const callbackStart = VX_APP_SOURCE.indexOf('onPlayback: state =>');
+    const callbackEnd = VX_APP_SOURCE.indexOf('const apple = new AppleMusicReceiver', callbackStart);
+    const callbackSource = VX_APP_SOURCE.slice(callbackStart, callbackEnd);
+
+    assert.match(callbackSource, /handleControlledTrackEnded\(state\)/);
+    assert.match(callbackSource, /hasPendingControlledTrackEnd\(\)/);
+    assert.match(callbackSource, /nextMusic\(\{ automatic: true, expectedUrl: state\.url \}\)/);
+    assert.doesNotMatch(callbackSource, /!!state\.scheduledRunToken/);
+  });
+
   test('uses the stable X alias and writes only the X PKCE transaction', async () => {
     const env = browserEnvironment('https://poolside-pulse-x.vercel.app/#receiver');
     const otherVersions = seedOtherVersionStorage(env);
