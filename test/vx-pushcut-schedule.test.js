@@ -10,6 +10,7 @@ import {
   readPushcutXScheduleStatus,
   schedulePushcutXExecution,
   synchronizePushcutXSchedule,
+  verifyPushcutXDelayedScheduling,
   zonedOccurrenceTimestamp
 } from '../api/_pushcut-schedule-x.js';
 import {
@@ -488,6 +489,37 @@ describe('Version X Pushcut schedule synchronization', { concurrency: false }, (
 });
 
 describe('Version X Pushcut delayed API and session route', { concurrency: false }, () => {
+  test('proves Extended with a harmless far-future recovery and immediately cancels it', async () => {
+    const calls = [];
+    const result = await verifyPushcutXDelayedScheduling({
+      env: {
+        PUSHCUT_API_KEY_X: 'pushcut-secret',
+        PUSHCUT_RECOVERY_SHORTCUT_X: 'Volume Down'
+      },
+      now: () => NOW,
+      scheduleExecution: async payload => {
+        calls.push({ type: 'schedule', payload });
+        return { accepted: true };
+      },
+      cancelExecution: async identifier => {
+        calls.push({ type: 'cancel', identifier });
+        return { cancelled: true, status: 200 };
+      }
+    });
+
+    assert.equal(result.extendedVerified, true);
+    assert.equal(result.cancelled, true);
+    assert.equal(result.checkedAt, NOW);
+    assert.equal(result.delayedSeconds, 29 * 24 * 60 * 60);
+    assert.equal(calls[0].payload.shortcut, 'Volume Down');
+    assert.equal(calls[0].payload.delaySeconds, result.delayedSeconds);
+    assert.match(calls[0].payload.identifier, /^ppx-extended-check-[a-f0-9]{24}$/);
+    assert.equal(calls[0].payload.input.action, 'recover-volume');
+    assert.equal(calls[0].payload.input.musicPercent, 30);
+    assert.equal(calls[0].payload.input.scheduledFor, NOW + result.delayedSeconds * 1000);
+    assert.equal(calls[1].identifier, calls[0].payload.identifier);
+  });
+
   test('uses API-Key, deterministic delay/identifier, and the v1 cancellation endpoint', async () => {
     const calls = [];
     const env = { PUSHCUT_API_KEY_X: 'pushcut-secret' };
@@ -545,6 +577,49 @@ describe('Version X Pushcut delayed API and session route', { concurrency: false
     assert.equal(rejected.statusCode, 409);
     assert.equal(rejected.json().requiresExtended, true);
     assert.match(rejected.json().error, /Extended/i);
+  });
+
+  test('runs an authenticated delayed-entitlement diagnostic without reading or changing schedule state', async () => {
+    let delayedChecks = 0;
+    const handler = createPushcutScheduleXHandler({
+      manifestStoreFactory: () => memoryManifestStore(),
+      delayedVerifier: async () => {
+        delayedChecks += 1;
+        return {
+          extendedVerified: true,
+          cancelled: true,
+          checkedAt: NOW,
+          delayedSeconds: 29 * 24 * 60 * 60
+        };
+      },
+      stateReader: async () => {
+        throw new Error('The diagnostic must not read schedule state.');
+      },
+      synchronizer: async () => {
+        throw new Error('The diagnostic must not synchronize occurrences.');
+      }
+    });
+    const verified = await invoke(
+      handler,
+      request('POST', '/api/pushcut-schedule-x?v=x', {
+        cookie: xCookie(),
+        body: { diagnostic: true }
+      })
+    );
+    assert.equal(verified.statusCode, 200);
+    assert.equal(verified.json().extendedVerified, true);
+    assert.equal(verified.json().cancelled, true);
+    assert.equal(delayedChecks, 1);
+
+    const invalid = await invoke(
+      handler,
+      request('POST', '/api/pushcut-schedule-x?v=x', {
+        cookie: xCookie(),
+        body: { diagnostic: true, expectedRevision: 12 }
+      })
+    );
+    assert.equal(invalid.statusCode, 400);
+    assert.equal(delayedChecks, 1);
   });
 
   test('browser client sends only the expected revision and preserves Extended errors', async () => {

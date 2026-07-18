@@ -9,7 +9,8 @@ import {
   createPushcutScheduleManifestStore,
   PushcutScheduleXError,
   readPushcutXScheduleStatus,
-  synchronizePushcutXSchedule
+  synchronizePushcutXSchedule,
+  verifyPushcutXDelayedScheduling
 } from './_pushcut-schedule-x.js';
 import { readCanonicalVersionXState } from './state-x.js';
 
@@ -52,6 +53,7 @@ export function createPushcutScheduleXHandler({
   manifestStoreFactory = () => createPushcutScheduleManifestStore(),
   statusReader = readPushcutXScheduleStatus,
   synchronizer = synchronizePushcutXSchedule,
+  delayedVerifier = verifyPushcutXDelayedScheduling,
   stateReader = readCanonicalVersionXState
 } = {}) {
   return async function handler(req, res) {
@@ -108,6 +110,34 @@ export function createPushcutScheduleXHandler({
         error: tooLarge ? 'Pushcut schedule request is too large.' : 'Invalid JSON body.',
         requiresExtended: false
       });
+    }
+    if (body?.diagnostic === true) {
+      if (Object.keys(body).some(key => key !== 'diagnostic')) {
+        return json(res, 400, {
+          ok: false,
+          error: 'The Pushcut delayed-scheduling diagnostic request is invalid.',
+          requiresExtended: false
+        });
+      }
+      try {
+        const result = await delayedVerifier();
+        return json(res, 200, {
+          ok: true,
+          service: 'pushcut-delayed-schedule',
+          ...result,
+          requiresExtended: false,
+          note: 'Pushcut Automation Server Extended accepted and cancelled a harmless delayed recovery check.'
+        });
+      } catch (error) {
+        const safe = error instanceof PushcutScheduleXError
+          ? error
+          : new PushcutScheduleXError('providerUnavailable');
+        return json(res, safe.statusCode, {
+          ok: false,
+          error: safe.message,
+          requiresExtended: safe.requiresExtended
+        });
+      }
     }
     const expectedRevision = Number(body?.expectedRevision ?? body?.state?.revision);
     const pushcutEnabled = body?.pushcutEnabled !== false;

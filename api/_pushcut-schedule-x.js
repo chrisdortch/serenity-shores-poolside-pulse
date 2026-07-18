@@ -617,6 +617,54 @@ export async function cancelPushcutXExecution(identifier, {
   return Object.freeze({ cancelled: true, status: response.status });
 }
 
+/**
+ * Proves the Pushcut account accepts delayed Automation Server execution
+ * without changing Poolside Pulse state or leaving a test announcement armed.
+ * The harmless Volume Down recovery is placed 29 days ahead and immediately
+ * cancelled. If cancellation is uncertain, fail closed and report it.
+ */
+export async function verifyPushcutXDelayedScheduling({
+  env = process.env,
+  fetchImpl = globalThis.fetch,
+  now = Date.now,
+  scheduleExecution = (payload) => schedulePushcutXExecution(payload, { env, fetchImpl }),
+  cancelExecution = (identifier) => cancelPushcutXExecution(identifier, { env, fetchImpl })
+} = {}) {
+  const configured = configuration(env);
+  if (!configured.apiKey || !configured.recoveryShortcut) fail('notConfigured');
+  const checkedAt = Number(now());
+  if (!Number.isSafeInteger(checkedAt) || checkedAt < 0) fail('invalid');
+  const delaySeconds = PUSHCUT_X_SCHEDULE_HORIZON_DAYS * 24 * 60 * 60;
+  const nonce = sha(randomUUID(), 24);
+  const identifier = `ppx-extended-check-${nonce}`;
+  const scheduledFor = checkedAt + delaySeconds * 1000;
+
+  await scheduleExecution({
+    identifier,
+    delaySeconds,
+    shortcut: configured.recoveryShortcut,
+    input: Object.freeze({
+      schemaVersion: 1,
+      version: 'x',
+      action: 'recover-volume',
+      commandId: `pushcut-extended-check-${nonce}`,
+      eventId: `pushcut-extended-check-${nonce}`,
+      issuedAt: checkedAt,
+      scheduledFor,
+      musicPercent: 30,
+      reason: 'extended-entitlement-check'
+    })
+  });
+  const cancellation = await cancelExecution(identifier);
+  if (cancellation?.cancelled !== true) fail('cancellationUncertain');
+  return Object.freeze({
+    extendedVerified: true,
+    cancelled: true,
+    checkedAt,
+    delayedSeconds: delaySeconds
+  });
+}
+
 function manifestEntry(occurrence, status, now) {
   return {
     logicalId: occurrence.logicalId,
