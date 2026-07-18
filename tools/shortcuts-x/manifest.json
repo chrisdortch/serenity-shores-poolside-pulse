@@ -1,0 +1,15 @@
+{
+  "receiverContract": "poolside-pulse-x-audio-v4",
+  "signedFiles": {
+    "announcement": {
+      "file": "public/shortcuts/poolside-pulse-x-announcement.shortcut",
+      "name": "Poolside Pulse X Announcement",
+      "sha256": "4b47232261ffb8032f5033af14e8a3f0739c33099b81d600896ee8ad8f4b77f6"
+    },
+    "recovery": {
+      "file": "public/shortcuts/poolside-pulse-x-recovery.shortcut",
+      "name": "Poolside Pulse X Recovery",
+      "sha256": "f042cb2244d61d2d605c5e0456a5c75694afedd89c4bc1637ca01e8ff22ee9ec"
+    }
+  }
+}

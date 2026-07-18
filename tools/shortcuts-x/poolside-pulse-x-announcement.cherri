@@ -1,0 +1,51 @@
+/*
+Poolside Pulse X Announcement
+
+Receiver contract:
+music target -> pause/silence -> announcement at 100% -> wait for the sound
+to finish -> fetch the latest music target -> restore/resume -> signed receipt.
+*/
+
+#include 'actions/device'
+#include 'actions/media'
+#include 'actions/music'
+#include 'actions/web'
+
+#define name Poolside Pulse X Announcement
+#define color teal
+#define mac false
+
+action 'setvolume' setVolumeFromVariable(variable volume: 'WFVolume')
+
+const request = getDictionary(ShortcutInput)
+
+const audioUrl = getValue(request, "audioUrl")
+const announcementAudio = downloadURL("{audioUrl}")
+
+pause()
+wait(1)
+setVolume(1.0)
+playSound(announcementAudio)
+
+const restoreUrl = getValue(request, "restoreUrl")
+const restoreTarget = downloadURL("{restoreUrl}")
+const restoreDictionary = getDictionary(restoreTarget)
+const musicLevel = getValue(restoreDictionary, "musicLevel")
+setVolumeFromVariable(musicLevel)
+play()
+
+const receiptUrl = getValue(request, "receiptUrl")
+const restoredMusicPercentValue = getValue(restoreDictionary, "musicPercent")
+const restoredMusicPercent = number(restoredMusicPercentValue)
+rawAction("is.workflow.actions.downloadurl", {
+    "WFURL": "${receiptUrl}",
+    "WFHTTPMethod": "POST",
+    "WFHTTPBodyType": "JSON",
+    "WFJSONValues": {
+        "status": "completed",
+        "receiverContract": "poolside-pulse-x-audio-v4",
+        "volumeRestored": true,
+        "restoredMusicPercent": "${restoredMusicPercent}",
+        "musicResumed": true
+    }
+})

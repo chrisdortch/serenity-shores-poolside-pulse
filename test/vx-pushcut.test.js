@@ -6,6 +6,7 @@ import { after, beforeEach, describe, test } from 'node:test';
 import { createSessionToken } from '../api/_auth.js';
 import {
   PUSHCUT_X_API_URL,
+  PUSHCUT_X_DEFAULT_RECOVERY_SHORTCUT,
   PUSHCUT_X_DEFAULT_SHORTCUT,
   PUSHCUT_X_DEVICES_URL,
   PUSHCUT_X_RECEIVER_CONTRACT,
@@ -15,6 +16,11 @@ import {
   normalizePushcutXCommand,
   pushcutXHealth
 } from '../api/_pushcut-x.js';
+import {
+  PUSHCUT_X_ANNOUNCEMENT_SHORTCUT_NAME,
+  PUSHCUT_X_RECEIVER_CONTRACT as PUSHCUT_X_CANONICAL_RECEIVER_CONTRACT,
+  PUSHCUT_X_RECOVERY_SHORTCUT_NAME
+} from '../src/vx/pushcut-shortcuts.js';
 import {
   claimPushcutXAudioGeneration,
   claimPushcutXDispatch,
@@ -340,6 +346,12 @@ describe('Version X Pushcut command validation', { concurrency: false }, () => {
   });
 
   test('uses the fixed shortcut name by default and never exposes the API key in health', () => {
+    assert.equal(PUSHCUT_X_DEFAULT_SHORTCUT, 'Poolside Pulse X Announcement');
+    assert.equal(PUSHCUT_X_DEFAULT_RECOVERY_SHORTCUT, 'Poolside Pulse X Recovery');
+    assert.equal(PUSHCUT_X_RECEIVER_CONTRACT, 'poolside-pulse-x-audio-v4');
+    assert.equal(PUSHCUT_X_DEFAULT_SHORTCUT, PUSHCUT_X_ANNOUNCEMENT_SHORTCUT_NAME);
+    assert.equal(PUSHCUT_X_DEFAULT_RECOVERY_SHORTCUT, PUSHCUT_X_RECOVERY_SHORTCUT_NAME);
+    assert.equal(PUSHCUT_X_RECEIVER_CONTRACT, PUSHCUT_X_CANONICAL_RECEIVER_CONTRACT);
     const health = pushcutXHealth({ PUSHCUT_API_KEY_X: 'pushcut-test-secret' });
     assert.equal(health.ready, true);
     assert.deepEqual(health.actions, { announce: true, test: true });
@@ -398,6 +410,30 @@ describe('Version X Pushcut provider transport', { concurrency: false }, () => {
     assert.equal(calls[0].body.input.eventId, command.eventId);
     assert.equal(result.mode, 'wait');
     assert.equal(result.completed, true);
+  });
+
+  test('keeps legacy Shortcut names available through the existing environment overrides', async () => {
+    const command = normalizePushcutXCommand({
+      action: 'announce',
+      commandId: 'pushcut-provider-legacy-shortcut-0001',
+      text: 'Legacy Shortcut compatibility.',
+      announcementVolume: 100,
+      musicVolume: 30
+    });
+    let sentUrl;
+    await dispatchPushcutXCommand(command, {
+      env: {
+        PUSHCUT_API_KEY_X: 'pushcut-test-secret',
+        PUSHCUT_ANNOUNCE_SHORTCUT_X: 'Poolside Pulse Announcement',
+        PUSHCUT_RECOVERY_SHORTCUT_X: 'Volume Down'
+      },
+      fetchImpl: async url => {
+        sentUrl = new URL(String(url));
+        return { status: 200 };
+      }
+    });
+
+    assert.equal(sentUrl.searchParams.get('shortcut'), 'Poolside Pulse Announcement');
   });
 
   test('maps provider rejection to a generic safe error', async () => {
@@ -465,6 +501,10 @@ describe('Version X signed natural-audio delivery receipts', { concurrency: fals
     assert.equal(verifiedPushcutXCompletion({
       ...completion,
       receiverContract: 'poolside-pulse-x-audio-v2'
+    }), false);
+    assert.equal(verifiedPushcutXCompletion({
+      ...completion,
+      receiverContract: 'poolside-pulse-x-audio-v3'
     }), false);
     assert.equal(verifiedPushcutXCompletion({
       ...completion,
@@ -795,7 +835,7 @@ describe('Version X signed natural-audio delivery receipts', { concurrency: fals
     assert.equal(providerCalls, 1);
   });
 
-  test('rejects legacy GET completion and verifies one exact v3 POST receipt', async () => {
+  test('rejects legacy GET completion and verifies one exact v4 POST receipt', async () => {
     const eventId = 'pushcut-receipt-event-0001';
     const command = normalizePushcutXCommand({
       action: 'announce',
@@ -1047,7 +1087,7 @@ describe('Version X signed natural-audio delivery receipts', { concurrency: fals
     assert.equal(exactTarget.json().receipt.sequenceCompleted, true);
   });
 
-  test('refuses v3 completion unless the receiver proves that music resumed', async () => {
+  test('refuses v4 completion unless the receiver proves that music resumed', async () => {
     const eventId = 'pushcut-receipt-resume-required-0001';
     const created = await createPushcutXReceipt(normalizePushcutXCommand({
       action: 'announce',
@@ -1565,7 +1605,7 @@ describe('Version X Pushcut route and browser adapter', { concurrency: false }, 
     assert.equal(calls.length, 1);
   });
 
-  test('keeps a queued 202 receipt-eligible until the signed v3 completion arrives', async () => {
+  test('keeps a queued 202 receipt-eligible until the signed v4 completion arrives', async () => {
     process.env.PUSHCUT_API_KEY_X = 'pushcut-route-secret';
     process.env.OPENAI_API_KEY = 'openai-route-secret';
     let receiverInput;

@@ -22,6 +22,8 @@ import {
 } from './_pushcut-security-x.js';
 import {
   canonicalPushcutXMusicPercent,
+  PUSHCUT_X_DEFAULT_RECOVERY_SHORTCUT,
+  PUSHCUT_X_DEFAULT_SHORTCUT,
   PUSHCUT_X_RECEIVER_CONTRACT,
   pushcutXVolumeLevels
 } from './_pushcut-x.js';
@@ -36,8 +38,6 @@ export const PUSHCUT_X_CANCEL_URL = 'https://api.pushcut.io/v1/cancelExecution';
 export const PUSHCUT_X_SCHEDULE_MANIFEST_KEY = 'serenity-shores-poolside-pulse:vx:pushcut-schedule:v1:manifest';
 const PUSHCUT_X_SCHEDULE_LOCK_KEY = 'serenity-shores-poolside-pulse:vx:pushcut-schedule:v1:lock';
 const PUSHCUT_X_EXECUTE_URL = 'https://api.pushcut.io/v1/execute';
-const PUSHCUT_X_DEFAULT_SHORTCUT = 'Poolside Pulse Announcement';
-const PUSHCUT_X_DEFAULT_RECOVERY_SHORTCUT = 'Volume Down';
 const PUSHCUT_X_SCHEDULE_SCHEMA_VERSION = 1;
 // Keep the distributed lock beyond the route's 300-second execution ceiling.
 // Large rolling plans make sequential Pushcut and KV calls, so a shorter lock
@@ -635,7 +635,7 @@ export async function cancelPushcutXExecution(identifier, {
 /**
  * Proves the Pushcut account accepts delayed Automation Server execution
  * without changing Poolside Pulse state or leaving a test announcement armed.
- * The harmless Volume Down recovery is placed 29 days ahead and immediately
+ * The harmless canonical recovery is placed 29 days ahead and immediately
  * cancelled. If cancellation is uncertain, fail closed and report it.
  */
 export async function verifyPushcutXDelayedScheduling({
@@ -950,7 +950,7 @@ export async function synchronizePushcutXSchedule({
         reason: 'scheduled-announcement-recovery'
       });
 
-      // Arm the harmless Volume Down recovery first. If the announcement is
+      // Arm the harmless canonical recovery first. If the announcement is
       // rejected, cancellation can only leave a safe volume reduction behind.
       await scheduleExecution({
         identifier: occurrence.recoveryIdentifier,

@@ -4,6 +4,7 @@ import { after, beforeEach, describe, test } from 'node:test';
 import { createSessionToken } from '../api/_auth.js';
 import {
   PUSHCUT_VOLUME_X_API_URL,
+  PUSHCUT_VOLUME_X_DEFAULT_SHORTCUT,
   PushcutVolumeXError,
   applyPushcutXMusicVolume
 } from '../api/_pushcut-volume-x.js';
@@ -79,7 +80,7 @@ after(() => {
 });
 
 describe('Version X manual Pushcut music-volume action', () => {
-  test('waits for the existing Volume Down Shortcut and returns completion without secrets', async () => {
+  test('waits for the canonical Version X recovery Shortcut and returns completion without secrets', async () => {
     let sent;
     const result = await applyPushcutXMusicVolume({
       musicPercent: 100,
@@ -91,7 +92,8 @@ describe('Version X manual Pushcut music-volume action', () => {
     });
 
     assert.equal(sent.url.origin + sent.url.pathname, PUSHCUT_VOLUME_X_API_URL);
-    assert.equal(sent.url.searchParams.get('shortcut'), 'Volume Down');
+    assert.equal(PUSHCUT_VOLUME_X_DEFAULT_SHORTCUT, 'Poolside Pulse X Recovery');
+    assert.equal(sent.url.searchParams.get('shortcut'), PUSHCUT_VOLUME_X_DEFAULT_SHORTCUT);
     assert.equal(sent.url.searchParams.get('timeout'), '10');
     assert.equal(Object.hasOwn(sent.body, 'shortcut'), false);
     assert.equal(sent.options.headers['API-Key'], 'pushcut-api-key-test');
@@ -113,8 +115,8 @@ describe('Version X manual Pushcut music-volume action', () => {
     assert.equal(JSON.stringify(result).includes('pushcut-api-key-test'), false);
   });
 
-  test('honors the recovery Shortcut override and does not invent completion for 202', async () => {
-    process.env.PUSHCUT_RECOVERY_SHORTCUT_X = 'Pool Music Quiet';
+  test('honors the legacy recovery Shortcut override and does not invent completion for 202', async () => {
+    process.env.PUSHCUT_RECOVERY_SHORTCUT_X = 'Volume Down';
     let shortcut;
     const result = await applyPushcutXMusicVolume({
       fetchImpl: async (url) => {
@@ -122,7 +124,7 @@ describe('Version X manual Pushcut music-volume action', () => {
         return { status: 202 };
       }
     });
-    assert.equal(shortcut, 'Pool Music Quiet');
+    assert.equal(shortcut, 'Volume Down');
     assert.equal(result.accepted, true);
     assert.equal(result.completed, false);
     assert.equal(result.status, 'accepted-uncertain');

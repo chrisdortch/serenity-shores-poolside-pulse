@@ -633,7 +633,7 @@ function baseReceipt(command, now, ttlSeconds) {
     musicPercent: Number.isFinite(requestedMusicPercent)
       ? Math.max(0, Math.min(100, requestedMusicPercent))
       : 30,
-    // All v3 announcement receipts describe the same complete sequence,
+    // All v4 announcement receipts describe the same complete sequence,
     // including the final music resume. Legacy callers cannot weaken it.
     resumeMusic: true,
     status: 'queued',

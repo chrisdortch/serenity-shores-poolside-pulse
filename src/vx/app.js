@@ -41,6 +41,12 @@ import {
   PushcutScheduleSyncError,
   syncPushcutSchedule
 } from './pushcut-schedule-client.js';
+import {
+  PUSHCUT_X_ANNOUNCEMENT_INSTALL_URL,
+  PUSHCUT_X_ANNOUNCEMENT_SHORTCUT_NAME,
+  PUSHCUT_X_RECOVERY_INSTALL_URL,
+  PUSHCUT_X_RECOVERY_SHORTCUT_NAME
+} from './pushcut-shortcuts.js';
 import { preferredAnnouncementTransport } from './announcement-routing.js';
 import { ReceiverRuntime } from './receiver-runtime.js';
 import {
@@ -1329,23 +1335,22 @@ function renderAnnounce() {
     ${browserReady
       ? '<div class="callout"><strong>Browser Receiver is the live announcement path</strong><p>Remote voice commands, saved announcements, immediate weather warnings, and mixed schedules now go to the visible Browser Receiver. Suno/direct beds duck in the mixer; Apple Music and Spotify pause completely for speech and resume afterward.</p></div>'
       : pushcutSelectedReady
-        ? `<div class="callout"><strong>${pushcutStatus.operational ? 'Pushcut natural-voice receiver verified' : 'Pushcut natural-voice receiver configured'}</strong><p>Keep the receiver iPhone on <em>Ready For Requests</em>. Start any music bed directly in its native/background-capable player first. For each announcement, the signed v3 receipt confirms the Shortcut reached the end of Pause → Announcement 100% → Play Sound to completion → latest Music ${audibleMusicTarget()}% target → Play. It does not measure physical loudness or audibility.${pushcutStatus.operational ? '' : ' Run the receiver test below to verify the complete device path.'}</p><button type="button" data-action="pushcut-test" class="secondary">Run Verified Receiver Test</button></div>`
+        ? `<div class="callout"><strong>${pushcutStatus.operational ? 'Pushcut natural-voice receiver verified' : 'Pushcut natural-voice receiver configured'}</strong><p>Keep the receiver iPhone on <em>Ready For Requests</em>. Start any music bed directly in its native/background-capable player first. For each announcement, the signed Version X receipt confirms the Shortcut reached the end of Pause → Announcement 100% → Play Sound to completion → latest Music ${audibleMusicTarget()}% target → Play. It does not measure physical loudness or audibility.${pushcutStatus.operational ? '' : ' Run the receiver test below to verify the complete device path.'}</p><button type="button" data-action="pushcut-test" class="secondary">Run Verified Receiver Test</button></div>`
         : `<div class="callout warning"><strong>${operatingMode === 'browser' ? 'Browser Receiver is selected but offline' : operatingMode === 'pushcut' ? 'Pushcut Receiver is selected but unavailable' : 'No announcement receiver is online'}</strong><p>${operatingMode === 'browser' ? 'On the speaker iPhone, open Version X and tap Start Receiver. Commands stay disabled so they cannot be silently rerouted.' : 'Open Pushcut on the speaker iPhone and leave Ready For Requests visible, or return to Version X and start Browser Receiver.'}</p></div>`}
-    ${pushcutSelectedReady && !pushcutStatus.operational ? `<details class="savedEditor receiverShortcutSetup" open>
-      <summary>One-time Receiver Shortcut update required</summary>
+    ${pushcutSelectedReady ? `<div class="callout receiverShortcutSetup">
+      <strong>${pushcutStatus.operational ? 'Version X Receiver Shortcuts' : 'Install the two signed Version X Receiver Shortcuts'}</strong>
+      <p>These installers add <strong>${escapeHtml(PUSHCUT_X_ANNOUNCEMENT_SHORTCUT_NAME)}</strong> and <strong>${escapeHtml(PUSHCUT_X_RECOVERY_SHORTCUT_NAME)}</strong>. Their new names preserve your existing <strong>Poolside Pulse Announcement</strong>, <strong>Volume Up</strong>, and <strong>Volume Down</strong> shortcuts—do not delete or rename the originals.</p>
+      <div class="stackedActions shortcutInstallerActions">
+        <a class="shortcutLink loud" href="${escapeAttr(PUSHCUT_X_ANNOUNCEMENT_INSTALL_URL)}" download="${escapeAttr(`${PUSHCUT_X_ANNOUNCEMENT_SHORTCUT_NAME}.shortcut`)}">Download ${escapeHtml(PUSHCUT_X_ANNOUNCEMENT_SHORTCUT_NAME)}</a>
+        <a class="shortcutLink" href="${escapeAttr(PUSHCUT_X_RECOVERY_INSTALL_URL)}" download="${escapeAttr(`${PUSHCUT_X_RECOVERY_SHORTCUT_NAME}.shortcut`)}">Download ${escapeHtml(PUSHCUT_X_RECOVERY_SHORTCUT_NAME)}</a>
+      </div>
       <ol>
-        <li>Open Shortcuts → <strong>Poolside Pulse Announcement</strong>. Keep <strong>Get Dictionary from Shortcut Input</strong> first; this is the original Dictionary.</li>
-        <li>Get <code>audioUrl</code> from the original Dictionary → <strong>Get Contents of URL</strong> (GET) → <strong>Set Variable</strong> named <code>Announcement Audio</code>.</li>
-        <li>Add <strong>Pause on iPhone</strong> → <strong>Wait 1 second</strong>.</li>
-        <li>Get <code>announcementLevel</code> from the original Dictionary → <strong>Set Media Volume</strong> to that Dictionary Value. Version X sends <code>1</code>, meaning 100%.</li>
-        <li>Add <strong>Play Sound</strong> with Sound File set to <code>Announcement Audio</code>. Keep it before every restore action so Shortcuts waits for the sound to finish.</li>
-        <li>After <strong>Play Sound</strong> finishes: get <code>restoreUrl</code> from the original Dictionary → <strong>Get Contents of URL</strong> (GET) → <strong>Set Variable</strong> named <code>Restore Target</code>.</li>
-        <li>Get <code>musicLevel</code> from <code>Restore Target</code> → <strong>Set Media Volume</strong> to that value → <strong>Play on iPhone</strong>.</li>
-        <li>Get <code>receiptUrl</code> from the original Dictionary → <strong>Get Contents of URL</strong>. Expand it and set Method <strong>POST</strong>, Request Body <strong>JSON</strong>, with: <code>status</code>=<code>completed</code>, <code>receiverContract</code>=<code>poolside-pulse-x-audio-v3</code>, <code>volumeRestored</code>=true, <code>restoredMusicPercent</code>=<code>musicPercent</code> from <code>Restore Target</code>, and <code>musicResumed</code>=true.</li>
-        <li>Open <strong>Volume Down</strong> and replace its fixed 30% action: Get Dictionary from Shortcut Input and keep it as the original Dictionary. Get <code>recoveryUrl</code>. If it has a value, GET that URL, stop when its <code>shouldRecover</code> is false, and use the URL contents as the Recovery Dictionary; otherwise use the original Dictionary. Get <code>musicLevel</code> from the Recovery Dictionary → Set Media Volume. Get <code>resumeMusic</code>; only when true, run <strong>Play on iPhone</strong>. Manual slider requests send false; an incomplete timed announcement sends true.</li>
-        <li>Return to Pushcut → Server → <strong>Ready For Requests</strong>, then tap <strong>Run Verified Receiver Test</strong> here.</li>
+        <li>On the Receiver iPhone in Safari, tap each download button. After each one, tap Safari’s Downloads arrow → the <code>.shortcut</code> file → <strong>Add Shortcut</strong>.</li>
+        <li>In Pushcut, open <strong>Server → Server Actions → Shortcuts</strong>, tap the import/refresh button at the upper right, and leave <strong>Enable all actions</strong> on.</li>
+        <li>Return to <strong>Server → Ready For Requests</strong>, then tap <strong>Run Verified Receiver Test</strong> above.</li>
       </ol>
-    </details>` : ''}
+      <small>Keep both new shortcut names exactly as installed so Pushcut can match the Version X actions.</small>
+    </div>` : ''}
     ${renderAnnouncementSourceLibrary()}
     <section class="announcementComposer">
       ${voiceLevelControl()}

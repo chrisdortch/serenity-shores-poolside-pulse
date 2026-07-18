@@ -132,7 +132,7 @@ export default async function handler(req, res) {
     const patch = status === 'completed'
       ? {
           status,
-          providerStatus: 'receiver_completed_v3',
+          providerStatus: 'receiver_completed_v4',
           completedAt: now,
           volumeRestored: true,
           restoredMusicPercent: body.restoredMusicPercent,

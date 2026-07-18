@@ -1,11 +1,12 @@
 import {
   canonicalPushcutXMusicPercent,
+  PUSHCUT_X_DEFAULT_RECOVERY_SHORTCUT,
   PUSHCUT_X_RECEIVER_CONTRACT,
   pushcutXVolumeLevels
 } from './_pushcut-x.js';
 
 export const PUSHCUT_VOLUME_X_API_URL = 'https://api.pushcut.io/v1/execute';
-export const PUSHCUT_VOLUME_X_DEFAULT_SHORTCUT = 'Volume Down';
+export const PUSHCUT_VOLUME_X_DEFAULT_SHORTCUT = PUSHCUT_X_DEFAULT_RECOVERY_SHORTCUT;
 export const PUSHCUT_VOLUME_X_WAIT_SECONDS = 10;
 export const PUSHCUT_VOLUME_X_TIMEOUT_MS = 12_000;
 

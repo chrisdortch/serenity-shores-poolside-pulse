@@ -22,7 +22,11 @@ import {
   createPushcutXReceipt,
   readPushcutXReceipt
 } from '../api/_pushcut-receipts-x.js';
-import { PUSHCUT_X_RECEIVER_CONTRACT } from '../api/_pushcut-x.js';
+import {
+  PUSHCUT_X_DEFAULT_RECOVERY_SHORTCUT,
+  PUSHCUT_X_DEFAULT_SHORTCUT,
+  PUSHCUT_X_RECEIVER_CONTRACT
+} from '../api/_pushcut-x.js';
 import {
   createPushcutScheduleXHandler
 } from '../api/pushcut-schedule-x.js';
@@ -368,8 +372,9 @@ describe('Version X Pushcut schedule synchronization', { concurrency: false }, (
     }, options);
     assert.equal(first.scheduled, 1);
     assert.equal(scheduled.length, 2);
-    assert.equal(scheduled[0].shortcut, 'Volume Down');
-    assert.equal(scheduled[1].shortcut, 'Poolside Pulse Announcement');
+    assert.equal(PUSHCUT_X_RECEIVER_CONTRACT, 'poolside-pulse-x-audio-v4');
+    assert.equal(scheduled[0].shortcut, PUSHCUT_X_DEFAULT_RECOVERY_SHORTCUT);
+    assert.equal(scheduled[1].shortcut, PUSHCUT_X_DEFAULT_SHORTCUT);
     assert.equal(scheduled[1].input.voicePercent, 100);
     assert.equal(scheduled[1].input.resumeMusic, true);
     assert.equal(scheduled[0].input.receiverContract, PUSHCUT_X_RECEIVER_CONTRACT);

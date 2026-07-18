@@ -43,7 +43,7 @@ function resolvedTarget(receipt) {
 }
 
 /**
- * Called by Poolside Pulse Announcement immediately after Play Sound returns.
+ * Called by Poolside Pulse X Announcement immediately after Play Sound returns.
  * It freezes the latest shared slider M onto this receipt so the following
  * Set Media Volume and signed completion POST use one server-authorized value.
  */

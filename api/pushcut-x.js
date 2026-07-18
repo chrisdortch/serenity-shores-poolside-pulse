@@ -448,7 +448,7 @@ export default async function handler(req, res) {
     }
     // Pushcut may return 202 when a valid Automation Server request is queued
     // behind another Shortcut. Keep that event receipt-eligible: the queued
-    // Shortcut will prove the complete v3 sequence with its signed callback.
+    // Shortcut will prove the complete v4 sequence with its signed callback.
     // Declaring a 202 terminal here would make its one-time audio URL unusable
     // before the receiver ever gets a chance to run it.
     const publicReceipt = publicPushcutXReceipt(receipt, {

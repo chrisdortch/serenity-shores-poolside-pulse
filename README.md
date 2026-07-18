@@ -63,7 +63,7 @@ Also supported:
 - `OPENAI_API_KEY` for the required natural announcement voice. If generation is unavailable, Version X reports a failure and does not fall back to computer speech.
 - `PUSHCUT_API_KEY_X` for the Version X Receiver automation.
 - `PUSHCUT_PUBLIC_BASE_URL_X=https://poolside-pulse-x.vercel.app` so signed Receiver links always use the stable Version X alias.
-- `PUSHCUT_RECOVERY_SHORTCUT_X=Volume Down` when the recovery Shortcut uses a non-default name.
+- `PUSHCUT_ANNOUNCE_SHORTCUT_X` and `PUSHCUT_RECOVERY_SHORTCUT_X` only when deliberately overriding the default **Poolside Pulse X Announcement** and **Poolside Pulse X Recovery** names. Existing legacy names remain supported as overrides.
 - `XWEATHER_CLIENT_ID` and `XWEATHER_CLIENT_SECRET` as an optional weather supplement.
 
 Production requires durable KV, a dedicated session secret, and a valid access code. The receiver refuses to claim operational ownership without durable synchronization.
@@ -108,24 +108,22 @@ While Pushcut is foreground, Version X cannot choose or skip the native music so
 
 On an iPhone receiver, the dynamic Shortcut sets the shared iPhone media volume used by Apple Music, Spotify, or a background-capable Suno player. iOS does not report the resulting physical loudness of the iPhone or connected Bluetooth speaker back to Version X, so the app reports the requested target and signed Shortcut completion rather than claiming a physical measurement. Generated speech is required; Version X reports a failure instead of silently falling back to computer speech.
 
-### One-time Pushcut announcement Shortcut update
+### One-time signed Version X Shortcut installation
 
-On the Receiver iPhone, edit **Poolside Pulse Announcement**:
+Install these two signed shortcuts on the Receiver iPhone:
 
-1. Keep **Get Dictionary from Shortcut Input** first; this is the original Dictionary.
-2. Get `audioUrl` from the original Dictionary → **Get Contents of URL** (GET) → **Set Variable** named `Announcement Audio`.
-3. Add **Pause on iPhone** → **Wait 1 second**.
-4. Get `announcementLevel` from the original Dictionary → **Set Media Volume** to that Dictionary Value. Version X sends `1`, meaning 100%.
-5. Add **Play Sound** with Sound File set to `Announcement Audio`. Keep it before every restore action so Shortcuts waits for playback to finish.
-6. After **Play Sound** finishes: get `restoreUrl` from the original Dictionary → **Get Contents of URL** (GET) → **Set Variable** named `Restore Target`.
-7. Get `musicLevel` from `Restore Target` → **Set Media Volume** to that value → **Play on iPhone**.
-8. Get `receiptUrl` from the original Dictionary → **Get Contents of URL**. Set Method **POST**, Request Body **JSON**, and add `status`=`completed`, `receiverContract`=`poolside-pulse-x-audio-v3`, `volumeRestored`=true, `restoredMusicPercent`=`musicPercent` from `Restore Target`, and `musicResumed`=true.
-9. Open **Volume Down** and replace its fixed 30% action:
-   - **Get Dictionary from Shortcut Input** and keep it as the original Dictionary.
-   - Get `recoveryUrl`. If it has a value: **Get Contents of URL** (GET), get `shouldRecover`, and stop the Shortcut when it is false. Use those URL contents as the Recovery Dictionary. Otherwise use the original Dictionary as the Recovery Dictionary.
-   - Get `musicLevel` from the Recovery Dictionary → **Set Media Volume** to that value.
-   - Get `resumeMusic` from the Recovery Dictionary. If it is true, add **Play on iPhone** inside that If. Manual slider changes send false; an incomplete timed announcement sends true.
-10. Return to Pushcut → Server → **Ready For Requests**, then use **Run Verified Receiver Test** in Version X.
+1. [Install Poolside Pulse X Announcement](https://poolside-pulse-x.vercel.app/shortcuts/poolside-pulse-x-announcement.shortcut).
+2. [Install Poolside Pulse X Recovery](https://poolside-pulse-x.vercel.app/shortcuts/poolside-pulse-x-recovery.shortcut).
+
+The installers use the new names **Poolside Pulse X Announcement** and **Poolside Pulse X Recovery**. They do not overwrite **Poolside Pulse Announcement**, **Volume Up**, or **Volume Down**. Keep the originals and keep both new names exactly as installed.
+
+On the Receiver iPhone:
+
+1. On the Receiver iPhone in Safari, tap each installer link. After each one, tap Safari’s **Downloads** arrow → the `.shortcut` file → **Add Shortcut**.
+2. Open Pushcut → **Server → Server Actions → Shortcuts**.
+3. Tap the import/refresh button at the upper right and leave **Enable all actions** on.
+4. Return to **Server → Ready For Requests**.
+5. In Version X, open Announcements and use **Run Verified Receiver Test**.
 
 The signed receipt proves that the Shortcut reached its final step after playing the downloaded audio and running its recovery actions. It is not a microphone or physical-volume measurement.
 

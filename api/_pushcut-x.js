@@ -1,15 +1,20 @@
 import { randomUUID } from 'node:crypto';
 import { normalizeFiniteAudioReference } from './_finite-audio-x.js';
+import {
+  PUSHCUT_X_ANNOUNCEMENT_SHORTCUT_NAME,
+  PUSHCUT_X_RECEIVER_CONTRACT,
+  PUSHCUT_X_RECOVERY_SHORTCUT_NAME
+} from '../src/vx/pushcut-shortcuts.js';
 
 export const PUSHCUT_X_ACTIONS = Object.freeze(['announce', 'test']);
 export const PUSHCUT_X_API_URL = 'https://api.pushcut.io/v1/execute';
 export const PUSHCUT_X_DEVICES_URL = 'https://api.pushcut.io/v1/devices';
 export const PUSHCUT_X_UPSTREAM_TIMEOUT_MS = 12_000;
 export const PUSHCUT_X_HEALTH_TIMEOUT_MS = 5_000;
-export const PUSHCUT_X_DEFAULT_SHORTCUT = 'Poolside Pulse Announcement';
-export const PUSHCUT_X_DEFAULT_RECOVERY_SHORTCUT = 'Volume Down';
+export const PUSHCUT_X_DEFAULT_SHORTCUT = PUSHCUT_X_ANNOUNCEMENT_SHORTCUT_NAME;
+export const PUSHCUT_X_DEFAULT_RECOVERY_SHORTCUT = PUSHCUT_X_RECOVERY_SHORTCUT_NAME;
 export const PUSHCUT_X_TEST_WAIT_SECONDS = 10;
-export const PUSHCUT_X_RECEIVER_CONTRACT = 'poolside-pulse-x-audio-v3';
+export { PUSHCUT_X_RECEIVER_CONTRACT };
 
 // Pushcut recommends that server shortcuts finish within 60 seconds. Keeping
 // live speech below 500 characters leaves time for voice rendering, the pause,
@@ -639,7 +644,7 @@ export async function dispatchPushcutXCommand(command, {
     });
   } catch (error) {
     // A transport timeout does not prove the announcement Shortcut stopped.
-    // Do not enqueue a restore that could run before voice completion. The v3
+    // Do not enqueue a restore that could run before voice completion. The v4
     // receiver Shortcut owns the exact post-playback restore and proves it in
     // its signed receipt.
     const recovery = Object.freeze({ queued: false, acceptedAt: 0 });

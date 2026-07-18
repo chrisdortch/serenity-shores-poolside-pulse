@@ -1,0 +1,48 @@
+/*
+Poolside Pulse X Recovery
+
+Handles both immediate manager volume changes and signed recovery requests.
+Music resumes only when the Version X payload explicitly requests it.
+*/
+
+#include 'actions/device'
+#include 'actions/music'
+#include 'actions/web'
+
+#define name Poolside Pulse X Recovery
+#define color orange
+#define mac false
+
+action 'getvalueforkey' getFloatValue(
+    dictionary dictionary: 'WFInput',
+    text key: 'WFDictionaryKey'
+): float {
+    "WFGetDictionaryValueType": "Value"
+}
+
+action 'getvalueforkey' getBooleanValue(
+    dictionary dictionary: 'WFInput',
+    text key: 'WFDictionaryKey'
+): bool {
+    "WFGetDictionaryValueType": "Value"
+}
+
+@recoveryDictionary = getDictionary(ShortcutInput)
+const recoveryUrl = getValue(@recoveryDictionary, "recoveryUrl")
+
+if recoveryUrl {
+    const recoveryResponse = downloadURL("{recoveryUrl}")
+    @recoveryDictionary = getDictionary(recoveryResponse)
+    const shouldRecover = getBooleanValue(@recoveryDictionary, "shouldRecover")
+    if shouldRecover != true {
+        stop()
+    }
+}
+
+const musicLevel = getFloatValue(@recoveryDictionary, "musicLevel")
+setVolume(musicLevel)
+
+const resumeMusic = getBooleanValue(@recoveryDictionary, "resumeMusic")
+if resumeMusic == true {
+    play()
+}
