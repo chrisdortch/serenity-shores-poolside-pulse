@@ -118,11 +118,11 @@ export async function sendPushcutAnnouncement({
 } = {}) {
   if (typeof fetchImpl !== 'function') throw new Error('Announcement service is unavailable in this browser.');
   const stableEventId = validEventId(eventId || newEventId());
-  const normalizedVoicePercent = clampPercent(voicePercent, 100);
+  // Version X deliberately has no quiet-announcement mode. Keep accepting the
+  // legacy argument so older callers do not break, but never forward anything
+  // other than the fixed 100% announcement target.
+  const normalizedVoicePercent = 100;
   const normalizedMusicPercent = clampPercent(musicPercent, 30);
-  if (normalizedVoicePercent <= normalizedMusicPercent) {
-    throw new Error('For Pushcut announcements, Voice volume must be higher than Music volume. Lower Music or raise Voice, then try again.');
-  }
   const payload = {
     version: 'x',
     eventId: stableEventId,
@@ -245,14 +245,17 @@ export async function waitForPushcutAnnouncementCompletion(eventId, {
 }
 
 /**
- * Runs the receiver's existing Volume Down Shortcut once. A completed result
- * confirms Shortcut completion only; it is not a physical-volume measurement.
+ * Applies the current music-only slider target through the receiver's dynamic
+ * recovery Shortcut. A completed result confirms Shortcut completion only; it
+ * is not a physical-volume measurement.
  */
-export async function applyPushcutMusic30Now({
+export async function applyPushcutMusicVolume({
+  musicPercent = 30,
   fetchImpl = globalThis.fetch,
   timeoutMs = REQUEST_TIMEOUT_MS
 } = {}) {
   if (typeof fetchImpl !== 'function') throw new Error('Pushcut volume control is unavailable in this browser.');
+  const target = clampPercent(musicPercent, 30);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), Math.max(1_000, Number(timeoutMs) || REQUEST_TIMEOUT_MS));
   try {
@@ -261,7 +264,7 @@ export async function applyPushcutMusic30Now({
       credentials: 'same-origin',
       cache: 'no-store',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ version: 'x', musicPercent: 30 }),
+      body: JSON.stringify({ version: 'x', musicPercent: target }),
       signal: controller.signal
     });
     const data = await jsonResponse(response);
@@ -269,7 +272,7 @@ export async function applyPushcutMusic30Now({
       ...data,
       accepted: data.accepted === true,
       completed: data.completed === true,
-      musicPercent: 30
+      musicPercent: clampPercent(data.musicPercent, target)
     };
   } catch (error) {
     if (error?.status) throw error;
@@ -281,4 +284,13 @@ export async function applyPushcutMusic30Now({
   } finally {
     clearTimeout(timer);
   }
+}
+
+// Compatibility export for tests and old cached modules. New Version X UI
+// always calls applyPushcutMusicVolume with the persisted slider target.
+export async function applyPushcutMusic30Now(options = {}) {
+  const musicPercent = options.musicPercent === null || options.musicPercent === undefined
+    ? 30
+    : options.musicPercent;
+  return await applyPushcutMusicVolume({ ...options, musicPercent });
 }

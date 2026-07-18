@@ -78,7 +78,7 @@ function harness({ voiceLevel = 37 } = {}) {
 }
 
 describe('Version X announcement-volume delivery', { concurrency: false }, () => {
-  test('captures the shared voice level when the job is queued', async () => {
+  test('ignores stale shared voice levels and queues every announcement at 100%', async () => {
     const { runtime, store, calls } = harness({ voiceLevel: 37 });
     const started = Promise.withResolvers();
     const release = Promise.withResolvers();
@@ -95,9 +95,9 @@ describe('Version X announcement-volume delivery', { concurrency: false }, () =>
     await announcement;
     await new Promise(resolve => setTimeout(resolve, 0));
 
-    assert.deepEqual(calls, ['duck', 'voice-37', 'blob-at-37', 'voice-100', 'restore-music']);
+    assert.deepEqual(calls, ['duck', 'voice-100', 'blob-at-100', 'voice-100', 'restore-music']);
     assert.equal(store.state.activityLog[0].voiceOutput, 'ai-mixer');
-    assert.match(store.state.activityLog[0].detail, /Version X mixer voice 37%/i);
+    assert.match(store.state.activityLog[0].detail, /Version X mixer voice 100%/i);
   });
 
   test('records generated speech as mixer-controlled output', async () => {
@@ -107,9 +107,9 @@ describe('Version X announcement-volume delivery', { concurrency: false }, () =>
     await runtime.announce('Generated pool update');
     await new Promise(resolve => setTimeout(resolve, 0));
 
-    assert.equal(calls.includes('blob-at-64'), true);
+    assert.equal(calls.includes('blob-at-100'), true);
     assert.equal(store.state.activityLog[0].voiceOutput, 'ai-mixer');
-    assert.match(store.state.activityLog[0].detail, /Version X mixer voice 64%/i);
+    assert.match(store.state.activityLog[0].detail, /Version X mixer voice 100%/i);
   });
 
   test('plays a finite announcement clip through the voice mixer without synthesizing its text', async () => {
@@ -135,10 +135,10 @@ describe('Version X announcement-volume delivery', { concurrency: false }, () =>
     assert.equal(requested.announcementProvider, 'direct');
     assert.equal(requested.announcementAudioUrl, 'https://audio.example.test/pool-update.mp3');
     assert.equal(requested.announcementDurationSeconds, 12);
-    assert.equal(calls.includes('blob-at-72'), true);
+    assert.equal(calls.includes('blob-at-100'), true);
     assert.equal(calls.some(call => call.startsWith('speech-at-')), false);
     assert.equal(store.state.activityLog[0].voiceOutput, 'finite-audio-mixer');
-    assert.match(store.state.activityLog[0].detail, /finite clip 72%/i);
+    assert.match(store.state.activityLog[0].detail, /finite clip 100%/i);
   });
 
   test('passes a live command volume through event dispatch', async () => {

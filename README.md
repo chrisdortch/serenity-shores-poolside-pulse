@@ -20,9 +20,9 @@ No other Serenity Shores repository, Vercel project, database namespace, domain,
 - Plays Spotify URLs through an isolated Version X PKCE receiver after the exact Version X redirect URI is registered.
 - Generates natural resort-style announcement audio on the server and delivers it to the Receiver through one-time signed URLs.
 - Supports short, downloadable Suno/direct announcement clips in Browser and Pushcut modes only when their actual media duration is no longer than 45 seconds.
-- On the two-iPhone Pushcut path, runs the existing Volume Up and Volume Down Shortcuts for a fixed 100% announcement / 30% music sequence and records a signed final-Shortcut receipt.
-- Provides independent 0–100 global Suno/direct-music and spoken-announcement controls.
-- Lets every scheduled Suno/direct music or announcement item inherit its global level or use a custom 0–100 level.
+- On the two-iPhone Pushcut path, uses a dynamic Shortcut contract: music follows the shared 0–100 slider, reaches 0% during speech, every announcement plays at 100%, and the same music is restored to the slider target only after playback completes.
+- Provides one 0–100 music control. Announcement volume is fixed at 100% for live, saved, weather, safety, and scheduled speech.
+- Lets scheduled music inherit the shared music level or use a custom 0–100 level. Scheduled announcements are always 100%.
 - Fully silences Suno/direct music during speech, then continues the same track.
 - Fades and pauses Apple Music before Suno or speech. Apple Music and the interruption do not overlap. It resumes only after the interruption finishes and only if it was playing beforehand.
 - With the Mac receiver app, sets Music.app volume from 0–100 and reads the value back after every manager or schedule change. The app confirms Music.app is silent before spoken audio and restores the requested music target afterward.
@@ -60,7 +60,7 @@ APPLE_MUSIC_ALLOWED_ORIGINS=https://poolside-pulse-x.vercel.app
 
 Also supported:
 
-- `OPENAI_API_KEY` for the natural announcement voice; bounded device speech is the fallback.
+- `OPENAI_API_KEY` for the required natural announcement voice. If generation is unavailable, Version X reports a failure and does not fall back to computer speech.
 - `PUSHCUT_API_KEY_X` for the Version X Receiver automation.
 - `PUSHCUT_PUBLIC_BASE_URL_X=https://poolside-pulse-x.vercel.app` so signed Receiver links always use the stable Version X alias.
 - `PUSHCUT_RECOVERY_SHORTCUT_X=Volume Down` when the recovery Shortcut uses a non-default name.
@@ -75,7 +75,7 @@ Use the dedicated Mac receiver for Apple Music, Suno/direct audio, spoken announ
 1. Build once with `native/PoolsidePulseXMusicReceiver/scripts/build-app.sh`, then open `native/PoolsidePulseXMusicReceiver/dist/Poolside Pulse X Music Receiver.app`.
 2. In macOS **Control Center → Sound**, choose the pool speaker as the Mac system output. Do not select a Music.app-only AirPlay destination because Music.app and announcement audio must share the same output.
 3. In the receiver app, enter `7900`, tap **Start Receiver**, then **Allow Music.app Control / Connect Music.app Receiver**. Click **Allow** on the one-time macOS Automation prompt. Music.app must be signed in to the active Apple Music subscription.
-4. On any command device, open [Poolside Pulse X](https://poolside-pulse-x.vercel.app/#command), enter `7900`, and choose **Remote Control**. The music and voice sliders apply to live commands and schedules.
+4. On any command device, open [Poolside Pulse X](https://poolside-pulse-x.vercel.app/#command), enter `7900`, and choose **Remote Control**. The music slider sets the shared music target; all announcements are fixed at 100%.
 
 Leave the Mac receiver app open. It prevents idle system sleep while running and silences Music.app if the window closes, the web receiver crashes, its page fails, or the app quits. Closing the last receiver window quits the app.
 
@@ -98,27 +98,34 @@ The Receiver page shows Apple Music and Spotify setup separately; Spotify login 
 
 ### B. Pushcut announcement mode
 
-Use this for dependable remote natural-voice or short finite-audio announcements over a background-capable music session at fixed 30% music / 100% announcement volume.
+Use this for dependable remote natural-voice or short finite-audio announcements over a background-capable music session. Music follows the Remote slider; announcements are fixed at 100%.
 
 1. **Receiver iPhone:** use **Stop Receiver & Prepare Pushcut**. Version X first re-arms timed Pushcut announcements; it does not expose the Pushcut deep link while Browser Receiver still owns the schedule. Start the music directly in the Apple Music, Spotify, or background-capable Suno app—not in Version X.
 2. Return to **Pushcut → Server → Ready For Requests** and leave Pushcut foreground.
-3. **Command iPhone:** open Version X in **Remote Control**, choose **Apply Music 30% Now**, then use **Speak Now**, a saved announcement, or a synced timed announcement.
+3. **Command iPhone:** open Version X in **Remote Control**, move the Music slider to the desired target and choose **Apply Music _M_% Now**, then use **Speak Now**, a saved announcement, or a synced timed announcement.
 
-While Pushcut is foreground, Version X cannot start, stop, or change the native music bed from the Command phone. The announcement Shortcut pauses the current media session, applies 100%, plays the downloaded natural voice or finite clip, restores 30%, then resumes that session.
+While Pushcut is foreground, Version X cannot choose or skip the native music source from the Command phone. It can set the iPhone media output to the music slider target. The announcement Shortcut pauses the current media session, applies 100%, plays the downloaded natural voice or finite clip to completion, fetches and restores the latest shared music target, then resumes that session.
 
-On an iPhone receiver, Apple Music playback level is set with the receiver iPhone or connected speaker's physical volume controls. MusicKit for the web cannot set or verify that physical output level, so Version X does not claim that Apple Music live or scheduled percentages were applied. Suno/direct audio and generated announcement audio remain adjustable from 0–100 in Version X. If generated speech is unavailable and iPhone device speech is used as a fallback, its percentage is a requested target rather than verified speaker loudness.
+On an iPhone receiver, the dynamic Shortcut sets the shared iPhone media volume used by Apple Music, Spotify, or a background-capable Suno player. iOS does not report the resulting physical loudness of the iPhone or connected Bluetooth speaker back to Version X, so the app reports the requested target and signed Shortcut completion rather than claiming a physical measurement. Generated speech is required; Version X reports a failure instead of silently falling back to computer speech.
 
 ### One-time Pushcut announcement Shortcut update
 
 On the Receiver iPhone, edit **Poolside Pulse Announcement**:
 
-1. Keep **Get Dictionary from Input**.
-2. Change the next key from `text` to `audioUrl`.
-3. Add **Get Contents of URL** using that Dictionary Value.
-4. Delete **Make Spoken Audio** and set **Play Sound** to the new Contents of URL.
-5. Keep this exact order: Pause → Wait 1 second → Volume Up → Play Sound → Volume Down → Play.
-6. At the bottom, add **Get Value for `receiptUrl`** from the original Dictionary, followed by **Get Contents of URL** using that value.
-7. Return to Pushcut → Server → **Ready For Requests**, then use **Run Verified Receiver Test** in Version X.
+1. Keep **Get Dictionary from Shortcut Input** first; this is the original Dictionary.
+2. Get `audioUrl` from the original Dictionary → **Get Contents of URL** (GET) → **Set Variable** named `Announcement Audio`.
+3. Add **Pause on iPhone** → **Wait 1 second**.
+4. Get `announcementLevel` from the original Dictionary → **Set Media Volume** to that Dictionary Value. Version X sends `1`, meaning 100%.
+5. Add **Play Sound** with Sound File set to `Announcement Audio`. Keep it before every restore action so Shortcuts waits for playback to finish.
+6. After **Play Sound** finishes: get `restoreUrl` from the original Dictionary → **Get Contents of URL** (GET) → **Set Variable** named `Restore Target`.
+7. Get `musicLevel` from `Restore Target` → **Set Media Volume** to that value → **Play on iPhone**.
+8. Get `receiptUrl` from the original Dictionary → **Get Contents of URL**. Set Method **POST**, Request Body **JSON**, and add `status`=`completed`, `receiverContract`=`poolside-pulse-x-audio-v3`, `volumeRestored`=true, `restoredMusicPercent`=`musicPercent` from `Restore Target`, and `musicResumed`=true.
+9. Open **Volume Down** and replace its fixed 30% action:
+   - **Get Dictionary from Shortcut Input** and keep it as the original Dictionary.
+   - Get `recoveryUrl`. If it has a value: **Get Contents of URL** (GET), get `shouldRecover`, and stop the Shortcut when it is false. Use those URL contents as the Recovery Dictionary. Otherwise use the original Dictionary as the Recovery Dictionary.
+   - Get `musicLevel` from the Recovery Dictionary → **Set Media Volume** to that value.
+   - Get `resumeMusic` from the Recovery Dictionary. If it is true, add **Play on iPhone** inside that If. Manual slider changes send false; an incomplete timed announcement sends true.
+10. Return to Pushcut → Server → **Ready For Requests**, then use **Run Verified Receiver Test** in Version X.
 
 The signed receipt proves that the Shortcut reached its final step after playing the downloaded audio and running its recovery actions. It is not a microphone or physical-volume measurement.
 

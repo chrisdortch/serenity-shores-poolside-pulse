@@ -8,6 +8,7 @@ import {
   PUSHCUT_X_API_URL,
   PUSHCUT_X_DEFAULT_SHORTCUT,
   PUSHCUT_X_DEVICES_URL,
+  PUSHCUT_X_RECEIVER_CONTRACT,
   PushcutXError,
   dispatchPushcutXCommand,
   inspectPushcutXServerHealth,
@@ -21,7 +22,9 @@ import {
   PUSHCUT_X_RECEIVER_BUSY_LEASE_MS,
   PushcutXReceiptError,
   readPushcutXReceipt,
-  updatePushcutXReceipt
+  resolvePushcutXRestoreTarget,
+  updatePushcutXReceipt,
+  verifiedPushcutXCompletion
 } from '../api/_pushcut-receipts-x.js';
 import {
   FiniteAudioXError,
@@ -41,7 +44,8 @@ import {
 } from '../api/_tts.js';
 import pushcutAudioXHandler, { createPushcutAudioXHandler } from '../api/pushcut-audio-x.js';
 import pushcutReceiptXHandler from '../api/pushcut-receipt-x.js';
-import pushcutXHandler from '../api/pushcut-x.js';
+import pushcutRestoreXHandler, { createPushcutRestoreXHandler } from '../api/pushcut-restore-x.js';
+import pushcutXHandler, { resolveCanonicalPushcutXCommand } from '../api/pushcut-x.js';
 import {
   PushcutDispatchUncertainError,
   getPushcutAnnouncementStatus,
@@ -124,6 +128,28 @@ function xCookie() {
   return `poolside_vx_session=${encodeURIComponent(token)}`;
 }
 
+function completedReceiptBody(eventId, musicPercent = 30) {
+  return {
+    eventId,
+    status: 'completed',
+    receiverContract: PUSHCUT_X_RECEIVER_CONTRACT,
+    volumeRestored: true,
+    restoredMusicPercent: musicPercent,
+    musicResumed: true
+  };
+}
+
+async function bindRestoreTarget(eventId, musicPercent = 30) {
+  const receipt = await readPushcutXReceipt(eventId);
+  const resolvedAt = Math.max(
+    Date.now(),
+    Number(receipt?.audioFetchedAt || 0)
+  );
+  return await resolvePushcutXRestoreTarget(eventId, musicPercent, {
+    now: () => resolvedAt
+  });
+}
+
 function jsonFetchResponse(status, body) {
   return {
     ok: status >= 200 && status < 300,
@@ -161,6 +187,7 @@ beforeEach(() => {
   globalThis.__POOL_SIDE_API_RATE_LIMITS__ = new Map();
   globalThis.__POOL_SIDE_X_PUSHCUT_RECEIPTS__ = new Map();
   globalThis.__POOL_SIDE_X_PUSHCUT_RECEIPT_LOCKS__ = new Map();
+  globalThis.__POOL_SIDE_X_MEMORY_STATES__ = Object.create(null);
 });
 
 after(() => {
@@ -180,7 +207,7 @@ describe('Version X Pushcut command validation', { concurrency: false }, () => {
       text: 'Please clear the pool deck.',
       label: 'Pool Deck',
       safety: true,
-      voicePercent: 92,
+      voicePercent: 100,
       musicPercent: 35
     }, { now: () => 1_234 });
 
@@ -199,13 +226,13 @@ describe('Version X Pushcut command validation', { concurrency: false }, () => {
       text: 'Please clear the pool deck.',
       label: 'Pool Deck',
       safety: true,
-      voicePercent: 92,
+      voicePercent: 100,
       musicPercent: 35,
       resumeMusic: true
     });
   });
 
-  test('rejects unknown fields, long speech, and music that is not quieter than voice', () => {
+  test('rejects unknown fields and long speech while allowing a 100% music target', () => {
     const base = {
       version: 'x',
       eventId: 'pushcut-live-event-0002',
@@ -218,7 +245,39 @@ describe('Version X Pushcut command validation', { concurrency: false }, () => {
     };
     assert.throws(() => normalizePushcutXCommand({ ...base, secret: 'never-forward' }), PushcutXError);
     assert.throws(() => normalizePushcutXCommand({ ...base, text: 'a'.repeat(501) }), PushcutXError);
-    assert.throws(() => normalizePushcutXCommand({ ...base, voicePercent: 30, musicPercent: 30 }), PushcutXError);
+    const fullMusic = normalizePushcutXCommand({ ...base, voicePercent: 30, musicPercent: 100 });
+    assert.equal(fullMusic.voicePercent, 100);
+    assert.equal(fullMusic.musicPercent, 100);
+    const legacyNoResume = normalizePushcutXCommand({
+      action: 'announce',
+      commandId: 'pushcut-legacy-no-resume-0001',
+      text: 'A legacy client cannot suppress music resume.',
+      announcementVolume: 100,
+      musicVolume: 30,
+      resumeMusic: false
+    });
+    assert.equal(legacyNoResume.resumeMusic, true);
+  });
+
+  test('replaces stale Remote levels with the canonical Version X slider value', async () => {
+    const command = await resolveCanonicalPushcutXCommand({
+      version: 'x',
+      eventId: 'pushcut-canonical-level-0001',
+      source: 'live',
+      text: 'Canonical level test.',
+      label: 'Canonical',
+      safety: false,
+      voicePercent: 12,
+      musicPercent: 7
+    }, {
+      stateReader: async () => ({
+        state: { config: { musicLevel: 100 } },
+        revision: 44,
+        durable: true
+      })
+    });
+    assert.equal(command.voicePercent, 100);
+    assert.equal(command.musicPercent, 100);
   });
 
   test('accepts only finite direct files or exact Suno song/share references', () => {
@@ -289,19 +348,19 @@ describe('Version X Pushcut command validation', { concurrency: false }, () => {
 });
 
 describe('Version X Pushcut provider transport', { concurrency: false }, () => {
-  test('waits for the receiver test and queues a sequential volume recovery', async () => {
+  test('waits for the receiver test without dispatching an early restore', async () => {
     const calls = [];
     const command = normalizePushcutXCommand({ action: 'test', commandId: 'pushcut-provider-test-0001' }, { now: () => 9_876 });
     const result = await dispatchPushcutXCommand(command, {
       env: { PUSHCUT_API_KEY_X: 'pushcut-test-secret' },
       fetchImpl: async (url, options) => {
         calls.push({ url: String(url), options });
-        return { status: calls.length === 1 ? 200 : 202 };
+        return { status: 200 };
       },
       now: () => 10_000
     });
 
-    assert.equal(calls.length, 2);
+    assert.equal(calls.length, 1);
     const sentUrl = new URL(calls[0].url);
     assert.equal(`${sentUrl.origin}${sentUrl.pathname}`, PUSHCUT_X_API_URL);
     assert.equal(sentUrl.searchParams.get('shortcut'), PUSHCUT_X_DEFAULT_SHORTCUT);
@@ -310,14 +369,8 @@ describe('Version X Pushcut provider transport', { concurrency: false }, () => {
     const body = JSON.parse(calls[0].options.body);
     assert.equal(Object.hasOwn(body, 'shortcut'), false);
     assert.equal(body.input.commandId, 'pushcut-provider-test-0001');
-    const recoveryUrl = new URL(calls[1].url);
-    assert.equal(recoveryUrl.searchParams.get('shortcut'), 'Volume Down');
-    assert.equal(recoveryUrl.searchParams.get('timeout'), 'nowait');
-    const recoveryBody = JSON.parse(calls[1].options.body);
-    assert.equal(Object.hasOwn(recoveryBody, 'shortcut'), false);
-    assert.equal(recoveryBody.input.action, 'recover-volume');
     assert.equal(result.completed, true);
-    assert.equal(result.recoveryQueued, true);
+    assert.equal(result.recoveryQueued, false);
     assert.equal(JSON.stringify(result).includes('pushcut-test-secret'), false);
   });
 
@@ -390,6 +443,37 @@ describe('Version X Pushcut provider transport', { concurrency: false }, () => {
 });
 
 describe('Version X signed natural-audio delivery receipts', { concurrency: false }, () => {
+  test('never accepts a legacy v1 completion as current receiver verification', () => {
+    const completion = {
+      status: 'completed',
+      receiverContract: 'poolside-pulse-x-audio-v1',
+      voicePercent: 100,
+      musicPercent: 30,
+      resumeMusic: true,
+      audioFetchedAt: 10_000,
+      restoreTargetMusicPercent: 30,
+      restoreTargetResolvedAt: 11_000,
+      volumeRestored: true,
+      restoredMusicPercent: 30,
+      musicResumed: true
+    };
+    assert.equal(verifiedPushcutXCompletion(completion), false);
+    assert.equal(verifiedPushcutXCompletion({
+      ...completion,
+      receiverContract: PUSHCUT_X_RECEIVER_CONTRACT
+    }), true);
+    assert.equal(verifiedPushcutXCompletion({
+      ...completion,
+      receiverContract: 'poolside-pulse-x-audio-v2'
+    }), false);
+    assert.equal(verifiedPushcutXCompletion({
+      ...completion,
+      receiverContract: PUSHCUT_X_RECEIVER_CONTRACT,
+      resumeMusic: false,
+      musicResumed: false
+    }), false);
+  });
+
   test('capabilities reject tampering and expiry', () => {
     const now = 1_700_000_000_000;
     const capability = createPushcutXCapability('pushcut-capability-event-0001', 'receipt', {
@@ -461,7 +545,7 @@ describe('Version X signed natural-audio delivery receipts', { concurrency: fals
     assert.equal(reclaimed.receipt.dispatchAttempt, 2);
   });
 
-  test('shares the receiver busy owner with scheduled audio and releases it only on a terminal receipt', async () => {
+  test('queues dispatches freely but serializes scheduled and live audio fetches', async () => {
     const scheduledEventId = 'pushcut-scheduled-busy-0001';
     const liveEventId = 'pushcut-live-after-scheduled-0001';
     await createPushcutXReceipt({
@@ -480,28 +564,34 @@ describe('Version X signed natural-audio delivery receipts', { concurrency: fals
     const scheduled = await claimPushcutXAudioGeneration(scheduledEventId, {
       now: () => 20_000
     });
-    const blocked = await claimPushcutXDispatch(liveEventId, {
+    const queued = await claimPushcutXDispatch(liveEventId, {
       now: () => 20_001
     });
     assert.equal(scheduled.claimed, true);
-    assert.equal(blocked.claimed, false);
-    assert.equal(blocked.busy, true);
+    assert.equal(queued.claimed, true);
+    assert.equal(queued.busy, false);
+    const blockedAudio = await claimPushcutXAudioGeneration(liveEventId, {
+      now: () => 20_002
+    });
+    assert.equal(blockedAudio.claimed, false);
+    assert.equal(blockedAudio.busy, true);
 
     await updatePushcutXReceipt(scheduledEventId, {
       status: 'completed',
       completedAt: 21_000,
       providerStatus: 'receiver_completed',
       volumeRestored: true,
+      restoredMusicPercent: 30,
       musicResumed: true
     }, { now: () => 21_000 });
-    const released = await claimPushcutXDispatch(liveEventId, {
+    const released = await claimPushcutXAudioGeneration(liveEventId, {
       now: () => 21_001
     });
     assert.equal(released.claimed, true);
     assert.equal(released.busy, false);
   });
 
-  test('expires a lost receiver owner after the bounded fail-safe lease', async () => {
+  test('expires a lost audio owner after the bounded fail-safe lease', async () => {
     const lostEventId = 'pushcut-lost-busy-owner-0001';
     const nextEventId = 'pushcut-after-busy-expiry-0001';
     for (const eventId of [lostEventId, nextEventId]) {
@@ -510,13 +600,16 @@ describe('Version X signed natural-audio delivery receipts', { concurrency: fals
         commandId: eventId
       }), { now: () => 10_000 });
     }
-    assert.equal((await claimPushcutXDispatch(lostEventId, {
+    assert.equal((await claimPushcutXAudioGeneration(lostEventId, {
       now: () => 10_000
     })).claimed, true);
-    const beforeExpiry = await claimPushcutXDispatch(nextEventId, {
+    assert.equal((await claimPushcutXDispatch(nextEventId, {
+      now: () => 10_001
+    })).claimed, true);
+    const beforeExpiry = await claimPushcutXAudioGeneration(nextEventId, {
       now: () => 10_000 + PUSHCUT_X_RECEIVER_BUSY_LEASE_MS - 1
     });
-    const afterExpiry = await claimPushcutXDispatch(nextEventId, {
+    const afterExpiry = await claimPushcutXAudioGeneration(nextEventId, {
       now: () => 10_000 + PUSHCUT_X_RECEIVER_BUSY_LEASE_MS
     });
     assert.equal(beforeExpiry.busy, true);
@@ -702,7 +795,7 @@ describe('Version X signed natural-audio delivery receipts', { concurrency: fals
     assert.equal(providerCalls, 1);
   });
 
-  test('plain signed GET marks completion once and the manager status sees it', async () => {
+  test('rejects legacy GET completion and verifies one exact v3 POST receipt', async () => {
     const eventId = 'pushcut-receipt-event-0001';
     const command = normalizePushcutXCommand({
       action: 'announce',
@@ -723,9 +816,16 @@ describe('Version X signed natural-audio delivery receipts', { concurrency: fals
     );
     assert.ok(signed);
 
-    const premature = await invoke(
+    const legacyGet = await invoke(
       pushcutReceiptXHandler,
       request('GET', signed.url)
+    );
+    assert.equal(legacyGet.statusCode, 405);
+    assert.equal((await readPushcutXReceipt(eventId)).status, 'accepted');
+
+    const premature = await invoke(
+      pushcutReceiptXHandler,
+      request('POST', signed.url, { body: completedReceiptBody(eventId) })
     );
     assert.equal(premature.statusCode, 409);
     assert.equal((await readPushcutXReceipt(eventId)).status, 'accepted');
@@ -737,19 +837,33 @@ describe('Version X signed natural-audio delivery receipts', { concurrency: fals
       audioFetchedAt: 1_700_000_001_500,
       audioContentType: 'audio/wav'
     });
+    await bindRestoreTarget(eventId, 30);
+    const {
+      status: _missingStatus,
+      ...missingStatusBody
+    } = completedReceiptBody(eventId);
+    const missingStatus = await invoke(
+      pushcutReceiptXHandler,
+      request('POST', signed.url, { body: missingStatusBody })
+    );
+    assert.equal(missingStatus.statusCode, 400);
+    assert.equal((await readPushcutXReceipt(eventId)).status, 'started');
+
     const first = await invoke(
       pushcutReceiptXHandler,
-      request('GET', signed.url)
+      request('POST', signed.url, { body: completedReceiptBody(eventId) })
     );
     assert.equal(first.statusCode, 200);
     assert.equal(first.json().receipt.completed, true);
     assert.equal(first.json().receipt.volumeRestored, true);
+    assert.equal(first.json().receipt.restoredMusicPercent, 30);
     assert.equal(first.json().receipt.musicResumed, true);
+    assert.equal(first.json().receipt.sequenceCompleted, true);
     const completedAt = first.json().receipt.completedAt;
 
     const replay = await invoke(
       pushcutReceiptXHandler,
-      request('GET', signed.url)
+      request('POST', signed.url, { body: completedReceiptBody(eventId) })
     );
     assert.equal(replay.statusCode, 200);
     assert.equal(replay.json().receipt.completedAt, completedAt);
@@ -766,9 +880,219 @@ describe('Version X signed natural-audio delivery receipts', { concurrency: fals
     tampered.searchParams.set('sig', `${tampered.searchParams.get('sig')}x`);
     const denied = await invoke(
       pushcutReceiptXHandler,
-      request('GET', tampered.toString())
+      request('POST', tampered.toString(), { body: completedReceiptBody(eventId) })
     );
     assert.equal(denied.statusCode, 403);
+  });
+
+  test('restores and verifies the latest canonical M after speech, not dispatch-time M', async () => {
+    const baseNow = Date.now();
+    const eventId = 'pushcut-latest-restore-target-0001';
+    await createPushcutXReceipt(normalizePushcutXCommand({
+      action: 'announce',
+      commandId: eventId,
+      text: 'Restore the manager target that is current after this audio.',
+      announcementVolume: 100,
+      musicVolume: 30
+    }), { now: () => baseNow });
+    await updatePushcutXReceipt(eventId, {
+      status: 'started',
+      providerStatus: 'natural_audio_ready',
+      startedAt: baseNow + 50,
+      audioFetchedAt: baseNow + 100,
+      audioContentType: 'audio/mpeg'
+    }, { now: () => baseNow + 100 });
+    const restoreUrl = createSignedPushcutXUrl(
+      request('GET', '/'),
+      '/api/pushcut-restore-x',
+      eventId,
+      'restore',
+      { now: () => baseNow + 100 }
+    );
+    const receiptUrl = createSignedPushcutXUrl(
+      request('GET', '/'),
+      '/api/pushcut-receipt-x',
+      eventId,
+      'receipt',
+      { now: () => baseNow + 100 }
+    );
+    let canonicalMusicPercent = 67;
+    const restoreHandler = createPushcutRestoreXHandler({
+      stateReader: async () => ({
+        state: { config: { musicLevel: canonicalMusicPercent } }
+      }),
+      // Model harmless clock skew between the audio-serving and restore
+      // serverless instances.
+      now: () => baseNow + 75
+    });
+
+    const latestTarget = await invoke(
+      restoreHandler,
+      request('GET', restoreUrl.url)
+    );
+    assert.equal(latestTarget.statusCode, 200);
+    assert.equal(latestTarget.json().musicPercent, 67);
+    assert.equal(latestTarget.json().musicLevel, 0.67);
+    assert.equal(latestTarget.json().resumeMusic, true);
+    const resolvedReceipt = await readPushcutXReceipt(eventId);
+    assert.equal(resolvedReceipt.restoreTargetResolvedAt, baseNow + 100);
+    assert.equal(resolvedReceipt.updatedAt, baseNow + 100);
+
+    canonicalMusicPercent = 80;
+    const replayedTarget = await invoke(
+      restoreHandler,
+      request('GET', restoreUrl.url)
+    );
+    assert.equal(replayedTarget.statusCode, 200);
+    assert.equal(replayedTarget.json().musicPercent, 67);
+
+    const staleDispatchTarget = await invoke(
+      pushcutReceiptXHandler,
+      request('POST', receiptUrl.url, {
+        body: completedReceiptBody(eventId, 30)
+      })
+    );
+    assert.equal(staleDispatchTarget.statusCode, 409);
+
+    const latestCompletion = await invoke(
+      pushcutReceiptXHandler,
+      request('POST', receiptUrl.url, {
+        body: completedReceiptBody(eventId, 67)
+      })
+    );
+    assert.equal(latestCompletion.statusCode, 200);
+    assert.equal(latestCompletion.json().receipt.dispatchedMusicPercent, 30);
+    assert.equal(latestCompletion.json().receipt.expectedMusicPercent, 67);
+    assert.equal(latestCompletion.json().receipt.restoredMusicPercent, 67);
+    assert.equal(latestCompletion.json().receipt.sequenceCompleted, true);
+  });
+
+  test('restore lookup rejects pre-audio, wrong-purpose, and expired capabilities', async () => {
+    const baseNow = Date.now();
+    const eventId = 'pushcut-restore-capability-guards-0001';
+    await createPushcutXReceipt(normalizePushcutXCommand({
+      action: 'announce',
+      commandId: eventId,
+      text: 'Restore capability guard test.'
+    }), { now: () => baseNow });
+    const restoreUrl = createSignedPushcutXUrl(
+      request('GET', '/'),
+      '/api/pushcut-restore-x',
+      eventId,
+      'restore',
+      { now: () => baseNow, ttlSeconds: 60 }
+    );
+    const receiptUrl = createSignedPushcutXUrl(
+      request('GET', '/'),
+      '/api/pushcut-receipt-x',
+      eventId,
+      'receipt',
+      { now: () => baseNow, ttlSeconds: 60 }
+    );
+    const beforeAudio = await invoke(
+      createPushcutRestoreXHandler({ now: () => baseNow + 1_000 }),
+      request('GET', restoreUrl.url)
+    );
+    assert.equal(beforeAudio.statusCode, 409);
+    const wrongPurpose = await invoke(
+      createPushcutRestoreXHandler({ now: () => baseNow + 1_000 }),
+      request('GET', receiptUrl.url)
+    );
+    assert.equal(wrongPurpose.statusCode, 403);
+    const expired = await invoke(
+      createPushcutRestoreXHandler({ now: () => baseNow + 91_000 }),
+      request('GET', restoreUrl.url)
+    );
+    assert.equal(expired.statusCode, 403);
+  });
+
+  test('refuses completion unless the receiver proves the exact 100% music target', async () => {
+    const eventId = 'pushcut-receipt-full-music-0001';
+    await createPushcutXReceipt(normalizePushcutXCommand({
+      action: 'announce',
+      commandId: eventId,
+      text: 'Full music target receipt test.',
+      announcementVolume: 100,
+      musicVolume: 100
+    }));
+    await updatePushcutXReceipt(eventId, {
+      status: 'started',
+      providerStatus: 'natural_audio_ready',
+      startedAt: 1_700_000_001_000,
+      audioFetchedAt: 1_700_000_001_500,
+      audioContentType: 'audio/wav'
+    });
+    await bindRestoreTarget(eventId, 100);
+    const signed = createSignedPushcutXUrl(
+      request('GET', '/'),
+      '/api/pushcut-receipt-x',
+      eventId,
+      'receipt'
+    );
+
+    const wrongTarget = await invoke(
+      pushcutReceiptXHandler,
+      request('POST', signed.url, { body: completedReceiptBody(eventId, 30) })
+    );
+    assert.equal(wrongTarget.statusCode, 409);
+    assert.equal((await readPushcutXReceipt(eventId)).status, 'started');
+
+    const exactTarget = await invoke(
+      pushcutReceiptXHandler,
+      request('POST', signed.url, { body: completedReceiptBody(eventId, 100) })
+    );
+    assert.equal(exactTarget.statusCode, 200);
+    assert.equal(exactTarget.json().receipt.expectedMusicPercent, 100);
+    assert.equal(exactTarget.json().receipt.restoredMusicPercent, 100);
+    assert.equal(exactTarget.json().receipt.sequenceCompleted, true);
+  });
+
+  test('refuses v3 completion unless the receiver proves that music resumed', async () => {
+    const eventId = 'pushcut-receipt-resume-required-0001';
+    const created = await createPushcutXReceipt(normalizePushcutXCommand({
+      action: 'announce',
+      commandId: eventId,
+      text: 'Music must resume after this announcement.',
+      announcementVolume: 100,
+      musicVolume: 30,
+      resumeMusic: false
+    }));
+    assert.equal(created.receipt.resumeMusic, true);
+    await updatePushcutXReceipt(eventId, {
+      status: 'started',
+      providerStatus: 'natural_audio_ready',
+      startedAt: 1_700_000_001_000,
+      audioFetchedAt: 1_700_000_001_500,
+      audioContentType: 'audio/wav'
+    });
+    await bindRestoreTarget(eventId, 30);
+    const signed = createSignedPushcutXUrl(
+      request('GET', '/'),
+      '/api/pushcut-receipt-x',
+      eventId,
+      'receipt'
+    );
+
+    const notResumed = await invoke(
+      pushcutReceiptXHandler,
+      request('POST', signed.url, {
+        body: {
+          ...completedReceiptBody(eventId),
+          musicResumed: false
+        }
+      })
+    );
+    assert.equal(notResumed.statusCode, 409);
+    assert.equal((await readPushcutXReceipt(eventId)).status, 'started');
+
+    const resumed = await invoke(
+      pushcutReceiptXHandler,
+      request('POST', signed.url, {
+        body: completedReceiptBody(eventId)
+      })
+    );
+    assert.equal(resumed.statusCode, 200);
+    assert.equal(resumed.json().receipt.sequenceCompleted, true);
   });
 
   test('commits a durable completion and latest pointer in one KV operation', async () => {
@@ -807,6 +1131,7 @@ describe('Version X signed natural-audio delivery receipts', { concurrency: fals
       providerStatus: 'receiver_completed',
       completedAt: 20_000,
       volumeRestored: true,
+      restoredMusicPercent: 30,
       musicResumed: true
     }, {
       env,
@@ -831,13 +1156,20 @@ describe('Version X signed natural-audio delivery receipts', { concurrency: fals
       action: 'announce',
       source: 'live',
       status: 'completed',
+      receiverContract: PUSHCUT_X_RECEIVER_CONTRACT,
+      voicePercent: 100,
+      musicPercent: 30,
+      resumeMusic: true,
       queuedAt: 10_000,
       updatedAt: 20_000,
       acceptedAt: 11_000,
       startedAt: 12_000,
       audioFetchedAt: 13_000,
+      restoreTargetMusicPercent: 30,
+      restoreTargetResolvedAt: 14_000,
       completedAt: 20_000,
       volumeRestored: true,
+      restoredMusicPercent: 30,
       musicResumed: true
     };
     const kvCommands = [];
@@ -868,7 +1200,7 @@ describe('Version X signed natural-audio delivery receipts', { concurrency: fals
     );
     const replay = await invoke(
       pushcutReceiptXHandler,
-      request('GET', signed.url)
+      request('POST', signed.url, { body: completedReceiptBody(eventId) })
     );
 
     assert.equal(replay.statusCode, 200);
@@ -1125,11 +1457,13 @@ describe('Version X Pushcut route and browser adapter', { concurrency: false }, 
       audioFetchedAt: Date.now(),
       providerStatus: 'natural_audio_ready'
     });
+    await bindRestoreTarget(eventId, 30);
     await updatePushcutXReceipt(eventId, {
       status: 'completed',
       completedAt: Date.now(),
       providerStatus: 'receiver_completed',
       volumeRestored: true,
+      restoredMusicPercent: 30,
       musicResumed: true
     });
     globalThis.fetch = async () => jsonFetchResponse(200, {
@@ -1190,8 +1524,8 @@ describe('Version X Pushcut route and browser adapter', { concurrency: false }, 
     assert.equal(result.json().completed, false);
     assert.equal(result.json().eventId, eventId);
     assert.equal(result.json().receipt.status, 'started');
-    assert.equal(result.json().receipt.recoveryQueued, true);
-    assert.equal(calls.length, 2);
+    assert.equal(result.json().receipt.recoveryQueued, false);
+    assert.equal(calls.length, 1);
     const executeUrl = new URL(calls[0].url);
     assert.equal(executeUrl.searchParams.get('shortcut'), PUSHCUT_X_DEFAULT_SHORTCUT);
     assert.equal(executeUrl.searchParams.get('timeout'), '10');
@@ -1201,9 +1535,15 @@ describe('Version X Pushcut route and browser adapter', { concurrency: false }, 
     assert.equal(input.speechMode, 'natural-audio');
     assert.match(input.audioUrl, /^https:\/\/poolside\.test\/api\/pushcut-audio-x\?v=x&/);
     assert.match(input.receiptUrl, /^https:\/\/poolside\.test\/api\/pushcut-receipt-x\?v=x&/);
-    assert.equal(input.receiverContract, 'poolside-pulse-x-audio-v1');
+    assert.match(input.restoreUrl, /^https:\/\/poolside\.test\/api\/pushcut-restore-x\?v=x&/);
+    assert.equal(input.receiverContract, PUSHCUT_X_RECEIVER_CONTRACT);
+    assert.equal(input.voicePercent, 100);
+    assert.equal(input.musicPercent, 30);
+    assert.equal(input.announcementLevel, 1);
+    assert.equal(input.musicLevel, 0.3);
     assert.equal(input.audioUrl.includes('openai-route-secret'), false);
     assert.equal(input.receiptUrl.includes('pushcut-route-secret'), false);
+    assert.equal(input.restoreUrl.includes('pushcut-route-secret'), false);
     assert.equal(Object.hasOwn(input, 'secret'), false);
 
     const replay = await invoke(pushcutXHandler, request('POST', '/api/pushcut-x?v=x', {
@@ -1222,10 +1562,71 @@ describe('Version X Pushcut route and browser adapter', { concurrency: false }, 
     }));
     assert.equal(replay.statusCode, 202);
     assert.equal(replay.json().idempotentReplay, true);
-    assert.equal(calls.length, 2);
+    assert.equal(calls.length, 1);
   });
 
-  test('serializes concurrent Remotes until the receiver posts a terminal receipt', async () => {
+  test('keeps a queued 202 receipt-eligible until the signed v3 completion arrives', async () => {
+    process.env.PUSHCUT_API_KEY_X = 'pushcut-route-secret';
+    process.env.OPENAI_API_KEY = 'openai-route-secret';
+    let receiverInput;
+    let providerCalls = 0;
+    globalThis.fetch = async (_url, options) => {
+      providerCalls += 1;
+      receiverInput = JSON.parse(options.body).input;
+      return { status: 202 };
+    };
+    const eventId = 'pushcut-route-queued-202-0001';
+    const queued = await invoke(pushcutXHandler, request('POST', '/api/pushcut-x?v=x', {
+      cookie: xCookie(),
+      headers: { 'idempotency-key': eventId },
+      body: {
+        version: 'x',
+        eventId,
+        source: 'live',
+        text: 'Queued Remote announcement.',
+        label: 'Queued Remote',
+        safety: false,
+        voicePercent: 100,
+        musicPercent: 30
+      }
+    }));
+
+    assert.equal(queued.statusCode, 202);
+    assert.equal(queued.json().accepted, true);
+    assert.equal(queued.json().completed, false);
+    assert.equal(queued.json().providerStatus, 202);
+    assert.equal(queued.json().receipt.status, 'accepted');
+    assert.equal(queued.json().receipt.failed, false);
+    assert.equal(queued.json().receipt.recoveryQueued, false);
+    assert.equal(providerCalls, 1);
+
+    const claim = await claimPushcutXAudioGeneration(eventId);
+    assert.equal(claim.claimed, true);
+    assert.equal(claim.busy, false);
+    await updatePushcutXReceipt(eventId, {
+      status: 'started',
+      providerStatus: 'natural_audio_ready',
+      audioClaimedAt: 0,
+      audioFetchedAt: Date.now(),
+      audioContentType: 'audio/mpeg'
+    });
+    await bindRestoreTarget(eventId, 30);
+    const completion = await invoke(
+      pushcutReceiptXHandler,
+      request('POST', receiverInput.receiptUrl, {
+        body: completedReceiptBody(eventId)
+      })
+    );
+
+    assert.equal(completion.statusCode, 200);
+    assert.equal(completion.json().receipt.sequenceCompleted, true);
+    const receipt = await readPushcutXReceipt(eventId);
+    assert.equal(receipt.status, 'completed');
+    assert.equal(receipt.failureCode, '');
+    assert.equal(verifiedPushcutXCompletion(receipt), true);
+  });
+
+  test('lets Pushcut queue concurrent Remotes without rejecting the second dispatch', async () => {
     process.env.PUSHCUT_API_KEY_X = 'pushcut-route-secret';
     process.env.OPENAI_API_KEY = 'openai-route-secret';
     const firstEventId = 'pushcut-concurrent-remote-a-0001';
@@ -1240,26 +1641,11 @@ describe('Version X Pushcut route and browser adapter', { concurrency: false }, 
       if (endpoint.searchParams.get('shortcut') === PUSHCUT_X_DEFAULT_SHORTCUT) {
         const input = JSON.parse(options.body).input;
         announcementDispatches += 1;
-        await updatePushcutXReceipt(input.eventId, {
-          status: 'started',
-          providerStatus: 'receiver_fetching_audio',
-          startedAt: Date.now(),
-          audioFetchedAt: Date.now(),
-          audioContentType: 'audio/mpeg'
-        });
         if (input.eventId === firstEventId) {
           signalFirstDispatch();
           await firstDispatchGate;
-          return { status: 504 };
         }
-        await updatePushcutXReceipt(input.eventId, {
-          status: 'completed',
-          providerStatus: 'receiver_completed',
-          completedAt: Date.now(),
-          volumeRestored: true,
-          musicResumed: true
-        });
-        return { status: 200 };
+        return { status: 504 };
       }
       return { status: 202 };
     };
@@ -1291,38 +1677,23 @@ describe('Version X Pushcut route and browser adapter', { concurrency: false }, 
       body: firstBody
     }));
     await firstDispatchStarted;
-    const blocked = await invoke(pushcutXHandler, request('POST', '/api/pushcut-x?v=x', {
+    const queued = await invoke(pushcutXHandler, request('POST', '/api/pushcut-x?v=x', {
       cookie: xCookie(),
       ip: '203.0.113.52',
       headers: { 'idempotency-key': secondEventId },
       body: secondBody
     }));
-    assert.equal(blocked.statusCode, 409);
-    assert.equal(blocked.getHeader('retry-after'), '3');
-    assert.equal(blocked.json().status, 'busy');
-    assert.match(blocked.json().error, /already playing another announcement/i);
-    assert.equal(announcementDispatches, 1);
+    assert.equal(queued.statusCode, 202);
+    assert.equal(queued.json().accepted, true);
+    assert.equal(queued.json().mode, 'wait-timeout');
+    assert.equal(announcementDispatches, 2);
 
     releaseFirstDispatch();
     const first = await firstRequest;
     assert.equal(first.statusCode, 202);
-    await updatePushcutXReceipt(firstEventId, {
-      status: 'completed',
-      providerStatus: 'receiver_completed',
-      completedAt: Date.now(),
-      volumeRestored: true,
-      musicResumed: true
-    });
-
-    const later = await invoke(pushcutXHandler, request('POST', '/api/pushcut-x?v=x', {
-      cookie: xCookie(),
-      ip: '203.0.113.52',
-      headers: { 'idempotency-key': secondEventId },
-      body: secondBody
-    }));
-    assert.equal(later.statusCode, 200);
-    assert.equal(later.json().completed, true);
-    assert.equal(announcementDispatches, 2);
+    assert.equal(first.json().accepted, true);
+    assert.equal((await readPushcutXReceipt(firstEventId)).status, 'accepted');
+    assert.equal((await readPushcutXReceipt(secondEventId)).status, 'accepted');
   });
 
   test('keeps a 504 execution race eligible for the signed receiver receipt', async () => {
@@ -1354,7 +1725,7 @@ describe('Version X Pushcut route and browser adapter', { concurrency: false }, 
     assert.equal(result.json().completed, false);
     assert.equal(result.json().mode, 'wait-timeout');
     assert.notEqual(result.json().receipt.status, 'timed_out');
-    assert.equal(calls, 2);
+    assert.equal(calls, 1);
   });
 
   test('queues finite audio without OpenAI and forwards only the signed proxy URL', async () => {
@@ -1445,11 +1816,13 @@ describe('Version X Pushcut route and browser adapter', { concurrency: false }, 
           audioFetchedAt: Date.now(),
           audioContentType: 'audio/mpeg'
         });
+        await bindRestoreTarget(input.eventId, 30);
         await updatePushcutXReceipt(input.eventId, {
           status: 'completed',
           providerStatus: 'receiver_completed',
           completedAt: Date.now(),
           volumeRestored: true,
+          restoredMusicPercent: 30,
           musicResumed: true
         });
         return { status: 200 };

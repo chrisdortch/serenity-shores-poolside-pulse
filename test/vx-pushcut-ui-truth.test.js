@@ -25,7 +25,7 @@ describe('Version X Pushcut UI truthfulness', () => {
       'Pushcut must override any stale provider verification before it is displayed'
     );
     assert.match(policySource, /exact:\s*false/);
-    assert.match(policySource, /physical output unmeasured/);
+    assert.match(policySource, /does not report the resulting physical speaker loudness/);
   });
 
   test('replaces Browser now-playing state with an explicit manual native-bed card', () => {
@@ -40,7 +40,8 @@ describe('Version X Pushcut UI truthfulness', () => {
       'Pushcut must return before reading stale Browser playback state'
     );
     assert.match(playbackSource, /Native music bed status is manual/);
-    assert.match(playbackSource, /Shortcut target 30\/100 · physical output unmeasured/);
+    assert.match(playbackSource, /Remote slider sets \$\{target\}%/);
+    assert.match(playbackSource, /Physical speaker loudness is not measured/);
     assert.match(playbackSource, /Browser controls unavailable/);
   });
 
@@ -49,8 +50,43 @@ describe('Version X Pushcut UI truthfulness', () => {
     const receiverSource = sourceBetween('function renderReceiver', 'function providerSelector');
     const appSource = sourceBetween('function renderApp', 'function formIdentity');
 
-    assert.match(shellSource, /mode === 'pushcut'[\s\S]*Shortcut target 30\/100 · output unmeasured/);
-    assert.match(receiverSource, /physical loudness and native playback status are not measured/);
-    assert.match(appSource, /receiverOperatingMode\(\) === 'pushcut'[\s\S]*Shortcut target 30\/100 · physical output unmeasured/);
+    assert.match(shellSource, /mode === 'pushcut'[\s\S]*Shortcut \$\{audibleMusicTarget\(state\)\} → 0 → 100 → \$\{audibleMusicTarget\(state\)\} · output unmeasured/);
+    assert.match(receiverSource, /Physical loudness is not measured/);
+    assert.match(appSource, /receiverOperatingMode\(\) === 'pushcut'[\s\S]*Shortcut \$\{audibleMusicTarget\(\)\} → 0 → 100 → \$\{audibleMusicTarget\(\)\} · physical output unmeasured/);
+  });
+
+  test('shows and accepts the Pushcut volume action only in Pushcut Receiver mode', () => {
+    const levelSource = sourceBetween('function musicLevelControl', 'function voiceLevelControl');
+    const applySource = sourceBetween(
+      'async function applyReceiverMusicTargetNow',
+      'async function playScheduleItem'
+    );
+
+    assert.match(
+      levelSource,
+      /\$\{pushcutMode && pushcutMusicVolumeReady\(\) \? `<div class="managedVolumePrompt pushcutVolumePrompt"/
+    );
+    assert.match(applySource, /if \(receiverOperatingMode\(\) !== 'pushcut'\)/);
+    assert.match(applySource, /Apply Music Now is available only while Pushcut Receiver mode is selected/);
+    assert.match(applySource, /if \(!pushcutMusicVolumeReady\(\)\)/);
+  });
+
+  test('uses physical-volume language for Apple and Spotify in Browser Receiver mode', () => {
+    const scheduleSource = sourceBetween('function renderScheduleRow', 'function renderSchedule');
+    const appSource = sourceBetween('function renderApp', 'function formIdentity');
+    const providerSource = sourceBetween('async function setProvider', 'async function saveManagedMusicLevel');
+
+    assert.match(
+      appSource,
+      /activeReceiverIsIOS\(\) && \['apple', 'spotify'\]\.includes\(effectiveProvider\(\)\)[\s\S]*physical volume unverified · Voice/
+    );
+    assert.doesNotMatch(scheduleSource, /Poolside Pulse Shortcut/);
+    assert.match(scheduleSource, /The active Browser Receiver is an iPhone/);
+    assert.match(
+      providerSource,
+      /const iphoneExternal = selected !== 'controlled' && !pushcutMode && activeReceiverIsIOS\(\)/
+    );
+    assert.match(providerSource, /pushcutMode[\s\S]*receiver Shortcut requests/);
+    assert.match(providerSource, /iphoneExternal[\s\S]*selected in Browser Receiver mode[\s\S]*physical volume/);
   });
 });

@@ -38,14 +38,14 @@ describe('Poolside Pulse Version X state isolation and volume model', () => {
     assert.equal(Object.hasOwn(normalizeState({}, 2).config, 'receiverMode'), false);
   });
 
-  test('preserves and clamps the shared announcement level while keeping a full music mute', () => {
-    assert.equal(normalizeState({ config: { voiceLevel: 37, duckLevel: 88 } }).config.voiceLevel, 37);
-    assert.equal(normalizeState({ config: { voiceLevel: -1 } }).config.voiceLevel, 0);
+  test('forces every saved announcement level to 100 while keeping a full music mute', () => {
+    assert.equal(normalizeState({ config: { voiceLevel: 37, duckLevel: 88 } }).config.voiceLevel, 100);
+    assert.equal(normalizeState({ config: { voiceLevel: -1 } }).config.voiceLevel, 100);
     assert.equal(normalizeState({ config: { voiceLevel: 101 } }).config.voiceLevel, 100);
     assert.equal(DUCK_LEVEL_PERCENT, 0);
   });
 
-  test('supports global and custom announcement volume in both schedule modes', () => {
+  test('normalizes global and custom scheduled announcements to fixed 100%', () => {
     const globalItem = normalizeScheduleItem({
       type: 'announcement',
       volume: { mode: 'global', percent: 91 }
@@ -55,8 +55,10 @@ describe('Poolside Pulse Version X state isolation and volume model', () => {
       volume: { mode: 'custom', percent: 42 }
     });
 
-    assert.equal(effectiveScheduleItemVolume(globalItem, { voiceLevel: 63 }), 63);
-    assert.equal(effectiveScheduleItemVolume(customItem, { voiceLevel: 63 }), 42);
+    assert.equal(globalItem.volume.mode, 'global');
+    assert.equal(customItem.volume.mode, 'global');
+    assert.equal(effectiveScheduleItemVolume(globalItem, { voiceLevel: 63 }), 100);
+    assert.equal(effectiveScheduleItemVolume(customItem, { voiceLevel: 63 }), 100);
   });
 
   test('accepts Apple Music web URLs and rejects Spotify, open.apple.com, and arbitrary URLs', () => {
@@ -143,14 +145,14 @@ describe('Poolside Pulse Version X state isolation and volume model', () => {
     assert.throws(() => announcementDeliveryForSource(apple), /Natural Voice or a supported short/i);
   });
 
-  test('reports the selected voice level in both controlled and Apple policies', () => {
+  test('reports fixed 100% announcements in every provider policy', () => {
     const controlled = audioPolicy({ provider: 'controlled', musicPercent: 30, voicePercent: 72 });
     const apple = audioPolicy({ provider: 'apple', musicPercent: 30, voicePercent: 72 });
-    assert.equal(controlled.voicePercent, 72);
-    assert.equal(apple.voicePercent, 72);
+    assert.equal(controlled.voicePercent, 100);
+    assert.equal(apple.voicePercent, 100);
     assert.equal(controlled.duringVoicePercent, 0);
     assert.equal(apple.duringVoicePercent, 0);
-    assert.equal(audioPolicy({ provider: 'spotify', musicPercent: 30, voicePercent: 72 }).voicePercent, 72);
+    assert.equal(audioPolicy({ provider: 'spotify', musicPercent: 30, voicePercent: 72 }).voicePercent, 100);
   });
 
   test('labels iPhone Apple Music as physical-volume pause compatibility', () => {
@@ -210,11 +212,11 @@ describe('Poolside Pulse Version X state isolation and volume model', () => {
 });
 
 describe('Version X announcement output level', () => {
-  test('updates the actual audio-engine voice target without requiring a graph', () => {
+  test('keeps the actual audio-engine voice target fixed without requiring a graph', () => {
     const engine = new AudioEngine();
     assert.equal(engine.status().voiceLevelPercent, 100);
-    assert.equal(engine.setVoiceLevelPercent(48, { report: false }), 48);
-    assert.equal(engine.status().voiceLevelPercent, 48);
+    assert.equal(engine.setVoiceLevelPercent(48, { report: false }), 100);
+    assert.equal(engine.status().voiceLevelPercent, 100);
     assert.equal(engine.setVoiceLevelPercent(500, { report: false }), 100);
     assert.equal(engine.status().voiceLevelPercent, 100);
   });

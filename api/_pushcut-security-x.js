@@ -11,10 +11,12 @@ const CAPABILITY_MAX_TTL_SECONDS = 30 * 60;
 const DEFAULT_CAPABILITY_TTL_SECONDS = 15 * 60;
 const CAPABILITY_MAX_FUTURE_SECONDS = 30 * 24 * 60 * 60;
 const EVENT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/;
-const PURPOSES = new Set(['audio', 'receipt']);
+const PURPOSES = new Set(['audio', 'receipt', 'recovery', 'restore']);
 const PURPOSE_PATHS = Object.freeze({
   audio: '/api/pushcut-audio-x',
-  receipt: '/api/pushcut-receipt-x'
+  receipt: '/api/pushcut-receipt-x',
+  recovery: '/api/pushcut-recovery-x',
+  restore: '/api/pushcut-restore-x'
 });
 
 function header(req, name) {

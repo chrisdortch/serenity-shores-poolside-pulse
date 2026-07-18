@@ -370,7 +370,13 @@ export function normalizeScheduleItem(item, index = 0) {
     : ['complete', 'track-end', 'duration', 'manual'].includes(requestedAdvanceMode)
       ? requestedAdvanceMode
       : defaultAdvanceMode;
-  const volumeMode = String(volumeSource.mode ?? source.volumeMode ?? '').toLowerCase() === 'custom' ? 'custom' : 'global';
+  // Version X has one announcement level: 100%. Only music items may keep a
+  // custom level. This prevents a legacy/custom schedule row from quietly
+  // weakening a safety or manager announcement.
+  const volumeMode = kind !== 'announcement'
+    && String(volumeSource.mode ?? source.volumeMode ?? '').toLowerCase() === 'custom'
+      ? 'custom'
+      : 'global';
   const defaultPercent = kind === 'announcement' ? VOICE_LEVEL_PERCENT : MUSIC_LEVEL_PERCENT;
   const time = normalizeTime(source.position?.time ?? source.time);
   const order = scheduleItemOrder(source, index);
@@ -395,7 +401,9 @@ export function normalizeScheduleItem(item, index = 0) {
     },
     volume: {
       mode: volumeMode,
-      percent: clamp(volumeSource.percent ?? source.volumePercent, 0, 100, defaultPercent)
+      percent: kind === 'announcement'
+        ? VOICE_LEVEL_PERCENT
+        : clamp(volumeSource.percent ?? source.volumePercent, 0, 100, defaultPercent)
     },
     advance: {
       mode: advanceMode,
@@ -516,14 +524,13 @@ export function getActiveSchedule(state) {
 
 export function effectiveScheduleItemVolume(item, config = {}) {
   const kind = scheduleActionKind(item);
+  if (kind === 'announcement') return VOICE_LEVEL_PERCENT;
   const volume = item?.volume && typeof item.volume === 'object' ? item.volume : {};
   if (String(volume.mode ?? item?.volumeMode ?? '').toLowerCase() === 'custom') {
-    return clamp(volume.percent ?? item?.volumePercent, 0, 100, kind === 'announcement' ? VOICE_LEVEL_PERCENT : MUSIC_LEVEL_PERCENT);
+    return clamp(volume.percent ?? item?.volumePercent, 0, 100, MUSIC_LEVEL_PERCENT);
   }
   if (typeof config === 'number') return clamp(config, 0, 100, MUSIC_LEVEL_PERCENT);
-  return kind === 'announcement'
-    ? clamp(config?.voiceLevel, 0, 100, VOICE_LEVEL_PERCENT)
-    : clamp(config?.musicLevel, 0, 100, MUSIC_LEVEL_PERCENT);
+  return clamp(config?.musicLevel, 0, 100, MUSIC_LEVEL_PERCENT);
 }
 
 export function inlineAnnouncementText(item) {
@@ -717,7 +724,9 @@ export function normalizeState(input, now = Date.now()) {
   }
   config.musicProvider = ['apple', 'spotify'].includes(config.musicProvider) ? config.musicProvider : 'controlled';
   config.musicLevel = clamp(config.musicLevel, 0, 100, MUSIC_LEVEL_PERCENT);
-  config.voiceLevel = clamp(config.voiceLevel, 0, 100, VOICE_LEVEL_PERCENT);
+  // Announcements are intentionally not user-adjustable in Version X.
+  config.voiceLevel = VOICE_LEVEL_PERCENT;
+  config.voiceMode = 'ai';
   config.duckLevel = DUCK_LEVEL_PERCENT;
   config.latitude = clamp(config.latitude, -90, 90, defaults.config.latitude);
   config.longitude = clamp(config.longitude, -180, 180, defaults.config.longitude);
@@ -970,7 +979,7 @@ export function audioPolicy({
   voicePercent = VOICE_LEVEL_PERCENT
 } = {}) {
   const target = clamp(musicPercent, 0, 100, MUSIC_LEVEL_PERCENT);
-  const voiceTarget = clamp(voicePercent, 0, 100, VOICE_LEVEL_PERCENT);
+  const voiceTarget = VOICE_LEVEL_PERCENT;
   const verifiedAtTarget = volumeVerified === true && Number(verifiedPercent) === target;
   if (provider === 'controlled') {
     return {

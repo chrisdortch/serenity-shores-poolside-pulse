@@ -31,7 +31,7 @@ import { AppleMusicReceiver } from './apple-music-receiver.js';
 import { SPOTIFY_REDIRECT_URI, SpotifyReceiver } from './spotify-receiver.js';
 import {
   PUSHCUT_MAX_ANNOUNCEMENT_CHARACTERS,
-  applyPushcutMusic30Now,
+  applyPushcutMusicVolume,
   getPushcutAnnouncementStatus,
   sendPushcutAnnouncement,
   waitForPushcutAnnouncementCompletion
@@ -90,10 +90,6 @@ let musicLevelDraft = null;
 let musicLevelSaveSequence = 0;
 let musicLevelInputSaveTimer = null;
 let activeMusicLevelSaveTarget = null;
-let queuedVoiceLevel = null;
-let voiceLevelDrain = null;
-let voiceLevelDraft = null;
-let voiceLevelSaveSequence = 0;
 let roleChangePending = false;
 let pendingTab = '';
 let previousTab = localStorage.getItem(PREVIOUS_TAB_KEY) || '';
@@ -228,19 +224,21 @@ function customPlaybackMusicTarget(state = store?.state) {
 }
 
 function audibleMusicTarget(state = store?.state, globalOverride = null) {
-  const customTarget = customPlaybackMusicTarget(state);
-  if (customTarget !== null) return customTarget;
   const sharedTarget = globalOverride === null || globalOverride === undefined
     ? state?.config?.musicLevel
     : globalOverride;
+  // Pushcut controls the native receiver output from the one shared slider.
+  // A stale custom Browser-schedule target must never override that value.
+  if (state?.config?.receiverMode === 'pushcut') {
+    return clamp(sharedTarget, 0, 100, 30);
+  }
+  const customTarget = customPlaybackMusicTarget(state);
+  if (customTarget !== null) return customTarget;
   return clamp(sharedTarget, 0, 100, 30);
 }
 
-function audibleVoiceTarget(state = store?.state, globalOverride = null) {
-  const sharedTarget = globalOverride === null || globalOverride === undefined
-    ? state?.config?.voiceLevel
-    : globalOverride;
-  return clamp(sharedTarget, 0, 100, VOICE_LEVEL_PERCENT);
+function audibleVoiceTarget() {
+  return VOICE_LEVEL_PERCENT;
 }
 
 function platformIsIOS(userAgent = '') {
@@ -316,6 +314,7 @@ function pushcutScheduleFingerprint(state = store?.state) {
     browserReceiverOnline: receiverOnline(source.receiver, now),
     config: {
       receiverMode: source.config?.receiverMode,
+      musicLevel: source.config?.musicLevel,
       lightningRadiusMiles: source.config?.lightningRadiusMiles,
       lightningHoldMinutes: source.config?.lightningHoldMinutes
     },
@@ -506,7 +505,7 @@ const store = new CloudStore({
       ? audibleMusicTarget(state, musicLevelDraft === null ? state.config.musicLevel : musicLevelDraft)
       : physicalCustomTarget;
     audio.setMusicLevelPercent?.(effectiveTarget, { report: false });
-    audio.setVoiceLevelPercent?.(audibleVoiceTarget(state, voiceLevelDraft === null ? state.config.voiceLevel : voiceLevelDraft), { report: false });
+    audio.setVoiceLevelPercent?.(VOICE_LEVEL_PERCENT, { report: false });
     apple.setTargetVolumePercent?.(effectiveTarget);
     spotify.setTargetVolumePercent?.(effectiveTarget);
     if (takeoverTarget && (!receiverOnline(state.receiver, store.now()) || state.receiver?.id !== takeoverTarget.id || state.receiver?.sessionId !== takeoverTarget.sessionId)) {
@@ -603,14 +602,14 @@ function displayAudioPolicy(provider = effectiveProvider()) {
   const musicPercent = audibleMusicTarget(store.state);
   if (receiverOperatingMode() === 'pushcut') {
     return {
-      id: 'pushcut-shortcut-unmeasured',
+      id: 'pushcut-shortcut-dynamic-target',
       exact: false,
-      musicPercent: null,
-      voicePercent: 100,
-      duringVoicePercent: null,
+      musicPercent,
+      voicePercent: VOICE_LEVEL_PERCENT,
+      duringVoicePercent: DUCK_LEVEL_PERCENT,
       action: 'shortcut',
-      label: 'Shortcut target 30/100 · physical output unmeasured',
-      detail: 'Pushcut runs the Receiver Shortcut at a 30% music target and 100% announcement target. iOS does not report the resulting physical speaker loudness back to Version X.'
+      label: `Shortcut sequence ${musicPercent}% → 0% → 100% → ${musicPercent}%`,
+      detail: `Pushcut pauses native music, sets the shared output to 100% for the announcement, waits for Play Sound to finish, restores ${musicPercent}%, and resumes music. iOS does not report the resulting physical speaker loudness back to Version X.`
     };
   }
   if (provider === 'apple' && cloudAppleMusicVerified()) {
@@ -680,6 +679,7 @@ function spotifyDeveloperSetupCard() {
 
 function iphoneReceiverModePanel({ owned = false } = {}) {
   const mode = receiverOperatingMode();
+  const musicTarget = audibleMusicTarget(store.state);
   const browserSelected = mode === 'browser';
   const browserActive = browserSelected && receiverOnline(store.state.receiver, store.now());
   const pushcutSelected = mode === 'pushcut';
@@ -693,7 +693,7 @@ function iphoneReceiverModePanel({ owned = false } = {}) {
       : `<a href="${PUSHCUT_RUN_SERVER_URL}" class="shortcutLink">Open Pushcut Server</a>`;
   return `
     <section class="workspacePanel receiverModePanel">
-      <div class="sectionHeading"><div><p class="kicker">Choose one receiver mode</p><h2>Remote music or Pushcut announcements</h2></div><span class="fixedMix">Music 30 · Voice 100</span></div>
+      <div class="sectionHeading"><div><p class="kicker">Choose one receiver mode</p><h2>Remote music or Pushcut announcements</h2></div><span class="fixedMix">Music ${musicTarget} · Announcement 100</span></div>
       <div class="settingsGrid">
         <div class="capabilityCard ${browserActive ? 'verified' : 'limited'}">
           <span>Mode 1 · remote music control</span>
@@ -708,7 +708,7 @@ function iphoneReceiverModePanel({ owned = false } = {}) {
         <div class="capabilityCard ${pushcutSelected && pushcutOperational ? 'verified' : 'limited'}">
           <span>Mode 2 · remote Pushcut announcements</span>
           <strong>${pushcutOperational ? 'Pushcut is connected and verified' : pushcutStatus.connectedReady ? 'Pushcut connected; run the receiver test' : pushcutAnnouncementReady() ? 'Pushcut configured; receiver not verified' : 'Open Pushcut Server'}</strong>
-          <p>Use this when Pushcut should run announcements. Start the music directly in the Apple Music, Spotify, or background-capable Suno app, then leave Pushcut on Ready For Requests. The Remote can apply Music 30% and send announcements, but it cannot start, change, pause, or stop that native music bed while Pushcut is foreground.</p>
+          <p>Use this when Pushcut should run announcements over native Apple Music, Spotify, or a background-capable Suno app. Leave Pushcut on Ready For Requests. The Remote applies the music slider, pauses music for speech, plays the announcement at 100%, restores ${musicTarget}%, and resumes the same native music bed.</p>
           <div class="stackedActions">${pushcutModeAction}</div>
           <small>${browserActive ? 'Stop Receiver first so Version X can safely re-arm timed Pushcut announcements before Safari leaves the foreground.' : browserSelected ? 'Prepare Pushcut Mode before opening Pushcut so Remote commands do not route to a stale Browser Receiver lease.' : pushcutScheduleStatus.error ? `Pushcut schedule preparation needs attention: ${escapeHtml(pushcutScheduleStatus.error)}` : pushcutOperational ? 'Pushcut schedule ownership is prepared and the receiver has returned a recent signed completion receipt.' : 'Keep Ready For Requests visible. Each Remote announcement waits for its own signed completion receipt and reports a real failure if Pushcut is unavailable; Receiver Test is optional.'}</small>
         </div>
@@ -883,7 +883,7 @@ function shellStatus() {
   const provider = effectiveProvider();
   const providerName = provider === 'spotify' ? 'Spotify' : provider === 'apple' ? 'Apple Music' : 'Suno';
   const mixStatus = mode === 'pushcut'
-    ? 'Shortcut target 30/100 · output unmeasured'
+    ? `Shortcut ${audibleMusicTarget(state)} → 0 → 100 → ${audibleMusicTarget(state)} · output unmeasured`
     : policy.exact
     ? `${policy.musicPercent}% music / ${audibleVoiceTarget()}% voice`
     : activeReceiverIsIOS() && ['apple', 'spotify'].includes(provider)
@@ -947,13 +947,14 @@ function receiverSummary() {
 
 function playbackCard() {
   if (receiverOperatingMode() === 'pushcut') {
+    const target = audibleMusicTarget(store.state);
     return `
       <section class="nowPlaying manual" data-now-playing>
         <div class="nowMark" aria-hidden="true"><span></span><span></span><span></span></div>
         <div class="nowText">
           <div class="nowMeta"><p class="kicker">Pushcut announcement mode</p></div>
           <h2>Native music bed status is manual</h2>
-          <p>Choose and control music directly on the Receiver iPhone. Shortcut target 30/100 · physical output unmeasured.</p>
+          <p>Choose the native music directly on the Receiver iPhone. The Remote slider sets ${target}%; each announcement pauses music, plays at 100%, restores ${target}%, and resumes. Physical speaker loudness is not measured.</p>
         </div>
         <div class="transport" aria-label="Native playback status">
           <span class="statusPill warn">Browser controls unavailable</span>
@@ -990,7 +991,7 @@ function playbackCard() {
           ? `receiver-verified at ${audibleTarget}%`
           : activeReceiverIsIOS()
             ? receiverOperatingMode() === 'pushcut'
-              ? 'iPhone physical output · Pushcut 30/100 Shortcut'
+              ? `iPhone physical output · Pushcut ${audibleTarget} → 0 → 100 → ${audibleTarget}`
               : 'iPhone physical output · pauses completely for voice'
             : `pause-for-voice mode; ${audibleTarget}% target unverified`)
       : `music bus set to ${audibleTarget}%`}`;
@@ -1086,9 +1087,9 @@ function renderReceiver() {
         </div>
       </div>
       <div class="mixMeter" aria-label="Audio levels">
-        <div><span>${pushcutMode ? 'Music Shortcut target' : activeReceiverIsIOS() && ['apple', 'spotify'].includes(activeProvider) ? 'Music output' : 'Music target'}</span><strong>${pushcutMode ? '30%' : policy.exact ? `${policy.musicPercent}%` : activeReceiverIsIOS() && ['apple', 'spotify'].includes(activeProvider) ? 'Physical' : `${audibleTarget}%?`}</strong><i style="--level:${pushcutMode ? 0.3 : policy.exact ? policy.musicPercent / 100 : audibleTarget / 100}"></i></div>
-        <div><span>${pushcutMode ? 'Announcement Shortcut target' : 'Voice'}</span><strong>${pushcutMode ? '100%' : `${audibleVoiceTarget()}%`}</strong><i style="--level:${pushcutMode ? 1 : audibleVoiceTarget() / 100}"></i></div>
-        <small>${pushcutMode ? 'The Receiver Shortcut requests 30% music and 100% announcements on the shared iPhone output; physical loudness and native playback status are not measured.' : policy.exact ? `The receiver has verified this music level. Voice is set to ${audibleVoiceTarget()}%.` : activeReceiverIsIOS() && ['apple', 'spotify'].includes(activeProvider) ? `${activeProvider === 'spotify' ? 'Spotify' : 'Apple Music'} uses physical iPhone/speaker loudness in Browser mode and pauses completely before voice.` : 'External music volume is not software-verified here. It pauses completely before voice or Suno plays.'}</small>
+        <div><span>${pushcutMode ? 'Music Shortcut target' : activeReceiverIsIOS() && ['apple', 'spotify'].includes(activeProvider) ? 'Music output' : 'Music target'}</span><strong>${pushcutMode ? `${audibleTarget}%` : policy.exact ? `${policy.musicPercent}%` : activeReceiverIsIOS() && ['apple', 'spotify'].includes(activeProvider) ? 'Physical' : `${audibleTarget}%?`}</strong><i style="--level:${pushcutMode ? audibleTarget / 100 : policy.exact ? policy.musicPercent / 100 : audibleTarget / 100}"></i></div>
+        <div><span>Announcement target</span><strong>${VOICE_LEVEL_PERCENT}%</strong><i style="--level:1"></i></div>
+        <small>${pushcutMode ? `The Receiver Shortcut pauses music, sets 100% for speech, waits for playback completion, then restores ${audibleTarget}% and resumes. Physical loudness is not measured.` : policy.exact ? `The receiver has verified this music level. Announcements are fixed at ${VOICE_LEVEL_PERCENT}%.` : activeReceiverIsIOS() && ['apple', 'spotify'].includes(activeProvider) ? `${activeProvider === 'spotify' ? 'Spotify' : 'Apple Music'} uses physical iPhone/speaker loudness in Browser mode and pauses completely before voice.` : 'External music volume is not software-verified here. It pauses completely before voice or Suno plays.'}</small>
       </div>
     </section>
     ${isIOSLike() ? iphoneReceiverModePanel({ owned }) : ''}
@@ -1113,26 +1114,26 @@ function providerSelector() {
   return `
     <div class="providerSelector" role="group" aria-label="Music source">
       <button aria-pressed="${provider === 'controlled'}" data-action="provider" data-provider="controlled" class="${provider === 'controlled' ? 'active' : ''}"><strong>Manager Volume · Suno / Direct</strong><small>Exact ${target}% music / ${audibleVoiceTarget()}% announcements</small></button>
-      <button aria-pressed="${provider === 'apple'}" data-action="provider" data-provider="apple" class="${provider === 'apple' ? 'active' : ''}"><strong>Apple Music</strong><small>${cloudAppleMusicVerified() ? `Verified ${target}%` : iphoneExternal ? pushcutMode ? 'Shortcut 30% bed' : 'Physical volume · pauses for voice' : liveReceiverIsNative() ? `Music.app ${target}% target` : `${target}% target`}</small></button>
-      <button aria-pressed="${provider === 'spotify'}" data-action="provider" data-provider="spotify" class="${provider === 'spotify' ? 'active' : ''}"><strong>Spotify</strong><small>${cloudSpotifyVerified() ? `Verified ${target}%` : iphoneExternal ? pushcutMode ? 'Shortcut 30% bed' : 'Physical volume · pauses for voice' : `${target}% target`}</small></button>
+      <button aria-pressed="${provider === 'apple'}" data-action="provider" data-provider="apple" class="${provider === 'apple' ? 'active' : ''}"><strong>Apple Music</strong><small>${cloudAppleMusicVerified() ? `Verified ${target}%` : iphoneExternal ? pushcutMode ? `Shortcut ${target}% bed` : 'Physical volume · pauses for voice' : liveReceiverIsNative() ? `Music.app ${target}% target` : `${target}% target`}</small></button>
+      <button aria-pressed="${provider === 'spotify'}" data-action="provider" data-provider="spotify" class="${provider === 'spotify' ? 'active' : ''}"><strong>Spotify</strong><small>${cloudSpotifyVerified() ? `Verified ${target}%` : iphoneExternal ? pushcutMode ? `Shortcut ${target}% bed` : 'Physical volume · pauses for voice' : `${target}% target`}</small></button>
     </div>`;
 }
 
 function musicLevelControl() {
-  const pushcutFixed = receiverOperatingMode() === 'pushcut';
-  const target = pushcutFixed ? 30 : clamp(musicLevelDraft === null ? store.state.config.musicLevel : musicLevelDraft, 0, 100, 30);
+  const pushcutMode = receiverOperatingMode() === 'pushcut';
+  const target = clamp(musicLevelDraft === null ? store.state.config.musicLevel : musicLevelDraft, 0, 100, 30);
   const customTarget = customPlaybackMusicTarget(store.state);
-  const iphoneExternal = ['apple', 'spotify'].includes(store.state.config.musicProvider) && activeReceiverIsIOS();
+  const iphoneExternal = !pushcutMode && ['apple', 'spotify'].includes(store.state.config.musicProvider) && activeReceiverIsIOS();
   const externalProviderName = store.state.config.musicProvider === 'spotify' ? 'Spotify' : 'Apple Music';
   return `
     <section class="volumeControl" aria-labelledby="musicLevelLabel">
-      <div class="volumeHeading"><div><p class="kicker">${iphoneExternal ? 'Remote volume available' : 'Shared music target'}</p><h2 id="musicLevelLabel">${iphoneExternal ? 'Manager-controlled music volume' : 'Music volume'}</h2></div><output for="musicLevel" data-music-level-output>${target}%</output></div>
-      <input id="musicLevel" type="range" min="0" max="100" step="1" value="${target}" aria-labelledby="musicLevelLabel" aria-describedby="musicLevelHelp" aria-valuetext="${pushcutFixed ? '30% music fixed by the receiver Shortcut' : iphoneExternal ? `${target}% manager-volume target; releasing switches music to Suno or Direct` : `${target}% music; announcements ${audibleVoiceTarget()}%`}" style="--level:${target / 100}" ${pushcutFixed ? 'disabled' : ''} />
+      <div class="volumeHeading"><div><p class="kicker">${pushcutMode ? 'Receiver music target' : iphoneExternal ? 'Remote volume available' : 'Shared music target'}</p><h2 id="musicLevelLabel">${iphoneExternal ? 'Manager-controlled music volume' : 'Music volume'}</h2></div><output for="musicLevel" data-music-level-output>${target}%</output></div>
+      <input id="musicLevel" type="range" min="0" max="100" step="1" value="${target}" aria-labelledby="musicLevelLabel" aria-describedby="musicLevelHelp" aria-valuetext="${pushcutMode ? `${target}% native music; zero during announcements; announcements 100%` : iphoneExternal ? `${target}% manager-volume target; releasing switches music to Suno or Direct` : `${target}% music; announcements ${audibleVoiceTarget()}%`}" style="--level:${target / 100}" />
       <div class="volumeScale" aria-hidden="true"><span>0%</span><span>Default 30%</span><span>100%</span></div>
-      ${pushcutMusicVolumeReady() ? `<div class="managedVolumePrompt pushcutVolumePrompt"><div><strong>Apply the receiver music setting now</strong><span>Keep Pushcut open on <em>Ready For Requests</em>. This runs the existing Volume Down Shortcut; it confirms Shortcut completion but does not measure the iPhone or Bluetooth speaker’s physical output.</span><small class="pushcutVolumeResult ${escapeAttr(pushcutVolumeStatus.state)}">${escapeHtml(pushcutVolumeStatus.message)}</small></div><button type="button" data-action="apply-pushcut-music-30" class="primary">Apply Music 30% Now</button></div>` : ''}
+      ${pushcutMode && pushcutMusicVolumeReady() ? `<div class="managedVolumePrompt pushcutVolumePrompt"><div><strong>Apply ${target}% to the Receiver now</strong><span>Keep Pushcut on <em>Ready For Requests</em>. The dynamic recovery Shortcut sets the iPhone media output to this slider value; completion is confirmed, but physical speaker loudness is not measured.</span><small class="pushcutVolumeResult ${escapeAttr(pushcutVolumeStatus.state)}">${escapeHtml(pushcutVolumeStatus.message)}</small></div><button type="button" data-action="apply-pushcut-music-target" data-music-percent="${target}" class="primary">Apply Music ${target}% Now</button></div>` : ''}
       ${iphoneExternal ? `<div class="managedVolumePrompt"><div><strong>Use a volume the manager can actually control</strong><span data-managed-volume-description>iPhone cannot lower protected ${externalProviderName} playback in a web page. This starts the saved Suno / Direct bed at ${target}%; ${externalProviderName} stays authorized for later.</span></div><button type="button" data-action="enable-managed-volume" data-managed-volume-button class="primary">Start Manager Volume · ${target}%</button></div>` : ''}
-      <p id="musicLevelHelp">${pushcutFixed
-        ? 'The receiver Shortcuts are the physical source of truth: music is fixed at 30% after every completed announcement.'
+      <p id="musicLevelHelp">${pushcutMode
+        ? `This slider is the single music target. Every announcement pauses the music, sets announcement output to 100%, waits for playback to finish, restores ${target}%, and resumes the same music.`
         : iphoneExternal
         ? `Move and release the slider to save the target without unexpectedly starting paused music. Tap Start Manager Volume to safely pause ${externalProviderName} and start the saved Suno source at ${target}%. Announcements then silence music to ${DUCK_LEVEL_PERCENT}% and play at ${audibleVoiceTarget()}%.`
         : `${customTarget === null ? 'Applies immediately' : `Saves the shared target for later; the current schedule item remains at its custom ${customTarget}%`} for Suno/direct on the receiver and to Apple Music only when that desktop receiver verifies volume control. Apple Music always pauses before Suno or speech; it never overlaps an announcement.`}</p>
@@ -1140,14 +1141,11 @@ function musicLevelControl() {
 }
 
 function voiceLevelControl() {
-  const pushcutFixed = receiverOperatingMode() === 'pushcut';
-  const target = pushcutFixed ? 100 : audibleVoiceTarget(store.state, voiceLevelDraft === null ? store.state.config.voiceLevel : voiceLevelDraft);
   return `
     <section class="volumeControl voiceVolumeControl" aria-labelledby="voiceLevelLabel">
-      <div class="volumeHeading"><div><p class="kicker">Shared announcement target</p><h2 id="voiceLevelLabel">Voice volume</h2></div><output for="voiceLevel" data-voice-level-output>${target}%</output></div>
-      <input id="voiceLevel" type="range" min="0" max="100" step="1" value="${target}" aria-labelledby="voiceLevelLabel" aria-describedby="voiceLevelHelp" aria-valuetext="${target}% announcement voice" style="--level:${target / 100}" ${pushcutFixed ? 'disabled' : ''} />
-      <div class="volumeScale" aria-hidden="true"><span>0%</span><span style="left:${target}%">Shared ${target}%</span><span>100%</span></div>
-      <p id="voiceLevelHelp">${pushcutFixed ? 'The receiver Shortcut fixes announcements at 100%. The signed receipt confirms the Shortcut reached the end of its playback sequence.' : 'Applies to Speak Now, saved messages, safety announcements, and schedule items using the shared voice level. A scheduled announcement can override it. Every spoken message requires natural generated audio through the Version X mixer; the app reports a failure instead of silently falling back to unreliable computer speech.'}</p>
+      <div class="volumeHeading"><div><p class="kicker">Fixed announcement target</p><h2 id="voiceLevelLabel">Announcement volume</h2></div><output data-voice-level-output>${VOICE_LEVEL_PERCENT}%</output></div>
+      <div class="fixedVoiceNote"><strong>Always ${VOICE_LEVEL_PERCENT}%</strong><span>Speak Now, saved messages, safety alerts, weather, and every scheduled announcement use the same fixed level. Music is fully silent before speech starts and restores only after playback finishes.</span></div>
+      <p id="voiceLevelHelp">Natural generated audio is required. Version X reports a failure instead of silently falling back to computer speech or lowering an announcement.</p>
     </section>`;
 }
 
@@ -1164,7 +1162,7 @@ function musicSourceForm() {
       <div class="stackedActions"><button type="button" data-action="test-spotify-source" class="secondary" ${receiverSpotifyReady ? '' : 'disabled'}>Test with a public Spotify track</button></div>
       ${receiverSpotifyReady ? '' : `<div class="callout warning"><strong>Spotify is not ready on the speaker receiver.</strong><p>${escapeHtml(store.state.receiver?.spotifyDetail || 'On the receiver, log in to Spotify, check access, then tap Connect Spotify Receiver.')}</p></div>`}
       <div class="capabilityCard ${policy.exact ? 'verified' : 'limited'}"><span>${policy.exact ? 'Verified path' : 'Compatibility path'}</span><strong>${escapeHtml(policy.label)}</strong><p>${escapeHtml(policy.detail)}</p></div>
-      <div class="policyNote"><strong>Same iPhone rule as Apple Music:</strong> Spotify uses the receiver’s shared physical output. ${receiverOperatingMode() === 'pushcut' ? 'The Receiver Shortcut runs Pause → Volume Up → Play Sound → Volume Down → Play; the configured 100/30 targets are requested but physical loudness is not measured.' : 'Browser Receiver pauses Spotify completely for each announcement, then resumes it; physical music loudness remains controlled by the iPhone or speaker.'} A Spotify Premium account and receiver login are required.</div>`;
+      <div class="policyNote"><strong>Same iPhone rule as Apple Music:</strong> Spotify uses the receiver’s shared physical output. ${receiverOperatingMode() === 'pushcut' ? `The Receiver Shortcut runs Pause → Announcement 100% → Play Sound to completion → Music ${audibleMusicTarget()}% → Play. Physical loudness is not measured.` : 'Browser Receiver pauses Spotify completely for each announcement, then resumes it; physical music loudness remains controlled by the iPhone or speaker.'} A Spotify Premium account and receiver login are required.</div>`;
   }
   if (config.musicProvider === 'apple') {
     const iphoneApple = activeReceiverIsIOS();
@@ -1181,7 +1179,7 @@ function musicSourceForm() {
         <strong>${escapeHtml(policy.label)}</strong>
         <p>${escapeHtml(policy.detail)}</p>
       </div>
-      <div class="policyNote"><strong>Safe Apple behavior:</strong> Poolside Pulse pauses Apple Music completely before Suno or speech and resumes it only afterward; the sources never overlap. ${iphoneApple ? 'The active receiver is an iPhone: set Apple Music loudness with the iPhone or connected speaker controls. Suno and announcement voice percentages remain adjustable.' : 'Exact Apple Music volume is shown only after a desktop receiver verifies it.'} An active Apple Music subscription and an open, signed-in receiver are required.</div>`;
+      <div class="policyNote"><strong>Safe Apple behavior:</strong> Poolside Pulse pauses Apple Music completely before Suno or speech and resumes it only afterward; the sources never overlap. ${iphoneApple ? 'The active receiver is an iPhone: Browser mode uses the iPhone or connected speaker controls; Pushcut mode applies the shared music slider. Suno music remains adjustable and announcements are fixed at 100%.' : 'Exact Apple Music volume is shown only after a desktop receiver verifies it.'} An active Apple Music subscription and an open, signed-in receiver are required.</div>`;
   }
   return `
     <form data-form="controlled-play" class="sourceForm">
@@ -1204,7 +1202,7 @@ function renderControl() {
       ? '<div class="callout"><strong>Browser Receiver mode · remote music control is available</strong><p>The speaker receiver must keep Version X visible. Choose Suno, Apple Music, or Spotify below; the Remote can start, change, pause, and stop that browser-owned music bed.</p></div>'
       : '<div class="callout warning"><strong>Browser Receiver mode is selected, but the speaker is offline</strong><p>On the Receiver iPhone, reopen Version X and tap Start Receiver before sending music or voice commands.</p></div>'
     : operatingMode === 'pushcut'
-      ? `<div class="callout warning"><strong>Pushcut announcement mode · music is manual</strong><p>On the Receiver iPhone, start music directly in Apple Music, Spotify, or a background-capable Suno app, then ${pushcutOpenStep} and leave Ready For Requests visible. The Remote can apply Music 30% and send announcements, but it cannot start, change, pause, or stop that native music bed. To restore remote music control, return the Receiver to Version X and tap Start Receiver.</p></div>`
+      ? `<div class="callout warning"><strong>Pushcut announcement mode · native music source is chosen on Receiver</strong><p>On the Receiver iPhone, start music in Apple Music, Spotify, or a background-capable Suno app, then ${pushcutOpenStep} and leave Ready For Requests visible. The Remote slider applies ${audibleMusicTarget()}%, and each announcement pauses, speaks at 100%, restores ${audibleMusicTarget()}%, and resumes. To restore browser transport controls, return the Receiver to Version X and tap Start Receiver.</p></div>`
       : '';
   return `
     <section class="pageHeading"><p class="kicker">Music control</p><h1>One source. One receiver.</h1><p>Suno, Apple Music, and Spotify are mutually exclusive. Every command targets the current receiver session; expired commands are never replayed.</p></section>
@@ -1285,7 +1283,7 @@ function renderAnnouncementSourceLibrary() {
   const finiteSources = sources.filter(source => source.kind === 'finite-audio' && ['direct', 'suno'].includes(source.provider));
   return `
     <section class="workspacePanel announcementSourcesPanel">
-      <div class="sectionHeading"><div><p class="kicker">Announcement audio</p><h2>Reliable sources</h2></div><span class="fixedMix">Music 30 · Announcement 100</span></div>
+      <div class="sectionHeading"><div><p class="kicker">Announcement audio</p><h2>Reliable sources</h2></div><span class="fixedMix">Music ${audibleMusicTarget()} · Announcement 100</span></div>
       <div class="announcementSourceStatus">
         <div class="sourceCapability verified"><strong>Natural Voice</strong><span>Default · natural generated speech</span><p>Use this for live typing, saved messages, safety alerts, and schedules.</p></div>
         <div class="sourceCapability"><strong>Short Suno / direct clip</strong><span>Supported · finite HTTPS audio</span><p>Use a directly downloadable clip and enter its expected duration. Maximum ${ANNOUNCEMENT_FINITE_AUDIO_MAX_SECONDS} seconds.</p></div>
@@ -1331,17 +1329,20 @@ function renderAnnounce() {
     ${browserReady
       ? '<div class="callout"><strong>Browser Receiver is the live announcement path</strong><p>Remote voice commands, saved announcements, immediate weather warnings, and mixed schedules now go to the visible Browser Receiver. Suno/direct beds duck in the mixer; Apple Music and Spotify pause completely for speech and resume afterward.</p></div>'
       : pushcutSelectedReady
-        ? `<div class="callout"><strong>${pushcutStatus.operational ? 'Pushcut natural-voice receiver verified' : 'Pushcut natural-voice receiver configured'}</strong><p>Keep the receiver iPhone on <em>Ready For Requests</em>. Start any music bed directly in its native/background-capable player first. For each announcement, the signed receipt confirms the Shortcut reached the end of Pause → Volume Up → Play Sound → Volume Down → Play. It does not measure physical loudness or audibility.${pushcutStatus.operational ? '' : ' Run the receiver test below to verify the complete device path.'}</p><button type="button" data-action="pushcut-test" class="secondary">Run Verified Receiver Test</button></div>`
+        ? `<div class="callout"><strong>${pushcutStatus.operational ? 'Pushcut natural-voice receiver verified' : 'Pushcut natural-voice receiver configured'}</strong><p>Keep the receiver iPhone on <em>Ready For Requests</em>. Start any music bed directly in its native/background-capable player first. For each announcement, the signed v3 receipt confirms the Shortcut reached the end of Pause → Announcement 100% → Play Sound to completion → latest Music ${audibleMusicTarget()}% target → Play. It does not measure physical loudness or audibility.${pushcutStatus.operational ? '' : ' Run the receiver test below to verify the complete device path.'}</p><button type="button" data-action="pushcut-test" class="secondary">Run Verified Receiver Test</button></div>`
         : `<div class="callout warning"><strong>${operatingMode === 'browser' ? 'Browser Receiver is selected but offline' : operatingMode === 'pushcut' ? 'Pushcut Receiver is selected but unavailable' : 'No announcement receiver is online'}</strong><p>${operatingMode === 'browser' ? 'On the speaker iPhone, open Version X and tap Start Receiver. Commands stay disabled so they cannot be silently rerouted.' : 'Open Pushcut on the speaker iPhone and leave Ready For Requests visible, or return to Version X and start Browser Receiver.'}</p></div>`}
     ${pushcutSelectedReady && !pushcutStatus.operational ? `<details class="savedEditor receiverShortcutSetup" open>
       <summary>One-time Receiver Shortcut update required</summary>
       <ol>
-        <li>On the Receiver, open Shortcuts → <strong>Poolside Pulse Announcement</strong>.</li>
-        <li>Keep <strong>Get Dictionary from Input</strong>. Change the next key from <code>text</code> to <code>audioUrl</code>.</li>
-        <li>Add <strong>Get Contents of URL</strong> immediately after it, using that Dictionary Value.</li>
-        <li>Delete <strong>Make Spoken Audio</strong>. In <strong>Play Sound</strong>, choose the new Contents of URL as the Sound File.</li>
-        <li>Keep this order: Pause → Wait 1 second → Volume Up → Play Sound → Volume Down → Play.</li>
-        <li>At the very bottom, add <strong>Get Value for receiptUrl</strong> from the original Dictionary, then <strong>Get Contents of URL</strong> using that value.</li>
+        <li>Open Shortcuts → <strong>Poolside Pulse Announcement</strong>. Keep <strong>Get Dictionary from Shortcut Input</strong> first; this is the original Dictionary.</li>
+        <li>Get <code>audioUrl</code> from the original Dictionary → <strong>Get Contents of URL</strong> (GET) → <strong>Set Variable</strong> named <code>Announcement Audio</code>.</li>
+        <li>Add <strong>Pause on iPhone</strong> → <strong>Wait 1 second</strong>.</li>
+        <li>Get <code>announcementLevel</code> from the original Dictionary → <strong>Set Media Volume</strong> to that Dictionary Value. Version X sends <code>1</code>, meaning 100%.</li>
+        <li>Add <strong>Play Sound</strong> with Sound File set to <code>Announcement Audio</code>. Keep it before every restore action so Shortcuts waits for the sound to finish.</li>
+        <li>After <strong>Play Sound</strong> finishes: get <code>restoreUrl</code> from the original Dictionary → <strong>Get Contents of URL</strong> (GET) → <strong>Set Variable</strong> named <code>Restore Target</code>.</li>
+        <li>Get <code>musicLevel</code> from <code>Restore Target</code> → <strong>Set Media Volume</strong> to that value → <strong>Play on iPhone</strong>.</li>
+        <li>Get <code>receiptUrl</code> from the original Dictionary → <strong>Get Contents of URL</strong>. Expand it and set Method <strong>POST</strong>, Request Body <strong>JSON</strong>, with: <code>status</code>=<code>completed</code>, <code>receiverContract</code>=<code>poolside-pulse-x-audio-v3</code>, <code>volumeRestored</code>=true, <code>restoredMusicPercent</code>=<code>musicPercent</code> from <code>Restore Target</code>, and <code>musicResumed</code>=true.</li>
+        <li>Open <strong>Volume Down</strong> and replace its fixed 30% action: Get Dictionary from Shortcut Input and keep it as the original Dictionary. Get <code>recoveryUrl</code>. If it has a value, GET that URL, stop when its <code>shouldRecover</code> is false, and use the URL contents as the Recovery Dictionary; otherwise use the original Dictionary. Get <code>musicLevel</code> from the Recovery Dictionary → Set Media Volume. Get <code>resumeMusic</code>; only when true, run <strong>Play on iPhone</strong>. Manual slider requests send false; an incomplete timed announcement sends true.</li>
         <li>Return to Pushcut → Server → <strong>Ready For Requests</strong>, then tap <strong>Run Verified Receiver Test</strong> here.</li>
       </ol>
     </details>` : ''}
@@ -1352,7 +1353,7 @@ function renderAnnounce() {
         <label for="liveAnnouncementSource">Announcement source<select id="liveAnnouncementSource" name="sourceId">${announcementSourceOptions('natural-voice')}</select><small>Natural Voice is the default. A saved short clip plays its recorded audio; the typed text remains the activity description.</small></label>
         <label for="announcementText">Speak now</label>
         <textarea id="announcementText" name="text" maxlength="${messageCharacterLimit}" placeholder="Type the announcement exactly as guests should hear it." required></textarea>
-        <div class="composerFooter"><span>${operatingMode === 'pushcut' ? 'Natural Voice by default · Shortcut requests 100/30; physical output is not measured' : `Natural Voice by default · voice target ${audibleVoiceTarget()}% · music pauses or ducks fully`}</span><button type="submit" class="primary" ${announcementReady ? '' : 'disabled'}>Speak Now</button></div>
+        <div class="composerFooter"><span>${operatingMode === 'pushcut' ? `Natural Voice · music ${audibleMusicTarget()}% → 0% · announcement 100% · restore ${audibleMusicTarget()}%` : `Natural Voice · announcement ${audibleVoiceTarget()}% · music pauses or ducks fully`}</span><button type="submit" class="primary" ${announcementReady ? '' : 'disabled'}>Speak Now</button></div>
       </form>
     </section>
     <section class="workspacePanel">
@@ -1453,8 +1454,8 @@ function scheduleKindLabel(item) {
 
 function scheduleVolumeLabel(item) {
   const percent = effectiveScheduleItemVolume(item, store.state.config);
-  if (scheduleItemKind(item) === 'announcement') return `Voice ${percent}%`;
-  return scheduleItemKind(item) === 'apple'
+  if (scheduleItemKind(item) === 'announcement') return `Announcement ${VOICE_LEVEL_PERCENT}%`;
+  return ['apple', 'spotify'].includes(scheduleItemKind(item))
     ? (activeReceiverIsIOS() ? 'Physical speaker level' : liveReceiverIsNative() ? `Music.app ${percent}%` : `Target ${percent}%`)
     : `Music ${percent}%`;
 }
@@ -1478,6 +1479,7 @@ function renderScheduleRow(item, schedule, index) {
   const pushcutOnly = receiverOperatingMode() === 'pushcut';
   const playNowDisabled = pushcutOnly && kind !== 'announcement';
   const iphoneAppleVolume = ['apple', 'spotify'].includes(kind) && activeReceiverIsIOS();
+  const fixedVolume = kind === 'announcement' || iphoneAppleVolume;
   const announcementSource = item.action?.announcementSource || 'saved';
   const savedAnnouncement = store.state.announcements.find(entry => entry.id === (item.action?.announcementId || item.announcementId));
   const announcementSourceId = item.action?.sourceId || savedAnnouncement?.sourceId || 'natural-voice';
@@ -1513,17 +1515,17 @@ function renderScheduleRow(item, schedule, index) {
               <label data-show-announcement-source="saved" ${announcementSource === 'saved' ? '' : 'hidden'}>Saved message<select name="announcementId">${announcementOptions(item.action?.announcementId || item.announcementId)}</select></label>
               <label data-show-announcement-source="inline" ${announcementSource === 'inline' ? '' : 'hidden'}>Custom announcement<textarea name="text" maxlength="${announcementTextLimit}" placeholder="Type the announcement spoken only by this schedule item">${escapeHtml(item.action?.text || '')}</textarea><small>This text stays inside this schedule and is not added to Saved Messages.${announcementTextLimit === PUSHCUT_MAX_ANNOUNCEMENT_CHARACTERS ? ` Maximum ${announcementTextLimit} characters for reliable Pushcut playback.` : ''}</small></label>
               <label>Playback source<select name="sourceId">${announcementSourceOptions(announcementSourceId)}</select><small>Natural Voice or a saved finite clip. Apple Music and Spotify catalog items are disabled for announcement use on one iPhone.</small></label>
-              <div class="fixedVoiceNote"><strong>Voice ${itemVolume}%</strong><span>Suno fades fully to ${DUCK_LEVEL_PERCENT}%. Apple Music or Spotify pauses completely before this announcement.</span></div>
+              <div class="fixedVoiceNote"><strong>Announcement ${VOICE_LEVEL_PERCENT}%</strong><span>Music reaches ${DUCK_LEVEL_PERCENT}% before speech starts. Playback resumes at the music slider target only after the announcement finishes.</span></div>
             </div>
             <div class="conditionalFields musicFields" data-show-schedule-kind="music" ${kind === 'announcement' ? 'hidden' : ''}>
               <label>Music URL<input name="url" type="url" value="${escapeAttr(item.action?.url || item.url || '')}" placeholder="Apple Music, Spotify, Suno, or direct HTTPS audio URL" ${kind === 'announcement' ? '' : 'required'} /></label>
               ${schedule.mode === 'order' ? `<label>Advance<select name="advanceMode" data-advance-mode><option value="manual" ${advanceMode === 'manual' ? 'selected' : ''}>Manually with Play Next</option><option value="track-end" ${advanceMode === 'track-end' ? 'selected' : ''} ${['apple', 'spotify'].includes(kind) ? 'disabled' : ''}>At direct track end (Suno/direct only)</option><option value="duration" ${advanceMode === 'duration' ? 'selected' : ''}>After a duration</option><option value="complete" ${advanceMode === 'complete' ? 'selected' : ''}>Immediately after playback starts</option></select></label><label data-show-advance-mode="duration" ${advanceMode === 'duration' ? '' : 'hidden'}>Duration seconds<input name="durationSeconds" type="number" min="1" max="86400" step="1" value="${escapeAttr(item.advance?.durationSeconds || 300)}" /></label>` : ''}
             </div>
-            <div class="conditionalFields scheduleVolumeFields" data-standard-volume-fields ${iphoneAppleVolume ? 'hidden' : ''}>
-              <label>Volume<select name="volumeMode" data-volume-mode ${iphoneAppleVolume ? 'disabled' : ''}><option value="global" ${volumeMode === 'global' ? 'selected' : ''}>Use shared volume</option><option value="custom" ${volumeMode === 'custom' ? 'selected' : ''}>Custom for this item</option></select><small>${kind === 'announcement' ? `Shared voice is ${audibleVoiceTarget()}%.` : `Shared music is ${store.state.config.musicLevel}%.`}</small></label>
-              <label data-show-volume-mode="custom" ${volumeMode === 'custom' && !iphoneAppleVolume ? '' : 'hidden'}>Item ${kind === 'announcement' ? 'voice' : 'music'} volume<div class="itemVolumeControl"><input name="volumePercent" class="itemVolumeSlider" type="range" min="0" max="100" step="1" value="${itemVolume}" ${iphoneAppleVolume ? 'disabled' : ''} /><output>${itemVolume}%</output></div></label>
+            <div class="conditionalFields scheduleVolumeFields" data-standard-volume-fields ${fixedVolume ? 'hidden' : ''}>
+              <label>Volume<select name="volumeMode" data-volume-mode ${fixedVolume ? 'disabled' : ''}><option value="global" ${volumeMode === 'global' ? 'selected' : ''}>Use shared volume</option><option value="custom" ${volumeMode === 'custom' ? 'selected' : ''}>Custom for this item</option></select><small>Shared music is ${store.state.config.musicLevel}%.</small></label>
+              <label data-show-volume-mode="custom" ${volumeMode === 'custom' && !fixedVolume ? '' : 'hidden'}>Item music volume<div class="itemVolumeControl"><input name="volumePercent" class="itemVolumeSlider" type="range" min="0" max="100" step="1" value="${itemVolume}" ${fixedVolume ? 'disabled' : ''} /><output>${itemVolume}%</output></div></label>
             </div>
-            <div class="fixedVoiceNote" data-apple-ios-volume-note ${iphoneAppleVolume ? '' : 'hidden'}><strong>${kind === 'spotify' ? 'Spotify' : 'Apple Music'} volume: shared physical control</strong><span>The active receiver is an iPhone. The Poolside Pulse Shortcut requests the shared ${store.state.config.musicLevel}% music and ${audibleVoiceTarget()}% announcement targets; neither physical output nor per-item external-provider percentages can be verified.</span></div>
+            <div class="fixedVoiceNote" data-apple-ios-volume-note ${iphoneAppleVolume ? '' : 'hidden'}><strong>${kind === 'spotify' ? 'Spotify' : 'Apple Music'} volume: shared physical control</strong><span>The active Browser Receiver is an iPhone. Music uses the iPhone or connected speaker’s physical volume, so per-item external-provider percentages cannot be applied or verified. Music pauses completely before every ${audibleVoiceTarget()}% announcement.</span></div>
           </div>
           <div class="rowActions scheduleRowActions"><button type="submit" class="primary">Save Item</button><button type="submit" name="intent" value="play" class="secondary" ${playNowDisabled ? 'disabled title="Music schedule items require Browser Receiver mode"' : ''}>${playNowDisabled ? 'Browser Receiver Required' : 'Save & Play Now'}</button><button type="button" data-action="move-schedule-item" data-id="${escapeAttr(item.id)}" data-direction="-1" class="secondary" aria-label="Move ${escapeAttr(item.label)} up">Move Up</button><button type="button" data-action="move-schedule-item" data-id="${escapeAttr(item.id)}" data-direction="1" class="secondary" aria-label="Move ${escapeAttr(item.label)} down">Move Down</button><button type="button" data-action="duplicate-schedule-item" data-id="${escapeAttr(item.id)}" class="secondary">Duplicate</button><button type="button" data-action="delete-schedule-item" data-id="${escapeAttr(item.id)}" class="textDanger">Delete</button></div>
         </form>
@@ -1681,7 +1683,7 @@ function renderSettings() {
         ${role === 'receiver'
           ? `<div class="stackedActions">${appleSetupButton({ disabled: apple.loggedIn() && !runtime.isOwner() })}${nativeLocal ? apple.ready ? '<button data-action="apple-logout" class="secondary">Disconnect Music.app</button>' : '' : apple.loggedIn() ? '<button data-action="apple-logout" class="secondary">Remove Apple Music Authorization</button>' : ''}</div>${apple.loggedIn() && !runtime.isOwner() ? '<div class="callout"><strong>Start Receiver before connecting Apple Music.</strong><p>Only the device holding the live receiver lease may become the Apple Music player.</p></div>' : ''}`
           : '<div class="callout"><strong>Apple Music controls live only on the speaker receiver.</strong><p>Remote devices send commands and never authorize or connect an Apple Music account.</p></div>'}
-        <div class="policyNote"><strong>Required for live and scheduled playback:</strong> ${nativeContext ? 'Music.app signed in to an active Apple Music subscription, the Mac receiver app running, and its macOS Automation permission allowed.' : 'an active Apple Music subscription, an authorized MusicKit session, and this receiver page kept open on the speaker device.'} Apple pauses before Suno or speech; there is no overlap. ${iphoneApple ? 'This active iPhone receiver uses its physical speaker volume; Apple custom percentage targets are disabled. Suno and voice remain adjustable.' : nativeContext ? 'The Mac receiver applies and reads back the requested 0–100 Music.app volume.' : 'Desktop receivers may verify exact Apple Music volume.'}</div>
+        <div class="policyNote"><strong>Required for live and scheduled playback:</strong> ${nativeContext ? 'Music.app signed in to an active Apple Music subscription, the Mac receiver app running, and its macOS Automation permission allowed.' : 'an active Apple Music subscription, an authorized MusicKit session, and this receiver page kept open on the speaker device.'} Apple pauses before Suno or speech; there is no overlap. ${iphoneApple ? 'This active iPhone receiver uses its physical speaker volume; Apple custom percentage targets are disabled in Browser mode. Suno music remains adjustable and every announcement is fixed at 100%.' : nativeContext ? 'The Mac receiver applies and reads back the requested 0–100 Music.app volume.' : 'Desktop receivers may verify exact Apple Music volume.'}</div>
       </section>
       <section class="workspacePanel">
         <div class="sectionHeading"><div><p class="kicker">Spotify receiver</p><h2>${spotifyReadiness.ready ? 'Spotify account saved · browser playback active' : spotify.accessVerified ? 'Spotify account verified · activate browser playback' : spotify.loggedIn() ? 'Spotify account saved · verify access' : 'Authorize Spotify account'}</h2></div></div>
@@ -1722,11 +1724,11 @@ function renderContent() {
 function renderApp() {
   const policy = displayAudioPolicy();
   const footerMix = receiverOperatingMode() === 'pushcut'
-    ? 'Shortcut target 30/100 · physical output unmeasured'
+    ? `Shortcut ${audibleMusicTarget()} → 0 → 100 → ${audibleMusicTarget()} · physical output unmeasured`
     : policy.exact
     ? `Music ${policy.musicPercent}% · Voice ${audibleVoiceTarget()}%`
     : activeReceiverIsIOS() && ['apple', 'spotify'].includes(effectiveProvider())
-      ? `${effectiveProvider() === 'spotify' ? 'Spotify' : 'Apple Music'} Shortcut ${store.state.config.musicLevel}/${audibleVoiceTarget()}`
+      ? `${effectiveProvider() === 'spotify' ? 'Spotify' : 'Apple Music'} physical volume unverified · Voice ${audibleVoiceTarget()}%`
       : `${effectiveProvider() === 'spotify' ? 'Spotify' : 'Apple Music'} target ${store.state.config.musicLevel}% unverified · Voice ${audibleVoiceTarget()}%`;
   return `
     ${renderHeader()}
@@ -1907,17 +1909,30 @@ async function selectSharedReceiverMode(nextMode) {
 async function setProvider(provider) {
   const target = clamp(store.state.config.musicLevel, 0, 100, 30);
   const selected = ['apple', 'spotify'].includes(provider) ? provider : 'controlled';
-  const iphoneExternal = selected !== 'controlled' && activeReceiverIsIOS();
+  const pushcutMode = receiverOperatingMode() === 'pushcut';
+  const iphoneExternal = selected !== 'controlled' && !pushcutMode && activeReceiverIsIOS();
   const providerLabel = selected === 'apple' ? 'Apple Music' : selected === 'spotify' ? 'Spotify' : 'Suno / direct';
   await store.mutate(draft => {
     draft.config.musicProvider = selected;
-    draft.activityLog = [makeLog('settings', 'Music source selected', selected === 'controlled' ? `Manager Volume: Suno/direct exact ${target}/${draft.config.voiceLevel} mode` : iphoneExternal ? `${providerLabel} with Shortcut ${target}/${draft.config.voiceLevel} physical output` : `${providerLabel} ${target}% target`), ...(draft.activityLog || [])];
+    draft.activityLog = [makeLog(
+      'settings',
+      'Music source selected',
+      selected === 'controlled'
+        ? `Manager Volume: Suno/direct exact ${target}/${VOICE_LEVEL_PERCENT} mode`
+        : pushcutMode
+          ? `${providerLabel} with Pushcut Shortcut ${target}/${VOICE_LEVEL_PERCENT} physical output`
+          : iphoneExternal
+            ? `${providerLabel} with Browser Receiver physical volume; announcement ${VOICE_LEVEL_PERCENT}%`
+            : `${providerLabel} ${target}% target`
+    ), ...(draft.activityLog || [])];
     return draft;
   }, 'Music source selected');
   setFeedback(selected !== 'controlled'
-    ? iphoneExternal
+    ? pushcutMode
       ? `${providerLabel} selected. The receiver Shortcut requests ${target}% music and ${audibleVoiceTarget()}% announcements, then runs its restore steps; physical loudness is not measured.`
-      : `${providerLabel} selected with a ${target}% target. It will pause for announcements.`
+      : iphoneExternal
+        ? `${providerLabel} selected in Browser Receiver mode. Music uses the iPhone or connected speaker’s physical volume and pauses completely before ${audibleVoiceTarget()}% announcements.`
+        : `${providerLabel} selected with a ${target}% target. It will pause for announcements.`
     : `Manager Volume selected for guaranteed ${target}% music / ${audibleVoiceTarget()}% announcements.`, true);
 }
 
@@ -1998,6 +2013,14 @@ async function saveMusicLevel(percent, { forceManaged = false, startManagedSourc
     draft.activityLog = [makeLog('settings', 'Music target changed', `${target}% music; ${audibleVoiceTarget(draft)}% announcements.`), ...(draft.activityLog || [])];
     return draft;
   }, `Music target ${target}% saved`);
+  if (receiverOperatingMode(store.state) === 'pushcut') {
+    if (pushcutMusicVolumeReady()) {
+      await applyReceiverMusicTargetNow(target);
+    } else {
+      setFeedback(`Music target saved at ${target}%. It will be applied by the receiver Shortcut when Pushcut is ready.`, true);
+    }
+    return target;
+  }
   if (receiverOnline(store.state.receiver, store.now())) {
     await runtime.sendCommand('set-music-level', { percent: target, label: `${target}% music target` }, `Music target ${target}% sent to receiver.`);
   } else {
@@ -2072,52 +2095,6 @@ function flushMusicLevelSave(percent) {
   return queueMusicLevelSave(target);
 }
 
-async function saveVoiceLevel(percent) {
-  const target = clamp(percent, 0, 100, VOICE_LEVEL_PERCENT);
-  audio.setVoiceLevelPercent?.(target, { report: false });
-  await store.mutate(draft => {
-    draft.config.voiceLevel = target;
-    draft.activityLog = [makeLog('settings', 'Voice target changed', `${target}% shared announcement volume.`), ...(draft.activityLog || [])];
-    return draft;
-  }, `Voice target ${target}% saved`);
-  setFeedback(`Voice target saved at ${target}%. It applies to live, saved, and shared-volume scheduled announcements.`, true);
-  return target;
-}
-
-function queueVoiceLevelSave(percent) {
-  queuedVoiceLevel = clamp(percent, 0, 100, VOICE_LEVEL_PERCENT);
-  voiceLevelDraft = queuedVoiceLevel;
-  if (voiceLevelDrain) return voiceLevelDrain;
-  voiceLevelDrain = (async () => {
-    while (queuedVoiceLevel !== null) {
-      await new Promise(resolve => setTimeout(resolve, 180));
-      const target = queuedVoiceLevel;
-      queuedVoiceLevel = null;
-      if (busy) await actionSettled;
-      const sequence = ++voiceLevelSaveSequence;
-      setFeedback(`Saving voice at ${target}%...`, true);
-      try {
-        await saveVoiceLevel(target);
-        if (sequence === voiceLevelSaveSequence && queuedVoiceLevel === null) {
-          voiceLevelDraft = null;
-          renderWhenIdle(true);
-        }
-      } catch (error) {
-        if (sequence === voiceLevelSaveSequence && queuedVoiceLevel === null) {
-          voiceLevelDraft = null;
-          audio.setVoiceLevelPercent?.(audibleVoiceTarget(store.state), { report: false });
-          setFeedback(error.message || String(error), false);
-          renderWhenIdle(true);
-        }
-      }
-    }
-  })().finally(() => {
-    voiceLevelDrain = null;
-    if (queuedVoiceLevel !== null) queueVoiceLevelSave(queuedVoiceLevel);
-  });
-  return voiceLevelDrain;
-}
-
 async function sendLiveAnnouncement({
   text,
   label = 'Speak Now',
@@ -2140,7 +2117,7 @@ async function sendLiveAnnouncement({
     return await runtime.sendCommand(safety ? 'announce-safety' : 'announce', {
       text,
       label,
-      volumePercent,
+      volumePercent: VOICE_LEVEL_PERCENT,
       ...delivery
     }, `${label} sent to receiver.`);
   }
@@ -2152,16 +2129,21 @@ async function sendLiveAnnouncement({
         : 'Browser Receiver mode is selected, but the speaker receiver is offline. Open Version X on that iPhone and tap Start Receiver.');
   }
 
+  const requestedMusicTarget = audibleMusicTarget(store.state);
   const result = await sendPushcutAnnouncement({
     text,
     label,
     safety,
-    // The receiver's two imported volume shortcuts are the physical source of
-    // truth on iPhone: announcement 100%, music restoration 30%.
-    voicePercent: 100,
-    musicPercent: 30,
+    voicePercent: VOICE_LEVEL_PERCENT,
+    musicPercent: requestedMusicTarget,
     ...delivery
   });
+  const expectedMusicTarget = clamp(
+    result.receipt?.expectedMusicPercent ?? result.musicPercent,
+    0,
+    100,
+    requestedMusicTarget
+  );
 
   // Pushcut's nowait response proves acceptance only. Save that exact fact, but
   // never turn a later state-save problem into a retryable announcement error.
@@ -2179,7 +2161,7 @@ async function sendLiveAnnouncement({
     return draft;
   }, 'Pushcut acceptance recorded').catch(() => {});
 
-  setFeedback(`${label} is queued with ${source.label}. Waiting for the receiver to complete the configured 100/30 Shortcut sequence...`, true);
+  setFeedback(`${label} is queued with ${source.label}. Waiting for music 0% → announcement 100% → restore ${expectedMusicTarget}%...`, true);
   const completed = await waitForPushcutAnnouncementCompletion(result.eventId, {
     onUpdate: status => {
       const stage = String(status.receipt?.providerStatus || status.status || '');
@@ -2192,7 +2174,7 @@ async function sendLiveAnnouncement({
       makeLog(
         safety ? 'safety' : 'announcement',
         `${label} completed on receiver`,
-        'Signed receipt: the Shortcut reached its final step after audio playback and the Volume Down/resume actions. Physical loudness was not measured.',
+        `Signed receipt: the Shortcut reached its final step after audio playback, restored music to ${clamp(completed.receipt?.restoredMusicPercent, 0, 100, expectedMusicTarget)}%, and resumed playback. Physical loudness was not measured.`,
         store.now(),
         { eventId: result.eventId, commandType: safety ? 'announce-safety' : 'announce', pushcutStatus: 'completed' }
       ),
@@ -2200,8 +2182,14 @@ async function sendLiveAnnouncement({
     ];
     return draft;
   }, 'Pushcut completion recorded').catch(() => {});
-  setFeedback(`${label} completed. The Receiver Shortcut finished its 100/30 sequence; physical loudness was not measured.`, true);
-  return { ...result, ...completed, completed: true };
+  const restoredMusicTarget = clamp(
+    completed.receipt?.restoredMusicPercent,
+    0,
+    100,
+    expectedMusicTarget
+  );
+  setFeedback(`${label} completed. Music was restored to ${restoredMusicTarget}% after the 100% announcement; physical loudness was not measured.`, true);
+  return { ...result, ...completed, musicPercent: restoredMusicTarget, completed: true };
 }
 
 async function runImmediateWeatherCheck() {
@@ -2362,17 +2350,25 @@ async function sendTransport(command) {
   await runtime.sendCommand(command, { label: labels[command] || command }, labels[command] || 'Music command sent.');
 }
 
-async function applyReceiverMusic30Now() {
+async function applyReceiverMusicTargetNow(percent = audibleMusicTarget(store.state)) {
+  if (receiverOperatingMode() !== 'pushcut') {
+    throw new Error('Apply Music Now is available only while Pushcut Receiver mode is selected.');
+  }
+  if (!pushcutMusicVolumeReady()) {
+    throw new Error('The Pushcut music-volume Shortcut is not ready.');
+  }
+  const requestedTarget = clamp(percent, 0, 100, 30);
   pushcutVolumeStatus = {
     state: 'working',
-    message: 'Waiting for the Receiver Volume Down Shortcut...'
+    message: `Waiting for the Receiver music Shortcut to apply ${requestedTarget}%...`
   };
   renderWhenIdle(true);
   try {
-    const result = await applyPushcutMusic30Now();
+    const result = await applyPushcutMusicVolume({ musicPercent: requestedTarget });
+    const appliedTarget = clamp(result.musicPercent, 0, 100, requestedTarget);
     const message = result.completed
-      ? 'Volume Down Shortcut completed. Physical output was not measured.'
-      : 'Pushcut accepted the Volume Down Shortcut, but completion was not confirmed.';
+      ? `Receiver music Shortcut completed at ${appliedTarget}%. Physical output was not measured.`
+      : `Pushcut accepted the canonical ${appliedTarget}% music target, but completion was not confirmed.`;
     pushcutVolumeStatus = {
       state: result.completed ? 'completed' : 'accepted',
       message
@@ -2381,7 +2377,7 @@ async function applyReceiverMusic30Now() {
       draft.activityLog = [
         makeLog(
           'settings',
-          result.completed ? 'Music 30% Shortcut completed' : 'Music 30% Shortcut accepted',
+          result.completed ? `Music ${appliedTarget}% Shortcut completed` : `Music ${appliedTarget}% Shortcut accepted`,
           `${message} Receiver must remain on Ready For Requests.`
         ),
         ...(draft.activityLog || [])
@@ -2454,6 +2450,7 @@ function updateScheduleFormVisibility(form) {
   const announcementSource = form.querySelector('[data-announcement-source]')?.value || form.dataset.announcementSource || 'saved';
   const volumeMode = form.querySelector('[data-volume-mode]')?.value || form.dataset.volumeMode || 'global';
   const iphoneAppleVolume = ['apple', 'spotify'].includes(kind) && activeReceiverIsIOS();
+  const fixedVolume = kind === 'announcement' || iphoneAppleVolume;
   const advanceSelect = form.querySelector('[data-advance-mode]');
   const trackEndOption = advanceSelect?.querySelector('option[value="track-end"]');
   if (trackEndOption) trackEndOption.disabled = ['apple', 'spotify'].includes(kind);
@@ -2473,14 +2470,14 @@ function updateScheduleFormVisibility(form) {
     field.hidden = field.dataset.showAnnouncementSource !== announcementSource;
   }
   for (const field of form.querySelectorAll('[data-show-volume-mode]')) {
-    field.hidden = iphoneAppleVolume || field.dataset.showVolumeMode !== volumeMode;
+    field.hidden = fixedVolume || field.dataset.showVolumeMode !== volumeMode;
   }
   const standardVolumeFields = form.querySelector('[data-standard-volume-fields]');
-  if (standardVolumeFields) standardVolumeFields.hidden = iphoneAppleVolume;
+  if (standardVolumeFields) standardVolumeFields.hidden = fixedVolume;
   const iphoneVolumeNote = form.querySelector('[data-apple-ios-volume-note]');
   if (iphoneVolumeNote) iphoneVolumeNote.hidden = !iphoneAppleVolume;
   for (const control of form.querySelectorAll('[data-standard-volume-fields] select, [data-standard-volume-fields] input')) {
-    control.disabled = iphoneAppleVolume;
+    control.disabled = fixedVolume;
   }
   for (const field of form.querySelectorAll('[data-show-advance-mode]')) {
     field.hidden = field.dataset.showAdvanceMode !== advanceMode;
@@ -2642,8 +2639,9 @@ root.addEventListener('click', event => {
     }
     if (action === 'provider') return await runAction('Changing music source', () => setProvider(button.dataset.provider));
     if (action === 'transport') return await runAction('Sending music command', () => sendTransport(button.dataset.command));
-    if (action === 'apply-pushcut-music-30') {
-      return await runAction('Applying Music 30% on Receiver', () => applyReceiverMusic30Now());
+    if (action === 'apply-pushcut-music-target') {
+      const target = clamp(button.dataset.musicPercent, 0, 100, audibleMusicTarget(store.state));
+      return await runAction(`Applying Music ${target}% on Receiver`, () => applyReceiverMusicTargetNow(target));
     }
     if (action === 'sync-pushcut-schedule') {
       return await runAction('Syncing timed Pushcut announcements', () => syncCurrentPushcutSchedule({
@@ -2901,7 +2899,7 @@ root.addEventListener('click', event => {
           days: [0, 1, 2, 3, 4, 5, 6],
           position: { time: '12:00', order: nextOrder },
           action: { kind: 'announcement', announcementSource: 'inline', announcementId: '', text: '', url: '' },
-          volume: { mode: 'global', percent: clamp(draft.config.voiceLevel, 0, 100, VOICE_LEVEL_PERCENT) },
+          volume: { mode: 'global', percent: VOICE_LEVEL_PERCENT },
           advance: { mode: 'complete', durationSeconds: 300 }
         });
         resetScheduleSequence(draft, scheduleId);
@@ -3085,20 +3083,6 @@ root.addEventListener('input', event => {
     }
     return;
   }
-  const voiceSlider = event.target.closest?.('#voiceLevel');
-  if (voiceSlider) {
-    const target = clamp(voiceSlider.value, 0, 100, VOICE_LEVEL_PERCENT);
-    voiceLevelDraft = target;
-    audio.setVoiceLevelPercent?.(target, { report: false });
-    voiceSlider.style.setProperty('--level', target / 100);
-    voiceSlider.setAttribute('aria-valuetext', `${target}% announcement voice`);
-    const output = root.querySelector('[data-voice-level-output]');
-    if (output) {
-      output.value = `${target}%`;
-      output.textContent = `${target}%`;
-    }
-    return;
-  }
   const slider = event.target.closest?.('#musicLevel');
   if (!slider) return;
   const target = clamp(slider.value, 0, 100, 30);
@@ -3145,13 +3129,6 @@ root.addEventListener('change', event => {
   }
   if (event.target.matches?.('[data-schedule-kind], [data-announcement-source], [data-volume-mode], [data-advance-mode]')) {
     updateScheduleFormVisibility(form);
-    return;
-  }
-  const voiceSlider = event.target.closest?.('#voiceLevel');
-  if (voiceSlider) {
-    const target = clamp(voiceSlider.value, 0, 100, VOICE_LEVEL_PERCENT);
-    voiceLevelDraft = target;
-    queueVoiceLevelSave(target);
     return;
   }
   const slider = event.target.closest?.('#musicLevel');
@@ -3346,7 +3323,11 @@ root.addEventListener('submit', event => {
         if (index < 0) throw new Error('Schedule item no longer exists.');
         const existing = schedule.items[index];
         const targetOrder = clamp(data.get('order') || existing.position?.order || index + 1, 1, 100, index + 1);
-        const volumeMode = !iphoneAppleVolume && data.get('volumeMode') === 'custom' ? 'custom' : 'global';
+        const volumeMode = actionKind !== 'announcement'
+          && !iphoneAppleVolume
+          && data.get('volumeMode') === 'custom'
+            ? 'custom'
+            : 'global';
       const advanceMode = ['complete', 'track-end', 'duration', 'manual'].includes(String(data.get('advanceMode')))
           ? String(data.get('advanceMode'))
           : (actionKind === 'announcement' ? 'complete' : 'manual');
@@ -3370,12 +3351,14 @@ root.addEventListener('submit', event => {
           },
           volume: {
             mode: volumeMode,
-            percent: clamp(
-              iphoneAppleVolume ? existing.volume?.percent : data.get('volumePercent'),
-              0,
-              100,
-              actionKind === 'announcement' ? draft.config.voiceLevel : draft.config.musicLevel
-            )
+            percent: actionKind === 'announcement'
+              ? VOICE_LEVEL_PERCENT
+              : clamp(
+                  iphoneAppleVolume ? existing.volume?.percent : data.get('volumePercent'),
+                  0,
+                  100,
+                  draft.config.musicLevel
+                )
           },
           advance: {
             mode: actionKind === 'announcement' ? 'complete' : advanceMode,

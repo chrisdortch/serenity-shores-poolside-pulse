@@ -8,13 +8,17 @@ import {
   readPushcutXReceipt,
   repairLatestCompletedPushcutXReceipt,
   pushcutXReceiptStorageHealth,
-  updatePushcutXReceipt
+  updatePushcutXReceipt,
+  verifiedPushcutXCompletion
 } from './_pushcut-receipts-x.js';
 import {
   readPushcutXCapability,
   verifyPushcutXCapability
 } from './_pushcut-security-x.js';
-import { logPushcutXEvent } from './_pushcut-x.js';
+import {
+  logPushcutXEvent,
+  PUSHCUT_X_RECEIVER_CONTRACT
+} from './_pushcut-x.js';
 
 const MAX_RECEIPT_BYTES = 4_000;
 const RECEIPT_STATUSES = new Set(['started', 'completed', 'failed']);
@@ -33,9 +37,9 @@ export default async function handler(req, res) {
   if (sessionVariant(req) !== 'x') {
     return json(res, 400, { ok: false, error: 'Version X requests must use ?v=x.' });
   }
-  if (req.method !== 'GET' && req.method !== 'POST') {
-    res.setHeader('Allow', 'GET, POST');
-    return json(res, 405, { ok: false, error: 'GET or POST required.' });
+  if (req.method !== 'POST') {
+    res.setHeader('Allow', 'POST');
+    return json(res, 405, { ok: false, error: 'POST required.' });
   }
 
   const capability = readPushcutXCapability(req);
@@ -43,17 +47,19 @@ export default async function handler(req, res) {
     return json(res, 403, { ok: false, error: 'The announcement receipt link is invalid or expired.' });
   }
 
-  let body = {};
-  if (req.method === 'POST') {
-    try {
-      body = await readJsonBody(req, MAX_RECEIPT_BYTES);
-    } catch {
-      return json(res, 400, { ok: false, error: 'Invalid receipt body.' });
-    }
+  let body;
+  try {
+    body = await readJsonBody(req, MAX_RECEIPT_BYTES);
+  } catch {
+    return json(res, 400, { ok: false, error: 'Invalid receipt body.' });
   }
   const requestedEventId = String(body?.eventId || capability.eventId).trim();
-  const status = String(body?.status || 'completed').trim().toLowerCase();
-  if (requestedEventId !== capability.eventId || !RECEIPT_STATUSES.has(status)) {
+  const status = String(body?.status || '').trim().toLowerCase();
+  if (
+    requestedEventId !== capability.eventId
+    || !RECEIPT_STATUSES.has(status)
+    || String(body?.receiverContract || '') !== PUSHCUT_X_RECEIVER_CONTRACT
+  ) {
     return json(res, 400, { ok: false, error: 'The announcement receipt is invalid.' });
   }
   logPushcutXEvent('receiver_receipt_requested', {
@@ -64,13 +70,49 @@ export default async function handler(req, res) {
   try {
     const existing = await readPushcutXReceipt(capability.eventId);
     if (!existing) throw new PushcutXReceiptError('notFound');
+    if (String(existing.receiverContract || '') !== PUSHCUT_X_RECEIVER_CONTRACT) {
+      return json(res, 409, {
+        ok: false,
+        error: 'This announcement was created for an outdated Receiver contract.'
+      });
+    }
     if (status === 'completed' && !Number(existing.audioFetchedAt || 0)) {
       return json(res, 409, {
         ok: false,
         error: 'The natural announcement audio has not been fetched by the Receiver.'
       });
     }
-    if (existing.status === status && (status === 'completed' || status === 'failed')) {
+    if (status === 'completed') {
+      const expectedMusicPercent = Number(existing.restoreTargetMusicPercent);
+      const restoreTargetResolvedAt = Number(existing.restoreTargetResolvedAt || 0);
+      const audioFetchedAt = Number(existing.audioFetchedAt || 0);
+      const validRestoredMusicPercent = typeof body?.restoredMusicPercent === 'number'
+        && Number.isFinite(body.restoredMusicPercent)
+        && body.restoredMusicPercent === expectedMusicPercent;
+      const validMusicResume = body?.musicResumed === true;
+      if (
+        body?.volumeRestored !== true
+        || !Number.isSafeInteger(restoreTargetResolvedAt)
+        || restoreTargetResolvedAt <= 0
+        || !Number.isSafeInteger(audioFetchedAt)
+        || audioFetchedAt <= 0
+        || restoreTargetResolvedAt < audioFetchedAt
+        || !validRestoredMusicPercent
+        || !validMusicResume
+      ) {
+        return json(res, 409, {
+          ok: false,
+          error: 'The Receiver did not prove that it restored the latest signed music target and resumed the music bed.'
+        });
+      }
+    }
+    if (
+      existing.status === status
+      && (
+        status === 'failed'
+        || (status === 'completed' && verifiedPushcutXCompletion(existing))
+      )
+    ) {
       if (status === 'completed') {
         await repairLatestCompletedPushcutXReceipt(capability.eventId);
       }
@@ -90,12 +132,11 @@ export default async function handler(req, res) {
     const patch = status === 'completed'
       ? {
           status,
-          providerStatus: 'receiver_completed',
+          providerStatus: 'receiver_completed_v3',
           completedAt: now,
-          volumeRestored: body?.volumeRestored !== false,
-          musicResumed: req.method === 'GET'
-            ? existing.resumeMusic !== false
-            : body?.musicResumed !== false
+          volumeRestored: true,
+          restoredMusicPercent: body.restoredMusicPercent,
+          musicResumed: body.musicResumed
         }
       : status === 'started'
         ? {

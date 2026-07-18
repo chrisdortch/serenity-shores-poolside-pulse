@@ -654,7 +654,7 @@ export class ReceiverRuntime {
       volumeVerified: provider === 'controlled' ? false : !!external.volumeVerified,
       verifiedPercent: provider === 'controlled' ? null : external.verifiedPercent,
       musicPercent,
-      voicePercent: this.state.config.voiceLevel
+      voicePercent: VOICE_LEVEL_PERCENT
     });
   }
 
@@ -755,7 +755,7 @@ export class ReceiverRuntime {
             updatedAt: this.now()
           };
         }
-        draft.activityLog = [makeLog('settings', 'Music level applied', `${target}% target; announcements ${draft.config.voiceLevel}%.`, this.now()), ...(draft.activityLog || [])];
+        draft.activityLog = [makeLog('settings', 'Music level applied', `${target}% target; announcements ${VOICE_LEVEL_PERCENT}%.`, this.now()), ...(draft.activityLog || [])];
         return draft;
       }, 'Music level applied', { requireDurable: true });
       const policy = this.currentPolicy(this.physicalProvider || this.state.playback.provider || this.state.config.musicProvider);
@@ -765,7 +765,7 @@ export class ReceiverRuntime {
           ? `Global music target saved at ${target}%. The current scheduled item remains at its custom ${customPlaybackTarget}% level.`
           : externalActive && verification?.verified !== true
             ? `Music target is ${target}%. ${externalProvider === 'spotify' ? 'Spotify' : 'Apple Music'} could not verify that level on this receiver; announcements will still pause it.`
-            : `Music level is ${target}%. Announcements are ${this.state.config.voiceLevel}%.`,
+            : `Music level is ${target}%. Announcements are ${VOICE_LEVEL_PERCENT}%.`,
         !externalActive || verification?.verified === true,
         { policy, verification }
       );
@@ -3212,14 +3212,10 @@ export class ReceiverRuntime {
   async announce(text, options = {}) {
     const message = String(text || '').trim().slice(0, 900);
     if (!message) throw new Error('Announcement text is empty.');
-    const volumePercent = clamp(
-      options.volumePercent === null || options.volumePercent === undefined
-        ? this.state.config.voiceLevel
-        : options.volumePercent,
-      0,
-      100,
-      VOICE_LEVEL_PERCENT
-    );
+    // Version X announcements are a fixed 100%. Keep the option on the queued
+    // job for backward compatibility, but never allow stale state, a schedule
+    // override, or an older Remote to weaken the announcement.
+    const volumePercent = VOICE_LEVEL_PERCENT;
     return await new Promise((resolve, reject) => {
       const cancellation = { cancelled: false };
       const jobOptions = { ...options, volumePercent, cancellation };
@@ -3330,7 +3326,7 @@ export class ReceiverRuntime {
     const voiceOutput = delivery.announcementMode === 'finite-audio'
       ? 'finite-audio-mixer'
       : 'ai-mixer';
-    const voicePercent = clamp(options.volumePercent, 0, 100, this.state.config.voiceLevel);
+    const voicePercent = VOICE_LEVEL_PERCENT;
     this.assertAnnouncementActive(options, 'Announcement was preempted while its voice was preparing.');
     const completed = await this.serializeAudio(async () => {
     this.assertAnnouncementActive(options, 'Announcement was cancelled while waiting for the audio mixer.');
@@ -3345,8 +3341,9 @@ export class ReceiverRuntime {
     let appleSnapshot = null;
     let spotifySnapshot = null;
     let controlledDucked = false;
-    const previousVoicePercent = clamp(this.audio.status?.().voiceLevelPercent, 0, 100, this.state.config.voiceLevel);
     let voiceTargetApplied = false;
+    let playbackFinished = false;
+    let restoreFailure = '';
     const applePauseHeld = provider === 'apple' || !!this.apple.ready;
     const spotifyPauseHeld = provider === 'spotify' || !!this.spotify.ready;
     if (applePauseHeld) this.beginTemporaryAppleMusicPause();
@@ -3418,9 +3415,9 @@ export class ReceiverRuntime {
       voiceTargetApplied = true;
       await this.audio.playVoiceBlob(voiceBlob);
       this.assertAnnouncementActive(options, 'Announcement was cancelled before speech completed.');
-      return true;
+      playbackFinished = true;
     } finally {
-      if (voiceTargetApplied) this.audio.setVoiceLevelPercent?.(previousVoicePercent, { report: false });
+      if (voiceTargetApplied) this.audio.setVoiceLevelPercent?.(VOICE_LEVEL_PERCENT, { report: false });
       const chainedSafety = !!options.safety && announcementEpoch !== this.audioEpoch && this.safetyPendingCount > 1;
       const carriedSafetyRestore = options.safety && this.safetyRestoreSnapshot?.epoch === announcementEpoch
         ? this.safetyRestoreSnapshot
@@ -3444,7 +3441,7 @@ export class ReceiverRuntime {
           const mayResume = announcementEpoch === this.audioEpoch && !options?.cancellation?.cancelled && this.active && this.isOwner();
           if (mayResume && resumeSnapshot?.wasPlaying) {
             if (Number.isFinite(Number(carriedSafetyRestore?.musicLevelPercent))) {
-              this.applyConfiguredMusicTarget({ report: false, percent: carriedSafetyRestore.musicLevelPercent });
+              this.applyConfiguredMusicTarget({ report: false, percent: this.currentMusicTarget() });
             }
             await this.apple.resumeAfterAnnouncement(resumeSnapshot, {
               assertCurrent: () => {
@@ -3452,7 +3449,10 @@ export class ReceiverRuntime {
                   throw new Error('Announcement restore was superseded.');
                 }
               }
-            }).then(() => { this.physicalProvider = 'apple'; }).catch(error => this.status(`Announcement finished; Apple Music resume failed: ${error.message}`, false));
+            }).then(() => { this.physicalProvider = 'apple'; }).catch(error => {
+              restoreFailure = `Apple Music could not resume: ${error.message || String(error)}`;
+              this.status(`Announcement finished; ${restoreFailure}`, false);
+            });
           }
         }
       } else if (provider === 'spotify') {
@@ -3474,7 +3474,7 @@ export class ReceiverRuntime {
           const mayResume = announcementEpoch === this.audioEpoch && !options?.cancellation?.cancelled && this.active && this.isOwner();
           if (mayResume && resumeSnapshot?.wasPlaying) {
             if (Number.isFinite(Number(carriedSafetyRestore?.musicLevelPercent))) {
-              this.applyConfiguredMusicTarget({ report: false, percent: carriedSafetyRestore.musicLevelPercent });
+              this.applyConfiguredMusicTarget({ report: false, percent: this.currentMusicTarget() });
             }
             await this.spotify.resumeAfterAnnouncement(resumeSnapshot, {
               assertCurrent: () => {
@@ -3482,7 +3482,10 @@ export class ReceiverRuntime {
                   throw new Error('Announcement restore was superseded.');
                 }
               }
-            }).then(() => { this.physicalProvider = 'spotify'; }).catch(error => this.status(`Announcement finished; Spotify resume failed: ${error.message}`, false));
+            }).then(() => { this.physicalProvider = 'spotify'; }).catch(error => {
+              restoreFailure = `Spotify could not resume: ${error.message || String(error)}`;
+              this.status(`Announcement finished; ${restoreFailure}`, false);
+            });
           }
         }
       } else if (controlledDucked) {
@@ -3492,19 +3495,26 @@ export class ReceiverRuntime {
         if (restoreAllowed && carriedSafetyRestore?.provider === 'controlled' && carriedSafetyRestore.controlledSnapshot?.wasPlaying) {
           const snapshot = carriedSafetyRestore.controlledSnapshot;
           if (Number.isFinite(Number(carriedSafetyRestore.musicLevelPercent))) {
-            this.applyConfiguredMusicTarget({ report: false, percent: carriedSafetyRestore.musicLevelPercent });
+            this.applyConfiguredMusicTarget({ report: false, percent: this.currentMusicTarget() });
           }
           await this.audio.playMusicUrl(snapshot.audioUrl, {
             label: snapshot.label,
             startAt: snapshot.position,
             scheduledRunToken: snapshot.scheduledRunToken
-          }).then(() => { this.physicalProvider = 'controlled'; }).catch(error => this.status(`Safety announcement finished; controlled music restore failed: ${error.message}`, false));
+          }).then(() => { this.physicalProvider = 'controlled'; }).catch(error => {
+            restoreFailure = `the prior Suno/direct music bed could not resume: ${error.message || String(error)}`;
+            this.status(`Safety announcement finished; ${restoreFailure}`, false);
+          });
         }
       }
       if (options.safety && !chainedSafety && this.safetyRestoreSnapshot?.epoch === announcementEpoch) this.safetyRestoreSnapshot = null;
       if (applePauseHeld) this.endTemporaryAppleMusicPause();
       if (spotifyPauseHeld) this.endTemporarySpotifyPause();
     }
+    if (playbackFinished && restoreFailure) {
+      throw new Error(`Announcement played at ${VOICE_LEVEL_PERCENT}%, but ${restoreFailure}`);
+    }
+    return playbackFinished;
     });
     this.store.mutate(draft => {
         if (draft.receiver?.id !== this.deviceId || draft.receiver?.sessionId !== this.sessionId) {
@@ -4564,7 +4574,7 @@ export class ReceiverRuntime {
           throw new Error('Receiver ownership changed before the sound-check receipt could be saved.');
         }
         const target = clamp(draft.config.musicLevel, 0, 100, 30);
-        const voiceTarget = clamp(draft.config.voiceLevel, 0, 100, VOICE_LEVEL_PERCENT);
+        const voiceTarget = VOICE_LEVEL_PERCENT;
         draft.activityLog = [makeLog('diagnostic', `${target}/${voiceTarget} calibration completed`, `${target}% calibration bed, ${Math.min(DUCK_LEVEL_PERCENT, target)}% duck, and ${voiceTarget}% announcement path played on the receiver.`), ...(draft.activityLog || [])];
         return draft;
       }, 'Calibration completed', { requireDurable: true });

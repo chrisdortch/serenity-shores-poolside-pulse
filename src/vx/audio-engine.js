@@ -444,8 +444,11 @@ export class AudioEngine {
     return targetPercent;
   }
 
-  setVoiceLevelPercent(percent, { rampMs = 80, report = true } = {}) {
-    const targetPercent = clamp(percent, 0, 100, VOICE_LEVEL_PERCENT);
+  setVoiceLevelPercent(_percent, { rampMs = 80, report = true } = {}) {
+    // Announcement gain is a Version X invariant, not a user preference.
+    // Keeping the clamp out of this final enforcement point prevents stale
+    // state or an older Remote bundle from lowering live or scheduled speech.
+    const targetPercent = VOICE_LEVEL_PERCENT;
     this.voiceLevel = targetPercent / 100;
     if (this.voiceBus && this.context) {
       const now = this.context.currentTime;
@@ -465,7 +468,7 @@ export class AudioEngine {
       }
       gain.linearRampToValueAtTime(this.voiceLevel, now + Math.max(0.01, rampMs / 1000));
     }
-    if (report) this.report(`Announcement target set to ${targetPercent}%.`, true);
+    if (report) this.report(`Announcement target is fixed at ${targetPercent}%.`, true);
     return targetPercent;
   }
 

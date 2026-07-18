@@ -1,4 +1,5 @@
 import { normalizeFiniteAudioReference } from './_finite-audio-x.js';
+import { PUSHCUT_X_RECEIVER_CONTRACT } from './_pushcut-x.js';
 
 const RECEIPT_NAMESPACE = 'serenity-shores-poolside-pulse:vx:pushcut-receipt:v1:';
 const RECEIPT_KEY_PREFIX = `${RECEIPT_NAMESPACE}event:`;
@@ -35,6 +36,7 @@ const PATCH_FIELDS = new Set([
   'providerStatus',
   'recoveryAcceptedAt',
   'recoveryQueued',
+  'restoredMusicPercent',
   'startedAt',
   'status',
   'updatedAt',
@@ -85,6 +87,7 @@ if statusRejected then
     "failureCode",
     "musicResumed",
     "providerStatus",
+    "restoredMusicPercent",
     "startedAt",
     "volumeRestored"
   }
@@ -109,8 +112,19 @@ end
 if tostring(current.status or "") == "completed" then
   local latest = {
     eventId = current.eventId,
+    status = "completed",
     completedAt = current.completedAt or current.updatedAt or 0,
-    updatedAt = current.updatedAt or 0
+    updatedAt = current.updatedAt or 0,
+    audioFetchedAt = current.audioFetchedAt or 0,
+    receiverContract = current.receiverContract or "",
+    voicePercent = current.voicePercent or 0,
+    musicPercent = current.musicPercent or 0,
+    resumeMusic = current.resumeMusic ~= false,
+    volumeRestored = current.volumeRestored == true,
+    restoreTargetMusicPercent = current.restoreTargetMusicPercent,
+    restoreTargetResolvedAt = current.restoreTargetResolvedAt or 0,
+    restoredMusicPercent = current.restoredMusicPercent,
+    musicResumed = current.musicResumed == true
   }
   local latestEncoded = cjson.encode(latest)
   local latestRaw = redis.call("GET", KEYS[2])
@@ -130,6 +144,47 @@ if tostring(current.status or "") == "completed" then
   end
 end
 return encoded
+`;
+const KV_RESOLVE_RESTORE_TARGET_SCRIPT = `
+local raw = redis.call("GET", KEYS[1])
+if not raw then
+  return ""
+end
+local decodedOk, current = pcall(cjson.decode, raw)
+if not decodedOk or type(current) ~= "table" then
+  return ""
+end
+local status = tostring(current.status or "queued")
+local receiverContract = tostring(current.receiverContract or "")
+local audioFetchedAt = tonumber(current.audioFetchedAt or 0) or 0
+local existingTarget = nil
+if type(current.restoreTargetMusicPercent) == "number" then
+  existingTarget = current.restoreTargetMusicPercent
+end
+local requestedTarget = tonumber(ARGV[1])
+local now = tonumber(ARGV[2]) or 0
+local resolvedAt = now
+if audioFetchedAt > resolvedAt then
+  resolvedAt = audioFetchedAt
+end
+if existingTarget == nil
+  and requestedTarget ~= nil
+  and requestedTarget >= 0
+  and requestedTarget <= 100
+  and audioFetchedAt > 0
+  and (status == "started" or status == "timed_out")
+  and receiverContract == tostring(ARGV[4] or "")
+then
+  current.restoreTargetMusicPercent = requestedTarget
+  current.restoreTargetResolvedAt = resolvedAt
+  current.updatedAt = resolvedAt
+  local receiptTtl = redis.call("TTL", KEYS[1])
+  if receiptTtl == nil or receiptTtl < 1 then
+    receiptTtl = tonumber(ARGV[3]) or 86400
+  end
+  redis.call("SET", KEYS[1], cjson.encode(current), "EX", receiptTtl)
+end
+return cjson.encode(current)
 `;
 const KV_LATEST_SCRIPT = `
 local raw = redis.call("GET", KEYS[1])
@@ -166,25 +221,7 @@ local previousClaim = tonumber(current.dispatchClaimedAt or 0) or 0
 local claimed = false
 local reclaimed = false
 local busy = false
-local busyOwner = redis.call("GET", KEYS[2])
-if busyOwner and busyOwner ~= KEYS[1] then
-  local holderRaw = redis.call("GET", busyOwner)
-  if not holderRaw then
-    redis.call("DEL", KEYS[2])
-    busyOwner = nil
-  else
-    local holderOk, holder = pcall(cjson.decode, holderRaw)
-    local holderStatus = holderOk and type(holder) == "table"
-      and tostring(holder.status or "queued") or ""
-    if holderStatus == "completed" or holderStatus == "failed" or holderStatus == "" then
-      redis.call("DEL", KEYS[2])
-      busyOwner = nil
-    else
-      busy = true
-    end
-  end
-end
-if not busy and status == "queued" and (previousClaim <= 0 or previousClaim + lease <= now) then
+if status == "queued" and (previousClaim <= 0 or previousClaim + lease <= now) then
   claimed = true
   reclaimed = previousClaim > 0
   current.dispatchClaimedAt = now
@@ -195,7 +232,6 @@ if not busy and status == "queued" and (previousClaim <= 0 or previousClaim + le
   if receiptTtl == nil or receiptTtl < 1 then
     receiptTtl = tonumber(ARGV[3]) or 86400
   end
-  redis.call("SET", KEYS[2], KEYS[1], "EX", tonumber(ARGV[4]) or 120)
   redis.call("SET", KEYS[1], cjson.encode(current), "EX", receiptTtl)
 end
 return cjson.encode({
@@ -483,6 +519,13 @@ function sanitizePatch(value, now) {
       clean[key] = timestamp;
       continue;
     }
+    if (key === 'restoredMusicPercent') {
+      if (typeof item !== 'number' || !Number.isFinite(item) || item < 0 || item > 100) {
+        throw new PushcutXReceiptError('invalid');
+      }
+      clean.restoredMusicPercent = item;
+      continue;
+    }
     const text = String(item || '').trim();
     if (text.length > 120) throw new PushcutXReceiptError('invalid');
     clean[key] = text;
@@ -513,6 +556,7 @@ function transition(current, patch) {
     'failureCode',
     'musicResumed',
     'providerStatus',
+    'restoredMusicPercent',
     'startedAt',
     'volumeRestored'
   ]);
@@ -532,6 +576,7 @@ function baseReceipt(command, now, ttlSeconds) {
   if (!text || text.length > 900) throw new PushcutXReceiptError('invalid');
   const voice = String(command.voice || 'marin').trim().slice(0, 40) || 'marin';
   const instructions = String(command.instructions || '').trim().slice(0, 700);
+  const requestedMusicPercent = Number(command.musicPercent);
   const scheduledFor = Number(command.scheduledFor || 0);
   if (
     scheduledFor
@@ -568,6 +613,7 @@ function baseReceipt(command, now, ttlSeconds) {
   return {
     schemaVersion: 1,
     version: 'x',
+    receiverContract: PUSHCUT_X_RECEIVER_CONTRACT,
     eventId: command.eventId,
     commandId: String(command.commandId || command.eventId),
     action: String(command.action || 'announce'),
@@ -583,13 +629,13 @@ function baseReceipt(command, now, ttlSeconds) {
     text,
     voice,
     instructions,
-    voicePercent: Number.isInteger(Number(command.voicePercent))
-      ? Math.max(0, Math.min(100, Number(command.voicePercent)))
-      : 100,
-    musicPercent: Number.isInteger(Number(command.musicPercent))
-      ? Math.max(0, Math.min(100, Number(command.musicPercent)))
+    voicePercent: 100,
+    musicPercent: Number.isFinite(requestedMusicPercent)
+      ? Math.max(0, Math.min(100, requestedMusicPercent))
       : 30,
-    resumeMusic: command.resumeMusic !== false,
+    // All v3 announcement receipts describe the same complete sequence,
+    // including the final music resume. Legacy callers cannot weaken it.
+    resumeMusic: true,
     status: 'queued',
     providerStatus: 'pending',
     providerMode: '',
@@ -610,7 +656,10 @@ function baseReceipt(command, now, ttlSeconds) {
     audioContentType: '',
     recoveryQueued: false,
     recoveryAcceptedAt: 0,
+    restoreTargetMusicPercent: null,
+    restoreTargetResolvedAt: 0,
     volumeRestored: false,
+    restoredMusicPercent: null,
     musicResumed: false
   };
 }
@@ -629,6 +678,7 @@ function ensureCompatible(existing, candidate) {
     || existing.text !== candidate.text
     || existing.voice !== candidate.voice
     || existing.instructions !== candidate.instructions
+    || String(existing.receiverContract || '') !== candidate.receiverContract
     || existing.voicePercent !== candidate.voicePercent
     || existing.musicPercent !== candidate.musicPercent
     || (existing.resumeMusic !== false) !== candidate.resumeMusic
@@ -704,53 +754,40 @@ export async function claimPushcutXDispatch(eventId, options = {}) {
     const claimed = parseClaimResult(await kv([
       'EVAL',
       KV_DISPATCH_CLAIM_SCRIPT,
-      '2',
+      '1',
       key,
-      RECEIVER_BUSY_KEY,
       String(now),
       String(leaseMs),
-      String(RECEIPT_TTL_SECONDS),
-      String(Math.ceil(PUSHCUT_X_RECEIVER_BUSY_LEASE_MS / 1000))
+      String(RECEIPT_TTL_SECONDS)
     ], deps));
     if (!claimed) throw new PushcutXReceiptError('notFound');
     return { ...claimed, durable: true };
   }
 
-  return await withMemoryLock(RECEIVER_BUSY_KEY, async () => {
-    return await withMemoryLock(key, async () => {
-      const receipts = memoryReceipts();
-      const current = receipts.get(key);
-      if (!current) throw new PushcutXReceiptError('notFound');
-      const ownerKey = activeMemoryBusyOwner(now);
-      const busy = Boolean(ownerKey && ownerKey !== key);
-      const previousClaim = Number(current.dispatchClaimedAt || 0);
-      const canClaim = !busy
-        && current.status === 'queued'
-        && (previousClaim <= 0 || previousClaim + leaseMs <= now);
-      const receipt = canClaim
-        ? {
-            ...current,
-            dispatchClaimedAt: now,
-            dispatchAttempt: Number(current.dispatchAttempt || 0) + 1,
-            providerStatus: 'pushcut_dispatching',
-            updatedAt: now
-          }
-        : current;
-      if (canClaim) {
-        receipts.set(RECEIVER_BUSY_KEY, {
-          ownerKey: key,
-          expiresAt: now + PUSHCUT_X_RECEIVER_BUSY_LEASE_MS
-        });
-        receipts.set(key, receipt);
-      }
-      return {
-        claimed: canClaim,
-        reclaimed: canClaim && previousClaim > 0,
-        busy,
-        receipt,
-        durable: false
-      };
-    });
+  return await withMemoryLock(key, async () => {
+    const receipts = memoryReceipts();
+    const current = receipts.get(key);
+    if (!current) throw new PushcutXReceiptError('notFound');
+    const previousClaim = Number(current.dispatchClaimedAt || 0);
+    const canClaim = current.status === 'queued'
+      && (previousClaim <= 0 || previousClaim + leaseMs <= now);
+    const receipt = canClaim
+      ? {
+          ...current,
+          dispatchClaimedAt: now,
+          dispatchAttempt: Number(current.dispatchAttempt || 0) + 1,
+          providerStatus: 'pushcut_dispatching',
+          updatedAt: now
+        }
+      : current;
+    if (canClaim) receipts.set(key, receipt);
+    return {
+      claimed: canClaim,
+      reclaimed: canClaim && previousClaim > 0,
+      busy: false,
+      receipt,
+      durable: false
+    };
   });
 }
 
@@ -846,6 +883,70 @@ export async function readPushcutXReceipt(eventId, options = {}) {
   return receipt;
 }
 
+/**
+ * Binds an announcement to the first canonical music target requested after
+ * its audio was fetched. The signed restore lookup and the signed completion
+ * receipt then agree on one server-recorded value even if another Remote moves
+ * the shared slider again while the Shortcut is finishing.
+ */
+export async function resolvePushcutXRestoreTarget(eventId, musicPercent, options = {}) {
+  const deps = dependencies(options);
+  const now = Number((options.now || Date.now)());
+  const target = Number(musicPercent);
+  if (
+    !Number.isSafeInteger(now)
+    || now < 0
+    || !Number.isFinite(target)
+    || target < 0
+    || target > 100
+  ) {
+    throw new PushcutXReceiptError('invalid');
+  }
+  const key = receiptKey(eventId);
+  const durable = kvReady(deps.env);
+  if (!durable && storageRequired(options, deps.env)) {
+    throw new PushcutXReceiptError('unavailable');
+  }
+
+  if (durable) {
+    const resolved = parseReceipt(await kv([
+      'EVAL',
+      KV_RESOLVE_RESTORE_TARGET_SCRIPT,
+      '1',
+      key,
+      String(target),
+      String(now),
+      String(RECEIPT_TTL_SECONDS),
+      PUSHCUT_X_RECEIVER_CONTRACT
+    ], deps));
+    if (!resolved) throw new PushcutXReceiptError('notFound');
+    return resolved;
+  }
+
+  return await withMemoryLock(key, async () => {
+    const receipts = memoryReceipts();
+    const current = receipts.get(key);
+    if (!current) throw new PushcutXReceiptError('notFound');
+    const existingTarget = Number(current.restoreTargetMusicPercent);
+    const targetAlreadyResolved = typeof current.restoreTargetMusicPercent === 'number'
+      && Number.isFinite(existingTarget);
+    const canResolve = !targetAlreadyResolved
+      && Number(current.audioFetchedAt || 0) > 0
+      && ['started', 'timed_out'].includes(current.status)
+      && String(current.receiverContract || '') === PUSHCUT_X_RECEIVER_CONTRACT;
+    const resolved = canResolve
+      ? {
+          ...current,
+          restoreTargetMusicPercent: target,
+          restoreTargetResolvedAt: Math.max(now, Number(current.audioFetchedAt || 0)),
+          updatedAt: Math.max(now, Number(current.audioFetchedAt || 0))
+        }
+      : current;
+    if (canResolve) receipts.set(key, resolved);
+    return resolved;
+  });
+}
+
 export async function updatePushcutXReceipt(eventId, value, options = {}) {
   const deps = dependencies(options);
   const now = Number((options.now || Date.now)());
@@ -891,8 +992,19 @@ export async function updatePushcutXReceipt(eventId, value, options = {}) {
   if (updated.status === 'completed') {
     const latest = JSON.stringify({
       eventId: updated.eventId,
+      status: 'completed',
       completedAt: updated.completedAt || updated.updatedAt,
-      updatedAt: updated.updatedAt
+      updatedAt: updated.updatedAt,
+      audioFetchedAt: Number(updated.audioFetchedAt || 0),
+      receiverContract: String(updated.receiverContract || ''),
+      voicePercent: Number(updated.voicePercent || 0),
+      musicPercent: Number(updated.musicPercent || 0),
+      resumeMusic: updated.resumeMusic !== false,
+      volumeRestored: updated.volumeRestored === true,
+      restoreTargetMusicPercent: updated.restoreTargetMusicPercent,
+      restoreTargetResolvedAt: Number(updated.restoreTargetResolvedAt || 0),
+      restoredMusicPercent: updated.restoredMusicPercent,
+      musicResumed: updated.musicResumed === true
     });
     if (!durable) {
       await withMemoryLock(LATEST_RECEIPT_KEY, async () => {
@@ -916,8 +1028,19 @@ export async function repairLatestCompletedPushcutXReceipt(eventId, options = {}
   if (receipt.status !== 'completed') return false;
   const latest = JSON.stringify({
     eventId: receipt.eventId,
+    status: 'completed',
     completedAt: receipt.completedAt || receipt.updatedAt,
-    updatedAt: receipt.updatedAt
+    updatedAt: receipt.updatedAt,
+    audioFetchedAt: Number(receipt.audioFetchedAt || 0),
+    receiverContract: String(receipt.receiverContract || ''),
+    voicePercent: Number(receipt.voicePercent || 0),
+    musicPercent: Number(receipt.musicPercent || 0),
+    resumeMusic: receipt.resumeMusic !== false,
+    volumeRestored: receipt.volumeRestored === true,
+    restoreTargetMusicPercent: receipt.restoreTargetMusicPercent,
+    restoreTargetResolvedAt: Number(receipt.restoreTargetResolvedAt || 0),
+    restoredMusicPercent: receipt.restoredMusicPercent,
+    musicResumed: receipt.musicResumed === true
   });
   const durable = kvReady(deps.env);
   if (!durable && storageRequired(options, deps.env)) {
@@ -958,11 +1081,40 @@ export async function readLatestCompletedPushcutXReceipt(options = {}) {
     : memoryReceipts().get(LATEST_RECEIPT_KEY) || null;
 }
 
+export function verifiedPushcutXCompletion(receipt) {
+  if (!isRecord(receipt)) return false;
+  const expectedMusicPercent = Number(receipt.restoreTargetMusicPercent);
+  const restoreTargetResolvedAt = Number(receipt.restoreTargetResolvedAt || 0);
+  const audioFetchedAt = Number(receipt.audioFetchedAt || 0);
+  const hasRestoredMusicPercent = typeof receipt.restoredMusicPercent === 'number'
+    && Number.isFinite(receipt.restoredMusicPercent);
+  const restoredMusicPercent = hasRestoredMusicPercent
+    ? receipt.restoredMusicPercent
+    : NaN;
+  return String(receipt.receiverContract || '') === PUSHCUT_X_RECEIVER_CONTRACT
+    && receipt.status === 'completed'
+    && Number(receipt.voicePercent) === 100
+    && Number.isFinite(expectedMusicPercent)
+    && expectedMusicPercent >= 0
+    && expectedMusicPercent <= 100
+    && Number.isSafeInteger(restoreTargetResolvedAt)
+    && restoreTargetResolvedAt > 0
+    && Number.isSafeInteger(audioFetchedAt)
+    && audioFetchedAt > 0
+    && restoreTargetResolvedAt >= audioFetchedAt
+    && Number.isFinite(restoredMusicPercent)
+    && restoredMusicPercent === expectedMusicPercent
+    && receipt.volumeRestored === true
+    && receipt.resumeMusic === true
+    && receipt.musicResumed === true;
+}
+
 export function publicPushcutXReceipt(receipt, { durable = false } = {}) {
   if (!isRecord(receipt)) return null;
   const status = STATUSES.has(receipt.status) ? receipt.status : 'queued';
   return Object.freeze({
     version: 'x',
+    receiverContract: String(receipt.receiverContract || ''),
     eventId: String(receipt.eventId || ''),
     action: String(receipt.action || ''),
     source: String(receipt.source || ''),
@@ -995,9 +1147,18 @@ export function publicPushcutXReceipt(receipt, { durable = false } = {}) {
     naturalAudio: receipt.announcementMode !== 'finite-audio' && Boolean(receipt.audioFetchedAt),
     finiteAudio: receipt.announcementMode === 'finite-audio' && Boolean(receipt.audioFetchedAt),
     recoveryQueued: receipt.recoveryQueued === true,
-    sequenceCompleted: status === 'completed',
+    sequenceCompleted: status === 'completed' && verifiedPushcutXCompletion(receipt),
     physicalVolumeMeasured: false,
     volumeRestored: receipt.volumeRestored === true,
+    dispatchedMusicPercent: Number(receipt.musicPercent || 0),
+    expectedMusicPercent: typeof receipt.restoreTargetMusicPercent === 'number'
+      && Number.isFinite(receipt.restoreTargetMusicPercent)
+      ? receipt.restoreTargetMusicPercent
+      : Number(receipt.musicPercent || 0),
+    restoredMusicPercent: typeof receipt.restoredMusicPercent === 'number'
+      && Number.isFinite(receipt.restoredMusicPercent)
+      ? receipt.restoredMusicPercent
+      : null,
     musicResumed: receipt.musicResumed === true
   });
 }

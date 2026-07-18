@@ -9,6 +9,7 @@ import {
   dispatchPushcutXCommand,
   inspectPushcutXServerHealth,
   logPushcutXEvent,
+  canonicalPushcutXMusicPercent,
   normalizePushcutXCommand,
   PUSHCUT_X_ACTIONS,
   PUSHCUT_X_DEFAULT_RECOVERY_SHORTCUT,
@@ -25,12 +26,14 @@ import {
   pushcutXReceiptStorageHealth,
   readLatestCompletedPushcutXReceipt,
   readPushcutXReceipt,
-  updatePushcutXReceipt
+  updatePushcutXReceipt,
+  verifiedPushcutXCompletion
 } from './_pushcut-receipts-x.js';
 import {
   createSignedPushcutXUrl,
   pushcutXCapabilityReady
 } from './_pushcut-security-x.js';
+import { readCanonicalVersionXState } from './state-x.js';
 
 const HEALTH_RATE_LIMIT = 60;
 const COMMAND_RATE_LIMIT = 20;
@@ -75,6 +78,29 @@ function limited(req, res, session, purpose, limit) {
   res.setHeader('Retry-After', String(rate.retryAfterSeconds));
   json(res, 429, { ok: false, error: 'Too many Pushcut requests. Try again shortly.' });
   return true;
+}
+
+export async function resolveCanonicalPushcutXCommand(body, {
+  env = process.env,
+  stateReader = readCanonicalVersionXState
+} = {}) {
+  const untrustedCommand = normalizePushcutXCommand(body);
+  let snapshot;
+  try {
+    snapshot = await stateReader({
+      env,
+      requireDurable: String(env?.VERCEL || '') === '1'
+    });
+  } catch {
+    throw new PushcutXError('stateUnavailable');
+  }
+  const musicPercent = canonicalPushcutXMusicPercent(snapshot?.state, 30);
+  return Object.freeze({
+    ...untrustedCommand,
+    voicePercent: 100,
+    musicPercent,
+    resumeMusic: true
+  });
 }
 
 export default async function handler(req, res) {
@@ -135,7 +161,10 @@ export default async function handler(req, res) {
     ]);
     const latestReceipt = latestResult.value;
     const receiptStorageReady = receiptStorage.ready && latestResult.ok;
-    const latestVerifiedAt = Number(latestReceipt?.completedAt || latestReceipt?.updatedAt || 0);
+    const latestReceiptVerified = verifiedPushcutXCompletion(latestReceipt);
+    const latestVerifiedAt = latestReceiptVerified
+      ? Number(latestReceipt?.completedAt || latestReceipt?.updatedAt || 0)
+      : 0;
     const recentlyVerified = latestVerifiedAt > 0
       && Date.now() - latestVerifiedAt <= VERIFIED_RECEIVER_WINDOW_MS;
     const connected = providerHealth.connected == null
@@ -209,7 +238,7 @@ export default async function handler(req, res) {
   }
 
   try {
-    const command = normalizePushcutXCommand(body);
+    const command = await resolveCanonicalPushcutXCommand(body);
     const idempotencyKey = header(req, 'idempotency-key').trim();
     if (idempotencyKey && (!validPushcutXEventId(idempotencyKey) || idempotencyKey !== command.eventId)) {
       throw new PushcutXError('invalid');
@@ -230,7 +259,19 @@ export default async function handler(req, res) {
       command.eventId,
       'receipt'
     );
-    if (!selectedAudioReady || !signedDeliveryReady || !audioCapability || !receiptCapability) {
+    const restoreCapability = createSignedPushcutXUrl(
+      req,
+      '/api/pushcut-restore-x',
+      command.eventId,
+      'restore'
+    );
+    if (
+      !selectedAudioReady
+      || !signedDeliveryReady
+      || !audioCapability
+      || !receiptCapability
+      || !restoreCapability
+    ) {
       throw new PushcutXError('notConfigured');
     }
 
@@ -293,8 +334,12 @@ export default async function handler(req, res) {
       audioExpiresAt: audioCapability.expiresAt,
       receiptUrl: receiptCapability.url,
       receiptExpiresAt: receiptCapability.expiresAt,
+      restoreUrl: restoreCapability.url,
+      restoreExpiresAt: restoreCapability.expiresAt,
       recoveryShortcut: PUSHCUT_X_DEFAULT_RECOVERY_SHORTCUT,
-      receiverContract: PUSHCUT_X_RECEIVER_CONTRACT
+      receiverContract: PUSHCUT_X_RECEIVER_CONTRACT,
+      announcementLevel: 1,
+      musicLevel: Number((command.musicPercent / 100).toFixed(6))
     });
     let accepted;
     logPushcutXEvent('route_dispatch_started', {
@@ -373,11 +418,14 @@ export default async function handler(req, res) {
       } : {})
     });
     const receipt = await readPushcutXReceipt(command.eventId);
-    if (accepted.completed && !receipt?.completedAt) {
+    const receiverCompletionVerified = verifiedPushcutXCompletion(receipt);
+    if (accepted.completed && !receiverCompletionVerified) {
       const audioFetched = Number(receipt?.audioFetchedAt || 0) > 0;
-      const failureCode = audioFetched
-        ? 'receiver_completion_missing'
-        : 'receiver_contract_missing';
+      const failureCode = !audioFetched
+        ? 'receiver_contract_missing'
+        : receipt?.completedAt
+          ? 'receiver_completion_invalid'
+          : 'receiver_completion_missing';
       await updatePushcutXReceipt(command.eventId, {
         status: 'failed',
         providerStatus: failureCode,
@@ -395,23 +443,14 @@ export default async function handler(req, res) {
       });
       throw new PushcutXError('receiverContract');
     }
-    if (!accepted.completed && accepted.providerStatus >= 200 && accepted.providerStatus < 300) {
-      await updatePushcutXReceipt(command.eventId, {
-        status: 'failed',
-        providerStatus: 'pushcut_unverified_acceptance',
-        failedAt: Date.now(),
-        failureCode: 'pushcut_unverified_acceptance'
-      }).catch(() => {});
-      logPushcutXEvent('route_provider_unverified_acceptance', {
-        action: command.action,
-        eventId: command.eventId,
-        mode: accepted.mode,
-        providerStatus: accepted.providerStatus,
-        audioFetched: Number(receipt?.audioFetchedAt || 0) > 0,
-        receiptStatus: receipt?.status
-      });
-      throw new PushcutXError('providerRejected');
+    if (receipt?.status === 'completed' && !receiverCompletionVerified) {
+      throw new PushcutXError('receiverContract');
     }
+    // Pushcut may return 202 when a valid Automation Server request is queued
+    // behind another Shortcut. Keep that event receipt-eligible: the queued
+    // Shortcut will prove the complete v3 sequence with its signed callback.
+    // Declaring a 202 terminal here would make its one-time audio URL unusable
+    // before the receiver ever gets a chance to run it.
     const publicReceipt = publicPushcutXReceipt(receipt, {
       durable: dispatchClaim.durable
     });
@@ -425,11 +464,11 @@ export default async function handler(req, res) {
       recoveryQueued: accepted.recoveryQueued,
       receiptStatus: publicReceipt.status
     });
-    return json(res, publicReceipt.completed ? 200 : 202, {
+    return json(res, publicReceipt.sequenceCompleted ? 200 : 202, {
       ok: true,
       version: 'x',
       accepted: accepted.accepted,
-      completed: publicReceipt.completed,
+      completed: publicReceipt.sequenceCompleted,
       status: publicReceipt.status,
       mode: accepted.mode,
       providerStatus: accepted.providerStatus,

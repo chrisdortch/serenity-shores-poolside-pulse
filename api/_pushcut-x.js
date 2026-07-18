@@ -9,7 +9,7 @@ export const PUSHCUT_X_HEALTH_TIMEOUT_MS = 5_000;
 export const PUSHCUT_X_DEFAULT_SHORTCUT = 'Poolside Pulse Announcement';
 export const PUSHCUT_X_DEFAULT_RECOVERY_SHORTCUT = 'Volume Down';
 export const PUSHCUT_X_TEST_WAIT_SECONDS = 10;
-export const PUSHCUT_X_RECEIVER_CONTRACT = 'poolside-pulse-x-audio-v1';
+export const PUSHCUT_X_RECEIVER_CONTRACT = 'poolside-pulse-x-audio-v3';
 
 // Pushcut recommends that server shortcuts finish within 60 seconds. Keeping
 // live speech below 500 characters leaves time for voice rendering, the pause,
@@ -72,6 +72,10 @@ const SAFE_ERRORS = Object.freeze({
   receiverContract: Object.freeze({
     statusCode: 502,
     message: 'The Receiver Shortcut is outdated or incomplete. Install the current Poolside Pulse X receiver Shortcut.'
+  }),
+  stateUnavailable: Object.freeze({
+    statusCode: 503,
+    message: 'The saved Version X music level is temporarily unavailable.'
   })
 });
 
@@ -350,6 +354,35 @@ function percent(value, fallback) {
   return value;
 }
 
+/**
+ * Resolves the one authoritative music target used by every Pushcut path.
+ * Version X's saved state is already sanitized, but this boundary remains
+ * defensive because its output is forwarded to an iPhone Shortcut.
+ */
+export function canonicalPushcutXMusicPercent(state, fallback = 30) {
+  const fallbackNumber = Number(fallback);
+  const safeFallback = Number.isFinite(fallbackNumber)
+    ? Math.max(0, Math.min(100, fallbackNumber))
+    : 30;
+  const raw = state?.config?.musicLevel;
+  if (raw == null || raw === '') return safeFallback;
+  const value = Number(raw);
+  if (!Number.isFinite(value)) return safeFallback;
+  return Math.max(0, Math.min(100, value));
+}
+
+export function pushcutXVolumeLevels(musicPercent) {
+  const safeMusicPercent = canonicalPushcutXMusicPercent({
+    config: { musicLevel: musicPercent }
+  });
+  return Object.freeze({
+    voicePercent: 100,
+    musicPercent: safeMusicPercent,
+    announcementLevel: 1,
+    musicLevel: Number((safeMusicPercent / 100).toFixed(6))
+  });
+}
+
 function validateFields(body, action) {
   const allowed = ACTION_FIELDS[action];
   if (!allowed || Object.keys(body).some(key => !allowed.has(key))) invalid();
@@ -419,9 +452,8 @@ function normalizeLiveAnnouncement(body, { idFactory, issuedAt }) {
   if (body.version !== 'x' || body.source !== 'live') invalid();
   if (typeof body.safety !== 'boolean') invalid();
   const eventId = normalizedCommandId(body.eventId, idFactory);
-  const voicePercent = percent(body.voicePercent, 100);
+  percent(body.voicePercent, 100);
   const musicPercent = percent(body.musicPercent, 30);
-  if (voicePercent <= musicPercent) invalid();
   const source = announcementSource(body);
   return Object.freeze({
     ...commandBase('announce', eventId, issuedAt),
@@ -430,7 +462,7 @@ function normalizeLiveAnnouncement(body, { idFactory, issuedAt }) {
     text: announcementText(body.text),
     label: announcementLabel(body.label),
     safety: body.safety,
-    voicePercent,
+    voicePercent: 100,
     musicPercent,
     resumeMusic: true
   });
@@ -479,11 +511,10 @@ export function normalizePushcutXCommand(body, {
     });
   }
 
-  const voicePercent = percent(body.announcementVolume, 100);
+  percent(body.announcementVolume, 100);
   const musicPercent = percent(body.musicVolume, 30);
-  if (voicePercent <= musicPercent) invalid();
-  const resumeMusic = body.resumeMusic == null ? true : body.resumeMusic;
-  if (typeof resumeMusic !== 'boolean') invalid();
+  const requestedResumeMusic = body.resumeMusic == null ? true : body.resumeMusic;
+  if (typeof requestedResumeMusic !== 'boolean') invalid();
   const source = announcementSource(body);
 
   return Object.freeze({
@@ -493,9 +524,12 @@ export function normalizePushcutXCommand(body, {
     text: announcementText(body.text),
     label: 'Speak Now',
     safety: false,
-    voicePercent,
+    voicePercent: 100,
     musicPercent,
-    resumeMusic
+    // Version X has one universal contract: every announcement restores and
+    // resumes the music bed. Accept the legacy field shape, but never allow an
+    // older client to opt out of the final resume step.
+    resumeMusic: true
   });
 }
 
@@ -550,45 +584,6 @@ async function executeShortcut({
   }
 }
 
-async function queueRecovery(command, configured, dependencies) {
-  if (!configured.apiKey || !configured.recoveryShortcut) {
-    return Object.freeze({ queued: false, acceptedAt: 0 });
-  }
-  const recoveryCommand = Object.freeze({
-    schemaVersion: 1,
-    version: 'x',
-    action: 'recover-volume',
-    commandId: `${String(command.commandId || '').slice(0, 150)}:recovery`,
-    eventId: command.eventId,
-    issuedAt: Number(dependencies.now()),
-    musicPercent: Number.isInteger(command.musicPercent) ? command.musicPercent : 30,
-    reason: 'post-announcement-recovery'
-  });
-  try {
-    const response = await executeShortcut({
-      apiKey: configured.apiKey,
-      apiUrl: dependencies.apiUrl,
-      fetchImpl: dependencies.fetchImpl,
-      input: recoveryCommand,
-      shortcut: configured.recoveryShortcut,
-      timeout: 'nowait',
-      upstreamTimeoutMs: Math.min(dependencies.upstreamTimeoutMs, 8_000),
-      AbortControllerImpl: dependencies.AbortControllerImpl,
-      setTimeoutImpl: dependencies.setTimeoutImpl,
-      clearTimeoutImpl: dependencies.clearTimeoutImpl
-    });
-    if (!responseOk(response)) {
-      return Object.freeze({ queued: false, acceptedAt: 0 });
-    }
-    return Object.freeze({
-      queued: true,
-      acceptedAt: Number(dependencies.now())
-    });
-  } catch {
-    return Object.freeze({ queued: false, acceptedAt: 0 });
-  }
-}
-
 function dispatchError(code, recovery, providerStatus = 0) {
   const error = new PushcutXError(code);
   error.recoveryQueued = recovery?.queued === true;
@@ -619,15 +614,6 @@ export async function dispatchPushcutXCommand(command, {
     throw new PushcutXError('providerRejected');
   }
 
-  const dependencies = {
-    apiUrl,
-    fetchImpl,
-    upstreamTimeoutMs,
-    AbortControllerImpl,
-    setTimeoutImpl,
-    clearTimeoutImpl,
-    now
-  };
   // A nowait response is always 202, even when the Shortcut later fails.
   // Waiting the standard ten seconds makes Pushcut expose missing/disabled
   // Shortcuts and disconnected receivers while remaining plan-compatible.
@@ -652,7 +638,11 @@ export async function dispatchPushcutXCommand(command, {
       clearTimeoutImpl
     });
   } catch (error) {
-    const recovery = await queueRecovery(command, configured, dependencies);
+    // A transport timeout does not prove the announcement Shortcut stopped.
+    // Do not enqueue a restore that could run before voice completion. The v3
+    // receiver Shortcut owns the exact post-playback restore and proves it in
+    // its signed receipt.
+    const recovery = Object.freeze({ queued: false, acceptedAt: 0 });
     logPushcutXEvent('provider_dispatch_transport_failed', {
       action: command.action,
       eventId: command.eventId,
@@ -674,7 +664,7 @@ export async function dispatchPushcutXCommand(command, {
     providerStatus: status
   }, env);
   if (responseOk(response)) {
-    const recovery = await queueRecovery(command, configured, dependencies);
+    const recovery = Object.freeze({ queued: false, acceptedAt: 0 });
     return Object.freeze({
       accepted: true,
       completed: waitForResult && status === 200,
@@ -688,13 +678,15 @@ export async function dispatchPushcutXCommand(command, {
     });
   }
   if (status === 504) {
-    const recovery = await queueRecovery(command, configured, dependencies);
+    // Pushcut may still be running or may have queued the Shortcut. Restoring
+    // here would violate M -> 0 -> voice -> M if the provider is merely late.
+    const recovery = Object.freeze({ queued: false, acceptedAt: 0 });
     throw dispatchError('timeout', recovery, status);
   }
   if (status === 429) throw dispatchError('providerBusy', null, status);
   if (status === 401 || status === 403) {
     throw dispatchError('providerRejected', null, status);
   }
-  const recovery = await queueRecovery(command, configured, dependencies);
+  const recovery = Object.freeze({ queued: false, acceptedAt: 0 });
   throw dispatchError('providerRejected', recovery, status);
 }

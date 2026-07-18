@@ -160,7 +160,7 @@ describe('Version X API isolation', { concurrency: false }, () => {
     assert.notEqual(commands[0][3], commands[1][3]);
   });
 
-  test('stores only Version X state, enforces CAS revisions, and sanitizes adjustable levels', async () => {
+  test('stores only Version X state, enforces CAS revisions, and fixes announcements at 100%', async () => {
     const xCookie = cookieFor('x');
     const finalCookie = cookieFor('final');
     const denied = await invoke(stateXHandler, request('GET', '/api/state-x?v=x', { cookie: finalCookie }));
@@ -194,7 +194,8 @@ describe('Version X API isolation', { concurrency: false }, () => {
     assert.equal(first.json().state.version, 'x');
     assert.equal(first.json().state.revision, 1);
     assert.equal(first.json().state.config.musicLevel, 100);
-    assert.equal(first.json().state.config.voiceLevel, 42);
+    assert.equal(first.json().state.config.voiceLevel, 100);
+    assert.equal(first.json().state.config.voiceMode, 'ai');
     assert.equal(first.json().state.config.duckLevel, 0);
     assert.equal(first.json().state.config.address, 'Preserve this setting');
     assert.equal('appleMusicPrivateKey' in first.json().state.config, false);
@@ -224,7 +225,7 @@ describe('Version X API isolation', { concurrency: false }, () => {
     assert.equal(second.statusCode, 200);
     assert.equal(second.json().state.revision, 2);
     assert.equal(second.json().state.config.musicLevel, 100);
-    assert.equal(second.json().state.config.voiceLevel, 17);
+    assert.equal(second.json().state.config.voiceLevel, 100);
     assert.equal(second.json().state.marker, 'version-x-only');
 
     const read = await invoke(stateXHandler, request('GET', '/api/state-x?v=x', { cookie: xCookie }));

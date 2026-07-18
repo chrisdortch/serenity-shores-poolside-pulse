@@ -7,6 +7,7 @@ import {
   PushcutVolumeXError,
   applyPushcutXMusicVolume
 } from '../api/_pushcut-volume-x.js';
+import { PUSHCUT_X_RECEIVER_CONTRACT } from '../api/_pushcut-x.js';
 import { createPushcutVolumeXHandler } from '../api/pushcut-volume-x.js';
 import { applyPushcutMusic30Now } from '../src/vx/pushcut-client.js';
 
@@ -81,6 +82,7 @@ describe('Version X manual Pushcut music-volume action', () => {
   test('waits for the existing Volume Down Shortcut and returns completion without secrets', async () => {
     let sent;
     const result = await applyPushcutXMusicVolume({
+      musicPercent: 100,
       now: () => 12_345,
       fetchImpl: async (url, options) => {
         sent = { url: new URL(String(url)), options, body: JSON.parse(options.body) };
@@ -96,12 +98,17 @@ describe('Version X manual Pushcut music-volume action', () => {
     const input = sent.body.input;
     assert.equal(input.version, 'x');
     assert.equal(input.action, 'recover-volume');
-    assert.equal(input.musicPercent, 30);
+    assert.equal(input.receiverContract, PUSHCUT_X_RECEIVER_CONTRACT);
+    assert.equal(input.musicPercent, 100);
+    assert.equal(input.musicLevel, 1);
+    assert.equal(input.announcementLevel, 1);
+    assert.equal(input.resumeMusic, false);
     assert.deepEqual(result, {
       accepted: true,
       completed: true,
       status: 'completed',
-      musicPercent: 30
+      musicPercent: 100,
+      uncertain: false
     });
     assert.equal(JSON.stringify(result).includes('pushcut-api-key-test'), false);
   });
@@ -118,7 +125,20 @@ describe('Version X manual Pushcut music-volume action', () => {
     assert.equal(shortcut, 'Pool Music Quiet');
     assert.equal(result.accepted, true);
     assert.equal(result.completed, false);
-    assert.equal(result.status, 'accepted');
+    assert.equal(result.status, 'accepted-uncertain');
+    assert.equal(result.uncertain, true);
+  });
+
+  test('treats a provider 504 as accepted-uncertain because Pushcut may have queued it', async () => {
+    const result = await applyPushcutXMusicVolume({
+      musicPercent: 45,
+      fetchImpl: async () => ({ status: 504 })
+    });
+    assert.equal(result.accepted, true);
+    assert.equal(result.completed, false);
+    assert.equal(result.status, 'accepted-uncertain');
+    assert.equal(result.musicPercent, 45);
+    assert.equal(result.uncertain, true);
   });
 
   test('fails closed when the Version X Pushcut key is absent', async () => {
@@ -130,8 +150,13 @@ describe('Version X manual Pushcut music-volume action', () => {
   });
 
   test('endpoint requires an authenticated Version X session and returns only honest status', async () => {
+    let requestedTarget;
     const handler = createPushcutVolumeXHandler({
-      applyVolume: async () => ({ accepted: true, completed: true, status: 'completed', musicPercent: 30 })
+      stateReader: async () => ({ state: { config: { musicLevel: 45 } } }),
+      applyVolume: async ({ musicPercent }) => {
+        requestedTarget = musicPercent;
+        return { accepted: true, completed: true, status: 'completed', musicPercent };
+      }
     });
     const unauthenticated = await invoke(handler, request('/api/pushcut-volume-x?v=x'));
     assert.equal(unauthenticated.statusCode, 401);
@@ -145,7 +170,8 @@ describe('Version X manual Pushcut music-volume action', () => {
     const body = authenticated.json();
     assert.equal(body.accepted, true);
     assert.equal(body.completed, true);
-    assert.equal(body.musicPercent, 30);
+    assert.equal(requestedTarget, 45);
+    assert.equal(body.musicPercent, 45);
     assert.match(body.note, /Shortcut completed/i);
     assert.match(body.note, /did not measure/i);
     assert.equal('shortcut' in body, false);

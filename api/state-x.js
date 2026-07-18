@@ -124,9 +124,10 @@ function sanitizeConfig(value) {
     // Suno/direct Web Audio bed. Apple and Spotify are separate provider beds.
     musicProvider: normalizeBedProvider(source.musicProvider),
     musicLevel: clamp(source.musicLevel, 0, 100, 30),
-    voiceLevel: clamp(source.voiceLevel, 0, 100, 100),
+    voiceLevel: 100,
+    voiceMode: 'ai',
     // Version X guarantees no music/voice overlap. A spoken announcement fully
-    // silences the music path, while music and voice levels remain adjustable.
+    // silences the music path and always uses the fixed 100% announcement gain.
     duckLevel: 0
   };
   if (hasReceiverMode) {

@@ -133,7 +133,7 @@ describe('Version X Spotify receiver isolation', { concurrency: false }, () => {
     assert.match(modeSource, /state\?\.config\?\.receiverMode/);
     assert.match(modeSource, /configuredMode === 'browser' \|\| configuredMode === 'pushcut'/);
     assert.match(VX_APP_SOURCE, /const PUSHCUT_RUN_SERVER_URL = 'pushcut:\/\/open\/runServer'/);
-    assert.match(VX_APP_SOURCE, /The Remote can apply Music 30% and send announcements, but it cannot start, change, pause, or stop that native music bed while Pushcut is foreground/);
+    assert.match(VX_APP_SOURCE, /The Remote applies the music slider, pauses music for speech, plays the announcement at 100%, restores \$\{musicTarget\}%, and resumes/);
     assert.match(VX_APP_SOURCE, /operatingMode === 'pushcut'[\s\S]*Version X intentionally hides browser Play controls in Pushcut mode/);
   });
 
@@ -151,12 +151,13 @@ describe('Version X Spotify receiver isolation', { concurrency: false }, () => {
     assert.match(sendSource, /browserReceiverOnline: receiverMode === 'browser' && receiverOnline/);
     assert.match(sendSource, /const pushcutReady = pushcutAnnouncementReady\(\)/);
     assert.ok(sendSource.indexOf("transport === 'browser'") < sendSource.indexOf('sendPushcutAnnouncement'));
-    assert.match(sendSource, /volumePercent,[\s\S]*\.\.\.delivery/);
+    assert.match(sendSource, /volumePercent: VOICE_LEVEL_PERCENT,[\s\S]*\.\.\.delivery/);
     assert.doesNotMatch(sendSource, /Short Suno\/direct announcement clips use Pushcut mode/);
     assert.match(sendSource, /forcePushcut = false/);
     assert.match(VX_APP_SOURCE, /label: 'Pushcut Receiver Test'[\s\S]*forcePushcut: true/);
     assert.match(VX_APP_SOURCE.slice(musicStart, musicEnd), /receiverOperatingMode\(\) === 'pushcut'/);
-    assert.match(VX_APP_SOURCE.slice(voiceStart, voiceEnd), /receiverOperatingMode\(\) === 'pushcut'/);
+    assert.match(VX_APP_SOURCE.slice(voiceStart, voiceEnd), /Fixed announcement target/);
+    assert.doesNotMatch(VX_APP_SOURCE.slice(voiceStart, voiceEnd), /id="voiceLevel" type="range"/);
   });
 
   test('keeps Pushcut timed copies separate from the live Browser schedule', () => {

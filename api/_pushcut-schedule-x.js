@@ -20,6 +20,11 @@ import {
 import {
   createSignedPushcutXUrl
 } from './_pushcut-security-x.js';
+import {
+  canonicalPushcutXMusicPercent,
+  PUSHCUT_X_RECEIVER_CONTRACT,
+  pushcutXVolumeLevels
+} from './_pushcut-x.js';
 
 export const PUSHCUT_X_SCHEDULE_TIME_ZONE = 'America/Chicago';
 // Pushcut delayed requests allow at most 30 days. Keep one day of headroom for
@@ -178,6 +183,9 @@ function parseManifest(raw) {
       eventId,
       scheduledFor,
       recoveryFor: Number(occurrence.recoveryFor || 0),
+      musicPercent: canonicalPushcutXMusicPercent({
+        config: { musicLevel: occurrence.musicPercent }
+      }),
       fingerprint: bounded(occurrence.fingerprint, 64),
       scheduleId: bounded(occurrence.scheduleId, 120),
       itemId: bounded(occurrence.itemId, 120),
@@ -428,6 +436,7 @@ export function planPushcutXSchedule(stateInput, {
   let effectiveHorizonDays = boundedHorizonDays;
   let horizonEnd = safeNow + effectiveHorizonDays * 24 * 60 * 60 * 1000;
   const state = normalizeState(stateInput, safeNow);
+  const levels = pushcutXVolumeLevels(canonicalPushcutXMusicPercent(state));
   const active = getActiveSchedule(state);
   const warnings = [];
   if (!active || active.enabled === false || active.mode !== 'time') {
@@ -494,7 +503,9 @@ export function planPushcutXSchedule(stateInput, {
         label: announcement.label,
         delivery: announcement.delivery,
         voice: announcement.source.voice || '',
-        instructions: announcement.source.instructions || ''
+        instructions: announcement.source.instructions || '',
+        receiverContract: PUSHCUT_X_RECEIVER_CONTRACT,
+        musicPercent: levels.musicPercent
       }), 48);
       const ids = occurrenceIdentifiers(logicalId);
       const finiteSeconds = Number(announcement.delivery.announcementDurationSeconds || 0);
@@ -516,6 +527,10 @@ export function planPushcutXSchedule(stateInput, {
         label: announcement.label,
         voice: bounded(announcement.source.voice, 40) || 'marin',
         instructions: bounded(announcement.source.instructions, 700),
+        voicePercent: levels.voicePercent,
+        musicPercent: levels.musicPercent,
+        announcementLevel: levels.announcementLevel,
+        musicLevel: levels.musicLevel,
         ...announcement.delivery
       }));
       if (occurrences.length > MAX_PLAN_OCCURRENCES) fail('invalid');
@@ -627,6 +642,7 @@ export async function verifyPushcutXDelayedScheduling({
   env = process.env,
   fetchImpl = globalThis.fetch,
   now = Date.now,
+  musicPercent = 30,
   scheduleExecution = (payload) => schedulePushcutXExecution(payload, { env, fetchImpl }),
   cancelExecution = (identifier) => cancelPushcutXExecution(identifier, { env, fetchImpl })
 } = {}) {
@@ -638,6 +654,7 @@ export async function verifyPushcutXDelayedScheduling({
   const nonce = sha(randomUUID(), 24);
   const identifier = `ppx-extended-check-${nonce}`;
   const scheduledFor = checkedAt + delaySeconds * 1000;
+  const levels = pushcutXVolumeLevels(musicPercent);
 
   await scheduleExecution({
     identifier,
@@ -651,7 +668,11 @@ export async function verifyPushcutXDelayedScheduling({
       eventId: `pushcut-extended-check-${nonce}`,
       issuedAt: checkedAt,
       scheduledFor,
-      musicPercent: 30,
+      receiverContract: PUSHCUT_X_RECEIVER_CONTRACT,
+      musicPercent: levels.musicPercent,
+      musicLevel: levels.musicLevel,
+      announcementLevel: levels.announcementLevel,
+      resumeMusic: false,
       reason: 'extended-entitlement-check'
     })
   });
@@ -673,6 +694,7 @@ function manifestEntry(occurrence, status, now) {
     eventId: occurrence.eventId,
     scheduledFor: occurrence.scheduledFor,
     recoveryFor: occurrence.recoveryFor,
+    musicPercent: occurrence.musicPercent,
     fingerprint: occurrence.fingerprint,
     scheduleId: occurrence.scheduleId,
     itemId: occurrence.itemId,
@@ -825,8 +847,9 @@ export async function synchronizePushcutXSchedule({
         voice: occurrence.voice,
         instructions: occurrence.instructions,
         safety: false,
-        voicePercent: 100,
-        musicPercent: 30,
+        receiverContract: PUSHCUT_X_RECEIVER_CONTRACT,
+        voicePercent: occurrence.voicePercent,
+        musicPercent: occurrence.musicPercent,
         resumeMusic: true
       });
       await createReceipt(command, {
@@ -859,7 +882,36 @@ export async function synchronizePushcutXSchedule({
           ttlSeconds: 30 * 60
         }
       );
-      if (!audioCapability || !receiptCapability) fail('notConfigured');
+      const restoreCapability = createSignedPushcutXUrl(
+        request,
+        '/api/pushcut-restore-x',
+        occurrence.eventId,
+        'restore',
+        {
+          env,
+          now: () => syncNow,
+          notBeforeMs: occurrence.scheduledFor,
+          ttlSeconds: 30 * 60
+        }
+      );
+      const recoveryCapability = createSignedPushcutXUrl(
+        request,
+        '/api/pushcut-recovery-x',
+        occurrence.eventId,
+        'recovery',
+        {
+          env,
+          now: () => syncNow,
+          notBeforeMs: occurrence.recoveryFor,
+          ttlSeconds: 30 * 60
+        }
+      );
+      if (
+        !audioCapability
+        || !receiptCapability
+        || !restoreCapability
+        || !recoveryCapability
+      ) fail('notConfigured');
       const {
         announcementAudioUrl: _privateSourceUrl,
         ...receiverCommand
@@ -873,7 +925,12 @@ export async function synchronizePushcutXSchedule({
         audioExpiresAt: audioCapability.expiresAt,
         receiptUrl: receiptCapability.url,
         receiptExpiresAt: receiptCapability.expiresAt,
-        recoveryShortcut: configured.recoveryShortcut
+        restoreUrl: restoreCapability.url,
+        restoreExpiresAt: restoreCapability.expiresAt,
+        recoveryShortcut: configured.recoveryShortcut,
+        receiverContract: PUSHCUT_X_RECEIVER_CONTRACT,
+        announcementLevel: occurrence.announcementLevel,
+        musicLevel: occurrence.musicLevel
       });
       const recoveryInput = Object.freeze({
         schemaVersion: 1,
@@ -883,7 +940,13 @@ export async function synchronizePushcutXSchedule({
         eventId: occurrence.eventId,
         issuedAt: syncNow,
         scheduledFor: occurrence.recoveryFor,
-        musicPercent: 30,
+        receiverContract: PUSHCUT_X_RECEIVER_CONTRACT,
+        recoveryUrl: recoveryCapability.url,
+        recoveryExpiresAt: recoveryCapability.expiresAt,
+        musicPercent: occurrence.musicPercent,
+        musicLevel: occurrence.musicLevel,
+        announcementLevel: occurrence.announcementLevel,
+        resumeMusic: true,
         reason: 'scheduled-announcement-recovery'
       });
 

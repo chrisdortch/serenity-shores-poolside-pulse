@@ -8,6 +8,8 @@ import {
   applyPushcutXMusicVolume,
   PushcutVolumeXError
 } from './_pushcut-volume-x.js';
+import { canonicalPushcutXMusicPercent } from './_pushcut-x.js';
+import { readCanonicalVersionXState } from './state-x.js';
 
 const RATE_LIMIT = 20;
 const RATE_WINDOW_MS = 60_000;
@@ -24,7 +26,8 @@ function json(res, status, body) {
 }
 
 export function createPushcutVolumeXHandler({
-  applyVolume = applyPushcutXMusicVolume
+  applyVolume = applyPushcutXMusicVolume,
+  stateReader = readCanonicalVersionXState
 } = {}) {
   return async function handler(req, res) {
     if (sessionVariant(req) !== 'x') {
@@ -46,18 +49,31 @@ export function createPushcutVolumeXHandler({
     }
 
     try {
-      const result = await applyVolume();
+      let snapshot;
+      try {
+        snapshot = await stateReader({
+          requireDurable: String(process.env.VERCEL || '') === '1'
+        });
+      } catch {
+        throw new PushcutVolumeXError('stateUnavailable');
+      }
+      const musicPercent = canonicalPushcutXMusicPercent(snapshot?.state, 30);
+      const result = await applyVolume({ musicPercent });
+      const appliedMusicPercent = typeof result.musicPercent === 'number'
+        ? result.musicPercent
+        : musicPercent;
       return json(res, result.completed ? 200 : 202, {
         ok: true,
         version: 'x',
         action: 'music-volume',
-        musicPercent: 30,
+        musicPercent: appliedMusicPercent,
         accepted: result.accepted === true,
         completed: result.completed === true,
-        status: result.completed === true ? 'completed' : 'accepted',
+        status: result.completed === true ? 'completed' : 'accepted-uncertain',
+        uncertain: result.completed !== true,
         note: result.completed === true
-          ? 'The Receiver Volume Down Shortcut completed. Poolside Pulse did not measure the physical output volume.'
-          : 'Pushcut accepted the Volume Down Shortcut request, but completion was not confirmed.'
+          ? `The Receiver Shortcut completed and restored the saved ${appliedMusicPercent}% music target. Poolside Pulse did not measure the physical output volume.`
+          : `Pushcut accepted the saved ${appliedMusicPercent}% music target, but completion was not confirmed because it may be queued behind an announcement.`
       });
     } catch (error) {
       const safe = error instanceof PushcutVolumeXError

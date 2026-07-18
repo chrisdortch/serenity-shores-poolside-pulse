@@ -1,11 +1,18 @@
+import {
+  canonicalPushcutXMusicPercent,
+  PUSHCUT_X_RECEIVER_CONTRACT,
+  pushcutXVolumeLevels
+} from './_pushcut-x.js';
+
 export const PUSHCUT_VOLUME_X_API_URL = 'https://api.pushcut.io/v1/execute';
 export const PUSHCUT_VOLUME_X_DEFAULT_SHORTCUT = 'Volume Down';
-export const PUSHCUT_VOLUME_X_PERCENT = 30;
 export const PUSHCUT_VOLUME_X_WAIT_SECONDS = 10;
 export const PUSHCUT_VOLUME_X_TIMEOUT_MS = 12_000;
 
 const SAFE_ERRORS = Object.freeze({
   notConfigured: Object.freeze({ statusCode: 503, message: 'The Version X Pushcut music-volume action is not configured.' }),
+  invalid: Object.freeze({ statusCode: 400, message: 'The Version X music-volume target is invalid.' }),
+  stateUnavailable: Object.freeze({ statusCode: 503, message: 'The saved Version X music level is temporarily unavailable.' }),
   providerBusy: Object.freeze({ statusCode: 503, message: 'The Pushcut receiver is busy. Try again shortly.' }),
   providerRejected: Object.freeze({ statusCode: 502, message: 'Pushcut could not run the music-volume Shortcut.' }),
   timeout: Object.freeze({ statusCode: 504, message: 'The music-volume Shortcut did not confirm completion in time.' })
@@ -45,7 +52,7 @@ export function pushcutVolumeXHealth(env = process.env) {
   return Object.freeze({
     ready: Boolean(configured.apiKey && configured.shortcut),
     mode: 'wait',
-    musicPercent: PUSHCUT_VOLUME_X_PERCENT
+    target: 'canonical-state'
   });
 }
 
@@ -54,6 +61,7 @@ export function pushcutVolumeXHealth(env = process.env) {
  * no provider body, Shortcut name, server identifier, or API-key metadata.
  */
 export async function applyPushcutXMusicVolume({
+  musicPercent = 30,
   env = process.env,
   fetchImpl = globalThis.fetch,
   apiUrl = PUSHCUT_VOLUME_X_API_URL,
@@ -67,6 +75,12 @@ export async function applyPushcutXMusicVolume({
   if (typeof fetchImpl !== 'function' || typeof AbortControllerImpl !== 'function') {
     throw new PushcutVolumeXError('providerRejected');
   }
+  if (typeof musicPercent !== 'number' || !Number.isFinite(musicPercent) || musicPercent < 0 || musicPercent > 100) {
+    throw new PushcutVolumeXError('invalid');
+  }
+  const levels = pushcutXVolumeLevels(canonicalPushcutXMusicPercent({
+    config: { musicLevel: musicPercent }
+  }));
 
   const controller = new AbortControllerImpl();
   const timer = setTimeoutImpl(() => controller.abort(), PUSHCUT_VOLUME_X_TIMEOUT_MS);
@@ -93,7 +107,11 @@ export async function applyPushcutXMusicVolume({
           commandId,
           eventId: commandId,
           issuedAt,
-          musicPercent: PUSHCUT_VOLUME_X_PERCENT,
+          receiverContract: PUSHCUT_X_RECEIVER_CONTRACT,
+          musicPercent: levels.musicPercent,
+          musicLevel: levels.musicLevel,
+          announcementLevel: levels.announcementLevel,
+          resumeMusic: false,
           reason: 'manual-manager-volume'
         }
       })
@@ -104,19 +122,29 @@ export async function applyPushcutXMusicVolume({
         accepted: true,
         completed: true,
         status: 'completed',
-        musicPercent: PUSHCUT_VOLUME_X_PERCENT
+        musicPercent: levels.musicPercent,
+        uncertain: false
       });
     }
     if (successfulStatus(status)) {
       return Object.freeze({
         accepted: true,
         completed: false,
-        status: 'accepted',
-        musicPercent: PUSHCUT_VOLUME_X_PERCENT
+        status: 'accepted-uncertain',
+        musicPercent: levels.musicPercent,
+        uncertain: true
       });
     }
     if (status === 429) throw new PushcutVolumeXError('providerBusy');
-    if (status === 504) throw new PushcutVolumeXError('timeout');
+    if (status === 504) {
+      return Object.freeze({
+        accepted: true,
+        completed: false,
+        status: 'accepted-uncertain',
+        musicPercent: levels.musicPercent,
+        uncertain: true
+      });
+    }
     throw new PushcutVolumeXError('providerRejected');
   } catch (error) {
     if (error instanceof PushcutVolumeXError) throw error;

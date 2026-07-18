@@ -15,15 +15,20 @@ import {
 } from '../api/_pushcut-schedule-x.js';
 import {
   createPushcutXCapability,
+  createSignedPushcutXUrl,
   verifyPushcutXCapability
 } from '../api/_pushcut-security-x.js';
 import {
   createPushcutXReceipt,
   readPushcutXReceipt
 } from '../api/_pushcut-receipts-x.js';
+import { PUSHCUT_X_RECEIVER_CONTRACT } from '../api/_pushcut-x.js';
 import {
   createPushcutScheduleXHandler
 } from '../api/pushcut-schedule-x.js';
+import {
+  createPushcutRecoveryXHandler
+} from '../api/pushcut-recovery-x.js';
 import {
   createDefaultState
 } from '../src/vx/core.js';
@@ -87,9 +92,11 @@ function xCookie() {
 function scheduleState({
   text = 'Scheduled pool message.',
   enabled = true,
+  musicLevel = 30,
   source = null
 } = {}) {
   const state = createDefaultState(NOW);
+  state.config.musicLevel = musicLevel;
   const weekday = new Date(Date.UTC(2026, 6, 17)).getUTCDay();
   state.revision = 12;
   state.announcements = [{
@@ -162,10 +169,21 @@ describe('Version X Central Time occurrence planner', { concurrency: false }, ()
     assert.equal(plan.timeZone, 'America/Chicago');
     assert.equal(plan.occurrences.length, 1);
     assert.equal(plan.occurrences[0].scheduledFor, Date.parse('2026-07-17T15:30:00.000Z'));
-    assert.equal(plan.occurrences[0].voicePercent, undefined);
+    assert.equal(plan.occurrences[0].voicePercent, 100);
+    assert.equal(plan.occurrences[0].musicPercent, 30);
+    assert.equal(plan.occurrences[0].announcementLevel, 1);
+    assert.equal(plan.occurrences[0].musicLevel, 0.3);
     assert.equal(plan.occurrences[0].announcementMode, 'natural-voice');
     assert.equal(plan.occurrences[0].delaySeconds, 30 * 60);
     assert.ok(plan.horizonEnd >= NOW + 7 * 24 * 60 * 60 * 1000);
+
+    const fullMusicPlan = planPushcutXSchedule(scheduleState({ musicLevel: 100 }), {
+      now: NOW,
+      horizonDays: 7
+    });
+    assert.equal(fullMusicPlan.occurrences[0].musicPercent, 100);
+    assert.equal(fullMusicPlan.occurrences[0].musicLevel, 1);
+    assert.notEqual(fullMusicPlan.occurrences[0].fingerprint, plan.occurrences[0].fingerprint);
 
     const orderState = scheduleState();
     orderState.schedules[0].mode = 'order';
@@ -345,7 +363,7 @@ describe('Version X Pushcut schedule synchronization', { concurrency: false }, (
       }
     };
     const first = await synchronizePushcutXSchedule({
-      state: scheduleState(),
+      state: scheduleState({ musicLevel: 45 }),
       request: request('POST', '/api/pushcut-schedule-x?v=x')
     }, options);
     assert.equal(first.scheduled, 1);
@@ -353,23 +371,38 @@ describe('Version X Pushcut schedule synchronization', { concurrency: false }, (
     assert.equal(scheduled[0].shortcut, 'Volume Down');
     assert.equal(scheduled[1].shortcut, 'Poolside Pulse Announcement');
     assert.equal(scheduled[1].input.voicePercent, 100);
-    assert.equal(scheduled[1].input.musicPercent, 30);
+    assert.equal(scheduled[1].input.resumeMusic, true);
+    assert.equal(scheduled[0].input.receiverContract, PUSHCUT_X_RECEIVER_CONTRACT);
+    assert.equal(scheduled[0].input.musicPercent, 45);
+    assert.equal(scheduled[0].input.musicLevel, 0.45);
+    assert.equal(scheduled[0].input.announcementLevel, 1);
+    assert.equal(scheduled[0].input.resumeMusic, true);
+    assert.match(scheduled[0].input.recoveryUrl, /\/api\/pushcut-recovery-x\?v=x&/);
+    assert.match(scheduled[0].input.recoveryUrl, /cv=2/);
+    assert.equal(scheduled[1].input.receiverContract, PUSHCUT_X_RECEIVER_CONTRACT);
+    assert.equal(scheduled[1].input.musicPercent, 45);
+    assert.equal(scheduled[1].input.musicLevel, 0.45);
+    assert.equal(scheduled[1].input.announcementLevel, 1);
     assert.match(scheduled[1].input.audioUrl, /cv=2/);
     assert.match(scheduled[1].input.audioUrl, /nbf=/);
+    assert.match(scheduled[1].input.restoreUrl, /\/api\/pushcut-restore-x\?v=x&/);
+    assert.match(scheduled[1].input.restoreUrl, /cv=2/);
+    assert.match(scheduled[1].input.restoreUrl, /nbf=/);
     assert.equal(scheduled[1].input.scheduledFor, Date.parse('2026-07-17T15:30:00.000Z'));
     assert.equal(receipts[0].scheduledFor, scheduled[1].input.scheduledFor);
+    assert.equal(receipts[0].resumeMusic, true);
     const firstIdentifier = scheduled[1].identifier;
     const firstEventId = scheduled[1].input.eventId;
 
     scheduled.length = 0;
     const second = await synchronizePushcutXSchedule({
-      state: scheduleState(),
+      state: scheduleState({ musicLevel: 45 }),
       request: request('POST', '/api/pushcut-schedule-x?v=x')
     }, options);
     assert.equal(second.unchanged, 1);
     assert.equal(scheduled.length, 0);
 
-    const changedState = scheduleState({ text: 'Changed scheduled message.' });
+    const changedState = scheduleState({ text: 'Changed scheduled message.', musicLevel: 45 });
     const changed = await synchronizePushcutXSchedule({
       state: changedState,
       request: request('POST', '/api/pushcut-schedule-x?v=x')
@@ -381,12 +414,134 @@ describe('Version X Pushcut schedule synchronization', { concurrency: false }, (
 
     scheduled.length = 0;
     const removed = await synchronizePushcutXSchedule({
-      state: scheduleState({ enabled: false }),
+      state: scheduleState({ enabled: false, musicLevel: 45 }),
       request: request('POST', '/api/pushcut-schedule-x?v=x')
     }, options);
     assert.equal(removed.cancelled, 1);
     assert.equal(cancelled.length, 2);
     assert.equal(manifestStore.inspect().occurrences && Object.keys(manifestStore.inspect().occurrences).length, 0);
+  });
+
+  test('scheduled watchdog skips completed speech and otherwise restores the latest canonical M and resumes', async () => {
+    const eventId = 'pushcut-schedule-recovery-0001';
+    const recoveryFor = NOW + 65_000;
+    const signed = createSignedPushcutXUrl(
+      request('GET', '/'),
+      '/api/pushcut-recovery-x',
+      eventId,
+      'recovery',
+      {
+        env: {
+          POOL_SIDE_SESSION_SECRET: SESSION_SECRET,
+          POOL_SIDE_PIN: '7900'
+        },
+        now: () => NOW,
+        notBeforeMs: recoveryFor,
+        ttlSeconds: 30 * 60
+      }
+    );
+    let receipt = {
+      eventId,
+      source: 'schedule',
+      scheduledFor: NOW + 30 * 60_000,
+      status: 'started',
+      receiverContract: PUSHCUT_X_RECEIVER_CONTRACT,
+      voicePercent: 100,
+      musicPercent: 30,
+      resumeMusic: true,
+      volumeRestored: false,
+      restoredMusicPercent: null,
+      musicResumed: false
+    };
+    let manifestStatus = 'scheduled';
+    const handler = createPushcutRecoveryXHandler({
+      receiptReader: async () => receipt,
+      manifestReader: async () => ({
+        occurrences: {
+          recovery: {
+            eventId,
+            status: manifestStatus
+          }
+        }
+      }),
+      stateReader: async () => ({
+        durable: true,
+        revision: 13,
+        state: { config: { musicLevel: 67 } }
+      }),
+      now: () => recoveryFor
+    });
+
+    const incomplete = await invoke(handler, request('GET', signed.url));
+    assert.equal(incomplete.statusCode, 200);
+    assert.equal(incomplete.json().shouldRecover, true);
+    assert.equal(incomplete.json().musicPercent, 67);
+    assert.equal(incomplete.json().musicLevel, 0.67);
+    assert.equal(incomplete.json().resumeMusic, true);
+
+    receipt = {
+      ...receipt,
+      status: 'completed',
+      audioFetchedAt: NOW + 30 * 60_000 + 1_000,
+      restoreTargetMusicPercent: 30,
+      restoreTargetResolvedAt: NOW + 30 * 60_000 + 2_000,
+      volumeRestored: true,
+      restoredMusicPercent: 30,
+      musicResumed: true
+    };
+    const completed = await invoke(handler, request('GET', signed.url));
+    assert.equal(completed.statusCode, 200);
+    assert.equal(completed.json().shouldRecover, false);
+    assert.equal(completed.json().resumeMusic, false);
+    assert.equal(Object.hasOwn(completed.json(), 'musicLevel'), false);
+
+    receipt = {
+      ...receipt,
+      restoreTargetMusicPercent: null,
+      restoreTargetResolvedAt: 0,
+      volumeRestored: false,
+      restoredMusicPercent: null,
+      musicResumed: false
+    };
+    const incompleteCompletedReceipt = await invoke(handler, request('GET', signed.url));
+    assert.equal(incompleteCompletedReceipt.statusCode, 200);
+    assert.equal(incompleteCompletedReceipt.json().shouldRecover, true);
+    assert.equal(incompleteCompletedReceipt.json().musicPercent, 67);
+    assert.equal(incompleteCompletedReceipt.json().resumeMusic, true);
+
+    receipt = {
+      ...receipt,
+      status: 'accepted',
+      volumeRestored: false,
+      restoredMusicPercent: null,
+      musicResumed: false
+    };
+    manifestStatus = 'cancel-pending';
+    const cancelledButProviderStale = await invoke(handler, request('GET', signed.url));
+    assert.equal(cancelledButProviderStale.statusCode, 200);
+    assert.equal(cancelledButProviderStale.json().shouldRecover, false);
+    assert.equal(cancelledButProviderStale.json().resumeMusic, false);
+    assert.equal(cancelledButProviderStale.json().reason, 'scheduled-occurrence-is-no-longer-active');
+    assert.equal(Object.hasOwn(cancelledButProviderStale.json(), 'musicLevel'), false);
+    manifestStatus = 'scheduled';
+
+    for (const staleStatus of ['queued', 'failed']) {
+      receipt = {
+        ...receipt,
+        status: staleStatus,
+        providerStatus: staleStatus === 'failed' ? 'schedule_replaced' : 'pending',
+        failureCode: staleStatus === 'failed' ? 'schedule_replaced' : '',
+        volumeRestored: false,
+        restoredMusicPercent: null,
+        musicResumed: false
+      };
+      const stale = await invoke(handler, request('GET', signed.url));
+      assert.equal(stale.statusCode, 200);
+      assert.equal(stale.json().shouldRecover, false);
+      assert.equal(stale.json().resumeMusic, false);
+      assert.equal(stale.json().reason, 'announcement-was-not-left-incomplete');
+      assert.equal(Object.hasOwn(stale.json(), 'musicLevel'), false);
+    }
   });
 
   test('Browser Receiver mode cancels delayed Pushcut copies instead of duplicating announcements', async () => {
@@ -515,7 +670,11 @@ describe('Version X Pushcut delayed API and session route', { concurrency: false
     assert.equal(calls[0].payload.delaySeconds, result.delayedSeconds);
     assert.match(calls[0].payload.identifier, /^ppx-extended-check-[a-f0-9]{24}$/);
     assert.equal(calls[0].payload.input.action, 'recover-volume');
+    assert.equal(calls[0].payload.input.receiverContract, PUSHCUT_X_RECEIVER_CONTRACT);
     assert.equal(calls[0].payload.input.musicPercent, 30);
+    assert.equal(calls[0].payload.input.musicLevel, 0.3);
+    assert.equal(calls[0].payload.input.announcementLevel, 1);
+    assert.equal(calls[0].payload.input.resumeMusic, false);
     assert.equal(calls[0].payload.input.scheduledFor, NOW + result.delayedSeconds * 1000);
     assert.equal(calls[1].identifier, calls[0].payload.identifier);
   });
