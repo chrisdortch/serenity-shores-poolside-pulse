@@ -15,8 +15,10 @@ import {
   pushcutXHealth
 } from '../api/_pushcut-x.js';
 import {
+  claimPushcutXAudioGeneration,
   claimPushcutXDispatch,
   createPushcutXReceipt,
+  PUSHCUT_X_RECEIVER_BUSY_LEASE_MS,
   PushcutXReceiptError,
   readPushcutXReceipt,
   updatePushcutXReceipt
@@ -459,6 +461,70 @@ describe('Version X signed natural-audio delivery receipts', { concurrency: fals
     assert.equal(reclaimed.receipt.dispatchAttempt, 2);
   });
 
+  test('shares the receiver busy owner with scheduled audio and releases it only on a terminal receipt', async () => {
+    const scheduledEventId = 'pushcut-scheduled-busy-0001';
+    const liveEventId = 'pushcut-live-after-scheduled-0001';
+    await createPushcutXReceipt({
+      ...normalizePushcutXCommand({
+        action: 'test',
+        commandId: scheduledEventId
+      }),
+      source: 'scheduled',
+      scheduledFor: 20_000
+    }, { now: () => 10_000 });
+    await createPushcutXReceipt(normalizePushcutXCommand({
+      action: 'test',
+      commandId: liveEventId
+    }), { now: () => 10_000 });
+
+    const scheduled = await claimPushcutXAudioGeneration(scheduledEventId, {
+      now: () => 20_000
+    });
+    const blocked = await claimPushcutXDispatch(liveEventId, {
+      now: () => 20_001
+    });
+    assert.equal(scheduled.claimed, true);
+    assert.equal(blocked.claimed, false);
+    assert.equal(blocked.busy, true);
+
+    await updatePushcutXReceipt(scheduledEventId, {
+      status: 'completed',
+      completedAt: 21_000,
+      providerStatus: 'receiver_completed',
+      volumeRestored: true,
+      musicResumed: true
+    }, { now: () => 21_000 });
+    const released = await claimPushcutXDispatch(liveEventId, {
+      now: () => 21_001
+    });
+    assert.equal(released.claimed, true);
+    assert.equal(released.busy, false);
+  });
+
+  test('expires a lost receiver owner after the bounded fail-safe lease', async () => {
+    const lostEventId = 'pushcut-lost-busy-owner-0001';
+    const nextEventId = 'pushcut-after-busy-expiry-0001';
+    for (const eventId of [lostEventId, nextEventId]) {
+      await createPushcutXReceipt(normalizePushcutXCommand({
+        action: 'test',
+        commandId: eventId
+      }), { now: () => 10_000 });
+    }
+    assert.equal((await claimPushcutXDispatch(lostEventId, {
+      now: () => 10_000
+    })).claimed, true);
+    const beforeExpiry = await claimPushcutXDispatch(nextEventId, {
+      now: () => 10_000 + PUSHCUT_X_RECEIVER_BUSY_LEASE_MS - 1
+    });
+    const afterExpiry = await claimPushcutXDispatch(nextEventId, {
+      now: () => 10_000 + PUSHCUT_X_RECEIVER_BUSY_LEASE_MS
+    });
+    assert.equal(beforeExpiry.busy, true);
+    assert.equal(beforeExpiry.claimed, false);
+    assert.equal(afterExpiry.busy, false);
+    assert.equal(afterExpiry.claimed, true);
+  });
+
   test('serves natural voice only through a valid signed audio URL', async () => {
     process.env.OPENAI_API_KEY = 'openai-audio-secret';
     const eventId = 'pushcut-audio-event-0001';
@@ -721,10 +787,11 @@ describe('Version X signed natural-audio delivery receipts', { concurrency: fals
         return jsonFetchResponse(200, { result: 'OK' });
       }
       if (command[0] === 'EVAL') {
-        assert.equal(command[2], '2');
+        assert.equal(command[2], '3');
         assert.match(command[3], /:event:pushcut-atomic-completion-0001$/);
         assert.match(command[4], /:meta:latest-completed$/);
-        const patch = JSON.parse(command[5]);
+        assert.match(command[5], /:meta:receiver-busy$/);
+        const patch = JSON.parse(command[6]);
         stored = { ...stored, ...patch };
         return jsonFetchResponse(200, { result: JSON.stringify(stored) });
       }
@@ -1156,6 +1223,106 @@ describe('Version X Pushcut route and browser adapter', { concurrency: false }, 
     assert.equal(replay.statusCode, 202);
     assert.equal(replay.json().idempotentReplay, true);
     assert.equal(calls.length, 2);
+  });
+
+  test('serializes concurrent Remotes until the receiver posts a terminal receipt', async () => {
+    process.env.PUSHCUT_API_KEY_X = 'pushcut-route-secret';
+    process.env.OPENAI_API_KEY = 'openai-route-secret';
+    const firstEventId = 'pushcut-concurrent-remote-a-0001';
+    const secondEventId = 'pushcut-concurrent-remote-b-0001';
+    let releaseFirstDispatch;
+    let signalFirstDispatch;
+    const firstDispatchGate = new Promise(resolve => { releaseFirstDispatch = resolve; });
+    const firstDispatchStarted = new Promise(resolve => { signalFirstDispatch = resolve; });
+    let announcementDispatches = 0;
+    globalThis.fetch = async (url, options) => {
+      const endpoint = new URL(String(url));
+      if (endpoint.searchParams.get('shortcut') === PUSHCUT_X_DEFAULT_SHORTCUT) {
+        const input = JSON.parse(options.body).input;
+        announcementDispatches += 1;
+        await updatePushcutXReceipt(input.eventId, {
+          status: 'started',
+          providerStatus: 'receiver_fetching_audio',
+          startedAt: Date.now(),
+          audioFetchedAt: Date.now(),
+          audioContentType: 'audio/mpeg'
+        });
+        if (input.eventId === firstEventId) {
+          signalFirstDispatch();
+          await firstDispatchGate;
+          return { status: 504 };
+        }
+        await updatePushcutXReceipt(input.eventId, {
+          status: 'completed',
+          providerStatus: 'receiver_completed',
+          completedAt: Date.now(),
+          volumeRestored: true,
+          musicResumed: true
+        });
+        return { status: 200 };
+      }
+      return { status: 202 };
+    };
+    const firstBody = {
+      version: 'x',
+      eventId: firstEventId,
+      source: 'live',
+      text: 'First Remote announcement.',
+      label: 'Remote A',
+      safety: false,
+      voicePercent: 100,
+      musicPercent: 30
+    };
+    const secondBody = {
+      version: 'x',
+      eventId: secondEventId,
+      source: 'live',
+      text: 'Second Remote announcement.',
+      label: 'Remote B',
+      safety: false,
+      voicePercent: 100,
+      musicPercent: 30
+    };
+
+    const firstRequest = invoke(pushcutXHandler, request('POST', '/api/pushcut-x?v=x', {
+      cookie: xCookie(),
+      ip: '203.0.113.51',
+      headers: { 'idempotency-key': firstEventId },
+      body: firstBody
+    }));
+    await firstDispatchStarted;
+    const blocked = await invoke(pushcutXHandler, request('POST', '/api/pushcut-x?v=x', {
+      cookie: xCookie(),
+      ip: '203.0.113.52',
+      headers: { 'idempotency-key': secondEventId },
+      body: secondBody
+    }));
+    assert.equal(blocked.statusCode, 409);
+    assert.equal(blocked.getHeader('retry-after'), '3');
+    assert.equal(blocked.json().status, 'busy');
+    assert.match(blocked.json().error, /already playing another announcement/i);
+    assert.equal(announcementDispatches, 1);
+
+    releaseFirstDispatch();
+    const first = await firstRequest;
+    assert.equal(first.statusCode, 202);
+    await updatePushcutXReceipt(firstEventId, {
+      status: 'completed',
+      providerStatus: 'receiver_completed',
+      completedAt: Date.now(),
+      volumeRestored: true,
+      musicResumed: true
+    });
+
+    const later = await invoke(pushcutXHandler, request('POST', '/api/pushcut-x?v=x', {
+      cookie: xCookie(),
+      ip: '203.0.113.52',
+      headers: { 'idempotency-key': secondEventId },
+      body: secondBody
+    }));
+    assert.equal(later.statusCode, 200);
+    assert.equal(later.json().completed, true);
+    assert.equal(announcementDispatches, 2);
   });
 
   test('keeps a 504 execution race eligible for the signed receiver receipt', async () => {

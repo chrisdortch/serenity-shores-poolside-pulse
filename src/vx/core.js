@@ -171,6 +171,10 @@ export function createDefaultState(now = Date.now()) {
     savedAt: now,
     receiver: null,
     config: {
+      // The shared control plane uses an explicit receiver mode so Remote
+      // devices never route commands to a browser lease that Safari left
+      // behind while the speaker switched to Pushcut.
+      receiverMode: 'browser',
       musicProvider: 'controlled',
       musicUrl: DEFAULT_SUNO_SOURCE,
       musicLabel: 'Serenity Shores Suno playlist',
@@ -696,7 +700,21 @@ function normalizeScheduleCollection(source, defaults) {
 export function normalizeState(input, now = Date.now()) {
   const defaults = createDefaultState(now);
   const source = input && typeof input === 'object' ? input : {};
-  const config = { ...defaults.config, ...(source.config || {}) };
+  const sourceConfig = source.config && typeof source.config === 'object' && !Array.isArray(source.config)
+    ? source.config
+    : {};
+  const hasReceiverMode = Object.prototype.hasOwnProperty.call(sourceConfig, 'receiverMode');
+  const config = { ...defaults.config, ...sourceConfig };
+  if (hasReceiverMode) {
+    config.receiverMode = config.receiverMode === 'pushcut' ? 'pushcut' : 'browser';
+  } else {
+    // State written before the shared receiver handoff existed must remain
+    // distinguishable from an explicit Browser selection. The app can then
+    // infer a ready Pushcut-only receiver until a user explicitly saves a
+    // receiver mode. Fresh state still starts in Browser mode because
+    // createDefaultState() includes receiverMode.
+    delete config.receiverMode;
+  }
   config.musicProvider = ['apple', 'spotify'].includes(config.musicProvider) ? config.musicProvider : 'controlled';
   config.musicLevel = clamp(config.musicLevel, 0, 100, MUSIC_LEVEL_PERCENT);
   config.voiceLevel = clamp(config.voiceLevel, 0, 100, VOICE_LEVEL_PERCENT);

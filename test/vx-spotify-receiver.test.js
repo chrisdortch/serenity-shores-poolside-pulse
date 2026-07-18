@@ -15,6 +15,7 @@ const V30_PKCE_KEY = 'poolside-pulse-v30-spotify-pkce';
 const V30_TOKEN_KEY = 'poolside-pulse-v30-spotify-token';
 const VFINAL_TOKEN_KEY = 'poolside-pulse-vfinal-spotify-token';
 const VX_APP_SOURCE = readFileSync(new URL('../src/vx/app.js', import.meta.url), 'utf8');
+const VX_CORE_SOURCE = readFileSync(new URL('../src/vx/core.js', import.meta.url), 'utf8');
 
 class MemoryStorage {
   constructor() {
@@ -123,19 +124,20 @@ describe('Version X Spotify receiver isolation', { concurrency: false }, () => {
     assert.match(panelSource, /Mode 2 · remote Pushcut announcements/);
   });
 
-  test('keeps Browser Receiver status ahead of configured Pushcut and exposes the official mode switch', () => {
+  test('uses the shared receiver mode ahead of a stale lease and exposes the official mode switch', () => {
     const modeStart = VX_APP_SOURCE.indexOf('function receiverOperatingMode');
     const modeEnd = VX_APP_SOURCE.indexOf('async function refreshPushcutStatus', modeStart);
     const modeSource = VX_APP_SOURCE.slice(modeStart, modeEnd);
 
     assert.ok(modeStart > 0 && modeEnd > modeStart);
-    assert.ok(modeSource.indexOf("return 'browser'") < modeSource.indexOf("return 'pushcut'"));
+    assert.match(modeSource, /state\?\.config\?\.receiverMode/);
+    assert.match(modeSource, /configuredMode === 'browser' \|\| configuredMode === 'pushcut'/);
     assert.match(VX_APP_SOURCE, /const PUSHCUT_RUN_SERVER_URL = 'pushcut:\/\/open\/runServer'/);
     assert.match(VX_APP_SOURCE, /The Remote can apply Music 30% and send announcements, but it cannot start, change, pause, or stop that native music bed while Pushcut is foreground/);
     assert.match(VX_APP_SOURCE, /operatingMode === 'pushcut'[\s\S]*Version X intentionally hides browser Play controls in Pushcut mode/);
   });
 
-  test('routes live voice to Browser first and keeps Browser-mode sliders usable', () => {
+  test('routes live voice by shared mode and keeps Browser-mode sliders usable', () => {
     const sendStart = VX_APP_SOURCE.indexOf('async function sendLiveAnnouncement');
     const sendEnd = VX_APP_SOURCE.indexOf('async function runImmediateWeatherCheck', sendStart);
     const sendSource = VX_APP_SOURCE.slice(sendStart, sendEnd);
@@ -145,7 +147,9 @@ describe('Version X Spotify receiver isolation', { concurrency: false }, () => {
     const voiceEnd = VX_APP_SOURCE.indexOf('function musicSourceForm', voiceStart);
 
     assert.match(sendSource, /preferredAnnouncementTransport/);
-    assert.match(sendSource, /browserReceiverOnline: receiverOnline/);
+    assert.match(sendSource, /receiverMode,/);
+    assert.match(sendSource, /browserReceiverOnline: receiverMode === 'browser' && receiverOnline/);
+    assert.match(sendSource, /const pushcutReady = pushcutAnnouncementReady\(\)/);
     assert.ok(sendSource.indexOf("transport === 'browser'") < sendSource.indexOf('sendPushcutAnnouncement'));
     assert.match(sendSource, /volumePercent,[\s\S]*\.\.\.delivery/);
     assert.doesNotMatch(sendSource, /Short Suno\/direct announcement clips use Pushcut mode/);
@@ -157,7 +161,7 @@ describe('Version X Spotify receiver isolation', { concurrency: false }, () => {
 
   test('keeps Pushcut timed copies separate from the live Browser schedule', () => {
     assert.match(VX_APP_SOURCE, /pushcutEnabled: requestedPushcutEnabled/);
-    assert.match(VX_APP_SOURCE, /browserReceiverOnline: receiverOnline/);
+    assert.match(VX_APP_SOURCE, /browserReceiverOnline: receiverMode === 'browser' && receiverOnline/);
     assert.match(VX_APP_SOURCE, /Pending Pushcut timed copies were cancelled/);
     assert.match(VX_APP_SOURCE, /Version X automatically cancels Pushcut timed copies/);
     assert.match(VX_APP_SOURCE, /runtime\.start[\s\S]*pushcutEnabledOverride: false/);
@@ -300,5 +304,134 @@ describe('Version X Spotify receiver isolation', { concurrency: false }, () => {
     } finally {
       env.restore();
     }
+  });
+
+  test('refreshes an expired saved login after reload without redirecting or losing its refresh token', async () => {
+    const env = browserEnvironment('https://poolside-pulse-x.vercel.app/#receiver');
+    const otherVersions = seedOtherVersionStorage(env);
+    const originalFetch = globalThis.fetch;
+    const requests = [];
+    env.localStorage.setItem(VX_TOKEN_KEY, JSON.stringify({
+      access_token: 'expired-vx-access-token',
+      refresh_token: 'saved-vx-refresh-token',
+      expiresAt: Date.now() - 60_000
+    }));
+    globalThis.fetch = async (url, options = {}) => {
+      const href = String(url);
+      requests.push({
+        href,
+        method: options.method || 'GET',
+        authorization: options.headers?.Authorization || '',
+        body: String(options.body || '')
+      });
+      if (href === 'https://accounts.spotify.com/api/token') {
+        return response(200, {
+          access_token: 'refreshed-vx-access-token',
+          expires_in: 3_600
+        });
+      }
+      if (href === 'https://api.spotify.com/v1/me') {
+        return response(200, { display_name: 'Reloaded Receiver', product: 'premium', id: 'account-x' });
+      }
+      if (href === 'https://api.spotify.com/v1/me/player/devices') return response(200, { devices: [] });
+      throw new Error(`Unexpected Spotify request: ${href}`);
+    };
+    try {
+      class FakePlayer {
+        addListener() {}
+      }
+
+      // This fresh adapter instance represents a page reload. It must recover
+      // from local storage instead of sending the receiver through OAuth again.
+      const receiver = new SpotifyReceiver({ clientId: 'client-id' });
+      receiver.ensureSdk = async () => ({ Player: FakePlayer });
+
+      assert.equal(await receiver.preparePlayer(), true);
+      assert.equal((await receiver.verifyAccess()).verified, true);
+
+      const tokenRequest = requests.find(request => request.href === 'https://accounts.spotify.com/api/token');
+      assert.ok(tokenRequest);
+      assert.equal(tokenRequest.method, 'POST');
+      assert.match(tokenRequest.body, /grant_type=refresh_token/);
+      assert.match(tokenRequest.body, /refresh_token=saved-vx-refresh-token/);
+      assert.equal(requests.filter(request => request.href === 'https://accounts.spotify.com/api/token').length, 1);
+      assert.equal(
+        requests.find(request => request.href === 'https://api.spotify.com/v1/me')?.authorization,
+        'Bearer refreshed-vx-access-token'
+      );
+
+      const savedToken = JSON.parse(env.localStorage.getItem(VX_TOKEN_KEY));
+      assert.equal(savedToken.access_token, 'refreshed-vx-access-token');
+      assert.equal(savedToken.refresh_token, 'saved-vx-refresh-token');
+      assert.ok(savedToken.expiresAt > Date.now());
+      assert.equal(env.assigned, '');
+      assert.equal(env.localStorage.getItem(VX_PKCE_KEY), null);
+      assertOtherVersionStorageUnchanged(env, otherVersions);
+    } finally {
+      globalThis.fetch = originalFetch;
+      env.restore();
+    }
+  });
+});
+
+describe('Version X receiver-mode and setup UI hardening', () => {
+  test('shows the exact Spotify developer values and keeps prior redirect instructions', () => {
+    assert.match(VX_CORE_SOURCE, /export const DEFAULT_SPOTIFY_CLIENT_ID = '7e086716aaea4ce98051287b552a676c'/);
+    assert.match(VX_APP_SOURCE, /const SPOTIFY_CLIENT_ID = DEFAULT_SPOTIFY_CLIENT_ID/);
+    assert.equal(SPOTIFY_REDIRECT_URI, 'https://poolside-pulse-x.vercel.app/');
+    assert.match(VX_APP_SOURCE, /import \{ SPOTIFY_REDIRECT_URI, SpotifyReceiver \} from '\.\/spotify-receiver\.js'/);
+    assert.match(VX_APP_SOURCE, /const SPOTIFY_DEVELOPER_DASHBOARD_URL = 'https:\/\/developer\.spotify\.com\/dashboard'/);
+    assert.match(VX_APP_SOURCE, /including the trailing slash/);
+    assert.match(VX_APP_SOURCE, /Keep every prior Poolside Pulse redirect URI; do not replace or remove it/);
+    assert.match(VX_APP_SOURCE, /data-action="copy-spotify-client-id"/);
+    assert.match(VX_APP_SOURCE, /data-action="copy-spotify-redirect-uri"/);
+  });
+
+  test('separates saved account authorization from browser playback activation', () => {
+    assert.match(VX_APP_SOURCE, /Apple account authorization saved/);
+    assert.match(VX_APP_SOURCE, /Activate Apple Browser Playback/);
+    assert.match(VX_APP_SOURCE, /Spotify account authorization saved/);
+    assert.match(VX_APP_SOURCE, /Activate Spotify Browser Playback/);
+    assert.match(VX_APP_SOURCE, /Account authorization persists separately from playback activation/);
+  });
+
+  test('shows verified Pushcut status without gating idle one-click commands and records mode transitions', () => {
+    assert.match(VX_APP_SOURCE, /function pushcutAnnouncementOperational\(\)/);
+    assert.match(VX_APP_SOURCE, /pushcutStatus\.operational === true/);
+    assert.match(VX_APP_SOURCE, /pushcutStatus\.connectedReady === true/);
+    assert.match(VX_APP_SOURCE, /const pushcutReady = pushcutAnnouncementReady\(\)/);
+    assert.match(VX_APP_SOURCE, /Every command waits for its own signed completion receipt/);
+    assert.match(VX_APP_SOURCE, /await selectSharedReceiverMode\('browser'\)/);
+    assert.match(VX_APP_SOURCE, /await selectSharedReceiverMode\('pushcut'\)/);
+    assert.match(VX_APP_SOURCE, /releaseToPushcut: true,[\s\S]*beacon: true/);
+    assert.doesNotMatch(VX_APP_SOURCE, /pagehide[\s\S]{0,800}store\.releaseReceiverSession/);
+  });
+
+  test('saves mobile slider input after a debounce and flushes every release event', () => {
+    assert.match(VX_APP_SOURCE, /function debounceMusicLevelSave/);
+    assert.match(VX_APP_SOURCE, /debounceMusicLevelSave\(target\)/);
+    assert.match(VX_APP_SOURCE, /function flushMusicLevelSave/);
+    assert.match(VX_APP_SOURCE, /addEventListener\('change'[\s\S]*flushMusicLevelSave\(target\)/);
+    assert.match(VX_APP_SOURCE, /addEventListener\('pointerup'[\s\S]*flushMusicLevelSave\(musicSlider\.value\)/);
+    assert.match(VX_APP_SOURCE, /addEventListener\('touchend'[\s\S]*flushMusicLevelSave\(musicSlider\.value\)/);
+  });
+
+  test('keeps Browser-mode announcement and schedule controls disabled while its lease is offline', () => {
+    const announceStart = VX_APP_SOURCE.indexOf('function renderAnnounce');
+    const announceEnd = VX_APP_SOURCE.indexOf('function scheduleItemSource', announceStart);
+    const announceSource = VX_APP_SOURCE.slice(announceStart, announceEnd);
+    const scheduleStart = VX_APP_SOURCE.indexOf('function renderSchedule()');
+    const scheduleEnd = VX_APP_SOURCE.indexOf('function renderActivity', scheduleStart);
+    const scheduleSource = VX_APP_SOURCE.slice(scheduleStart, scheduleEnd);
+
+    assert.match(announceSource, /const browserReady = operatingMode === 'browser' && receiverOnline/);
+    assert.match(announceSource, /const announcementReady = browserReady \|\| pushcutSelectedReady/);
+    assert.match(announceSource, /Browser Receiver is selected but offline/);
+    assert.match(announceSource, /type="submit" class="primary" \$\{announcementReady \? '' : 'disabled'\}>Speak Now/);
+    assert.match(announceSource, /data-action="saved-announcement"[\s\S]*announcementReady \? '' : 'disabled'/);
+    assert.match(scheduleSource, /const browserReady = operatingMode === 'browser' && receiverOnline/);
+    assert.match(scheduleSource, /Mixed and automatic Browser schedules are stopped/);
+    assert.match(scheduleSource, /sequenceRun\.status !== 'complete' && browserReady/);
+    assert.match(scheduleSource, /The selected receiver is offline; no scheduled item can run/);
   });
 });

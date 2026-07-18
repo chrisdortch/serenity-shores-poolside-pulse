@@ -21,6 +21,38 @@ export function sameWeatherConfig(left = {}, right = {}) {
   return Object.keys(a).every(key => Object.is(a[key], b[key]));
 }
 
+/**
+ * Returns the concise status spoken only for a user-requested weather check
+ * when no new safety announcement was generated. Automatic scans remain
+ * silent unless they detect a new warning.
+ */
+export function manualWeatherStatusAnnouncement({ payload = null } = {}) {
+  if (!payload || payload.ok === false) {
+    return 'The weather check could not be completed. Please check the Remote screen before relying on the result.';
+  }
+  const threatType = String(payload.threatType || '').toLowerCase();
+  if (payload.threat === true) {
+    if (threatType.includes('tornado')) {
+      return 'Weather check complete. A tornado warning is active for the configured pool area.';
+    }
+    if (threatType.includes('lightning')) {
+      return 'Weather check complete. Lightning is active within the configured pool safety radius.';
+    }
+    if (threatType.includes('wind')) {
+      return 'Weather check complete. Strong wind is active above the configured pool threshold.';
+    }
+    return 'Weather check complete. A configured weather safety trigger is active. Please check the Remote screen.';
+  }
+  const providerErrors = Array.isArray(payload.providerErrors) ? payload.providerErrors : [];
+  const coverageIncomplete = payload.lightningCoverageKnown !== true
+    || payload.tornadoCoverageKnown === false
+    || payload.windCoverageKnown === false;
+  if (providerErrors.length || coverageIncomplete) {
+    return 'Weather check complete, but part of the weather data is unavailable. Please check the Remote screen before relying on the result.';
+  }
+  return 'Weather check complete. No lightning, tornado warning, or strong wind trigger was detected for the configured pool area.';
+}
+
 function stageBeforeAnnouncement(previousWeather, evaluatedWeather, announcementIds, now, config) {
   const previous = previousWeather || {};
   const staged = {

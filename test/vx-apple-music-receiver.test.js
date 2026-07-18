@@ -195,6 +195,96 @@ describe('Version X MusicKit adapter', { concurrency: false }, () => {
     await receiver.connectFromUserGesture();
     assert.equal(receiver.ready, true);
     assert.equal(calls.some(call => call[0] === 'deferPlayback'), true);
+
+    await receiver.authorizeFromUserGesture();
+    assert.equal(calls.some(call => call[0] === 'authorize'), false);
+    assert.equal(storage.get('poolside-pulse-vx-apple-music-authorized-hint'), '1');
+  });
+
+  test('does not let a stale persisted hint suppress a user-gesture reauthorization', async () => {
+    const storage = installBrowser();
+    storage.set('poolside-pulse-vx-apple-music-authorized-hint', '1');
+    const { kit, music, calls } = fakeMusicKit();
+    const receiver = new AppleMusicReceiver({ musicKit: kit, fetchImpl: tokenFetch(calls) });
+
+    await receiver.prepareAuthorization();
+    music.tapActive = true;
+    const authorization = receiver.authorizeFromUserGesture();
+    music.tapActive = false;
+
+    assert.equal(calls.filter(call => call[0] === 'authorize').length, 1);
+    assert.equal(calls.find(call => call[0] === 'authorize')?.[1], true);
+    await authorization;
+    assert.equal(receiver.loggedIn(), true);
+    assert.equal(storage.get('poolside-pulse-vx-apple-music-authorized-hint'), '1');
+  });
+
+  test('clears a stale persisted hint when MusicKit definitively reports no authorization', async () => {
+    const storage = installBrowser();
+    storage.set('poolside-pulse-vx-apple-music-authorized-hint', '1');
+    const { kit, calls } = fakeMusicKit();
+    const receiver = new AppleMusicReceiver({ musicKit: kit, fetchImpl: tokenFetch(calls) });
+
+    await assert.rejects(receiver.restoreAuthorization(), /not authorized/i);
+
+    assert.equal(storage.has('poolside-pulse-vx-apple-music-authorized-hint'), false);
+    assert.equal(receiver.authorizedThisSession, false);
+    assert.equal(receiver.authorizationInvalidated, true);
+    assert.equal(receiver.loggedIn(), false);
+  });
+
+  test('requires a new authorize tap after a definitive account-verification rejection', async () => {
+    const storage = installBrowser();
+    const { kit, music, calls } = fakeMusicKit();
+    music.api.music = async path => {
+      calls.push(['api.music', path]);
+      throw Object.assign(new Error('Music user token unauthorized'), { status: 401 });
+    };
+    const receiver = new AppleMusicReceiver({ musicKit: kit, fetchImpl: tokenFetch(calls) });
+
+    await receiver.prepareAuthorization();
+    await assert.rejects(receiver.authorizeFromUserGesture(), /could not be verified/i);
+
+    assert.equal(storage.has('poolside-pulse-vx-apple-music-authorized-hint'), false);
+    assert.equal(receiver.authorizedThisSession, false);
+    assert.equal(receiver.authorizationInvalidated, true);
+    assert.equal(receiver.loggedIn(), false);
+
+    music.api.music = async path => {
+      calls.push(['api.music', path]);
+      return { data: [{ id: 'us' }] };
+    };
+    await receiver.authorizeFromUserGesture();
+
+    assert.equal(calls.filter(call => call[0] === 'authorize').length, 2);
+    assert.equal(receiver.authorizationInvalidated, false);
+    assert.equal(receiver.loggedIn(), true);
+    assert.equal(storage.get('poolside-pulse-vx-apple-music-authorized-hint'), '1');
+  });
+
+  test('keeps a valid restored authorization through a transient verification failure', async () => {
+    const storage = installBrowser();
+    storage.set('poolside-pulse-vx-apple-music-authorized-hint', '1');
+    const { kit, music, calls } = fakeMusicKit();
+    music.isAuthorized = true;
+    music.authorizationStatus = 3;
+    music.api.music = async path => {
+      calls.push(['api.music', path]);
+      throw new Error('temporary network interruption');
+    };
+    const receiver = new AppleMusicReceiver({ musicKit: kit, fetchImpl: tokenFetch(calls) });
+
+    await assert.rejects(receiver.restoreAuthorization(), /temporary network interruption/i);
+    assert.equal(receiver.authorizationInvalidated, false);
+    assert.equal(receiver.loggedIn(), true);
+    assert.equal(storage.get('poolside-pulse-vx-apple-music-authorized-hint'), '1');
+
+    music.api.music = async path => {
+      calls.push(['api.music', path]);
+      return { data: [{ id: 'us' }] };
+    };
+    assert.equal(await receiver.restoreAuthorization(), true);
+    assert.equal(calls.some(call => call[0] === 'authorize'), false);
   });
 
   test('blocks speech safety if a playing Apple receiver cannot confirm pause', async () => {

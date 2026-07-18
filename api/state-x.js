@@ -116,6 +116,8 @@ function safeHttpsUrl(value) {
 
 function sanitizeConfig(value) {
   const source = isRecord(value) ? safeClone(value) : {};
+  const hasReceiverMode = Object.prototype.hasOwnProperty.call(source, 'receiverMode');
+  const requestedReceiverMode = boundedString(source.receiverMode, 40).toLowerCase();
   const clean = {
     ...source,
     // `controlled` remains the compatibility identifier for the existing
@@ -127,6 +129,16 @@ function sanitizeConfig(value) {
     // silences the music path, while music and voice levels remain adjustable.
     duckLevel: 0
   };
+  if (hasReceiverMode) {
+    clean.receiverMode = ['browser', 'pushcut'].includes(requestedReceiverMode)
+      ? requestedReceiverMode
+      : 'browser';
+  } else {
+    // Preserve the absence of this newer field in legacy state. Treating an
+    // old Pushcut-only installation as an explicit Browser selection makes
+    // the client compatibility inference unreachable.
+    delete clean.receiverMode;
+  }
   for (const key of CONFIG_SECRET_KEYS) delete clean[key];
   return clean;
 }
@@ -641,6 +653,141 @@ export async function readCanonicalVersionXState({
     revision: stateRevision(state),
     state
   });
+}
+
+/**
+ * Releases only the exact Browser Receiver session named by the caller and
+ * hands canonical receiver ownership to Pushcut mode. The durable path uses
+ * the same compare-and-set revision gate as ordinary state saves. If another
+ * writer replaces the receiver between GET and CAS, the replacement is read
+ * and matched again before any retry, so a stale session cannot release a
+ * newer receiver.
+ */
+export async function releaseVersionXReceiverSession({
+  receiverId,
+  sessionId,
+  env = process.env,
+  fetchImpl = globalThis.fetch,
+  now = Date.now,
+  requireDurable = true,
+  maxAttempts = 8
+} = {}) {
+  const expectedReceiverId = boundedString(receiverId, 160);
+  const expectedSessionId = boundedString(sessionId, 160);
+  if (!expectedReceiverId || !expectedSessionId) {
+    const error = new Error('receiverId and sessionId are required.');
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const durable = kvReady(env);
+  if (requireDurable && !durable) {
+    const error = new Error('Durable Version X state storage is unavailable.');
+    error.statusCode = 503;
+    throw error;
+  }
+  const releaseAt = Math.max(0, Math.floor(Number(now()) || Date.now()));
+
+  const prepare = async stored => {
+    const current = await sanitizeStoredState(stored, releaseAt);
+    const receiver = current?.receiver;
+    if (!receiver
+      || receiver.id !== expectedReceiverId
+      || receiver.sessionId !== expectedSessionId) {
+      return {
+        matched: false,
+        released: false,
+        changed: false,
+        reason: 'session-mismatch',
+        durable,
+        revision: stateRevision(current),
+        state: current
+      };
+    }
+
+    const alreadyReleased = receiver.status === 'offline'
+      && Number(receiver.leaseUntil || 0) <= releaseAt
+      && current.config?.receiverMode === 'pushcut';
+    if (alreadyReleased) {
+      return {
+        matched: true,
+        released: true,
+        changed: false,
+        reason: 'already-released',
+        durable,
+        revision: stateRevision(current),
+        state: current
+      };
+    }
+
+    const next = await finalizeState({
+      ...current,
+      config: {
+        ...(current?.config || {}),
+        receiverMode: 'pushcut'
+      },
+      receiver: {
+        ...receiver,
+        status: 'offline',
+        lastSeen: releaseAt,
+        leaseUntil: releaseAt,
+        detail: 'Browser Receiver released for Pushcut handoff.'
+      }
+    }, stored, releaseAt);
+    const raw = JSON.stringify(next);
+    if (Buffer.byteLength(raw, 'utf8') > MAX_STATE_BYTES) {
+      const error = new Error('Saved Version X state exceeds the 1 MB state limit.');
+      error.statusCode = 400;
+      throw error;
+    }
+    return {
+      matched: true,
+      released: true,
+      changed: true,
+      reason: 'released',
+      durable,
+      revision: next.revision,
+      state: next,
+      raw,
+      expectedRevision: stateRevision(stored)
+    };
+  };
+
+  if (!durable) {
+    return await withMemoryLock(async () => {
+      const result = await prepare(memoryStates()[X_STATE_KEY] || null);
+      if (result.changed) memoryStates()[X_STATE_KEY] = result.state;
+      const { raw, expectedRevision, ...publicResult } = result;
+      return publicResult;
+    });
+  }
+
+  let stored = parseState(await kv(['GET', X_STATE_KEY], { env, fetchImpl }));
+  const attempts = Math.max(1, Math.min(20, Math.floor(Number(maxAttempts) || 8)));
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const result = await prepare(stored);
+    if (!result.changed) return result;
+    const cas = await kv([
+      'EVAL',
+      X_COMPARE_AND_SET_SCRIPT,
+      '1',
+      X_STATE_KEY,
+      String(result.expectedRevision),
+      result.raw
+    ], { env, fetchImpl });
+    if (!Array.isArray(cas) || cas.length < 2) {
+      throw new Error('Version X state storage is unavailable.');
+    }
+    if (Number(cas[0]) === 1) {
+      const { raw, expectedRevision, ...publicResult } = result;
+      return publicResult;
+    }
+    stored = parseState(cas[2]);
+  }
+
+  const error = new Error('Version X state changed too often to release this receiver safely.');
+  error.statusCode = 409;
+  throw error;
 }
 
 function versionXRequired(req, res) {

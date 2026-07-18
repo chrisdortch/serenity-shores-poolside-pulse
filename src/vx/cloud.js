@@ -2,6 +2,7 @@ import { createDefaultState, normalizeState } from './core.js';
 
 const STATE_URL = '/api/state-x?v=x';
 const SESSION_URL = '/api/session?v=x';
+const RECEIVER_RELEASE_URL = '/api/receiver-release-x?v=x';
 const LOCAL_STATE_KEY = 'poolside-pulse-vx-local-state';
 const REQUEST_TIMEOUT_MS = 12_000;
 
@@ -183,6 +184,81 @@ export class CloudStore {
     this.appliedFetchSequence = ++this.fetchSequence;
     this.emit('cloud save');
     return this.state;
+  }
+
+  /**
+   * Atomically hands the speaker from Safari to Pushcut. The dedicated route
+   * validates the exact receiver session, so a suspended/stale page can never
+   * release a newer speaker session. `beacon` is used during pagehide where
+   * iOS may suspend JavaScript before a normal fetch settles.
+   */
+  async releaseReceiverSession(receiver = this.state.receiver, { beacon = false } = {}) {
+    const receiverId = String(receiver?.id || '');
+    const sessionId = String(receiver?.sessionId || '');
+    if (!receiverId || !sessionId) {
+      throw new Error('The Browser Receiver session is missing and could not be handed to Pushcut.');
+    }
+    const payload = {
+      version: 'x',
+      receiverId,
+      sessionId,
+      mode: 'pushcut'
+    };
+    const applyOptimisticRelease = () => {
+      if (this.state.receiver?.id !== receiverId || this.state.receiver?.sessionId !== sessionId) return;
+      this.state = normalizeState({
+        ...this.state,
+        config: { ...this.state.config, receiverMode: 'pushcut' },
+        receiver: {
+          ...this.state.receiver,
+          status: 'offline',
+          leaseUntil: 0,
+          detail: 'Browser Receiver handed control to Pushcut.'
+        }
+      }, this.now());
+      this.emit('receiver handoff');
+    };
+
+    if (beacon && typeof globalThis.navigator?.sendBeacon === 'function') {
+      const body = new Blob([JSON.stringify(payload)], { type: 'application/json' });
+      if (globalThis.navigator.sendBeacon(RECEIVER_RELEASE_URL, body)) {
+        applyOptimisticRelease();
+        return { ok: true, released: true, queued: true, receiverMode: 'pushcut' };
+      }
+    }
+
+    const startedAt = Date.now();
+    let response;
+    try {
+      response = await request(RECEIVER_RELEASE_URL, {
+        method: 'POST',
+        credentials: 'same-origin',
+        cache: 'no-store',
+        keepalive: !!beacon,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      if (response.status === 404 || !isJsonResponse(response)) {
+        assertLocalFallbackAllowed('The receiver handoff service');
+        applyOptimisticRelease();
+        return { ok: true, released: true, development: true, receiverMode: 'pushcut' };
+      }
+      const data = await responseData(response);
+      this.observeServerTime(data, startedAt);
+      if (data.state) {
+        this.state = normalizeState(data.state, this.now());
+        this.appliedFetchSequence = ++this.fetchSequence;
+        this.emit('receiver handoff');
+      } else {
+        applyOptimisticRelease();
+      }
+      return data;
+    } catch (error) {
+      if (error.status === 409) {
+        await this.fetchRemote().catch(() => {});
+      }
+      throw error;
+    }
   }
 
   async load() {

@@ -56,6 +56,13 @@ export function createPushcutAudioXHandler({
       const claim = await claimPushcutXAudioGeneration(capability.eventId);
       receipt = claim.receipt;
       if (!claim.claimed) {
+        if (claim.busy) {
+          res.setHeader('Retry-After', '3');
+          return json(res, 409, {
+            ok: false,
+            error: 'The Receiver is already playing another announcement. Try again after it finishes.'
+          });
+        }
         if (receipt.status === 'completed') {
           return json(res, 410, { ok: false, error: 'This announcement has already completed.' });
         }

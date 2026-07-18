@@ -96,6 +96,17 @@ function authorizedBySdk(music) {
   return false;
 }
 
+function isDefinitiveAuthorizationFailure(error, music) {
+  if (music?.isAuthorized === false) return true;
+  const code = String(error?.code || error?.name || '').toUpperCase();
+  if (code === 'APPLE_MUSIC_AUTH_REQUIRED' || code.includes('NOT_AUTHORIZED') || code.includes('UNAUTHORIZED')) return true;
+  const status = Number(error?.status || error?.statusCode || error?.response?.status || 0);
+  if (status === 401) return true;
+  const message = String(error?.message || error || '').toLowerCase();
+  return /\b(?:not authorized|unauthori[sz]ed)\b/.test(message) ||
+    /music user token.{0,40}\b(?:invalid|expired|missing)\b/.test(message);
+}
+
 function rawPlaybackState(music) {
   return music?.playbackState ?? music?.player?.playbackState ?? null;
 }
@@ -204,6 +215,7 @@ export class AppleMusicReceiver {
     this.activationPromise = null;
     this.activationError = '';
     this.authorizedThisSession = false;
+    this.authorizationInvalidated = false;
     this.accessState = 'unchecked';
     this.accessVerified = false;
     this.accessVerifiedAt = 0;
@@ -381,9 +393,27 @@ export class AppleMusicReceiver {
     this.onState(this.current);
   }
 
+  invalidateWebAuthorization(message = '', { revokePlayback = true } = {}) {
+    if (this.nativeEnabled()) return;
+    storageRemove(AUTHORIZATION_HINT_KEY);
+    this.authorizedThisSession = false;
+    this.authorizationInvalidated = true;
+    this.playerPrepared = false;
+    if (message) this.resetAccessVerification(message);
+    if (revokePlayback && (this.ready || this.deviceId || this.activationState === 'active')) {
+      this.revokePlaybackReadiness(message || 'Apple Music authorization ended. Authorize this receiver again.');
+    }
+  }
+
   loggedIn() {
     if (this.nativeEnabled()) return true;
-    return this.authorizedThisSession || authorizedBySdk(this.music) || storageGet(AUTHORIZATION_HINT_KEY) === '1';
+    if (this.authorizationInvalidated) return false;
+    if (this.authorizedThisSession || authorizedBySdk(this.music)) return true;
+    if (this.music?.isAuthorized === false) {
+      this.invalidateWebAuthorization('', { revokePlayback: false });
+      return false;
+    }
+    return storageGet(AUTHORIZATION_HINT_KEY) === '1';
   }
 
   async ensureSdk() {
@@ -528,13 +558,13 @@ export class AppleMusicReceiver {
     listen('playbackTimeDidChange', update);
     listen('authorizationStatusDidChange', () => {
       if (authorizedBySdk(this.music)) {
+        this.authorizationInvalidated = false;
         this.authorizedThisSession = true;
         storageSet(AUTHORIZATION_HINT_KEY, '1');
       } else if (this.music?.isAuthorized === false) {
-        this.authorizedThisSession = false;
-        storageRemove(AUTHORIZATION_HINT_KEY);
-        this.resetAccessVerification('Apple Music authorization ended. Authorize this receiver again.');
-        this.revokePlaybackReadiness('Apple Music authorization ended. Authorize this receiver, then tap Connect Apple Music Receiver again.');
+        this.invalidateWebAuthorization(
+          'Apple Music authorization ended. Authorize this receiver, then tap Connect Apple Music Receiver again.'
+        );
       }
       this.onState(this.current);
     });
@@ -630,7 +660,15 @@ export class AppleMusicReceiver {
       });
       return this.loginPromise;
     }
-    if (this.loggedIn()) return Promise.resolve(true);
+    // A persisted hint is only a cue to attempt background restoration. It is
+    // never proof of a live MusicKit user token and must not suppress this
+    // explicit user-gesture authorization attempt.
+    if (!this.authorizationInvalidated && (this.authorizedThisSession || authorizedBySdk(this.music))) {
+      this.authorizationInvalidated = false;
+      this.authorizedThisSession = true;
+      storageSet(AUTHORIZATION_HINT_KEY, '1');
+      return Promise.resolve(true);
+    }
     if (!this.authorizationPrepared || !this.music) {
       throw new Error('Apple Music is not prepared. Tap Prepare Apple Music first, wait for it to finish, then tap Authorize Apple Music.');
     }
@@ -641,6 +679,9 @@ export class AppleMusicReceiver {
       authorization = this.music.authorize();
     } catch (error) {
       const message = cleanErrorMessage(error, 'Apple Music authorization could not start from this tap.');
+      if (isDefinitiveAuthorizationFailure(error, this.music)) {
+        this.invalidateWebAuthorization(message);
+      }
       this.resetAccessVerification(message);
       this.report(message, false);
       throw error;
@@ -650,6 +691,7 @@ export class AppleMusicReceiver {
       2 * 60_000,
       'Apple Music authorization timed out. Tap Authorize Apple Music and try again.'
     ).then(async () => {
+      this.authorizationInvalidated = false;
       this.authorizedThisSession = true;
       storageSet(AUTHORIZATION_HINT_KEY, '1');
       this.resetAccessVerification();
@@ -659,6 +701,9 @@ export class AppleMusicReceiver {
       return true;
     }).catch(error => {
       const message = cleanErrorMessage(error, 'Apple Music authorization failed.');
+      if (isDefinitiveAuthorizationFailure(error, this.music)) {
+        this.invalidateWebAuthorization(message);
+      }
       this.resetAccessVerification(message);
       this.report(message, false);
       throw error;
@@ -685,8 +730,7 @@ export class AppleMusicReceiver {
       this.report('Music.app was silenced and disconnected. macOS Automation permission was not removed.', true);
       return;
     }
-    storageRemove(AUTHORIZATION_HINT_KEY);
-    this.authorizedThisSession = false;
+    this.invalidateWebAuthorization('', { revokePlayback: false });
     try { await Promise.resolve(this.music?.unauthorize?.()); } catch {}
     this.resetAccessVerification();
     this.disconnect();
@@ -731,7 +775,7 @@ export class AppleMusicReceiver {
     try {
       const music = await this.ensureMusicKit();
       if (!this.authorizedThisSession && music?.isAuthorized === false) {
-        storageRemove(AUTHORIZATION_HINT_KEY);
+        this.invalidateWebAuthorization('', { revokePlayback: false });
         throw appleError('Apple Music is not authorized on this receiver. Tap Login Apple Music.', 'APPLE_MUSIC_AUTH_REQUIRED', 'MusicKit authorize');
       }
       if (!this.authorizedThisSession && !authorizedBySdk(music) && storageGet(AUTHORIZATION_HINT_KEY) !== '1') {
@@ -748,14 +792,17 @@ export class AppleMusicReceiver {
           );
           storefrontId = String(result?.data?.[0]?.id || result?.data?.data?.[0]?.id || storefrontId);
         } catch (error) {
-          throw appleError(
+          const wrapped = appleError(
             `Apple Music authorization could not be verified: ${cleanErrorMessage(error, 'account request failed')}`,
-            'APPLE_MUSIC_ACCESS_BLOCKED',
+            isDefinitiveAuthorizationFailure(error, music) ? 'APPLE_MUSIC_AUTH_REQUIRED' : 'APPLE_MUSIC_ACCESS_BLOCKED',
             'GET /v1/me/storefront'
           );
+          wrapped.status = Number(error?.status || error?.statusCode || error?.response?.status || 0);
+          throw wrapped;
         }
       }
 
+      this.authorizationInvalidated = false;
       this.authorizedThisSession = true;
       storageSet(AUTHORIZATION_HINT_KEY, '1');
       this.accountProfile = {
@@ -771,6 +818,9 @@ export class AppleMusicReceiver {
       return { verified: true, profile: this.accountProfile };
     } catch (error) {
       const message = cleanErrorMessage(error, 'Apple Music account access failed.');
+      if (isDefinitiveAuthorizationFailure(error, this.music)) {
+        this.invalidateWebAuthorization(message);
+      }
       this.resetAccessVerification(message);
       this.report(message, false, {
         errorCode: error?.code || 'APPLE_MUSIC_ACCESS_BLOCKED',

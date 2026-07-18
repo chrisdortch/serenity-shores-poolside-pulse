@@ -27,6 +27,7 @@ import {
   weatherRequestUrl
 } from './core.js';
 import { isIOSLike } from './audio-engine.js';
+import { manualWeatherStatusAnnouncement } from './weather-command.js';
 
 const DEVICE_KEY = 'poolside-pulse-vx-device-id';
 const HANDLED_KEY = 'poolside-pulse-vx-handled-events';
@@ -46,6 +47,7 @@ const EXTERNAL_AUDIO_INTENT_TYPES = new Map([
   ['order-next', 'schedule'],
   ['order-reset', 'terminal']
 ]);
+const SAFETY_PREEMPTION_EVENT_TYPES = new Set(['announce-safety', 'weather-check']);
 
 function wait(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -283,6 +285,7 @@ export class ReceiverRuntime {
     this.sessionStartedAt = 0;
     this.active = false;
     this.processing = false;
+    this.safetyEventProcessing = null;
     this.inFlightEventIds = new Set();
     this.scheduleProcessing = false;
     this.weatherTail = Promise.resolve();
@@ -329,6 +332,7 @@ export class ReceiverRuntime {
     this.pendingScheduleCancellationInFlight = null;
     this.pendingScheduledPlayback = null;
     this.wakeLock = null;
+    this.failSafeStopInFlight = null;
     this.visibilityHandler = () => this.onVisibilityChange();
   }
 
@@ -823,6 +827,7 @@ export class ReceiverRuntime {
         audioMode: policy.id,
         ...this.receiverLeasePatch()
       }, claimNow);
+      draft.config = { ...(draft.config || {}), receiverMode: 'browser' };
       draft.receiver = lease;
       draft.activityLog = [
         makeLog('receiver', takeover ? 'Receiver takeover started' : 'Fresh receiver session started', `${policy.label}. Commands older than this session are ignored.`, claimNow, { receiverId: this.deviceId, sessionId }),
@@ -1103,7 +1108,10 @@ export class ReceiverRuntime {
   async onVisibilityChange() {
     if (!this.active) return;
     if (isIOSLike() && document.visibilityState !== 'visible') {
-      await this.failSafeStop('The iPhone receiver left the foreground. Audio and cloud ownership stopped before Safari could suspend; keep this page visible and tap Start Receiver again.');
+      await this.failSafeStop(
+        'The iPhone receiver left the foreground. Browser ownership was handed to Pushcut before Safari could suspend.',
+        { releaseToPushcut: true, beacon: true }
+      );
       return;
     }
     if (document.visibilityState === 'visible') {
@@ -1328,12 +1336,57 @@ export class ReceiverRuntime {
     }
   }
 
-  async failSafeStop(message) {
+  async releaseToPushcut({ beacon = false } = {}) {
+    const receiver = this.state.receiver;
+    if (!receiver?.id || !receiver?.sessionId) return false;
+    if (typeof this.store.releaseReceiverSession === 'function') {
+      await this.store.releaseReceiverSession(receiver, { beacon });
+      return true;
+    }
+    // Test/local-store compatibility. Production uses the atomic endpoint so
+    // that an old Safari page cannot release a newer receiver session.
+    await this.store.mutate(draft => {
+      if (draft.receiver?.id !== receiver.id || draft.receiver?.sessionId !== receiver.sessionId) return draft;
+      const now = this.now();
+      draft.config = { ...(draft.config || {}), receiverMode: 'pushcut' };
+      draft.receiver = {
+        ...draft.receiver,
+        status: 'offline',
+        lastSeen: now,
+        leaseUntil: 0,
+        detail: 'Browser Receiver handed control to Pushcut.'
+      };
+      return draft;
+    }, 'Receiver handed to Pushcut', { requireDurable: true });
+    return true;
+  }
+
+  async failSafeStop(message, { releaseToPushcut = false, beacon = false } = {}) {
+    if (this.failSafeStopInFlight) return await this.failSafeStopInFlight;
+    const stopping = this.performFailSafeStop(message, { releaseToPushcut, beacon });
+    this.failSafeStopInFlight = stopping;
+    try {
+      return await stopping;
+    } finally {
+      if (this.failSafeStopInFlight === stopping) this.failSafeStopInFlight = null;
+    }
+  }
+
+  async performFailSafeStop(message, { releaseToPushcut = false, beacon = false } = {}) {
     this.beginExternalAudioIntent('terminal');
     this.nextAudioRequest();
     this.invalidateAudioRestores();
+    // Invalidate local ownership before the handoff emits its optimistic state.
+    // This prevents the app's ownership observer from re-entering this stop
+    // while iOS is suspending Safari.
     this.active = false;
     this.stopLoops();
+    const handoff = releaseToPushcut
+      ? this.releaseToPushcut({ beacon }).catch(error => {
+          this.status(`Pushcut handoff could not be confirmed: ${error.message || String(error)}`, false);
+          return false;
+        })
+      : Promise.resolve(false);
     this.cancelPendingAnnouncements(message);
     this.audio.stopCalibration?.('Sound check stopped because the receiver session ended.', { ok: true, report: false });
     this.audio.stopVoice();
@@ -1387,6 +1440,7 @@ export class ReceiverRuntime {
       try { await this.wakeLock.release(); } catch {}
       this.wakeLock = null;
     }
+    await handoff;
     const stopDetail = [
       settleError ? `Older audio action still settling: ${settleError}` : '',
       immediateApplePauseError ? `Immediate Apple Music pause failed: ${immediateApplePauseError}` : '',
@@ -1414,22 +1468,106 @@ export class ReceiverRuntime {
       draft.activityLog = [makeLog('command', message, payload.label || payload.text || payload.url || '', now, { eventId: created.id, commandType: type }), ...(draft.activityLog || [])];
       return draft;
     }, message, { requireDurable: true });
-    this.status(message, true, { event: created });
+    this.status(`${message} Waiting for the Receiver to confirm completion.`, true, { event: created });
     if (this.isOwner()) await this.processPendingEvents();
-    return created;
+    if (typeof this.store.fetchRemote !== 'function') return created;
+    return await this.waitForCommandCompletion(created, {
+      timeoutMs: ['announce', 'announce-safety', 'weather-check'].includes(type) ? 90_000 : 45_000,
+      message
+    });
+  }
+
+  async waitForCommandCompletion(created, { timeoutMs = 45_000, message = 'Command' } = {}) {
+    const deadline = Date.now() + timeoutMs;
+    let latest = created;
+    let lastRefreshError = '';
+    while (Date.now() <= deadline) {
+      latest = (this.state.events || []).find(event => event.id === created.id) || latest;
+      if (latest?.status === 'completed') {
+        this.status(`Receiver confirmed completion: ${message}`, true, { event: latest });
+        return latest;
+      }
+      if (latest?.status === 'failed') {
+        throw new Error(`The Receiver reported that the command failed: ${latest.error || 'unknown receiver error'}`);
+      }
+      const receiver = this.state.receiver;
+      if (!receiverOnline(receiver, this.now())) {
+        throw new Error('The speaker Receiver went offline before it confirmed this command. The command was not confirmed; restart the selected Receiver before trying again.');
+      }
+      if (
+        (String(receiver.id || '') !== String(created.targetReceiverId || '') ||
+          String(receiver.sessionId || '') !== String(created.targetSessionId || ''))
+      ) {
+        throw new Error('The speaker Receiver changed before this command confirmed completion.');
+      }
+      await wait(450);
+      try {
+        await this.store.fetchRemote();
+        lastRefreshError = '';
+      } catch (error) {
+        // The receiver may still be acting on the durable event. Never turn a
+        // lost receipt poll into advice that could duplicate an announcement.
+        lastRefreshError = error.message || String(error);
+      }
+    }
+    throw new Error(
+      `The command reached the cloud, but completion could not be confirmed${lastRefreshError ? ` because status refresh failed: ${lastRefreshError}` : ''}. ` +
+      'Do not repeat the command until you check the Receiver and Activity log.'
+    );
   }
 
   async processPendingEvents() {
-    if (!this.isOwner() || this.processing) return;
+    if (!this.isOwner()) return;
+    if (this.processing) {
+      await this.processPendingSafetyEvents();
+      return;
+    }
     this.processing = true;
     try {
+      // Urgent weather work has its own narrow lane so a newly-arrived safety
+      // event can reach announce({ safety: true }) and preempt a long normal
+      // announcement. Every other Remote command remains strictly serial.
+      await this.processPendingSafetyEvents();
+      if (!this.isOwner()) return;
       const handled = handledIds();
-      const events = pendingEventsForReceiver(this.state.events, this.state.receiver, this.sessionStartedAt, handled, this.now());
+      const events = pendingEventsForReceiver(this.state.events, this.state.receiver, this.sessionStartedAt, handled, this.now())
+        .filter(event => !SAFETY_PREEMPTION_EVENT_TYPES.has(event.type));
       for (const event of events) {
-        this.processEvent(event).catch(error => this.status(`Command completion failed: ${error.message}`, false, { event }));
+        try {
+          await this.processEvent(event);
+        } catch (error) {
+          this.status(`Command completion failed: ${error.message}`, false, { event });
+        }
       }
     } finally {
       this.processing = false;
+      this.onChange();
+    }
+  }
+
+  async processPendingSafetyEvents() {
+    if (!this.isOwner()) return;
+    if (this.safetyEventProcessing) return await this.safetyEventProcessing;
+    const processing = (async () => {
+      while (this.isOwner()) {
+        const handled = handledIds();
+        const events = pendingEventsForReceiver(this.state.events, this.state.receiver, this.sessionStartedAt, handled, this.now())
+          .filter(event => SAFETY_PREEMPTION_EVENT_TYPES.has(event.type) && !this.inFlightEventIds.has(event.id));
+        if (!events.length) return;
+        for (const event of events) {
+          try {
+            await this.processEvent(event);
+          } catch (error) {
+            this.status(`Safety command completion failed: ${error.message}`, false, { event });
+          }
+        }
+      }
+    })();
+    this.safetyEventProcessing = processing;
+    try {
+      return await processing;
+    } finally {
+      if (this.safetyEventProcessing === processing) this.safetyEventProcessing = null;
       this.onChange();
     }
   }
@@ -1537,7 +1675,11 @@ export class ReceiverRuntime {
           ...this.normalizeAnnouncementDelivery(payload)
         });
       case 'weather-check':
-        return await this.checkWeather({ announce: payload.announce !== false, reason: 'remote command' });
+        return await this.checkWeather({
+          announce: payload.announce !== false,
+          announceStatus: payload.announceStatus === true,
+          reason: 'remote command'
+        });
       case 'calibration':
         return await this.runCalibration(externalIntentGeneration);
       case 'order-next':
@@ -2940,7 +3082,7 @@ export class ReceiverRuntime {
     return announcementDeliveryForSource(source);
   }
 
-  async prepareVoice(text, { cacheOnly = false, signal = null } = {}) {
+  async prepareVoice(text, { cacheOnly = false, signal = null, required = false } = {}) {
     const message = String(text || '').trim().slice(0, 900);
     if (!message || this.state.config.voiceMode !== 'ai') return null;
     const voice = this.state.config.aiVoice || 'marin';
@@ -2980,7 +3122,10 @@ export class ReceiverRuntime {
         throw new Error('Announcement preparation was cancelled for a higher-priority safety action.');
       }
       const detail = controller.signal.aborted ? 'the natural voice request timed out' : (error.message || String(error));
-      this.status(`AI voice unavailable; device voice will be used: ${detail}`, false);
+      if (required) {
+        throw new Error(`Natural announcement audio could not be prepared: ${detail}`);
+      }
+      this.status(`Natural voice is not ready yet: ${detail}`, false);
       return null;
     } finally {
       clearTimeout(timer);
@@ -3178,12 +3323,13 @@ export class ReceiverRuntime {
     const delivery = this.normalizeAnnouncementDelivery(options);
     const voiceBlob = delivery.announcementMode === 'finite-audio'
       ? await this.prepareFiniteAnnouncementAudio(delivery)
-      : await this.prepareVoice(message, { cacheOnly: !!options.safety });
+      : await this.prepareVoice(message, { required: true });
+    if (!voiceBlob) {
+      throw new Error('Natural announcement audio was not returned. Nothing was played.');
+    }
     const voiceOutput = delivery.announcementMode === 'finite-audio'
       ? 'finite-audio-mixer'
-      : voiceBlob
-        ? 'ai-mixer'
-        : 'device-speech-fallback';
+      : 'ai-mixer';
     const voicePercent = clamp(options.volumePercent, 0, 100, this.state.config.voiceLevel);
     this.assertAnnouncementActive(options, 'Announcement was preempted while its voice was preparing.');
     const completed = await this.serializeAudio(async () => {
@@ -3270,8 +3416,7 @@ export class ReceiverRuntime {
       this.assertAnnouncementActive(options, 'Announcement was cancelled before speech began.');
       this.audio.setVoiceLevelPercent?.(voicePercent, { report: false });
       voiceTargetApplied = true;
-      if (voiceBlob) await this.audio.playVoiceBlob(voiceBlob);
-      else await this.audio.playDeviceSpeech(message);
+      await this.audio.playVoiceBlob(voiceBlob);
       this.assertAnnouncementActive(options, 'Announcement was cancelled before speech completed.');
       return true;
     } finally {
@@ -3367,16 +3512,12 @@ export class ReceiverRuntime {
         }
         const voiceReceipt = voiceOutput === 'finite-audio-mixer'
           ? `Version X mixer finite clip ${voicePercent}%`
-          : voiceOutput === 'ai-mixer'
-            ? `Version X mixer voice ${voicePercent}%`
-            : `device speech requested target ${voicePercent}%`;
+          : `Version X mixer voice ${voicePercent}%`;
         draft.activityLog = [makeLog(options.safety ? 'safety' : 'announcement', options.label || (options.safety ? 'Safety announcement played' : 'Announcement played'), `${message} [${voiceReceipt}]`, this.now(), { eventId: options.eventId || '', voicePercent, voiceOutput }), ...(draft.activityLog || [])];
         return draft;
       }, 'Announcement completed', { requireDurable: true })
       .then(() => this.status(
-        voiceOutput === 'ai-mixer' || voiceOutput === 'finite-audio-mixer'
-          ? `Announcement completed through the Version X mixer at the ${voicePercent}% voice setting.`
-          : `Announcement completed through device speech with a requested ${voicePercent}% target; iPhone speaker loudness cannot be verified in browser code.`,
+        `Announcement completed through the Version X mixer at the ${voicePercent}% voice setting.`,
         true
       ))
       .catch(error => this.status(`Announcement completed, but its cloud receipt could not be saved: ${error.message}`, false));
@@ -3427,7 +3568,7 @@ export class ReceiverRuntime {
     return true;
   }
 
-  async performWeatherCheck({ announce = true, reason = 'manual check' } = {}) {
+  async performWeatherCheck({ announce = true, announceStatus = false, reason = 'manual check' } = {}) {
     if (!this.isOwner()) throw new Error('Weather scans run on the active speaker receiver.');
     if (announce) await this.replayPendingWeatherWarning();
     for (let configAttempt = 0; configAttempt < 3; configAttempt += 1) {
@@ -3452,6 +3593,16 @@ export class ReceiverRuntime {
           draft.activityLog = [makeLog('warning', 'Weather check: unknown', `${reason}: ${status}`, requestNow), ...(draft.activityLog || [])];
           return draft;
         }, 'Weather failure recorded', { requireDurable: true });
+        if (announceStatus && this.isOwner()) {
+          try {
+            await this.announce(manualWeatherStatusAnnouncement({ payload: null }), {
+              safety: false,
+              label: 'Manual Weather Check'
+            });
+          } catch (speechError) {
+            throw new Error(`The weather scan failed (${error.message}), and its spoken failure status also failed: ${speechError.message}`);
+          }
+        }
         this.status(status, false, { weather: this.state.weather });
         return { payload: null, weather: this.state.weather, announcements: [] };
       }
@@ -3543,6 +3694,12 @@ export class ReceiverRuntime {
           }, 'Weather announcement retry recorded', { requireDurable: true });
           throw error;
         }
+      } else if (announceStatus) {
+        if (!this.isOwner()) throw new Error('Receiver ownership changed before the manual weather status announcement.');
+        await this.announce(manualWeatherStatusAnnouncement({ payload }), {
+          safety: payload.threat === true,
+          label: 'Manual Weather Check'
+        });
       }
       this.status(evaluated.weather.status, !coverageIncomplete || !!payload.threat, { weather: evaluated.weather });
       return { payload, ...evaluated };

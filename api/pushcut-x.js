@@ -240,6 +240,17 @@ export default async function handler(req, res) {
       const existing = publicPushcutXReceipt(dispatchClaim.receipt, {
         durable: dispatchClaim.durable
       });
+      if (dispatchClaim.busy) {
+        res.setHeader('Retry-After', '3');
+        return json(res, 409, {
+          ok: false,
+          error: 'The Receiver is already playing another announcement. Try again after it finishes.',
+          version: 'x',
+          eventId: command.eventId,
+          status: 'busy',
+          receipt: existing
+        });
+      }
       if (existing.failed) {
         return json(res, 409, {
           ok: false,

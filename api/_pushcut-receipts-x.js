@@ -3,9 +3,11 @@ import { normalizeFiniteAudioReference } from './_finite-audio-x.js';
 const RECEIPT_NAMESPACE = 'serenity-shores-poolside-pulse:vx:pushcut-receipt:v1:';
 const RECEIPT_KEY_PREFIX = `${RECEIPT_NAMESPACE}event:`;
 const LATEST_RECEIPT_KEY = `${RECEIPT_NAMESPACE}meta:latest-completed`;
+const RECEIVER_BUSY_KEY = `${RECEIPT_NAMESPACE}meta:receiver-busy`;
 const RECEIPT_TTL_SECONDS = 24 * 60 * 60;
 const RECEIPT_MAX_TTL_SECONDS = 31 * 24 * 60 * 60;
 const RECEIPT_DEADLINE_MS = 90_000;
+export const PUSHCUT_X_RECEIVER_BUSY_LEASE_MS = RECEIPT_DEADLINE_MS + 30_000;
 const KV_REQUEST_TIMEOUT_MS = 8_000;
 export const PUSHCUT_X_DISPATCH_LEASE_MS = 30_000;
 export const PUSHCUT_X_AUDIO_LEASE_MS = 30_000;
@@ -99,6 +101,11 @@ if receiptTtl == nil or receiptTtl < 1 then
   receiptTtl = tonumber(ARGV[2]) or 86400
 end
 redis.call("SET", KEYS[1], encoded, "EX", receiptTtl)
+if tostring(current.status or "") == "completed" or tostring(current.status or "") == "failed" then
+  if redis.call("GET", KEYS[3]) == KEYS[1] then
+    redis.call("DEL", KEYS[3])
+  end
+end
 if tostring(current.status or "") == "completed" then
   local latest = {
     eventId = current.eventId,
@@ -158,7 +165,26 @@ local status = tostring(current.status or "queued")
 local previousClaim = tonumber(current.dispatchClaimedAt or 0) or 0
 local claimed = false
 local reclaimed = false
-if status == "queued" and (previousClaim <= 0 or previousClaim + lease <= now) then
+local busy = false
+local busyOwner = redis.call("GET", KEYS[2])
+if busyOwner and busyOwner ~= KEYS[1] then
+  local holderRaw = redis.call("GET", busyOwner)
+  if not holderRaw then
+    redis.call("DEL", KEYS[2])
+    busyOwner = nil
+  else
+    local holderOk, holder = pcall(cjson.decode, holderRaw)
+    local holderStatus = holderOk and type(holder) == "table"
+      and tostring(holder.status or "queued") or ""
+    if holderStatus == "completed" or holderStatus == "failed" or holderStatus == "" then
+      redis.call("DEL", KEYS[2])
+      busyOwner = nil
+    else
+      busy = true
+    end
+  end
+end
+if not busy and status == "queued" and (previousClaim <= 0 or previousClaim + lease <= now) then
   claimed = true
   reclaimed = previousClaim > 0
   current.dispatchClaimedAt = now
@@ -169,11 +195,13 @@ if status == "queued" and (previousClaim <= 0 or previousClaim + lease <= now) t
   if receiptTtl == nil or receiptTtl < 1 then
     receiptTtl = tonumber(ARGV[3]) or 86400
   end
+  redis.call("SET", KEYS[2], KEYS[1], "EX", tonumber(ARGV[4]) or 120)
   redis.call("SET", KEYS[1], cjson.encode(current), "EX", receiptTtl)
 end
 return cjson.encode({
   claimed = claimed,
   reclaimed = reclaimed,
+  busy = busy,
   receipt = current
 })
 `;
@@ -194,7 +222,26 @@ local fetchedAt = tonumber(current.audioFetchedAt or 0) or 0
 local terminal = status == "completed" or status == "failed"
 local claimed = false
 local reclaimed = false
-if not terminal and fetchedAt <= 0 and (previousClaim <= 0 or previousClaim + lease <= now) then
+local busy = false
+local busyOwner = redis.call("GET", KEYS[2])
+if busyOwner and busyOwner ~= KEYS[1] then
+  local holderRaw = redis.call("GET", busyOwner)
+  if not holderRaw then
+    redis.call("DEL", KEYS[2])
+    busyOwner = nil
+  else
+    local holderOk, holder = pcall(cjson.decode, holderRaw)
+    local holderStatus = holderOk and type(holder) == "table"
+      and tostring(holder.status or "queued") or ""
+    if holderStatus == "completed" or holderStatus == "failed" or holderStatus == "" then
+      redis.call("DEL", KEYS[2])
+      busyOwner = nil
+    else
+      busy = true
+    end
+  end
+end
+if not busy and not terminal and fetchedAt <= 0 and (previousClaim <= 0 or previousClaim + lease <= now) then
   claimed = true
   reclaimed = previousClaim > 0
   current.audioClaimedAt = now
@@ -209,11 +256,13 @@ if not terminal and fetchedAt <= 0 and (previousClaim <= 0 or previousClaim + le
   if receiptTtl == nil or receiptTtl < 1 then
     receiptTtl = tonumber(ARGV[3]) or 86400
   end
+  redis.call("SET", KEYS[2], KEYS[1], "EX", tonumber(ARGV[4]) or 120)
   redis.call("SET", KEYS[1], cjson.encode(current), "EX", receiptTtl)
 end
 return cjson.encode({
   claimed = claimed,
   reclaimed = reclaimed,
+  busy = busy,
   receipt = current
 })
 `;
@@ -334,6 +383,26 @@ async function withMemoryLock(key, operation) {
   }
 }
 
+function activeMemoryBusyOwner(now) {
+  const receipts = memoryReceipts();
+  const busy = receipts.get(RECEIVER_BUSY_KEY);
+  const ownerKey = typeof busy === 'string' ? busy : String(busy?.ownerKey || '');
+  if (typeof ownerKey !== 'string' || !ownerKey) {
+    receipts.delete(RECEIVER_BUSY_KEY);
+    return '';
+  }
+  if (Number(busy?.expiresAt || 0) > 0 && Number(busy.expiresAt) <= now) {
+    receipts.delete(RECEIVER_BUSY_KEY);
+    return '';
+  }
+  const owner = receipts.get(ownerKey);
+  if (!owner || TERMINAL_STATUSES.has(owner.status)) {
+    receipts.delete(RECEIVER_BUSY_KEY);
+    return '';
+  }
+  return ownerKey;
+}
+
 function parseReceipt(raw) {
   if (!raw) return null;
   if (isRecord(raw)) return raw;
@@ -351,6 +420,7 @@ function parseClaimResult(raw) {
   return {
     claimed: parsed.claimed === true,
     reclaimed: parsed.reclaimed === true,
+    busy: parsed.busy === true,
     receipt: parsed.receipt
   };
 }
@@ -634,38 +704,53 @@ export async function claimPushcutXDispatch(eventId, options = {}) {
     const claimed = parseClaimResult(await kv([
       'EVAL',
       KV_DISPATCH_CLAIM_SCRIPT,
-      '1',
+      '2',
       key,
+      RECEIVER_BUSY_KEY,
       String(now),
       String(leaseMs),
-      String(RECEIPT_TTL_SECONDS)
+      String(RECEIPT_TTL_SECONDS),
+      String(Math.ceil(PUSHCUT_X_RECEIVER_BUSY_LEASE_MS / 1000))
     ], deps));
     if (!claimed) throw new PushcutXReceiptError('notFound');
     return { ...claimed, durable: true };
   }
 
-  return await withMemoryLock(key, async () => {
-    const current = memoryReceipts().get(key);
-    if (!current) throw new PushcutXReceiptError('notFound');
-    const previousClaim = Number(current.dispatchClaimedAt || 0);
-    const canClaim = current.status === 'queued'
-      && (previousClaim <= 0 || previousClaim + leaseMs <= now);
-    const receipt = canClaim
-      ? {
-          ...current,
-          dispatchClaimedAt: now,
-          dispatchAttempt: Number(current.dispatchAttempt || 0) + 1,
-          providerStatus: 'pushcut_dispatching',
-          updatedAt: now
-        }
-      : current;
-    if (canClaim) memoryReceipts().set(key, receipt);
-    return {
-      claimed: canClaim,
-      reclaimed: canClaim && previousClaim > 0,
-      receipt,
-      durable: false
-    };
+  return await withMemoryLock(RECEIVER_BUSY_KEY, async () => {
+    return await withMemoryLock(key, async () => {
+      const receipts = memoryReceipts();
+      const current = receipts.get(key);
+      if (!current) throw new PushcutXReceiptError('notFound');
+      const ownerKey = activeMemoryBusyOwner(now);
+      const busy = Boolean(ownerKey && ownerKey !== key);
+      const previousClaim = Number(current.dispatchClaimedAt || 0);
+      const canClaim = !busy
+        && current.status === 'queued'
+        && (previousClaim <= 0 || previousClaim + leaseMs <= now);
+      const receipt = canClaim
+        ? {
+            ...current,
+            dispatchClaimedAt: now,
+            dispatchAttempt: Number(current.dispatchAttempt || 0) + 1,
+            providerStatus: 'pushcut_dispatching',
+            updatedAt: now
+          }
+        : current;
+      if (canClaim) {
+        receipts.set(RECEIVER_BUSY_KEY, {
+          ownerKey: key,
+          expiresAt: now + PUSHCUT_X_RECEIVER_BUSY_LEASE_MS
+        });
+        receipts.set(key, receipt);
+      }
+      return {
+        claimed: canClaim,
+        reclaimed: canClaim && previousClaim > 0,
+        busy,
+        receipt,
+        durable: false
+      };
+    });
   });
 }
 
@@ -682,42 +767,57 @@ export async function claimPushcutXAudioGeneration(eventId, options = {}) {
     const claimed = parseClaimResult(await kv([
       'EVAL',
       KV_AUDIO_CLAIM_SCRIPT,
-      '1',
+      '2',
       key,
+      RECEIVER_BUSY_KEY,
       String(now),
       String(leaseMs),
-      String(RECEIPT_TTL_SECONDS)
+      String(RECEIPT_TTL_SECONDS),
+      String(Math.ceil(PUSHCUT_X_RECEIVER_BUSY_LEASE_MS / 1000))
     ], deps));
     if (!claimed) throw new PushcutXReceiptError('notFound');
     return { ...claimed, durable: true };
   }
 
-  return await withMemoryLock(key, async () => {
-    const current = memoryReceipts().get(key);
-    if (!current) throw new PushcutXReceiptError('notFound');
-    const previousClaim = Number(current.audioClaimedAt || 0);
-    const terminal = TERMINAL_STATUSES.has(current.status);
-    const canClaim = !terminal
-      && Number(current.audioFetchedAt || 0) <= 0
-      && (previousClaim <= 0 || previousClaim + leaseMs <= now);
-    const receipt = canClaim
-      ? {
-          ...current,
-          audioClaimedAt: now,
-          audioAttempt: Number(current.audioAttempt || 0) + 1,
-          status: 'started',
-          startedAt: Number(current.startedAt || 0) || now,
-          providerStatus: 'receiver_fetching_audio',
-          updatedAt: now
-        }
-      : current;
-    if (canClaim) memoryReceipts().set(key, receipt);
-    return {
-      claimed: canClaim,
-      reclaimed: canClaim && previousClaim > 0,
-      receipt,
-      durable: false
-    };
+  return await withMemoryLock(RECEIVER_BUSY_KEY, async () => {
+    return await withMemoryLock(key, async () => {
+      const receipts = memoryReceipts();
+      const current = receipts.get(key);
+      if (!current) throw new PushcutXReceiptError('notFound');
+      const ownerKey = activeMemoryBusyOwner(now);
+      const busy = Boolean(ownerKey && ownerKey !== key);
+      const previousClaim = Number(current.audioClaimedAt || 0);
+      const terminal = TERMINAL_STATUSES.has(current.status);
+      const canClaim = !busy
+        && !terminal
+        && Number(current.audioFetchedAt || 0) <= 0
+        && (previousClaim <= 0 || previousClaim + leaseMs <= now);
+      const receipt = canClaim
+        ? {
+            ...current,
+            audioClaimedAt: now,
+            audioAttempt: Number(current.audioAttempt || 0) + 1,
+            status: 'started',
+            startedAt: Number(current.startedAt || 0) || now,
+            providerStatus: 'receiver_fetching_audio',
+            updatedAt: now
+          }
+        : current;
+      if (canClaim) {
+        receipts.set(RECEIVER_BUSY_KEY, {
+          ownerKey: key,
+          expiresAt: now + PUSHCUT_X_RECEIVER_BUSY_LEASE_MS
+        });
+        receipts.set(key, receipt);
+      }
+      return {
+        claimed: canClaim,
+        reclaimed: canClaim && previousClaim > 0,
+        busy,
+        receipt,
+        durable: false
+      };
+    });
   });
 }
 
@@ -761,21 +861,30 @@ export async function updatePushcutXReceipt(eventId, value, options = {}) {
     const raw = await kv([
       'EVAL',
       KV_UPDATE_SCRIPT,
-      '2',
+      '3',
       key,
       LATEST_RECEIPT_KEY,
+      RECEIVER_BUSY_KEY,
       JSON.stringify(patch),
       String(RECEIPT_TTL_SECONDS)
     ], deps);
     updated = parseReceipt(raw);
     if (!updated) throw new PushcutXReceiptError('notFound');
   } else {
-    updated = await withMemoryLock(key, async () => {
-      const current = memoryReceipts().get(key);
-      if (!current) throw new PushcutXReceiptError('notFound');
-      const next = transition(current, patch);
-      memoryReceipts().set(key, next);
-      return next;
+    updated = await withMemoryLock(RECEIVER_BUSY_KEY, async () => {
+      return await withMemoryLock(key, async () => {
+        const receipts = memoryReceipts();
+        const current = receipts.get(key);
+        if (!current) throw new PushcutXReceiptError('notFound');
+        const next = transition(current, patch);
+        receipts.set(key, next);
+        const busy = receipts.get(RECEIVER_BUSY_KEY);
+        const busyOwnerKey = typeof busy === 'string' ? busy : String(busy?.ownerKey || '');
+        if (TERMINAL_STATUSES.has(next.status) && busyOwnerKey === key) {
+          receipts.delete(RECEIVER_BUSY_KEY);
+        }
+        return next;
+      });
     });
   }
 

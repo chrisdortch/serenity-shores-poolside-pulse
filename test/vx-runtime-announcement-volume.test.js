@@ -85,7 +85,7 @@ describe('Version X announcement-volume delivery', { concurrency: false }, () =>
     runtime.prepareVoice = async () => {
       started.resolve();
       await release.promise;
-      return null;
+      return new Blob(['natural voice'], { type: 'audio/mpeg' });
     };
 
     const announcement = runtime.announce('Pool update');
@@ -95,9 +95,9 @@ describe('Version X announcement-volume delivery', { concurrency: false }, () =>
     await announcement;
     await new Promise(resolve => setTimeout(resolve, 0));
 
-    assert.deepEqual(calls, ['duck', 'voice-37', 'speech-at-37', 'voice-100', 'restore-music']);
-    assert.equal(store.state.activityLog[0].voiceOutput, 'device-speech-fallback');
-    assert.match(store.state.activityLog[0].detail, /device speech requested target 37%/i);
+    assert.deepEqual(calls, ['duck', 'voice-37', 'blob-at-37', 'voice-100', 'restore-music']);
+    assert.equal(store.state.activityLog[0].voiceOutput, 'ai-mixer');
+    assert.match(store.state.activityLog[0].detail, /Version X mixer voice 37%/i);
   });
 
   test('records generated speech as mixer-controlled output', async () => {
@@ -157,6 +157,17 @@ describe('Version X announcement-volume delivery', { concurrency: false }, () =>
     assert.equal(received.options.eventId, 'event-1');
   });
 
+  test('fails clearly instead of falling back to unreliable device speech', async () => {
+    const { runtime, calls } = harness();
+    runtime.prepareVoice = async () => null;
+
+    await assert.rejects(
+      runtime.announce('Natural voice must be audible'),
+      /Natural announcement audio was not returned/i
+    );
+    assert.equal(calls.some(call => call.startsWith('speech-at-')), false);
+  });
+
   test('passes a validated finite source through live event dispatch', async () => {
     const { runtime } = harness();
     let received = null;
@@ -190,7 +201,7 @@ describe('Version X announcement-volume delivery', { concurrency: false }, () =>
     runtime.apple.ready = true;
     runtime.apple.pauseForAnnouncement = async () => { throw new Error('still playing'); };
     runtime.apple.pause = async () => calls.push('fallback-pause');
-    runtime.prepareVoice = async () => null;
+    runtime.prepareVoice = async () => new Blob(['natural voice'], { type: 'audio/mpeg' });
 
     await assert.rejects(runtime.announce('Do not overlap'), /could not be confirmed paused/i);
     assert.equal(calls.some(call => call.startsWith('speech-at-') || call.startsWith('blob-at-')), false);

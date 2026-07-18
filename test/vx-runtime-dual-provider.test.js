@@ -252,7 +252,7 @@ describe('Version X Apple and Spotify runtime integration', { concurrency: false
   test('announcements silence both external players and resume only the selected bed', async () => {
     for (const provider of ['apple', 'spotify']) {
       const { runtime, store, appleAudible, spotifyAudible } = harness();
-      runtime.prepareVoice = async () => null;
+      runtime.prepareVoice = async () => new Blob(['natural voice'], { type: 'audio/mpeg' });
       runtime.physicalProvider = provider;
       store.state.config.musicProvider = provider;
       store.state.playback = { ...store.state.playback, provider, intent: 'playing' };

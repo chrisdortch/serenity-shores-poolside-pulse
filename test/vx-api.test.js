@@ -233,6 +233,57 @@ describe('Version X API isolation', { concurrency: false }, () => {
     assert.equal(read.json().state.revision, 2);
   });
 
+  test('preserves a missing legacy receiver mode until an explicit handoff mode is saved', async () => {
+    const xCookie = cookieFor('x');
+    const legacy = await invoke(stateXHandler, request('POST', '/api/state-x?v=x', {
+      cookie: xCookie,
+      body: {
+        version: 'x',
+        expectedRevision: 0,
+        state: {
+          version: 'x',
+          config: { musicProvider: 'controlled', musicLevel: 30 }
+        }
+      }
+    }));
+
+    assert.equal(legacy.statusCode, 200);
+    assert.equal(Object.hasOwn(legacy.json().state.config, 'receiverMode'), false);
+
+    const unrelatedSave = await invoke(stateXHandler, request('POST', '/api/state-x?v=x', {
+      cookie: xCookie,
+      body: {
+        version: 'x',
+        expectedRevision: 1,
+        state: { version: 'x', config: { voiceLevel: 91 } }
+      }
+    }));
+    assert.equal(unrelatedSave.statusCode, 200);
+    assert.equal(Object.hasOwn(unrelatedSave.json().state.config, 'receiverMode'), false);
+
+    const explicit = await invoke(stateXHandler, request('POST', '/api/state-x?v=x', {
+      cookie: xCookie,
+      body: {
+        version: 'x',
+        expectedRevision: 2,
+        state: { version: 'x', config: { receiverMode: 'pushcut' } }
+      }
+    }));
+    assert.equal(explicit.statusCode, 200);
+    assert.equal(explicit.json().state.config.receiverMode, 'pushcut');
+
+    const afterExplicitSave = await invoke(stateXHandler, request('POST', '/api/state-x?v=x', {
+      cookie: xCookie,
+      body: {
+        version: 'x',
+        expectedRevision: 3,
+        state: { version: 'x', config: { voiceLevel: 92 } }
+      }
+    }));
+    assert.equal(afterExplicitSave.statusCode, 200);
+    assert.equal(afterExplicitSave.json().state.config.receiverMode, 'pushcut');
+  });
+
   test('stores Spotify as a Version X bed and derives honest announcement-source capabilities', async () => {
     const result = await invoke(stateXHandler, request('POST', '/api/state-x?v=x', {
       cookie: cookieFor('x'),

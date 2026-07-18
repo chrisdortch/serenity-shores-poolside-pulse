@@ -29,6 +29,15 @@ describe('Poolside Pulse Version X state isolation and volume model', () => {
     assert.match(weatherRequestUrl({ latitude: 1, longitude: 2 }), /[?&]v=x(?:&|$)/);
   });
 
+  test('persists only the two explicit receiver handoff modes without rewriting legacy state', () => {
+    assert.equal(createDefaultState(1).config.receiverMode, 'browser');
+    assert.equal(normalizeState({ config: { receiverMode: 'browser' } }, 2).config.receiverMode, 'browser');
+    assert.equal(normalizeState({ config: { receiverMode: 'pushcut' } }, 2).config.receiverMode, 'pushcut');
+    assert.equal(normalizeState({ config: { receiverMode: 'stale-browser' } }, 2).config.receiverMode, 'browser');
+    assert.equal(Object.hasOwn(normalizeState({ config: { musicLevel: 30 } }, 2).config, 'receiverMode'), false);
+    assert.equal(Object.hasOwn(normalizeState({}, 2).config, 'receiverMode'), false);
+  });
+
   test('preserves and clamps the shared announcement level while keeping a full music mute', () => {
     assert.equal(normalizeState({ config: { voiceLevel: 37, duckLevel: 88 } }).config.voiceLevel, 37);
     assert.equal(normalizeState({ config: { voiceLevel: -1 } }).config.voiceLevel, 0);

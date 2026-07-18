@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
 import {
+  manualWeatherStatusAnnouncement,
   prepareImmediateWeatherAnnouncement,
   preparePendingWeatherAnnouncement,
   sameWeatherConfig
@@ -70,6 +71,34 @@ describe('Version X immediate Pushcut weather planning', () => {
     assert.deepEqual(plan.announcementIds, []);
     assert.equal(plan.text, '');
     assert.deepEqual(plan.completedWeather.pendingAnnouncementIds, []);
+  });
+
+  test('gives every manual check a concise spoken result while automatic clear scans stay silent', () => {
+    const clearPayload = {
+      ok: true,
+      threat: false,
+      lightningCoverageKnown: true,
+      tornadoCoverageKnown: true,
+      windCoverageKnown: true,
+      providerErrors: []
+    };
+    const clearPlan = prepareImmediateWeatherAnnouncement({
+      previousWeather: {},
+      payload: clearPayload,
+      config,
+      savedAnnouncements: announcements,
+      now: 1_780_000_000_000
+    });
+
+    assert.equal(clearPlan.text, '', 'the automatic/new-warning planner must remain quiet');
+    assert.match(manualWeatherStatusAnnouncement({ payload: clearPayload }), /no lightning, tornado warning, or strong wind/i);
+    assert.match(manualWeatherStatusAnnouncement({
+      payload: { ...clearPayload, threat: true, threatType: 'Lightning' }
+    }), /lightning is active/i);
+    assert.match(manualWeatherStatusAnnouncement({
+      payload: { ...clearPayload, lightningCoverageKnown: false, providerErrors: ['timeout'] }
+    }), /part of the weather data is unavailable/i);
+    assert.match(manualWeatherStatusAnnouncement({ payload: null }), /could not be completed/i);
   });
 
   test('staging preserves the old repeat marker so failed speech remains retryable', () => {

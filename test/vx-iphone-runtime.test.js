@@ -85,6 +85,9 @@ describe('Version X iPhone receiver foreground safety', { concurrency: false }, 
     assert.equal(calls.includes('stop-voice'), true);
     assert.equal(calls.includes('pause-apple-immediate'), true);
     assert.equal(calls.includes('disconnect-apple'), true);
+    assert.equal(runtime.state.config.receiverMode, 'pushcut');
+    assert.equal(runtime.state.receiver.status, 'offline');
+    assert.equal(runtime.state.receiver.leaseUntil, 0);
   });
 
   test('requests a direct Apple pause before waiting for older audio work', async () => {
@@ -99,6 +102,28 @@ describe('Version X iPhone receiver foreground safety', { concurrency: false }, 
     assert.equal(runtime.active, false);
     settle.resolve();
     await stopping;
+  });
+
+  test('coalesces re-entrant handoff stops and releases the browser session once', async () => {
+    const { runtime, calls } = harness();
+    let releases = 0;
+    const settle = Promise.withResolvers();
+    runtime.store.releaseReceiverSession = async () => {
+      releases += 1;
+      return { released: true };
+    };
+    runtime.settleAudioOperations = () => settle.promise;
+
+    const first = runtime.failSafeStop('First stop.', { releaseToPushcut: true, beacon: true });
+    const second = runtime.failSafeStop('Observer stop.', { releaseToPushcut: true, beacon: true });
+
+    assert.equal(runtime.active, false);
+    assert.equal(releases, 1);
+    assert.equal(calls.filter(call => call === 'stop-music').length, 1);
+    settle.resolve();
+    await Promise.all([first, second]);
+    assert.equal(releases, 1);
+    assert.equal(calls.filter(call => call === 'disconnect-apple').length, 1);
   });
 
   test('does not renew or process work when iPhone audio cannot resume', async () => {
