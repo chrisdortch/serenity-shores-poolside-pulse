@@ -491,6 +491,20 @@ export function normalizePushcutXCommand(body, {
   if (!Object.hasOwn(body, 'action')) {
     return normalizeLiveAnnouncement(body, { idFactory, issuedAt });
   }
+  // The first Automatic Receiver browser build tagged the otherwise-valid
+  // live envelope with action=announce. Accept that exact transitional shape
+  // so an already-open Receiver page keeps working while its new bundle loads.
+  if (
+    body.action === 'announce'
+    && Object.hasOwn(body, 'eventId')
+    && Object.keys(body).every(
+      key => key === 'action' || LIVE_ANNOUNCEMENT_FIELDS.has(key)
+    )
+  ) {
+    const liveBody = { ...body };
+    delete liveBody.action;
+    return normalizeLiveAnnouncement(liveBody, { idFactory, issuedAt });
+  }
   if (typeof body.action !== 'string') invalid();
   const action = body.action.trim().toLowerCase();
   if (!ACTION_SET.has(action)) invalid();

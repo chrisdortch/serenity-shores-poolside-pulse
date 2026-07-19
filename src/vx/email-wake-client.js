@@ -212,7 +212,6 @@ export async function sendEmailWakeAnnouncement({
   const stableEventId = validEventId(eventId || newEventId());
   const payload = {
     version: 'x',
-    action: 'announce',
     eventId: stableEventId,
     source: 'live',
     text: cleanText(

@@ -123,7 +123,7 @@ describe('Version X Spotify receiver isolation', { concurrency: false }, () => {
 
     assert.ok(panelStart > 0 && panelEnd > panelStart);
     assert.match(panelSource, /spotifySetupButton\(\{ disabled: spotify\.loggedIn\(\) && !owned \}\)/);
-    assert.match(panelSource, /Spotify login is available before Start Receiver/);
+    assert.match(panelSource, /Spotify: Authorize → Prepare if shown → Activate on this Receiver/);
     assert.match(panelSource, /Mode 1 · remote music control/);
     assert.match(panelSource, /Mode 2 · remote Pushcut announcements/);
   });

@@ -12,6 +12,7 @@ import {
   getEmailWakeScheduleStatus,
   syncEmailWakeSchedule
 } from '../src/vx/email-wake-schedule-client.js';
+import { normalizePushcutXCommand } from '../api/_pushcut-x.js';
 
 function response(body, status = 200) {
   return {
@@ -81,11 +82,38 @@ describe('Version X Automatic Receiver browser clients', () => {
     const body = JSON.parse(request.options.body);
     assert.equal(request.url, '/api/email-wake-x?v=x');
     assert.equal(request.options.headers['Idempotency-Key'], body.eventId);
-    assert.equal(body.action, 'announce');
+    assert.equal(Object.hasOwn(body, 'action'), false);
     assert.equal(body.voicePercent, 100);
     assert.equal(body.musicPercent, 30);
     assert.equal(body.announcementMode, 'natural-voice');
     assert.equal(result.accepted, true);
+  });
+
+  test('sends an announcement envelope accepted by the real server validator', async () => {
+    let canonical;
+    const fetchImpl = async (_url, options) => {
+      canonical = normalizePushcutXCommand(JSON.parse(options.body), {
+        now: () => 1_234
+      });
+      return response({
+        ok: true,
+        queued: true,
+        eventId: canonical.eventId
+      }, 202);
+    };
+
+    await sendEmailWakeAnnouncement({
+      eventId: 'email-wake-validator-event-123456',
+      text: 'The pool closes in fifteen minutes.',
+      label: 'Closing',
+      musicPercent: 30,
+      fetchImpl
+    });
+
+    assert.equal(canonical.action, 'announce');
+    assert.equal(canonical.eventId, 'email-wake-validator-event-123456');
+    assert.equal(canonical.voicePercent, 100);
+    assert.equal(canonical.musicPercent, 30);
   });
 
   test('validates and queues finite Suno announcement audio', async () => {

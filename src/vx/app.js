@@ -82,6 +82,10 @@ const PREVIOUS_TAB_KEY = 'poolside-pulse-vx-previous-tab';
 const SCHEDULE_SELECTION_KEY = 'poolside-pulse-vx-schedule-selection';
 const PUSHCUT_RUN_SERVER_URL = 'pushcut://open/runServer';
 const RECEIVER_TEST_HOST = 'poolside-pulse-x-receiver.vercel.app';
+const RECEIVER_TEST_RECEIVER_URL =
+  `https://${RECEIVER_TEST_HOST}/#receiver`;
+const RECEIVER_TEST_REMOTE_URL =
+  `https://${RECEIVER_TEST_HOST}/#command`;
 const SPOTIFY_CLIENT_ID = DEFAULT_SPOTIFY_CLIENT_ID;
 const SPOTIFY_DEVELOPER_DASHBOARD_URL = 'https://developer.spotify.com/dashboard';
 const SCHEDULE_STRUCTURAL_ACTIONS = new Set([
@@ -1145,6 +1149,11 @@ function iphoneReceiverModePanel({ owned = false } = {}) {
         <span>Automatic Receiver · no Pushcut foreground</span>
       </div>
       <p class="setupLead">Do these four steps once on the iPhone connected to the speakers. Keep this Receiver Test page visible for Suno, Apple Music, Spotify, and scheduled music; the background automation handles music ${musicTarget}% → 0% → announcement 100% → restore ${musicTarget}%.</p>
+      <div class="roleAddressGuide">
+        <strong>Use this Version X address on every phone</strong>
+        <p>Speaker iPhone: <code>${RECEIVER_TEST_RECEIVER_URL}</code><br />Remote iPhones: <code>${RECEIVER_TEST_REMOTE_URL}</code></p>
+        <small>The older <code>poolside-pulse-x.vercel.app</code> address is a separate saved version and cannot control this Receiver.</small>
+      </div>
       ${automaticSetupIssues ? `<ul class="scheduleSyncWarnings automaticSetupIssues">${automaticSetupIssues}</ul>` : ''}
       <ol class="receiverSetupSteps automaticSetupSteps">
         <li class="setupStep">
@@ -1162,7 +1171,7 @@ function iphoneReceiverModePanel({ owned = false } = {}) {
         </li>
         <li class="setupStep ${automaticEnabled ? 'complete' : ''}">
           <div class="setupStepHeading"><span class="setupStepNumber" aria-hidden="true">3</span><div><strong>Create Email Automation</strong><small>One background trigger on this Receiver.</small></div></div>
-          <details class="setupInstructions">
+          <details class="setupInstructions" data-persist-open="automatic-email-automation">
             <summary>Create Email Automation</summary>
             <div class="setupInstructionBody">
               <p>Confirm <code>${escapeHtml(wakeRecipient)}</code> receives messages in Apple Mail on this Receiver iPhone.</p>
@@ -1175,12 +1184,12 @@ function iphoneReceiverModePanel({ owned = false } = {}) {
           <div class="setupStepHeading"><span class="setupStepNumber" aria-hidden="true">4</span><div><strong>Test &amp; Turn On</strong><small>Version X enables automation only after a signed completion.</small></div></div>
           <button type="button" data-action="${automaticEnabled ? 'disable-automatic-announcements' : 'enable-automatic-announcements'}" class="${automaticEnabled ? 'secondary' : 'primary'} setupAction" ${automaticReady ? '' : 'disabled'}>${automaticEnabled ? 'Use Browser Announcements Instead' : 'Test & Turn On Automatic Receiver'}</button>
           ${automaticEnabled && automaticReady ? '<button type="button" data-action="email-wake-test" class="secondary setupAction">Run Receiver Test Again</button>' : ''}
-          <small>Start Browser Receiver and music first. Version X stays on Browser announcements unless the iPhone returns a signed end-to-end completion.</small>
+          <small>Before testing, open <strong>Browser music receiver &amp; account controls</strong> below. Apple Music and Spotify each require their one-time authorization and activation taps on this speaker iPhone; a Remote cannot perform those account-security taps. Then start music and run this signed test.</small>
         </li>
       </ol>
       <small class="setupFootnote">${emailWakeStatus.note ? escapeHtml(emailWakeStatus.note) : automaticReady ? 'The Receiver token is revocable, the email carries no command or credential, and every action waits for a signed completion receipt.' : 'Pairing and the Email automation are required once on the speaker iPhone only. Remote iPhones need no Shortcut or Pushcut setup.'}</small>
-      <details class="receiverDetailDisclosure">
-        <summary>Browser music receiver &amp; account controls</summary>
+      <details class="receiverDetailDisclosure" data-persist-open="receiver-browser-accounts">
+        <summary>Browser music receiver &amp; account controls · required once</summary>
         <div class="capabilityCard ${browserActive ? 'verified' : 'limited'}">
           <span>Mode 1 · remote music control · Receiver browser</span>
           <strong>${browserActive ? 'Browser Receiver is active' : browserSelected ? 'Browser Receiver selected · tap Start Receiver' : 'Browser Receiver is not selected'}</strong>
@@ -1189,10 +1198,10 @@ function iphoneReceiverModePanel({ owned = false } = {}) {
             ${appleSetupButton({ disabled: apple.loggedIn() && !owned })}
             ${spotifySetupButton({ disabled: spotify.loggedIn() && !owned })}
           </div>
-          <small>Spotify login is available before Start Receiver. Its Connect step becomes available after this device owns the live receiver.</small>
+          <small>Apple Music: Prepare → Authorize → Activate on this Receiver. Spotify: Authorize → Prepare if shown → Activate on this Receiver. After the provider reports ready, any Remote using the Version X Remote address can choose it and tap Play.</small>
         </div>
       </details>
-      <details class="legacyFallback">
+      <details class="legacyFallback" data-persist-open="receiver-pushcut-fallback">
         <summary>Legacy fallback · Pushcut</summary>
         <div class="capabilityCard ${pushcutSelected && pushcutOperational ? 'verified' : 'limited'}">
           <span>Mode 2 · remote Pushcut announcements · legacy fallback</span>
@@ -1627,7 +1636,7 @@ function renderReceiver() {
     ${iphoneReceiverModePanel({ owned })}
     ${native ? '<div class="callout"><strong>One shared speaker output</strong><p>Choose the pool speaker in macOS Control Center > Sound. Do not select a Music.app-only AirPlay destination: Music.app and spoken announcements must use the same Mac system output.</p></div>' : ''}
     ${other ? `<div class="callout warning"><strong>Takeover protection</strong><p>Starting here will stop commands from targeting ${escapeHtml(receiver.name || 'the other receiver')}. Only take over if that device is no longer connected to the speakers.</p></div>` : ''}
-    <details class="readinessPanel receiverDiagnostics">
+    <details class="readinessPanel receiverDiagnostics" data-persist-open="receiver-diagnostics">
       <summary><span><span class="kicker">Live readiness</span><strong>Receiver diagnostics</strong></span><span class="score">${readiness.filter(([, ok]) => ok).length}/${readiness.length}</span></summary>
       <div class="readinessGrid">${readiness.map(([label, ok, detail]) => `<div class="readinessItem ${ok ? 'pass' : 'todo'}"><span>${ok ? 'Ready' : 'Check'}</span><strong>${escapeHtml(label)}</strong><small>${escapeHtml(detail)}</small></div>`).join('')}</div>
     </details>

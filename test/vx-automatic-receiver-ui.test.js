@@ -47,11 +47,18 @@ describe('Version X Automatic Receiver UI and routing contract', () => {
     assert.match(panel, /Add Action → Run Shortcut/);
     assert.match(panel, /automaticSetupIssues/);
     assert.match(panel, /Remote iPhones need no Shortcut or Pushcut setup/);
+    assert.match(panel, /Use this Version X address on every phone/);
+    assert.match(panel, /RECEIVER_TEST_RECEIVER_URL/);
+    assert.match(panel, /RECEIVER_TEST_REMOTE_URL/);
+    assert.match(panel, /separate saved version and cannot control this Receiver/);
     assert.match(panel, /Paired · run the required Receiver Test/);
     assert.match(panel, /Test & Turn On Automatic Receiver/);
+    assert.match(panel, /a Remote cannot perform those account-security taps/);
+    assert.match(panel, /Apple Music: Prepare → Authorize → Activate/);
+    assert.match(panel, /Spotify: Authorize → Prepare if shown → Activate/);
     assert.match(
       panel,
-      /stays on Browser announcements unless the iPhone returns a signed end-to-end completion/
+      /enables automation only after a signed completion/
     );
   });
 
@@ -66,7 +73,7 @@ describe('Version X Automatic Receiver UI and routing contract', () => {
       '<strong>Pair Receiver</strong>',
       '<strong>Create Email Automation</strong>',
       '<strong>Test &amp; Turn On</strong>',
-      '<details class="legacyFallback">'
+      '<details class="legacyFallback" data-persist-open="receiver-pushcut-fallback">'
     ];
     let previous = -1;
     for (const marker of expectedOrder) {
@@ -78,10 +85,50 @@ describe('Version X Automatic Receiver UI and routing contract', () => {
     assert.match(panel, /Receiver Test · Version X candidate/);
     assert.match(panel, /Finish the four one-time steps/);
     assert.match(panel, /class="shortcutLink setupAction"/);
-    assert.match(panel, /class="setupInstructions"/);
-    assert.match(panel, /class="receiverDetailDisclosure"/);
-    assert.match(panel, /<details class="legacyFallback">\s*<summary>Legacy fallback · Pushcut<\/summary>/);
+    assert.match(panel, /class="setupInstructions" data-persist-open="automatic-email-automation"/);
+    assert.match(panel, /class="receiverDetailDisclosure" data-persist-open="receiver-browser-accounts"/);
+    assert.match(panel, /<details class="legacyFallback" data-persist-open="receiver-pushcut-fallback">\s*<summary>Legacy fallback · Pushcut<\/summary>/);
     assert.doesNotMatch(panel, /<details class="legacyFallback"[^>]*\sopen/);
+  });
+
+  test('keeps every Receiver disclosure open or closed through live polling renders', () => {
+    const panel = sourceBetween(
+      'function iphoneReceiverModePanel',
+      'function updateLiveStatus'
+    );
+    const receiver = sourceBetween(
+      'function renderReceiver',
+      'function providerSelector'
+    );
+    const render = sourceBetween(
+      'function render(',
+      'function selectTab'
+    );
+
+    assert.match(
+      panel,
+      /<details class="setupInstructions" data-persist-open="automatic-email-automation">/
+    );
+    assert.match(
+      panel,
+      /<details class="receiverDetailDisclosure" data-persist-open="receiver-browser-accounts">/
+    );
+    assert.match(
+      panel,
+      /<details class="legacyFallback" data-persist-open="receiver-pushcut-fallback">/
+    );
+    assert.match(
+      receiver,
+      /<details class="readinessPanel receiverDiagnostics" data-persist-open="receiver-diagnostics">/
+    );
+    assert.match(
+      render,
+      /details\[open\]\[data-persist-open\]/
+    );
+    assert.match(
+      render,
+      /details\[data-persist-open="\$\{CSS\.escape\(key\)\}"\]/
+    );
   });
 
   test('labels the candidate host as the Automatic Receiver Test Build on every Speaker Receiver', () => {
@@ -140,7 +187,7 @@ describe('Version X Automatic Receiver UI and routing contract', () => {
 
     assert.match(
       receiver,
-      /<details class="readinessPanel receiverDiagnostics">/
+      /<details class="readinessPanel receiverDiagnostics" data-persist-open="receiver-diagnostics">/
     );
     assert.match(receiver, /<strong>Receiver diagnostics<\/strong>/);
     assert.doesNotMatch(

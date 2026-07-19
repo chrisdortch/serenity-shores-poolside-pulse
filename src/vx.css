@@ -1633,6 +1633,26 @@ select:focus-visible {
   font-size: 0.9rem;
 }
 
+.roleAddressGuide {
+  display: grid;
+  gap: 8px;
+  margin: 12px 0 0;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--paper-soft);
+}
+
+.roleAddressGuide p,
+.roleAddressGuide small {
+  margin: 0;
+}
+
+.roleAddressGuide code {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
 .automaticSetupSteps {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));

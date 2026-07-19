@@ -238,6 +238,26 @@ describe('Version X Pushcut command validation', { concurrency: false }, () => {
     });
   });
 
+  test('accepts the transitional action-tagged Automatic Receiver live envelope', () => {
+    const command = normalizePushcutXCommand({
+      version: 'x',
+      action: 'announce',
+      eventId: 'email-wake-transition-event-0001',
+      source: 'live',
+      text: 'Automatic receiver transition test.',
+      label: 'Receiver Test',
+      safety: false,
+      voicePercent: 100,
+      musicPercent: 30,
+      announcementMode: 'natural-voice'
+    }, { now: () => 1_235 });
+
+    assert.equal(command.action, 'announce');
+    assert.equal(command.eventId, 'email-wake-transition-event-0001');
+    assert.equal(command.voicePercent, 100);
+    assert.equal(command.musicPercent, 30);
+  });
+
   test('rejects unknown fields and long speech while allowing a 100% music target', () => {
     const base = {
       version: 'x',
