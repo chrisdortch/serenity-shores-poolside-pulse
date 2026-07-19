@@ -42,6 +42,24 @@ import {
   syncPushcutSchedule
 } from './pushcut-schedule-client.js';
 import {
+  applyEmailWakeMusicVolume,
+  createEmailWakePairingCode,
+  EMAIL_WAKE_MAX_ANNOUNCEMENT_CHARACTERS,
+  getEmailWakeStatus,
+  sendEmailWakeAnnouncement,
+  withEmailWakeBrowserAudioLease,
+  waitForEmailWakeCompletion
+} from './email-wake-client.js';
+import {
+  EmailWakeScheduleSyncError,
+  getEmailWakeScheduleStatus,
+  syncEmailWakeSchedule
+} from './email-wake-schedule-client.js';
+import {
+  EMAIL_WAKE_X_SHORTCUT_INSTALL_URL,
+  EMAIL_WAKE_X_SHORTCUT_NAME
+} from './email-wake-shortcut.js';
+import {
   PUSHCUT_X_ANNOUNCEMENT_INSTALL_URL,
   PUSHCUT_X_ANNOUNCEMENT_SHORTCUT_NAME,
   PUSHCUT_X_RECOVERY_INSTALL_URL,
@@ -135,6 +153,55 @@ let pushcutScheduleSyncPromise = null;
 let pushcutScheduleSyncFingerprint = '';
 let pushcutScheduleSyncPending = false;
 let observedPushcutScheduleFingerprint = '';
+let emailWakeStatus = {
+  checked: false,
+  ready: false,
+  operational: false,
+  receiverPaired: false,
+  pairedAt: 0,
+  wakeReady: false,
+  durable: false,
+  executionActive: false,
+  executionEventId: '',
+  executionLeaseUntil: 0,
+  wakeSender: '',
+  wakeSubject: '',
+  wakeRecipient: '',
+  naturalAudioReady: false,
+  signedDeliveryReady: false,
+  configurationIssues: [],
+  note: ''
+};
+let emailWakePairing = {
+  code: '',
+  expiresAt: 0
+};
+let emailWakeVolumeStatus = {
+  state: 'idle',
+  message: 'Not applied from this manager session yet.'
+};
+let emailWakeScheduleStatus = {
+  checked: false,
+  syncing: false,
+  syncedAt: 0,
+  horizonEnd: 0,
+  stateRevision: 0,
+  enabled: false,
+  current: false,
+  sourceFingerprint: '',
+  scheduledCount: 0,
+  occurrenceCount: 0,
+  nextScheduledFor: 0,
+  maintenanceScheduled: false,
+  maintenanceScheduledFor: 0,
+  warnings: [],
+  error: ''
+};
+let emailWakeScheduleSyncTimer = null;
+let emailWakeScheduleSyncPromise = null;
+let emailWakeScheduleSyncFingerprint = '';
+let emailWakeScheduleSyncPending = false;
+let observedEmailWakeScheduleFingerprint = '';
 
 function escapeHtml(value) {
   return String(value ?? '')
@@ -243,6 +310,15 @@ function audibleMusicTarget(state = store?.state, globalOverride = null) {
   return clamp(sharedTarget, 0, 100, 30);
 }
 
+function controlledBrowserGainTarget(
+  state = store?.state,
+  requestedPercent = audibleMusicTarget(state)
+) {
+  return automaticAnnouncementsEnabled(state)
+    ? 100
+    : clamp(requestedPercent, 0, 100, 30);
+}
+
 function audibleVoiceTarget() {
   return VOICE_LEVEL_PERCENT;
 }
@@ -269,6 +345,72 @@ function pushcutAnnouncementOperational() {
 
 function pushcutMusicVolumeReady() {
   return pushcutStatus.recoveryReady === true;
+}
+
+function automaticAnnouncementsEnabled(state = store?.state) {
+  return state?.config?.announcementTransport === 'email-wake'
+    && Number(state?.config?.automaticReceiverVerifiedPairingAt || 0) > 0;
+}
+
+function emailWakeOperational() {
+  return emailWakeStatus.ready === true
+    && emailWakeStatus.operational === true
+    && emailWakeStatus.receiverPaired === true;
+}
+
+async function refreshEmailWakeStatus() {
+  try {
+    const status = await getEmailWakeStatus();
+    emailWakeStatus = {
+      checked: true,
+      ready: status.ready === true,
+      operational: status.operational === true,
+      receiverPaired: status.receiverPaired === true,
+      pairedAt: Number(status.pairedAt || 0),
+      wakeReady: status.wakeReady === true,
+      durable: status.durable === true,
+      executionActive: status.executionActive === true,
+      executionEventId: String(status.executionEventId || ''),
+      executionLeaseUntil: Number(status.executionLeaseUntil || 0),
+      wakeSender: String(status.wakeSender || ''),
+      wakeSubject: String(status.wakeSubject || ''),
+      wakeRecipient: String(status.wakeRecipient || ''),
+      naturalAudioReady: status.naturalAudioReady === true,
+      signedDeliveryReady: status.signedDeliveryReady === true,
+      configurationIssues: Array.isArray(status.configurationIssues)
+        ? status.configurationIssues
+            .map(item => String(item || '').trim())
+            .filter(Boolean)
+            .slice(0, 12)
+        : [],
+      note: String(status.note || '')
+    };
+  } catch (error) {
+    emailWakeStatus = {
+      checked: true,
+      ready: false,
+      operational: false,
+      receiverPaired: false,
+      pairedAt: 0,
+      wakeReady: false,
+      durable: false,
+      executionActive: false,
+      executionEventId: '',
+      executionLeaseUntil: 0,
+      wakeSender: '',
+      wakeSubject: '',
+      wakeRecipient: '',
+      naturalAudioReady: false,
+      signedDeliveryReady: false,
+      configurationIssues: [
+        `Automatic Receiver status could not be checked: ${
+          error.message || String(error)
+        }`
+      ],
+      note: error.message || String(error)
+    };
+  }
+  return emailWakeStatus;
 }
 
 function receiverOperatingMode(state = store?.state) {
@@ -343,6 +485,8 @@ function setPushcutScheduleStatus(payload = {}, {
     scheduledCount: Number(payload.scheduledCount || 0),
     occurrenceCount: Number(payload.occurrenceCount || 0),
     nextScheduledFor: Number(payload.nextScheduledFor || 0),
+    maintenanceScheduled: payload.maintenanceScheduled === true,
+    maintenanceScheduledFor: Number(payload.maintenanceScheduledFor || 0),
     warnings: Array.isArray(payload.warnings)
       ? payload.warnings.map(item => String(item || '')).filter(Boolean).slice(0, 100)
       : [],
@@ -483,6 +627,239 @@ function queuePushcutScheduleSync(delayMs = 900) {
   }, delayMs);
 }
 
+function emailWakeScheduleFingerprint(state = store?.state) {
+  const source = state && typeof state === 'object' ? state : {};
+  return JSON.stringify({
+    announcementTransport:
+      automaticAnnouncementsEnabled(source)
+        ? 'email-wake'
+        : 'browser',
+    activeScheduleId: source.activeScheduleId || '',
+    config: {
+      musicLevel: source.config?.musicLevel,
+      lightningRadiusMiles: source.config?.lightningRadiusMiles,
+      lightningHoldMinutes: source.config?.lightningHoldMinutes
+    },
+    announcements: source.announcements || [],
+    announcementSources: source.announcementSources || [],
+    schedules: source.schedules || []
+  });
+}
+
+function setEmailWakeScheduleStatus(payload = {}, {
+  error = '',
+  syncing = false
+} = {}) {
+  emailWakeScheduleStatus = {
+    checked: true,
+    syncing,
+    syncedAt: Number(payload.syncedAt || 0),
+    horizonEnd: Number(payload.horizonEnd || 0),
+    stateRevision: Number(payload.stateRevision || 0),
+    enabled: payload.enabled === true,
+    current:
+      payload.current === true
+      || payload.synchronized === true,
+    sourceFingerprint: String(payload.sourceFingerprint || ''),
+    scheduledCount: Number(payload.scheduledCount || 0),
+    occurrenceCount: Number(payload.occurrenceCount || 0),
+    nextScheduledFor: Number(payload.nextScheduledFor || 0),
+    maintenanceScheduled: payload.maintenanceScheduled === true,
+    maintenanceScheduledFor: Number(payload.maintenanceScheduledFor || 0),
+    warnings: Array.isArray(payload.warnings)
+      ? payload.warnings.map(item => String(item || '')).filter(Boolean).slice(0, 100)
+      : [],
+    error: String(error || '')
+  };
+  renderWhenIdle(true);
+  return emailWakeScheduleStatus;
+}
+
+function automaticTimedAnnouncementsDelegated() {
+  return automaticAnnouncementsEnabled()
+    && emailWakeOperational()
+    && emailWakeScheduleStatus.checked === true
+    && emailWakeScheduleStatus.enabled === true
+    && emailWakeScheduleStatus.current === true
+    && !emailWakeScheduleStatus.error;
+}
+
+async function refreshEmailWakeScheduleStatus() {
+  if (!emailWakeStatus.ready) {
+    return setEmailWakeScheduleStatus({}, {
+      error: 'Configure the Automatic Receiver service before syncing timed announcements.'
+    });
+  }
+  try {
+    return setEmailWakeScheduleStatus(await getEmailWakeScheduleStatus());
+  } catch (error) {
+    return setEmailWakeScheduleStatus({}, {
+      error: error.message || String(error)
+    });
+  }
+}
+
+async function syncCurrentEmailWakeSchedule({
+  manual = false,
+  retryStale = true,
+  enabledOverride = null
+} = {}) {
+  if (!emailWakeStatus.ready) {
+    throw new Error('Configure the Automatic Receiver service before syncing timed announcements.');
+  }
+  const receiverModeTransition =
+    role === 'receiver'
+    && typeof enabledOverride === 'boolean';
+  if (role !== 'command' && !receiverModeTransition) {
+    throw new Error('Open Schedule on a Remote Control device to sync timed announcements.');
+  }
+  if (emailWakeScheduleSyncPromise) {
+    if (
+      emailWakeScheduleFingerprint(store.state)
+      !== emailWakeScheduleSyncFingerprint
+    ) {
+      emailWakeScheduleSyncPending = true;
+    }
+    return await emailWakeScheduleSyncPromise;
+  }
+  let requestedState = store.state;
+  let requestedFingerprint = emailWakeScheduleFingerprint(requestedState);
+  let requestedRevision = Number(requestedState?.revision || 0);
+  let requestedEnabled =
+    typeof enabledOverride === 'boolean'
+      ? enabledOverride
+      : automaticAnnouncementsEnabled(requestedState);
+  emailWakeScheduleSyncFingerprint = requestedFingerprint;
+  emailWakeScheduleStatus = {
+    ...emailWakeScheduleStatus,
+    checked: true,
+    syncing: true,
+    error: ''
+  };
+  renderWhenIdle(true);
+  emailWakeScheduleSyncPromise = (async () => {
+    try {
+      let result;
+      try {
+        result = await syncEmailWakeSchedule(requestedState, {
+          enabled: requestedEnabled
+        });
+      } catch (error) {
+        if (retryStale && Number(error?.status) === 409) {
+          await store.load();
+          requestedState = store.state;
+          requestedFingerprint = emailWakeScheduleFingerprint(requestedState);
+          requestedRevision = Number(requestedState?.revision || 0);
+          requestedEnabled =
+            typeof enabledOverride === 'boolean'
+              ? enabledOverride
+              : automaticAnnouncementsEnabled(requestedState);
+          emailWakeScheduleSyncFingerprint = requestedFingerprint;
+          result = await syncEmailWakeSchedule(requestedState, {
+            enabled: requestedEnabled
+          });
+        } else {
+          throw error;
+        }
+      }
+      setEmailWakeScheduleStatus(result);
+      if (
+        Number(result?.stateRevision) !== requestedRevision
+        || emailWakeScheduleFingerprint(store.state) !== requestedFingerprint
+      ) {
+        emailWakeScheduleSyncPending = true;
+      }
+      if (manual) {
+        const message = !requestedEnabled
+          ? 'Automatic timed announcements are paused; Browser music scheduling is unchanged.'
+          : result.scheduledCount
+            ? `${result.scheduledCount} automatic announcement ${
+                result.scheduledCount === 1 ? 'occurrence is' : 'occurrences are'
+              } synced through ${formatClock(result.horizonEnd)}.`
+            : 'The live Time schedule has no enabled automatic announcement occurrences.';
+        setFeedback(message, true);
+      }
+      return result;
+    } catch (error) {
+      const safe =
+        error instanceof EmailWakeScheduleSyncError
+          ? error
+          : new EmailWakeScheduleSyncError(error.message || String(error));
+      setEmailWakeScheduleStatus({}, { error: safe.message });
+      if (manual) setFeedback(safe.message, false);
+      throw safe;
+    } finally {
+      emailWakeScheduleSyncPromise = null;
+      emailWakeScheduleSyncFingerprint = '';
+      if (emailWakeScheduleSyncPending) {
+        emailWakeScheduleSyncPending = false;
+        queueEmailWakeScheduleSync(0);
+      }
+    }
+  })();
+  return await emailWakeScheduleSyncPromise;
+}
+
+function queueEmailWakeScheduleSync(delayMs = 900) {
+  if (!authenticated || role !== 'command' || !emailWakeStatus.ready) return;
+  clearTimeout(emailWakeScheduleSyncTimer);
+  emailWakeScheduleSyncTimer = setTimeout(() => {
+    emailWakeScheduleSyncTimer = null;
+    syncCurrentEmailWakeSchedule().catch(() => {});
+  }, delayMs);
+}
+
+async function ensureAutomaticScheduleSyncAfterChange(
+  previousFingerprint,
+  savedLabel = 'Change'
+) {
+  const nextFingerprint = emailWakeScheduleFingerprint(store.state);
+  if (
+    role !== 'command'
+    || !automaticAnnouncementsEnabled()
+    || previousFingerprint === nextFingerprint
+  ) {
+    return null;
+  }
+
+  clearTimeout(emailWakeScheduleSyncTimer);
+  emailWakeScheduleSyncTimer = null;
+  if (automaticTimedAnnouncementsDelegated()) return emailWakeScheduleStatus;
+
+  if (!emailWakeOperational()) {
+    const detail =
+      emailWakeStatus.note
+      || emailWakeStatus.configurationIssues?.[0]
+      || 'Automatic Receiver is not paired and operational.';
+    const message =
+      `${savedLabel} saved, but durable automatic announcement scheduling did not update: ${detail}`;
+    setEmailWakeScheduleStatus({}, { error: message });
+    throw new Error(message);
+  }
+
+  try {
+    // A prior debounce may already be finishing an older revision. The sync
+    // helper marks that result stale; one immediate follow-up then commits the
+    // state that this user just saved before success is reported.
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      await syncCurrentEmailWakeSchedule({ retryStale: true });
+      if (automaticTimedAnnouncementsDelegated()) {
+        return emailWakeScheduleStatus;
+      }
+    }
+    throw new Error(
+      'The schedule service did not confirm the saved Version X revision.'
+    );
+  } catch (error) {
+    const message =
+      `${savedLabel} saved, but durable automatic announcement scheduling did not update: ${
+        error.message || String(error)
+      }`;
+    setEmailWakeScheduleStatus({}, { error: message });
+    throw new Error(message);
+  }
+}
+
 function liveReceiverIsNative(state = store?.state) {
   const receiver = state?.receiver;
   return receiverOnline(receiver, store.now()) && receiver?.receiverKind === 'macos-music-helper';
@@ -502,6 +879,17 @@ const store = new CloudStore({
       observedPushcutScheduleFingerprint = nextScheduleFingerprint;
       queuePushcutScheduleSync();
     }
+    const nextEmailWakeFingerprint = emailWakeScheduleFingerprint(state);
+    if (!observedEmailWakeScheduleFingerprint) {
+      observedEmailWakeScheduleFingerprint = nextEmailWakeFingerprint;
+    } else if (nextEmailWakeFingerprint !== observedEmailWakeScheduleFingerprint) {
+      observedEmailWakeScheduleFingerprint = nextEmailWakeFingerprint;
+      emailWakeScheduleStatus = {
+        ...emailWakeScheduleStatus,
+        current: false
+      };
+      queueEmailWakeScheduleSync();
+    }
     if (!(state.schedules || []).some(schedule => schedule.id === selectedScheduleId)) {
       selectedScheduleId = state.activeScheduleId || state.schedules?.[0]?.id || '';
       if (selectedScheduleId) localStorage.setItem(SCHEDULE_SELECTION_KEY, selectedScheduleId);
@@ -510,7 +898,10 @@ const store = new CloudStore({
     const effectiveTarget = physicalCustomTarget === null || physicalCustomTarget === undefined
       ? audibleMusicTarget(state, musicLevelDraft === null ? state.config.musicLevel : musicLevelDraft)
       : physicalCustomTarget;
-    audio.setMusicLevelPercent?.(effectiveTarget, { report: false });
+    audio.setMusicLevelPercent?.(
+      controlledBrowserGainTarget(state, effectiveTarget),
+      { report: false }
+    );
     audio.setVoiceLevelPercent?.(VOICE_LEVEL_PERCENT, { report: false });
     apple.setTargetVolumePercent?.(effectiveTarget);
     spotify.setTargetVolumePercent?.(effectiveTarget);
@@ -558,7 +949,10 @@ const spotify = new SpotifyReceiver({
   onState: () => renderWhenIdle()
 });
 
-audio.setMusicLevelPercent(audibleMusicTarget(store.state), { report: false });
+audio.setMusicLevelPercent(
+  controlledBrowserGainTarget(store.state),
+  { report: false }
+);
 audio.setVoiceLevelPercent?.(audibleVoiceTarget(store.state), { report: false });
 apple.setTargetVolumePercent(audibleMusicTarget(store.state));
 spotify.setTargetVolumePercent(audibleMusicTarget(store.state));
@@ -569,7 +963,21 @@ const runtime = new ReceiverRuntime({
   apple,
   spotify,
   onStatus: status => setFeedback(status.message, status.ok),
-  onChange: () => renderWhenIdle()
+  onChange: () => renderWhenIdle(),
+  shouldDelegateScheduledAnnouncements:
+    () => automaticTimedAnnouncementsDelegated(),
+  isExternalAutomationActive: async () => {
+    const status = await refreshEmailWakeStatus();
+    return status.executionActive === true;
+  },
+  withExternalAudioLease: work =>
+    withEmailWakeBrowserAudioLease(work, {
+      onLeaseWarning: message => setFeedback(message, false)
+    }),
+  onExternalAnnouncement: (text, options) =>
+    dispatchAutomaticAnnouncement({ text, ...options }),
+  onExternalMusicTarget: percent =>
+    applyReceiverMusicTargetNow(percent)
 });
 
 function effectiveProvider() {
@@ -606,6 +1014,18 @@ function cloudSpotifyVerified() {
 
 function displayAudioPolicy(provider = effectiveProvider()) {
   const musicPercent = audibleMusicTarget(store.state);
+  if (automaticAnnouncementsEnabled()) {
+    return {
+      id: 'automatic-receiver-dynamic-target',
+      exact: false,
+      musicPercent,
+      voicePercent: VOICE_LEVEL_PERCENT,
+      duringVoicePercent: DUCK_LEVEL_PERCENT,
+      action: 'automatic-shortcut',
+      label: `Automatic sequence ${musicPercent}% → 0% → 100% → ${musicPercent}%`,
+      detail: `The background Receiver Shortcut sets the shared output to ${musicPercent}% for music, reaches 0% before playback changes, plays the announcement at 100%, then resumes and restores ${musicPercent}%. Physical speaker loudness is not measured.`
+    };
+  }
   if (receiverOperatingMode() === 'pushcut') {
     return {
       id: 'pushcut-shortcut-dynamic-target',
@@ -688,23 +1108,61 @@ function iphoneReceiverModePanel({ owned = false } = {}) {
   const musicTarget = audibleMusicTarget(store.state);
   const browserSelected = mode === 'browser';
   const browserActive = browserSelected && receiverOnline(store.state.receiver, store.now());
+  const automaticEnabled = automaticAnnouncementsEnabled();
+  const automaticReady = emailWakeOperational();
+  const pairingVisible =
+    emailWakePairing.code
+    && Number(emailWakePairing.expiresAt || 0) > store.now();
+  const automaticSetupIssues = emailWakeStatus.configurationIssues
+    .map(message => `<li>${escapeHtml(message)}</li>`)
+    .join('');
+  const wakeSender = emailWakeStatus.wakeSender || 'shown after server setup';
+  const wakeSubject = emailWakeStatus.wakeSubject || 'shown after server setup';
+  const wakeRecipient =
+    emailWakeStatus.wakeRecipient || 'the configured Receiver email';
   const pushcutSelected = mode === 'pushcut';
   const pushcutOperational = pushcutAnnouncementOperational();
   const pushcutModeAction = browserSelected
     ? browserActive
-      ? '<button type="button" data-action="stop-receiver" class="secondary">Stop Receiver &amp; Prepare Pushcut</button>'
+      ? `<button type="button" data-action="stop-receiver" class="secondary">${
+          automaticEnabled
+            ? 'Stop Music Receiver'
+            : 'Stop Receiver &amp; Prepare Pushcut'
+        }</button>`
       : '<button type="button" data-action="prepare-pushcut-mode" class="secondary">Prepare Pushcut Mode</button>'
     : pushcutScheduleStatus.error
       ? '<button type="button" data-action="prepare-pushcut-mode" class="secondary">Retry Pushcut Preparation</button>'
       : `<a href="${PUSHCUT_RUN_SERVER_URL}" class="shortcutLink">Open Pushcut Server</a>`;
   return `
     <section class="workspacePanel receiverModePanel">
-      <div class="sectionHeading"><div><p class="kicker">Choose one receiver mode</p><h2>Remote music or Pushcut announcements</h2></div><span class="fixedMix">Music ${musicTarget} · Announcement 100</span></div>
+      <div class="sectionHeading"><div><p class="kicker">Recommended Receiver</p><h2>Automatic music + loud announcements</h2></div><span class="fixedMix">Music ${musicTarget} · Announcement 100</span></div>
+      <div class="capabilityCard ${automaticEnabled && automaticReady && browserActive ? 'verified' : 'limited'}">
+        <span>Automatic Receiver · no Pushcut foreground</span>
+        <strong>${automaticEnabled && automaticReady ? browserActive ? 'Automatic Receiver is verified and ready' : 'Automation verified · start Browser Receiver' : automaticReady ? 'Paired · run the required Receiver Test' : automaticSetupIssues ? 'Automatic Receiver server setup needs attention' : emailWakeStatus.ready ? 'Finish the one-time Receiver setup' : 'Checking Automatic Receiver service'}</strong>
+        <p>Keep this Version X page visible for Suno, Apple Music, Spotify, and music schedule rows. A background iPhone automation handles music ${musicTarget}% → 0%, announcement 100%, then restores ${musicTarget}%—without leaving Pushcut open.</p>
+        ${automaticSetupIssues ? `<ul class="scheduleSyncWarnings automaticSetupIssues">${automaticSetupIssues}</ul>` : ''}
+        <ol class="receiverSetupSteps">
+          <li>Tap <a href="${EMAIL_WAKE_X_SHORTCUT_INSTALL_URL}" class="shortcutLink">Install ${EMAIL_WAKE_X_SHORTCUT_NAME}</a>.</li>
+          <li>In Safari, tap the <strong>Downloads</strong> arrow → <code>Poolside Pulse X Automatic Receiver.shortcut</code> → <strong>Add Shortcut</strong>, then return here.</li>
+          <li>Tap <strong>Create Pairing Code</strong>, run the installed Shortcut once, enter the six-digit code, return here, then tap <strong>Check Pairing</strong>.${pairingVisible ? ` <strong class="pairingCode">${escapeHtml(emailWakePairing.code)}</strong>` : ''}</li>
+          <li>Confirm <code>${escapeHtml(wakeRecipient)}</code> receives messages in Apple Mail on this Receiver iPhone.</li>
+          <li>On this Receiver: Shortcuts → Automation → <strong>+</strong> → <strong>Email</strong>. Set Sender to <code>${escapeHtml(wakeSender)}</code>${emailWakeStatus.wakeSender ? ` <button type="button" data-action="copy-email-wake-sender" class="secondary">Copy</button>` : ''}, Subject Contains to <code>${escapeHtml(wakeSubject)}</code>${emailWakeStatus.wakeSubject ? ` <button type="button" data-action="copy-email-wake-subject" class="secondary">Copy</button>` : ''}, choose <strong>Run Immediately</strong>, then tap Next.</li>
+          <li>Choose <strong>${EMAIL_WAKE_X_SHORTCUT_NAME}</strong>. If it is not listed, choose New Blank Automation → Add Action → Run Shortcut → <strong>${EMAIL_WAKE_X_SHORTCUT_NAME}</strong>. Tap Done.</li>
+          <li>Start Browser Receiver and music, then tap <strong>Test &amp; Turn On Automatic Receiver</strong>. Version X stays on Browser announcements unless the iPhone returns a signed end-to-end completion.</li>
+        </ol>
+        <div class="stackedActions">
+          <button type="button" data-action="create-email-wake-pairing" class="secondary" ${emailWakeStatus.ready ? '' : 'disabled'}>Create Pairing Code</button>
+          ${!automaticReady && emailWakeStatus.ready ? '<button type="button" data-action="check-email-wake-pairing" class="secondary">Check Pairing</button>' : ''}
+          <button type="button" data-action="${automaticEnabled ? 'disable-automatic-announcements' : 'enable-automatic-announcements'}" class="${automaticEnabled ? 'secondary' : 'primary'}" ${automaticReady ? '' : 'disabled'}>${automaticEnabled ? 'Use Browser Announcements Instead' : 'Test & Turn On Automatic Receiver'}</button>
+          ${automaticEnabled && automaticReady ? '<button type="button" data-action="email-wake-test" class="secondary">Run Receiver Test</button>' : ''}
+        </div>
+        <small>${emailWakeStatus.note ? escapeHtml(emailWakeStatus.note) : automaticReady ? 'The Receiver token is revocable, the email carries no command or credential, and every action waits for a signed completion receipt.' : 'Pairing and the Email automation are required once on the speaker iPhone only. Remote iPhones need no Shortcut or Pushcut setup.'}</small>
+      </div>
       <div class="settingsGrid">
         <div class="capabilityCard ${browserActive ? 'verified' : 'limited'}">
-          <span>Mode 1 · remote music control</span>
+          <span>Mode 1 · remote music control · Receiver browser</span>
           <strong>${browserActive ? 'Browser Receiver is active' : browserSelected ? 'Browser Receiver selected · tap Start Receiver' : 'Browser Receiver is not selected'}</strong>
-          <p>Use this when the Remote should start, change, pause, or stop Suno, Apple Music, or Spotify. Keep Version X visible on this Receiver iPhone. Natural Voice announcements play through this browser receiver.</p>
+          <p>The Remote starts, changes, pauses, or stops Suno, Apple Music, or Spotify here. Keep Version X visible on this Receiver iPhone. With Automatic Receiver enabled, background Shortcuts—not browser speech—handles announcements.</p>
           <div class="stackedActions">
             ${appleSetupButton({ disabled: apple.loggedIn() && !owned })}
             ${spotifySetupButton({ disabled: spotify.loggedIn() && !owned })}
@@ -712,7 +1170,7 @@ function iphoneReceiverModePanel({ owned = false } = {}) {
           <small>Spotify login is available before Start Receiver. Its Connect step becomes available after this device owns the live receiver.</small>
         </div>
         <div class="capabilityCard ${pushcutSelected && pushcutOperational ? 'verified' : 'limited'}">
-          <span>Mode 2 · remote Pushcut announcements</span>
+          <span>Mode 2 · remote Pushcut announcements · legacy fallback</span>
           <strong>${pushcutOperational ? 'Pushcut is connected and verified' : pushcutStatus.connectedReady ? 'Pushcut connected; run the receiver test' : pushcutAnnouncementReady() ? 'Pushcut configured; receiver not verified' : 'Open Pushcut Server'}</strong>
           <p>Use this when Pushcut should run announcements over native Apple Music, Spotify, or a background-capable Suno app. Leave Pushcut on Ready For Requests. The Remote applies the music slider, pauses music for speech, plays the announcement at 100%, restores ${musicTarget}%, and resumes the same native music bed.</p>
           <div class="stackedActions">${pushcutModeAction}</div>
@@ -735,19 +1193,42 @@ function updateLiveStatus() {
     const mode = receiverOperatingMode();
     const browserOnline = mode === 'browser' && online;
     const pushcutOperational = mode === 'pushcut' && pushcutAnnouncementOperational();
-    receiverBadge.textContent = browserOnline ? 'Browser Receiver online' : pushcutOperational ? 'Pushcut ready' : mode === 'pushcut' && pushcutReady ? 'Pushcut not verified' : 'Receiver offline';
-    receiverBadge.className = `statusPill ${browserOnline || pushcutOperational ? 'online' : pushcutReady ? 'warn' : 'offline'}`;
+    const automatic = automaticAnnouncementsEnabled();
+    const automaticReady = automatic && emailWakeOperational();
+    receiverBadge.textContent = automaticReady && browserOnline
+      ? 'Automatic Receiver online'
+      : automaticReady
+        ? 'Automation ready · music offline'
+        : browserOnline
+          ? 'Browser Receiver online'
+          : pushcutOperational
+            ? 'Pushcut ready'
+            : mode === 'pushcut' && pushcutReady
+              ? 'Pushcut not verified'
+              : 'Receiver offline';
+    receiverBadge.className = `statusPill ${
+      (automaticReady && browserOnline) || browserOnline || pushcutOperational
+        ? 'online'
+        : automaticReady || pushcutReady
+          ? 'warn'
+          : 'offline'
+    }`;
   }
 }
 
 async function runAction(label, action) {
   if (busy) return;
   busy = true;
+  const scheduleFingerprintBefore = emailWakeScheduleFingerprint(store.state);
   actionSettled = new Promise(resolve => { settleCurrentAction = resolve; });
   setFeedback(`${label}...`, true);
   renderWhenIdle(true);
   try {
     const result = await action();
+    await ensureAutomaticScheduleSyncAfterChange(
+      scheduleFingerprintBefore,
+      label
+    );
     if (feedback.message === `${label}...`) setFeedback(`${label} completed.`, true);
     return result;
   } catch (error) {
@@ -788,12 +1269,15 @@ async function bootstrapAuthenticatedApp() {
   }
   await refreshPushcutStatus();
   await refreshPushcutScheduleStatus();
+  await refreshEmailWakeStatus();
+  await refreshEmailWakeScheduleStatus();
   const requestedRole = location.hash === '#receiver' ? 'receiver' : location.hash === '#command' ? 'command' : '';
   if (requestedRole) await setRole(requestedRole, { silent: true });
   if (role === 'command') {
     apple.disconnect();
     spotify.disconnect();
     queuePushcutScheduleSync(0);
+    queueEmailWakeScheduleSync(0);
   } else {
     if (!apple.nativeEnabled?.()) await restoreStoredAppleAuthorization();
     if (spotify.loggedIn()) spotify.preparePlayer().catch(() => {});
@@ -888,7 +1372,11 @@ function shellStatus() {
   const policy = displayAudioPolicy();
   const provider = effectiveProvider();
   const providerName = provider === 'spotify' ? 'Spotify' : provider === 'apple' ? 'Apple Music' : 'Suno';
-  const mixStatus = mode === 'pushcut'
+  const automatic = automaticAnnouncementsEnabled(state);
+  const automaticReady = automatic && emailWakeOperational();
+  const mixStatus = automatic
+    ? `Automatic ${audibleMusicTarget(state)} → 0 → 100 → ${audibleMusicTarget(state)}`
+    : mode === 'pushcut'
     ? `Shortcut ${audibleMusicTarget(state)} → 0 → 100 → ${audibleMusicTarget(state)} · output unmeasured`
     : policy.exact
     ? `${policy.musicPercent}% music / ${audibleVoiceTarget()}% voice`
@@ -898,7 +1386,7 @@ function shellStatus() {
   return `
     <div class="shellStatus">
       <span class="statusPill ${syncGood ? 'online' : 'warn'}">${store.syncMode === 'kv' ? 'Cloud synced' : store.syncMode === 'local' ? 'Local preview' : escapeHtml(store.syncMode)}</span>
-      <span class="statusPill ${browserOnline || pushcutOperational ? 'online' : pushcutReady ? 'warn' : 'offline'}" data-live-receiver>${browserOnline ? 'Browser Receiver online' : pushcutOperational ? 'Pushcut ready' : mode === 'pushcut' && pushcutReady ? 'Pushcut not verified' : 'Receiver offline'}</span>
+      <span class="statusPill ${(automaticReady && browserOnline) || browserOnline || pushcutOperational ? 'online' : automaticReady || pushcutReady ? 'warn' : 'offline'}" data-live-receiver>${automaticReady && browserOnline ? 'Automatic Receiver online' : automaticReady ? 'Automation ready · music offline' : browserOnline ? 'Browser Receiver online' : pushcutOperational ? 'Pushcut ready' : mode === 'pushcut' && pushcutReady ? 'Pushcut not verified' : 'Receiver offline'}</span>
       <span class="statusPill mix">${escapeHtml(mixStatus)}</span>
     </div>`;
 }
@@ -941,7 +1429,9 @@ function receiverSummary() {
   const online = receiverOnline(receiver, store.now());
   const mode = receiverOperatingMode();
   if (mode === 'browser' && online) {
-    return `<strong>${escapeHtml(receiver.name || 'Browser Receiver')}</strong><span>Browser Receiver mode · ${escapeHtml(receiver.detail || 'Ready')} · seen ${escapeHtml(relativeTime(receiver.lastSeen))}</span>`;
+    return automaticAnnouncementsEnabled()
+      ? `<strong>${escapeHtml(receiver.name || 'Automatic Receiver')}</strong><span>Browser music + background announcements · ${emailWakeOperational() ? 'automation paired' : 'automation setup incomplete'} · seen ${escapeHtml(relativeTime(receiver.lastSeen))}</span>`
+      : `<strong>${escapeHtml(receiver.name || 'Browser Receiver')}</strong><span>Browser Receiver mode · ${escapeHtml(receiver.detail || 'Ready')} · seen ${escapeHtml(relativeTime(receiver.lastSeen))}</span>`;
   }
   if (mode === 'pushcut' && pushcutAnnouncementReady()) {
     return `<strong>Pushcut announcement path ${pushcutAnnouncementOperational() ? 'connected and recently verified' : pushcutStatus.connectedReady ? 'connected' : 'configured; live connection not yet confirmed'}</strong><span>Open Pushcut on the Receiver iPhone and keep Ready For Requests visible. Every command waits for its own signed completion receipt; native music is controlled on that iPhone, not from the Remote.</span>`;
@@ -996,7 +1486,9 @@ function playbackCard() {
       ? ((playback.provider === 'apple' ? appleVerified : spotifyVerified)
           ? `receiver-verified at ${audibleTarget}%`
           : activeReceiverIsIOS()
-            ? receiverOperatingMode() === 'pushcut'
+            ? automaticAnnouncementsEnabled()
+              ? `iPhone physical output · Automatic ${audibleTarget} → 0 → 100 → ${audibleTarget}`
+              : receiverOperatingMode() === 'pushcut'
               ? `iPhone physical output · Pushcut ${audibleTarget} → 0 → 100 → ${audibleTarget}`
               : 'iPhone physical output · pauses completely for voice'
             : `pause-for-voice mode; ${audibleTarget}% target unverified`)
@@ -1039,6 +1531,7 @@ function renderReceiver() {
   const activeProvider = effectiveProvider();
   const policy = displayAudioPolicy(activeProvider);
   const pushcutMode = receiverOperatingMode() === 'pushcut';
+  const automaticMode = automaticAnnouncementsEnabled();
   const audioStatus = audio.status();
   const audibleTarget = audibleMusicTarget(store.state);
   const calibrationActive = !!audioStatus.calibrationActive;
@@ -1093,9 +1586,9 @@ function renderReceiver() {
         </div>
       </div>
       <div class="mixMeter" aria-label="Audio levels">
-        <div><span>${pushcutMode ? 'Music Shortcut target' : activeReceiverIsIOS() && ['apple', 'spotify'].includes(activeProvider) ? 'Music output' : 'Music target'}</span><strong>${pushcutMode ? `${audibleTarget}%` : policy.exact ? `${policy.musicPercent}%` : activeReceiverIsIOS() && ['apple', 'spotify'].includes(activeProvider) ? 'Physical' : `${audibleTarget}%?`}</strong><i style="--level:${pushcutMode ? audibleTarget / 100 : policy.exact ? policy.musicPercent / 100 : audibleTarget / 100}"></i></div>
+        <div><span>${automaticMode ? 'Automatic music target' : pushcutMode ? 'Music Shortcut target' : activeReceiverIsIOS() && ['apple', 'spotify'].includes(activeProvider) ? 'Music output' : 'Music target'}</span><strong>${automaticMode ? `${audibleTarget}% target` : pushcutMode ? `${audibleTarget}%` : policy.exact ? `${policy.musicPercent}%` : activeReceiverIsIOS() && ['apple', 'spotify'].includes(activeProvider) ? 'Physical' : `${audibleTarget}%?`}</strong><i style="--level:${audibleTarget / 100}"></i></div>
         <div><span>Announcement target</span><strong>${VOICE_LEVEL_PERCENT}%</strong><i style="--level:1"></i></div>
-        <small>${pushcutMode ? `The Receiver Shortcut pauses music, sets 100% for speech, waits for playback completion, then restores ${audibleTarget}% and resumes. Physical loudness is not measured.` : policy.exact ? `The receiver has verified this music level. Announcements are fixed at ${VOICE_LEVEL_PERCENT}%.` : activeReceiverIsIOS() && ['apple', 'spotify'].includes(activeProvider) ? `${activeProvider === 'spotify' ? 'Spotify' : 'Apple Music'} uses physical iPhone/speaker loudness in Browser mode and pauses completely before voice.` : 'External music volume is not software-verified here. It pauses completely before voice or Suno plays.'}</small>
+        <small>${automaticMode ? `Automatic Receiver runs ${audibleTarget}% music → 0% → announcement 100% → 0% → resume → restore ${audibleTarget}%. Physical speaker loudness is not measured.` : pushcutMode ? `The Receiver Shortcut pauses music, sets 100% for speech, waits for playback completion, then restores ${audibleTarget}% and resumes. Physical loudness is not measured.` : policy.exact ? `The receiver has verified this music level. Announcements are fixed at ${VOICE_LEVEL_PERCENT}%.` : activeReceiverIsIOS() && ['apple', 'spotify'].includes(activeProvider) ? `${activeProvider === 'spotify' ? 'Spotify' : 'Apple Music'} uses physical iPhone/speaker loudness in Browser mode and pauses completely before voice.` : 'External music volume is not software-verified here. It pauses completely before voice or Suno plays.'}</small>
       </div>
     </section>
     ${isIOSLike() ? iphoneReceiverModePanel({ owned }) : ''}
@@ -1117,28 +1610,37 @@ function providerSelector() {
   const target = store.state.config.musicLevel;
   const iphoneExternal = activeReceiverIsIOS();
   const pushcutMode = receiverOperatingMode() === 'pushcut';
+  const automatic = automaticAnnouncementsEnabled();
+  const iphoneTarget = automatic
+    ? `Automatic ${target}% bed`
+    : pushcutMode
+      ? `Shortcut ${target}% bed`
+      : 'Physical volume · pauses for voice';
   return `
     <div class="providerSelector" role="group" aria-label="Music source">
       <button aria-pressed="${provider === 'controlled'}" data-action="provider" data-provider="controlled" class="${provider === 'controlled' ? 'active' : ''}"><strong>Manager Volume · Suno / Direct</strong><small>Exact ${target}% music / ${audibleVoiceTarget()}% announcements</small></button>
-      <button aria-pressed="${provider === 'apple'}" data-action="provider" data-provider="apple" class="${provider === 'apple' ? 'active' : ''}"><strong>Apple Music</strong><small>${cloudAppleMusicVerified() ? `Verified ${target}%` : iphoneExternal ? pushcutMode ? `Shortcut ${target}% bed` : 'Physical volume · pauses for voice' : liveReceiverIsNative() ? `Music.app ${target}% target` : `${target}% target`}</small></button>
-      <button aria-pressed="${provider === 'spotify'}" data-action="provider" data-provider="spotify" class="${provider === 'spotify' ? 'active' : ''}"><strong>Spotify</strong><small>${cloudSpotifyVerified() ? `Verified ${target}%` : iphoneExternal ? pushcutMode ? `Shortcut ${target}% bed` : 'Physical volume · pauses for voice' : `${target}% target`}</small></button>
+      <button aria-pressed="${provider === 'apple'}" data-action="provider" data-provider="apple" class="${provider === 'apple' ? 'active' : ''}"><strong>Apple Music</strong><small>${cloudAppleMusicVerified() ? `Verified ${target}%` : iphoneExternal ? iphoneTarget : liveReceiverIsNative() ? `Music.app ${target}% target` : `${target}% target`}</small></button>
+      <button aria-pressed="${provider === 'spotify'}" data-action="provider" data-provider="spotify" class="${provider === 'spotify' ? 'active' : ''}"><strong>Spotify</strong><small>${cloudSpotifyVerified() ? `Verified ${target}%` : iphoneExternal ? iphoneTarget : `${target}% target`}</small></button>
     </div>`;
 }
 
 function musicLevelControl() {
   const pushcutMode = receiverOperatingMode() === 'pushcut';
+  const automatic = automaticAnnouncementsEnabled();
+  const receiverManaged = pushcutMode || automatic;
   const target = clamp(musicLevelDraft === null ? store.state.config.musicLevel : musicLevelDraft, 0, 100, 30);
   const customTarget = customPlaybackMusicTarget(store.state);
-  const iphoneExternal = !pushcutMode && ['apple', 'spotify'].includes(store.state.config.musicProvider) && activeReceiverIsIOS();
+  const iphoneExternal = !receiverManaged && ['apple', 'spotify'].includes(store.state.config.musicProvider) && activeReceiverIsIOS();
   const externalProviderName = store.state.config.musicProvider === 'spotify' ? 'Spotify' : 'Apple Music';
   return `
     <section class="volumeControl" aria-labelledby="musicLevelLabel">
-      <div class="volumeHeading"><div><p class="kicker">${pushcutMode ? 'Receiver music target' : iphoneExternal ? 'Remote volume available' : 'Shared music target'}</p><h2 id="musicLevelLabel">${iphoneExternal ? 'Manager-controlled music volume' : 'Music volume'}</h2></div><output for="musicLevel" data-music-level-output>${target}%</output></div>
-      <input id="musicLevel" type="range" min="0" max="100" step="1" value="${target}" aria-labelledby="musicLevelLabel" aria-describedby="musicLevelHelp" aria-valuetext="${pushcutMode ? `${target}% native music; zero during announcements; announcements 100%` : iphoneExternal ? `${target}% manager-volume target; releasing switches music to Suno or Direct` : `${target}% music; announcements ${audibleVoiceTarget()}%`}" style="--level:${target / 100}" />
+      <div class="volumeHeading"><div><p class="kicker">${receiverManaged ? 'Receiver music target' : iphoneExternal ? 'Remote volume available' : 'Shared music target'}</p><h2 id="musicLevelLabel">${iphoneExternal ? 'Manager-controlled music volume' : 'Music volume'}</h2></div><output for="musicLevel" data-music-level-output>${target}%</output></div>
+      <input id="musicLevel" type="range" min="0" max="100" step="1" value="${target}" aria-labelledby="musicLevelLabel" aria-describedby="musicLevelHelp" aria-valuetext="${receiverManaged ? `${target}% native music; zero during announcements; announcements 100%` : iphoneExternal ? `${target}% manager-volume target; releasing switches music to Suno or Direct` : `${target}% music; announcements ${audibleVoiceTarget()}%`}" style="--level:${target / 100}" />
       <div class="volumeScale" aria-hidden="true"><span>0%</span><span>Default 30%</span><span>100%</span></div>
       ${pushcutMode && pushcutMusicVolumeReady() ? `<div class="managedVolumePrompt pushcutVolumePrompt"><div><strong>Apply ${target}% to the Receiver now</strong><span>Keep Pushcut on <em>Ready For Requests</em>. The dynamic recovery Shortcut sets the iPhone media output to this slider value; completion is confirmed, but physical speaker loudness is not measured.</span><small class="pushcutVolumeResult ${escapeAttr(pushcutVolumeStatus.state)}">${escapeHtml(pushcutVolumeStatus.message)}</small></div><button type="button" data-action="apply-pushcut-music-target" data-music-percent="${target}" class="primary">Apply Music ${target}% Now</button></div>` : ''}
+      ${automatic ? `<div class="managedVolumePrompt pushcutVolumePrompt"><div><strong>Apply ${target}% to the Receiver now</strong><span>The background Receiver Shortcut sets this iPhone media target without leaving Pushcut open. Completion is signed; physical speaker loudness is not measured.</span><small class="pushcutVolumeResult ${escapeAttr(emailWakeVolumeStatus.state)}">${escapeHtml(emailWakeVolumeStatus.message)}</small></div><button type="button" data-action="apply-pushcut-music-target" data-music-percent="${target}" class="primary" ${emailWakeOperational() ? '' : 'disabled'}>Apply Music ${target}% Now</button></div>` : ''}
       ${iphoneExternal ? `<div class="managedVolumePrompt"><div><strong>Use a volume the manager can actually control</strong><span data-managed-volume-description>iPhone cannot lower protected ${externalProviderName} playback in a web page. This starts the saved Suno / Direct bed at ${target}%; ${externalProviderName} stays authorized for later.</span></div><button type="button" data-action="enable-managed-volume" data-managed-volume-button class="primary">Start Manager Volume · ${target}%</button></div>` : ''}
-      <p id="musicLevelHelp">${pushcutMode
+      <p id="musicLevelHelp">${receiverManaged
         ? `This slider is the single music target. Every announcement pauses the music, sets announcement output to 100%, waits for playback to finish, restores ${target}%, and resumes the same music.`
         : iphoneExternal
         ? `Move and release the slider to save the target without unexpectedly starting paused music. Tap Start Manager Volume to safely pause ${externalProviderName} and start the saved Suno source at ${target}%. Announcements then silence music to ${DUCK_LEVEL_PERCENT}% and play at ${audibleVoiceTarget()}%.`
@@ -1168,7 +1670,7 @@ function musicSourceForm() {
       <div class="stackedActions"><button type="button" data-action="test-spotify-source" class="secondary" ${receiverSpotifyReady ? '' : 'disabled'}>Test with a public Spotify track</button></div>
       ${receiverSpotifyReady ? '' : `<div class="callout warning"><strong>Spotify is not ready on the speaker receiver.</strong><p>${escapeHtml(store.state.receiver?.spotifyDetail || 'On the receiver, log in to Spotify, check access, then tap Connect Spotify Receiver.')}</p></div>`}
       <div class="capabilityCard ${policy.exact ? 'verified' : 'limited'}"><span>${policy.exact ? 'Verified path' : 'Compatibility path'}</span><strong>${escapeHtml(policy.label)}</strong><p>${escapeHtml(policy.detail)}</p></div>
-      <div class="policyNote"><strong>Same iPhone rule as Apple Music:</strong> Spotify uses the receiver’s shared physical output. ${receiverOperatingMode() === 'pushcut' ? `The Receiver Shortcut runs Pause → Announcement 100% → Play Sound to completion → Music ${audibleMusicTarget()}% → Play. Physical loudness is not measured.` : 'Browser Receiver pauses Spotify completely for each announcement, then resumes it; physical music loudness remains controlled by the iPhone or speaker.'} A Spotify Premium account and receiver login are required.</div>`;
+      <div class="policyNote"><strong>Same iPhone rule as Apple Music:</strong> Spotify uses the receiver’s shared physical output. ${automaticAnnouncementsEnabled() ? `Automatic Receiver runs Music ${audibleMusicTarget()}% → 0% → Announcement 100% → 0% → resume → restore ${audibleMusicTarget()}%. Physical loudness is not measured.` : receiverOperatingMode() === 'pushcut' ? `The Receiver Shortcut runs Pause → Announcement 100% → Play Sound to completion → Music ${audibleMusicTarget()}% → Play. Physical loudness is not measured.` : 'Browser Receiver pauses Spotify completely for each announcement, then resumes it; physical music loudness remains controlled by the iPhone or speaker.'} A Spotify Premium account and receiver login are required.</div>`;
   }
   if (config.musicProvider === 'apple') {
     const iphoneApple = activeReceiverIsIOS();
@@ -1185,7 +1687,7 @@ function musicSourceForm() {
         <strong>${escapeHtml(policy.label)}</strong>
         <p>${escapeHtml(policy.detail)}</p>
       </div>
-      <div class="policyNote"><strong>Safe Apple behavior:</strong> Poolside Pulse pauses Apple Music completely before Suno or speech and resumes it only afterward; the sources never overlap. ${iphoneApple ? 'The active receiver is an iPhone: Browser mode uses the iPhone or connected speaker controls; Pushcut mode applies the shared music slider. Suno music remains adjustable and announcements are fixed at 100%.' : 'Exact Apple Music volume is shown only after a desktop receiver verifies it.'} An active Apple Music subscription and an open, signed-in receiver are required.</div>`;
+      <div class="policyNote"><strong>Safe Apple behavior:</strong> Poolside Pulse pauses Apple Music completely before Suno or speech and resumes it only afterward; the sources never overlap. ${iphoneApple ? automaticAnnouncementsEnabled() ? `Automatic Receiver applies Music ${audibleMusicTarget()}% → 0% → Announcement 100% → 0% → resume → restore ${audibleMusicTarget()}%; physical loudness is not measured.` : 'The active receiver is an iPhone: Browser mode uses the iPhone or connected speaker controls; Pushcut mode applies the shared music slider. Suno music remains adjustable and announcements are fixed at 100%.' : 'Exact Apple Music volume is shown only after a desktop receiver verifies it.'} An active Apple Music subscription and an open, signed-in receiver are required.</div>`;
   }
   return `
     <form data-form="controlled-play" class="sourceForm">
@@ -1200,10 +1702,15 @@ function renderControl() {
   const policy = displayAudioPolicy(store.state.config.musicProvider);
   const operatingMode = receiverOperatingMode();
   const browserOnline = operatingMode === 'browser' && online;
+  const automatic = automaticAnnouncementsEnabled();
   const pushcutOpenStep = role === 'receiver'
     ? `<a href="${PUSHCUT_RUN_SERVER_URL}">open Pushcut Server</a>`
     : 'return to Pushcut on the Receiver iPhone';
-  const modeGuidance = operatingMode === 'browser'
+  const modeGuidance = automatic
+    ? browserOnline && emailWakeOperational()
+      ? `<div class="callout"><strong>Automatic Receiver · music and announcements are ready</strong><p>Keep Version X visible for Suno, Apple Music, Spotify, and music schedule rows. Background Shortcut actions apply music ${audibleMusicTarget()}%, silence it for each 100% announcement, then restore it.</p></div>`
+      : '<div class="callout warning"><strong>Automatic Receiver needs attention</strong><p>Finish the one-time Receiver setup and start Browser Receiver before relying on music or announcements.</p></div>'
+    : operatingMode === 'browser'
     ? browserOnline
       ? '<div class="callout"><strong>Browser Receiver mode · remote music control is available</strong><p>The speaker receiver must keep Version X visible. Choose Suno, Apple Music, or Spotify below; the Remote can start, change, pause, and stop that browser-owned music bed.</p></div>'
       : '<div class="callout warning"><strong>Browser Receiver mode is selected, but the speaker is offline</strong><p>On the Receiver iPhone, reopen Version X and tap Start Receiver before sending music or voice commands.</p></div>'
@@ -1326,13 +1833,22 @@ function renderAnnounce() {
   const operatingMode = receiverOperatingMode();
   const browserReady = operatingMode === 'browser' && receiverOnline(store.state.receiver, store.now());
   const pushcutSelectedReady = operatingMode === 'pushcut' && pushcutReady;
-  const announcementReady = browserReady || pushcutSelectedReady;
-  const messageCharacterLimit = operatingMode === 'pushcut'
-    ? PUSHCUT_MAX_ANNOUNCEMENT_CHARACTERS
+  const automatic = automaticAnnouncementsEnabled();
+  const automaticReady = automatic && emailWakeOperational();
+  const legacyAnnouncementReady = browserReady || pushcutSelectedReady;
+  const announcementReady = automaticReady || legacyAnnouncementReady;
+  const messageCharacterLimit = automaticAnnouncementsEnabled()
+    ? EMAIL_WAKE_MAX_ANNOUNCEMENT_CHARACTERS
+    : operatingMode === 'pushcut'
+      ? PUSHCUT_MAX_ANNOUNCEMENT_CHARACTERS
     : 900;
   return `
     <section class="pageHeading"><p class="kicker">Announcements</p><h1>Clear voice, without music fighting it.</h1><p>Voice is prepared first, music is safely ducked or paused, and restoration waits until speech has ended.</p></section>
-    ${browserReady
+    ${automatic
+      ? automaticReady
+        ? `<div class="callout"><strong>Automatic Receiver is the live announcement path</strong><p>Keep Version X visible on the speaker iPhone for the music bed. Each command wakes the background Shortcut, downloads audio before touching playback, runs music ${audibleMusicTarget()}% → 0% → announcement 100% → 0% → resume → restore ${audibleMusicTarget()}%, and returns a signed receipt.</p><button type="button" data-action="email-wake-test" class="secondary">Run Automatic Receiver Test</button></div>`
+        : '<div class="callout warning"><strong>Automatic Receiver is selected but not ready</strong><p>On the speaker iPhone, open Receiver and finish the one-time signed Shortcut, pairing, and Email automation setup.</p></div>'
+      : browserReady
       ? '<div class="callout"><strong>Browser Receiver is the live announcement path</strong><p>Remote voice commands, saved announcements, immediate weather warnings, and mixed schedules now go to the visible Browser Receiver. Suno/direct beds duck in the mixer; Apple Music and Spotify pause completely for speech and resume afterward.</p></div>'
       : pushcutSelectedReady
         ? `<div class="callout"><strong>${pushcutStatus.operational ? 'Pushcut natural-voice receiver verified' : 'Pushcut natural-voice receiver configured'}</strong><p>Keep the receiver iPhone on <em>Ready For Requests</em>. Start any music bed directly in its native/background-capable player first. For each announcement, the signed Version X receipt confirms the Shortcut reached the end of Pause → Announcement 100% → Play Sound to completion → latest Music ${audibleMusicTarget()}% target → Play. It does not measure physical loudness or audibility.${pushcutStatus.operational ? '' : ' Run the receiver test below to verify the complete device path.'}</p><button type="button" data-action="pushcut-test" class="secondary">Run Verified Receiver Test</button></div>`
@@ -1358,7 +1874,7 @@ function renderAnnounce() {
         <label for="liveAnnouncementSource">Announcement source<select id="liveAnnouncementSource" name="sourceId">${announcementSourceOptions('natural-voice')}</select><small>Natural Voice is the default. A saved short clip plays its recorded audio; the typed text remains the activity description.</small></label>
         <label for="announcementText">Speak now</label>
         <textarea id="announcementText" name="text" maxlength="${messageCharacterLimit}" placeholder="Type the announcement exactly as guests should hear it." required></textarea>
-        <div class="composerFooter"><span>${operatingMode === 'pushcut' ? `Natural Voice · music ${audibleMusicTarget()}% → 0% · announcement 100% · restore ${audibleMusicTarget()}%` : `Natural Voice · announcement ${audibleVoiceTarget()}% · music pauses or ducks fully`}</span><button type="submit" class="primary" ${announcementReady ? '' : 'disabled'}>Speak Now</button></div>
+        <div class="composerFooter"><span>${automatic || operatingMode === 'pushcut' ? `Natural Voice · music ${audibleMusicTarget()}% → 0% · announcement 100% · restore ${audibleMusicTarget()}%` : `Natural Voice · announcement ${audibleVoiceTarget()}% · music pauses or ducks fully`}</span><button type="submit" class="primary" ${announcementReady ? '' : 'disabled'}>Speak Now</button></div>
       </form>
     </section>
     <section class="workspacePanel">
@@ -1370,7 +1886,7 @@ function renderAnnounce() {
           <div class="savedEditorRow"><strong>${escapeHtml(item.label)}</strong><p>${escapeHtml(renderedText(item))}</p><small>Generated from Lightning miles and Hold minutes in Settings so safety wording cannot become stale.</small></div>` : `
           <form data-form="announcement-edit" data-id="${escapeAttr(item.id)}" class="savedEditorRow">
             <label>Button name<input name="label" value="${escapeAttr(item.label)}" maxlength="80" required /></label>
-            <label>Spoken message<textarea name="text" maxlength="${messageCharacterLimit}" required>${escapeHtml(item.text)}</textarea><small>${pushcutReady ? `Maximum ${messageCharacterLimit} characters so the Receiver Shortcut completes reliably.` : ''}</small></label>
+            <label>Spoken message<textarea name="text" maxlength="${messageCharacterLimit}" required>${escapeHtml(item.text)}</textarea><small>${pushcutReady || automaticAnnouncementsEnabled() ? `Maximum ${messageCharacterLimit} characters so the Receiver Shortcut completes reliably.` : ''}</small></label>
             <label>Announcement source<select name="sourceId">${announcementSourceOptions(item.sourceId)}</select></label>
             <button type="submit" class="secondary">Save Message</button>
           </form>`).join('')}</div>
@@ -1461,7 +1977,15 @@ function scheduleVolumeLabel(item) {
   const percent = effectiveScheduleItemVolume(item, store.state.config);
   if (scheduleItemKind(item) === 'announcement') return `Announcement ${VOICE_LEVEL_PERCENT}%`;
   return ['apple', 'spotify'].includes(scheduleItemKind(item))
-    ? (activeReceiverIsIOS() ? 'Physical speaker level' : liveReceiverIsNative() ? `Music.app ${percent}%` : `Target ${percent}%`)
+    ? (
+        automaticAnnouncementsEnabled()
+          ? `Music ${percent}% via Receiver`
+          : activeReceiverIsIOS()
+            ? 'Physical speaker level'
+            : liveReceiverIsNative()
+              ? `Music.app ${percent}%`
+              : `Target ${percent}%`
+      )
     : `Music ${percent}%`;
 }
 
@@ -1483,7 +2007,10 @@ function renderScheduleRow(item, schedule, index) {
   const kind = scheduleItemKind(item);
   const pushcutOnly = receiverOperatingMode() === 'pushcut';
   const playNowDisabled = pushcutOnly && kind !== 'announcement';
-  const iphoneAppleVolume = ['apple', 'spotify'].includes(kind) && activeReceiverIsIOS();
+  const iphoneAppleVolume =
+    ['apple', 'spotify'].includes(kind)
+    && activeReceiverIsIOS()
+    && !automaticAnnouncementsEnabled();
   const fixedVolume = kind === 'announcement' || iphoneAppleVolume;
   const announcementSource = item.action?.announcementSource || 'saved';
   const savedAnnouncement = store.state.announcements.find(entry => entry.id === (item.action?.announcementId || item.announcementId));
@@ -1491,8 +2018,10 @@ function renderScheduleRow(item, schedule, index) {
   const volumeMode = item.volume?.mode || 'global';
   const itemVolume = effectiveScheduleItemVolume(item, store.state.config);
   const advanceMode = item.advance?.mode || (kind === 'announcement' ? 'complete' : 'manual');
-  const announcementTextLimit = pushcutAnnouncementReady() && schedule.mode === 'time'
-    ? PUSHCUT_MAX_ANNOUNCEMENT_CHARACTERS
+  const announcementTextLimit = automaticAnnouncementsEnabled() && schedule.mode === 'time'
+    ? EMAIL_WAKE_MAX_ANNOUNCEMENT_CHARACTERS
+    : pushcutAnnouncementReady() && schedule.mode === 'time'
+      ? PUSHCUT_MAX_ANNOUNCEMENT_CHARACTERS
     : 900;
   const collapsedPosition = schedule.mode === 'order'
     ? String(clamp(item.position?.order ?? item.order ?? index + 1, 1, 100, index + 1))
@@ -1518,7 +2047,7 @@ function renderScheduleRow(item, schedule, index) {
             <div class="conditionalFields announcementFields" data-show-schedule-kind="announcement" ${kind === 'announcement' ? '' : 'hidden'}>
               <label>Announcement source<select name="announcementSource" data-announcement-source><option value="saved" ${announcementSource === 'saved' ? 'selected' : ''}>Saved announcement</option><option value="inline" ${announcementSource === 'inline' ? 'selected' : ''}>Custom for this schedule only</option></select></label>
               <label data-show-announcement-source="saved" ${announcementSource === 'saved' ? '' : 'hidden'}>Saved message<select name="announcementId">${announcementOptions(item.action?.announcementId || item.announcementId)}</select></label>
-              <label data-show-announcement-source="inline" ${announcementSource === 'inline' ? '' : 'hidden'}>Custom announcement<textarea name="text" maxlength="${announcementTextLimit}" placeholder="Type the announcement spoken only by this schedule item">${escapeHtml(item.action?.text || '')}</textarea><small>This text stays inside this schedule and is not added to Saved Messages.${announcementTextLimit === PUSHCUT_MAX_ANNOUNCEMENT_CHARACTERS ? ` Maximum ${announcementTextLimit} characters for reliable Pushcut playback.` : ''}</small></label>
+              <label data-show-announcement-source="inline" ${announcementSource === 'inline' ? '' : 'hidden'}>Custom announcement<textarea name="text" maxlength="${announcementTextLimit}" placeholder="Type the announcement spoken only by this schedule item">${escapeHtml(item.action?.text || '')}</textarea><small>This text stays inside this schedule and is not added to Saved Messages.${announcementTextLimit < 900 ? ` Maximum ${announcementTextLimit} characters for reliable Receiver Shortcut playback.` : ''}</small></label>
               <label>Playback source<select name="sourceId">${announcementSourceOptions(announcementSourceId)}</select><small>Natural Voice or a saved finite clip. Apple Music and Spotify catalog items are disabled for announcement use on one iPhone.</small></label>
               <div class="fixedVoiceNote"><strong>Announcement ${VOICE_LEVEL_PERCENT}%</strong><span>Music reaches ${DUCK_LEVEL_PERCENT}% before speech starts. Playback resumes at the music slider target only after the announcement finishes.</span></div>
             </div>
@@ -1527,7 +2056,7 @@ function renderScheduleRow(item, schedule, index) {
               ${schedule.mode === 'order' ? `<label>Advance<select name="advanceMode" data-advance-mode><option value="manual" ${advanceMode === 'manual' ? 'selected' : ''}>Manually with Play Next</option><option value="track-end" ${advanceMode === 'track-end' ? 'selected' : ''} ${['apple', 'spotify'].includes(kind) ? 'disabled' : ''}>At direct track end (Suno/direct only)</option><option value="duration" ${advanceMode === 'duration' ? 'selected' : ''}>After a duration</option><option value="complete" ${advanceMode === 'complete' ? 'selected' : ''}>Immediately after playback starts</option></select></label><label data-show-advance-mode="duration" ${advanceMode === 'duration' ? '' : 'hidden'}>Duration seconds<input name="durationSeconds" type="number" min="1" max="86400" step="1" value="${escapeAttr(item.advance?.durationSeconds || 300)}" /></label>` : ''}
             </div>
             <div class="conditionalFields scheduleVolumeFields" data-standard-volume-fields ${fixedVolume ? 'hidden' : ''}>
-              <label>Volume<select name="volumeMode" data-volume-mode ${fixedVolume ? 'disabled' : ''}><option value="global" ${volumeMode === 'global' ? 'selected' : ''}>Use shared volume</option><option value="custom" ${volumeMode === 'custom' ? 'selected' : ''}>Custom for this item</option></select><small>Shared music is ${store.state.config.musicLevel}%.</small></label>
+              <label>Volume<select name="volumeMode" data-volume-mode ${fixedVolume ? 'disabled' : ''}><option value="global" ${volumeMode === 'global' ? 'selected' : ''}>Use shared volume</option><option value="custom" ${volumeMode === 'custom' ? 'selected' : ''}>Custom for this item</option></select><small>${automaticAnnouncementsEnabled() ? `Before each music row starts, Automatic Receiver applies its ${volumeMode === 'custom' ? `${itemVolume}% custom` : `${store.state.config.musicLevel}% shared`} iPhone media target.` : `Shared music is ${store.state.config.musicLevel}%.`}</small></label>
               <label data-show-volume-mode="custom" ${volumeMode === 'custom' && !fixedVolume ? '' : 'hidden'}>Item music volume<div class="itemVolumeControl"><input name="volumePercent" class="itemVolumeSlider" type="range" min="0" max="100" step="1" value="${itemVolume}" ${fixedVolume ? 'disabled' : ''} /><output>${itemVolume}%</output></div></label>
             </div>
             <div class="fixedVoiceNote" data-apple-ios-volume-note ${iphoneAppleVolume ? '' : 'hidden'}><strong>${kind === 'spotify' ? 'Spotify' : 'Apple Music'} volume: shared physical control</strong><span>The active Browser Receiver is an iPhone. Music uses the iPhone or connected speaker’s physical volume, so per-item external-provider percentages cannot be applied or verified. Music pauses completely before every ${audibleVoiceTarget()}% announcement.</span></div>
@@ -1544,6 +2073,8 @@ function renderSchedule() {
   const operatingMode = receiverOperatingMode();
   const browserReady = operatingMode === 'browser' && receiverOnline(store.state.receiver, store.now());
   const pushcutSelectedReady = operatingMode === 'pushcut' && pushcutReady;
+  const automatic = automaticAnnouncementsEnabled();
+  const automaticReady = automatic && emailWakeOperational();
   const schedule = activeSavedSchedule();
   const items = Array.isArray(schedule.items) ? schedule.items : [];
   const enabledItems = items.filter(item => item.enabled !== false);
@@ -1568,6 +2099,49 @@ function renderSchedule() {
   const pushcutScheduleWarnings = pushcutScheduleStatus.warnings
     .map(message => `<li>${escapeHtml(message)}</li>`)
     .join('');
+  const automaticScheduleHorizonHealthy =
+    emailWakeScheduleStatus.horizonEnd > store.now() + 3 * 24 * 60 * 60 * 1000;
+  const automaticScheduleReady =
+    automaticReady
+    && browserReady
+    && emailWakeScheduleStatus.checked
+    && emailWakeScheduleStatus.enabled
+    && emailWakeScheduleStatus.current
+    && Number(emailWakeScheduleStatus.syncedAt || 0) > 0
+    && automaticScheduleHorizonHealthy
+    && !emailWakeScheduleStatus.error
+    && (
+      emailWakeScheduleStatus.scheduledCount === 0
+      || emailWakeScheduleStatus.maintenanceScheduled
+    );
+  const automaticScheduleNeedsAttention = !automaticScheduleReady;
+  const automaticScheduleSummary = emailWakeScheduleStatus.syncing
+    ? 'Syncing the rolling automatic announcement window now...'
+    : emailWakeScheduleStatus.error
+      ? emailWakeScheduleStatus.error
+      : !emailWakeScheduleStatus.checked
+        ? 'Automatic schedule status has not been checked yet.'
+        : !emailWakeScheduleStatus.enabled
+          ? 'Automatic timed announcements are paused on the server. Sync them now before relying on this schedule.'
+          : !emailWakeScheduleStatus.current
+            ? 'The saved schedule is newer than the durable automatic announcement plan. Sync it now.'
+            : !emailWakeScheduleStatus.syncedAt
+              ? 'Automatic timed announcements have not been synced from this Remote yet.'
+              : !automaticScheduleHorizonHealthy
+                ? `The automatic announcement window expires soon at ${formatClock(emailWakeScheduleStatus.horizonEnd)}. Sync it now.`
+                : emailWakeScheduleStatus.scheduledCount > 0
+                  && !emailWakeScheduleStatus.maintenanceScheduled
+                  ? 'Announcement occurrences are synced, but automatic renewal is not confirmed. Sync them now.'
+                  : `${emailWakeScheduleStatus.scheduledCount} occurrence${
+                      emailWakeScheduleStatus.scheduledCount === 1 ? '' : 's'
+                    } synced through ${formatClock(emailWakeScheduleStatus.horizonEnd)}. Next: ${formatClock(emailWakeScheduleStatus.nextScheduledFor)}.${
+                      emailWakeScheduleStatus.maintenanceScheduled
+                        ? ` Automatic renewal: ${formatClock(emailWakeScheduleStatus.maintenanceScheduledFor)}.`
+                        : ''
+                    }`;
+  const automaticScheduleWarnings = emailWakeScheduleStatus.warnings
+    .map(message => `<li>${escapeHtml(message)}</li>`)
+    .join('');
   const orderBusy = ['claiming', 'waiting-duration', 'waiting-track-end', 'auto-pending'].includes(sequenceRun.status);
   const orderStatus = sequenceRun.status === 'waiting-duration'
     ? `Playing ${sequenceRun.active?.order || '?'} · advances at ${formatClock(sequenceRun.active?.dueAt)}`
@@ -1588,8 +2162,14 @@ function renderSchedule() {
                   : 'Ready · No enabled items';
   const deleteArmed = scheduleDeletePending === schedule.id;
   return `
-    <section class="pageHeading"><p class="kicker">Saved schedules</p><h1>Build the day in seconds.</h1><p>Create as many schedules as you need. ${browserReady ? 'Time schedules run all enabled music and announcement items while Browser Receiver remains visible.' : pushcutSelectedReady ? 'Pushcut can run synced timed announcements; mixed music-provider schedules require Browser Receiver.' : 'Saved items remain inactive until the selected receiver path is ready.'} Order schedules are numbered cue lists controlled with Play Next in Browser Receiver mode.</p></section>
-    ${pushcutReady && browserReady ? `<div class="callout">
+    <section class="pageHeading"><p class="kicker">Saved schedules</p><h1>Build the day in seconds.</h1><p>Create as many schedules as you need. ${browserReady && automaticReady ? 'Time schedules run Suno, Apple Music, and Spotify rows in the Receiver browser; announcement rows use the background Automatic Receiver.' : browserReady ? 'Time schedules run all enabled music and announcement items while Browser Receiver remains visible.' : pushcutSelectedReady ? 'Pushcut can run synced timed announcements; mixed music-provider schedules require Browser Receiver.' : 'Saved items remain inactive until the selected receiver path is ready.'} Order schedules are numbered cue lists controlled with Play Next in Browser Receiver mode.</p></section>
+    ${automatic ? `<div class="callout ${automaticScheduleNeedsAttention ? 'warning' : ''}">
+      <strong>${automaticScheduleReady ? 'Automatic mixed schedule is ready' : 'Automatic schedule needs attention'}</strong>
+      <p>${escapeHtml(automaticScheduleSummary)}</p>
+      <p>Music rows run in this visible Receiver browser. Timed Natural Voice and finite Suno/direct announcement clips wake the background Receiver Shortcut, so they do not play twice in Safari.</p>
+      ${automaticScheduleWarnings ? `<ul class="scheduleSyncWarnings">${automaticScheduleWarnings}</ul>` : ''}
+      <button type="button" data-action="sync-email-wake-schedule" class="secondary" ${role !== 'command' || emailWakeScheduleStatus.syncing || !automaticReady ? 'disabled' : ''}>${emailWakeScheduleStatus.syncing ? 'Syncing…' : 'Sync Automatic Announcements Now'}</button>
+    </div>` : pushcutReady && browserReady ? `<div class="callout">
       <strong>Browser Receiver owns this schedule</strong>
       <p>Mixed Suno, Apple Music, Spotify, and announcement items run here while the Receiver keeps Version X visible. Version X automatically cancels Pushcut timed copies in this mode so an announcement cannot play twice.</p>
     </div>` : pushcutSelectedReady ? `<div class="callout ${pushcutScheduleNeedsAttention ? 'warning' : ''}">
@@ -1610,7 +2190,7 @@ function renderSchedule() {
         <label class="checkLabel"><input name="enabled" type="checkbox" ${schedule.enabled ? 'checked' : ''} /> Schedule is enabled</label>
         <div class="scheduleSettingsActions"><button type="submit" class="primary">Save Schedule</button>${isLiveSchedule ? '<span class="liveScheduleBadge">Live schedule</span>' : '<button type="button" data-action="activate-schedule-set" class="warningButton">Make This the Live Schedule</button>'}<button type="button" data-action="duplicate-schedule-set" class="secondary">Duplicate</button>${deleteArmed ? `<button type="button" data-action="confirm-delete-schedule-set" class="danger">Confirm Delete</button><button type="button" data-action="cancel-delete-schedule-set" class="secondary">Cancel</button>` : '<button type="button" data-action="delete-schedule-set" class="textDanger">Delete Schedule</button>'}</div>
       </form>
-      ${schedule.mode === 'order' ? `<div class="orderRunner ${isLiveSchedule ? 'live' : 'inactive'}"><div><span>${isLiveSchedule ? 'Live order position' : 'Order schedule is not live'}</span><strong>${escapeHtml(orderStatus)}</strong><small>${operatingMode === 'pushcut' ? 'Pushcut can play individual announcement rows, but a mixed Order schedule requires Browser Receiver mode.' : browserReady ? 'Announcements advance after speech. Music follows each item’s Advance setting; manual items wait for Play Next. The final item never loops back by itself.' : 'Start Browser Receiver before using Play Next.'}</small></div><div class="orderRunnerActions"><button type="button" data-action="play-next-schedule" class="primary" ${isLiveSchedule && enabledItems.length > 0 && !orderBusy && sequenceRun.status !== 'complete' && browserReady ? '' : 'disabled'}>${sequenceRun.status === 'failed' ? 'Retry Next' : browserReady ? 'Play Next' : 'Browser Receiver Required'}</button><button type="button" data-action="reset-order-schedule" class="secondary" ${isLiveSchedule && browserReady ? '' : 'disabled'}>Reset to 1</button></div></div>` : `<div class="timeRunner ${isLiveSchedule ? 'live' : 'inactive'}"><strong>${isLiveSchedule ? 'Live automatic Time schedule' : 'Saved Time schedule · not live'}</strong><span>${isLiveSchedule ? browserReady ? 'All enabled music and announcement items run at or shortly after their scheduled Central Time while Browser Receiver stays visible.' : pushcutSelectedReady ? 'Pushcut runs timed announcement items only. Music items require Browser Receiver mode.' : 'The selected receiver is offline; no scheduled item can run until it is ready.' : 'Editing this schedule does not interrupt the current live schedule. Choose Make This the Live Schedule when it is ready.'}</span></div>`}
+      ${schedule.mode === 'order' ? `<div class="orderRunner ${isLiveSchedule ? 'live' : 'inactive'}"><div><span>${isLiveSchedule ? 'Live order position' : 'Order schedule is not live'}</span><strong>${escapeHtml(orderStatus)}</strong><small>${operatingMode === 'pushcut' ? 'Pushcut can play individual announcement rows, but a mixed Order schedule requires Browser Receiver mode.' : browserReady ? automaticReady ? 'Announcement steps use the background Receiver and advance after its signed completion. Music follows each item’s Advance setting.' : 'Announcements advance after speech. Music follows each item’s Advance setting; manual items wait for Play Next. The final item never loops back by itself.' : 'Start Browser Receiver before using Play Next.'}</small></div><div class="orderRunnerActions"><button type="button" data-action="play-next-schedule" class="primary" ${isLiveSchedule && enabledItems.length > 0 && !orderBusy && sequenceRun.status !== 'complete' && browserReady ? '' : 'disabled'}>${sequenceRun.status === 'failed' ? 'Retry Next' : browserReady ? 'Play Next' : 'Browser Receiver Required'}</button><button type="button" data-action="reset-order-schedule" class="secondary" ${isLiveSchedule && browserReady ? '' : 'disabled'}>Reset to 1</button></div></div>` : `<div class="timeRunner ${isLiveSchedule ? 'live' : 'inactive'}"><strong>${isLiveSchedule ? 'Live automatic Time schedule' : 'Saved Time schedule · not live'}</strong><span>${isLiveSchedule ? browserReady ? automaticReady ? 'Music runs in the visible Receiver browser; announcement occurrences run once through the background Shortcut.' : 'All enabled music and announcement items run at or shortly after their scheduled Central Time while Browser Receiver stays visible.' : pushcutSelectedReady ? 'Pushcut runs timed announcement items only. Music items require Browser Receiver mode.' : 'The selected receiver is offline; no scheduled item can run until it is ready.' : 'Editing this schedule does not interrupt the current live schedule. Choose Make This the Live Schedule when it is ready.'}</span></div>`}
       <div class="scheduleList">${items.map((item, index) => renderScheduleRow(item, schedule, index)).join('')}</div>
       <button type="button" data-action="add-schedule-item" class="secondary addButton">+ Add Schedule Item</button>
     </section>
@@ -1618,7 +2198,7 @@ function renderSchedule() {
       ? `<div class="callout ${scheduleHasApple && !nativeAppleReady ? 'warning' : ''}"><strong>${scheduleHasApple ? nativeAppleReady ? 'Mac Apple schedule receiver ready' : 'Apple schedule setup required' : 'Mac schedule receiver'}</strong><p>${scheduleHasApple && !nativeAppleReady ? escapeHtml(store.state.receiver?.appleDetail || 'On the receiver Mac, tap Start Receiver, allow Music.app control, then tap Connect Music.app Receiver before relying on Apple schedule items.') : 'Leave Poolside Pulse X Music Receiver running and the Mac connected to the pool speaker output. The app keeps the Mac awake; use any other device for commands.'}</p></div>`
       : operatingMode === 'pushcut'
         ? `<div class="callout warning"><strong>Pushcut schedule limitation</strong><p>Keep Pushcut visible on Ready For Requests. Timed Natural Voice and short Suno/direct announcement clips can run in this mode. Scheduled Apple Music, Spotify, and Suno music changes require Browser Receiver mode because Safari cannot control them while Pushcut is foreground.</p></div>`
-        : `<div class="callout warning"><strong>iPhone schedule requirement</strong><p>Keep the authorized receiver iPhone plugged in and this page visible; use a separate iPhone for commands. If the receiver page is hidden or locked, Version X stops safely and requires fresh Start and Connect taps. Apple Music also requires an active subscription and uses physical speaker volume. For unattended Apple Music schedules, use the Poolside Pulse X Music Receiver Mac app.</p></div>`}`;
+        : `<div class="callout warning"><strong>iPhone schedule requirement</strong><p>Keep the authorized receiver iPhone plugged in and this page visible for Suno, Apple Music, Spotify, and their scheduled changes; use separate iPhones for commands. ${automatic ? 'The Email automation may briefly run in the background and returns control to the Receiver browser; do not leave another app open.' : 'If the receiver page is hidden or locked, Version X stops safely and requires fresh Start and Connect taps.'} Apple Music requires an active subscription.</p></div>`}`;
 }
 
 function renderActivity() {
@@ -1728,7 +2308,9 @@ function renderContent() {
 
 function renderApp() {
   const policy = displayAudioPolicy();
-  const footerMix = receiverOperatingMode() === 'pushcut'
+  const footerMix = automaticAnnouncementsEnabled()
+    ? `Automatic ${audibleMusicTarget()} → 0 → 100 → ${audibleMusicTarget()} · physical output unmeasured`
+    : receiverOperatingMode() === 'pushcut'
     ? `Shortcut ${audibleMusicTarget()} → 0 → 100 → ${audibleMusicTarget()} · physical output unmeasured`
     : policy.exact
     ? `Music ${policy.musicPercent}% · Voice ${audibleVoiceTarget()}%`
@@ -1911,10 +2493,109 @@ async function selectSharedReceiverMode(nextMode) {
   }, `${mode === 'pushcut' ? 'Pushcut' : 'Browser Receiver'} mode selected`, { requireDurable: true });
 }
 
+async function selectAnnouncementTransport(nextTransport, {
+  verifiedPairingAt = 0
+} = {}) {
+  const transport =
+    nextTransport === 'email-wake' ? 'email-wake' : 'browser';
+  const previousTransport =
+    store.state.config?.announcementTransport === 'email-wake'
+      ? 'email-wake'
+      : 'browser';
+  const previousVerifiedPairingAt = Number(
+    store.state.config?.automaticReceiverVerifiedPairingAt || 0
+  );
+  const requestedVerifiedPairingAt = Number(verifiedPairingAt || 0);
+  if (
+    transport === 'email-wake'
+    && (
+      !Number.isSafeInteger(requestedVerifiedPairingAt)
+      || requestedVerifiedPairingAt <= 0
+    )
+  ) {
+    throw new Error(
+      'Run the signed Automatic Receiver test before enabling background announcements.'
+    );
+  }
+  if (
+    previousTransport === transport
+    && (
+      transport === 'email-wake'
+        ? previousVerifiedPairingAt === requestedVerifiedPairingAt
+        : previousVerifiedPairingAt === 0
+    )
+  ) {
+    return store.state;
+  }
+  if (!emailWakeStatus.ready) {
+    throw new Error(
+      transport === 'email-wake'
+        ? 'Configure the Automatic Receiver service before turning it on.'
+        : 'Automatic timed announcements could not be cancelled because the service is unavailable. Leave Automatic Receiver on and retry when service returns.'
+    );
+  }
+  const synchronized = await syncCurrentEmailWakeSchedule({
+    enabledOverride: transport === 'email-wake'
+  });
+  let saved;
+  try {
+    saved = await store.mutate(draft => {
+      draft.config.announcementTransport = transport;
+      draft.config.automaticReceiverVerifiedPairingAt =
+        transport === 'email-wake' ? requestedVerifiedPairingAt : 0;
+      return draft;
+    }, `${
+      transport === 'email-wake'
+        ? 'Automatic Receiver'
+        : 'Browser announcement'
+    } transport selected`, { requireDurable: true });
+  } catch (saveError) {
+    try {
+      const rolledBack = await syncCurrentEmailWakeSchedule({
+        enabledOverride:
+          previousTransport === 'email-wake'
+          && previousVerifiedPairingAt > 0,
+        retryStale: true
+      });
+      setEmailWakeScheduleStatus({
+        ...rolledBack,
+        enabled:
+          previousTransport === 'email-wake'
+          && previousVerifiedPairingAt > 0,
+        current: true,
+        synchronized: true
+      });
+    } catch (rollbackError) {
+      setEmailWakeScheduleStatus({}, {
+        error:
+          `Transport save failed and its schedule rollback also failed: ${
+            rollbackError.message || String(rollbackError)
+          }`
+      });
+      throw new Error(
+        `${saveError.message || String(saveError)} Automatic schedule rollback also failed: ${
+          rollbackError.message || String(rollbackError)
+        }`
+      );
+    }
+    throw saveError;
+  }
+  observedEmailWakeScheduleFingerprint =
+    emailWakeScheduleFingerprint(saved);
+  setEmailWakeScheduleStatus({
+    ...synchronized,
+    enabled: transport === 'email-wake',
+    current: true,
+    synchronized: true
+  });
+  return saved;
+}
+
 async function setProvider(provider) {
   const target = clamp(store.state.config.musicLevel, 0, 100, 30);
   const selected = ['apple', 'spotify'].includes(provider) ? provider : 'controlled';
   const pushcutMode = receiverOperatingMode() === 'pushcut';
+  const automatic = automaticAnnouncementsEnabled();
   const iphoneExternal = selected !== 'controlled' && !pushcutMode && activeReceiverIsIOS();
   const providerLabel = selected === 'apple' ? 'Apple Music' : selected === 'spotify' ? 'Spotify' : 'Suno / direct';
   await store.mutate(draft => {
@@ -1924,7 +2605,9 @@ async function setProvider(provider) {
       'Music source selected',
       selected === 'controlled'
         ? `Manager Volume: Suno/direct exact ${target}/${VOICE_LEVEL_PERCENT} mode`
-        : pushcutMode
+        : automatic
+          ? `${providerLabel} with Automatic Receiver ${target}/${VOICE_LEVEL_PERCENT} physical output`
+          : pushcutMode
           ? `${providerLabel} with Pushcut Shortcut ${target}/${VOICE_LEVEL_PERCENT} physical output`
           : iphoneExternal
             ? `${providerLabel} with Browser Receiver physical volume; announcement ${VOICE_LEVEL_PERCENT}%`
@@ -1933,7 +2616,9 @@ async function setProvider(provider) {
     return draft;
   }, 'Music source selected');
   setFeedback(selected !== 'controlled'
-    ? pushcutMode
+    ? automatic
+      ? `${providerLabel} selected. Automatic Receiver applies ${target}% music, 0% during announcements, 100% announcement playback, then restores ${target}%.`
+      : pushcutMode
       ? `${providerLabel} selected. The receiver Shortcut requests ${target}% music and ${audibleVoiceTarget()}% announcements, then runs its restore steps; physical loudness is not measured.`
       : iphoneExternal
         ? `${providerLabel} selected in Browser Receiver mode. Music uses the iPhone or connected speaker’s physical volume and pauses completely before ${audibleVoiceTarget()}% announcements.`
@@ -1954,7 +2639,10 @@ async function saveManagedMusicLevel(percent, { startSource = false } = {}) {
     controlledSource: sourceUrl,
     startControlled: startSource
   });
-  audio.setMusicLevelPercent(target, { report: false });
+  audio.setMusicLevelPercent(
+    controlledBrowserGainTarget(stateBefore, target),
+    { report: false }
+  );
   await store.mutate(draft => {
     draft.config.musicProvider = plan.nextProvider;
     draft.config.musicLevel = target;
@@ -1996,15 +2684,20 @@ async function saveManagedMusicLevel(percent, { startSource = false } = {}) {
 }
 
 async function saveMusicLevel(percent, { forceManaged = false, startManagedSource = false } = {}) {
+  const scheduleFingerprintBefore = emailWakeScheduleFingerprint(store.state);
   const target = clamp(percent, 0, 100, 30);
   const switchToManaged = forceManaged || (
     ['apple', 'spotify'].includes(store.state.config.musicProvider)
     && activeReceiverIsIOS()
     && receiverOperatingMode() !== 'pushcut'
+    && !automaticAnnouncementsEnabled()
   );
   if (switchToManaged) return await saveManagedMusicLevel(target, { startSource: startManagedSource });
   if (customPlaybackMusicTarget(store.state) === null) {
-    audio.setMusicLevelPercent(target, { report: false });
+    audio.setMusicLevelPercent(
+      controlledBrowserGainTarget(store.state, target),
+      { report: false }
+    );
     apple.setTargetVolumePercent(target);
     spotify.setTargetVolumePercent(target);
   }
@@ -2018,6 +2711,14 @@ async function saveMusicLevel(percent, { forceManaged = false, startManagedSourc
     draft.activityLog = [makeLog('settings', 'Music target changed', `${target}% music; ${audibleVoiceTarget(draft)}% announcements.`), ...(draft.activityLog || [])];
     return draft;
   }, `Music target ${target}% saved`);
+  if (automaticAnnouncementsEnabled()) {
+    await applyReceiverMusicTargetNow(target);
+    await ensureAutomaticScheduleSyncAfterChange(
+      scheduleFingerprintBefore,
+      `Music target ${target}%`
+    );
+    return target;
+  }
   if (receiverOperatingMode(store.state) === 'pushcut') {
     if (pushcutMusicVolumeReady()) {
       await applyReceiverMusicTargetNow(target);
@@ -2060,7 +2761,10 @@ function queueMusicLevelSave(percent) {
         if (sequence === musicLevelSaveSequence && queuedMusicLevel === null) {
           musicLevelDraft = null;
           const savedTarget = audibleMusicTarget(store.state);
-          audio.setMusicLevelPercent(savedTarget, { report: false });
+          audio.setMusicLevelPercent(
+            controlledBrowserGainTarget(store.state, savedTarget),
+            { report: false }
+          );
           apple.setTargetVolumePercent(savedTarget);
           spotify.setTargetVolumePercent(savedTarget);
           setFeedback(error.message || String(error), false);
@@ -2100,6 +2804,108 @@ function flushMusicLevelSave(percent) {
   return queueMusicLevelSave(target);
 }
 
+async function dispatchAutomaticAnnouncement({
+  text,
+  label = 'Speak Now',
+  safety = false,
+  announcementMode = 'natural-voice',
+  announcementProvider = '',
+  announcementAudioUrl = '',
+  announcementDurationSeconds = 0
+} = {}) {
+  if (!emailWakeOperational()) {
+    throw new Error(
+      emailWakeStatus.ready
+        ? 'Automatic Receiver has not paired with this speaker iPhone. Finish the one-time Receiver setup first.'
+        : emailWakeStatus.note
+          || 'Automatic Receiver is not configured yet.'
+    );
+  }
+  const requestedMusicTarget = audibleMusicTarget(store.state);
+  const result = await sendEmailWakeAnnouncement({
+    text,
+    label,
+    safety,
+    musicPercent: requestedMusicTarget,
+    announcementMode,
+    announcementProvider,
+    announcementAudioUrl,
+    announcementDurationSeconds
+  });
+  await store.mutate(draft => {
+    draft.activityLog = [
+      makeLog(
+        'command',
+        `${label} queued for Automatic Receiver`,
+        'Wake sent; waiting for the signed iPhone completion receipt.',
+        store.now(),
+        {
+          eventId: result.eventId,
+          commandType: safety ? 'announce-safety' : 'announce',
+          automaticReceiverStatus: 'queued'
+        }
+      ),
+      ...(draft.activityLog || [])
+    ];
+    return draft;
+  }, 'Automatic Receiver acceptance recorded').catch(() => {});
+  setFeedback(
+    `${label} is queued. Waiting for music ${requestedMusicTarget}% → 0% → announcement 100% → restore ${requestedMusicTarget}%...`,
+    true
+  );
+  const completed = await waitForEmailWakeCompletion(result.eventId, {
+    onUpdate: status => {
+      const stage = String(
+        status.receipt?.providerStatus || status.status || ''
+      );
+      if (stage.includes('claimed')) {
+        setFeedback(
+          `${label}: the Receiver claimed the command and is preparing audio...`,
+          true
+        );
+      } else if (stage.includes('audio') || stage === 'started') {
+        setFeedback(
+          `${label}: audio is ready; waiting for the Receiver to finish playback...`,
+          true
+        );
+      }
+    }
+  });
+  const restoredMusicTarget = clamp(
+    completed.receipt?.restoredMusicPercent,
+    0,
+    100,
+    requestedMusicTarget
+  );
+  await store.mutate(draft => {
+    draft.activityLog = [
+      makeLog(
+        safety ? 'safety' : 'announcement',
+        `${label} completed on Automatic Receiver`,
+        `Signed receipt: announcement playback finished, music resumed, and the Receiver restored the ${restoredMusicTarget}% target. Physical loudness was not measured.`,
+        store.now(),
+        {
+          eventId: result.eventId,
+          commandType: safety ? 'announce-safety' : 'announce',
+          automaticReceiverStatus: 'completed'
+        }
+      ),
+      ...(draft.activityLog || [])
+    ];
+    return draft;
+  }, 'Automatic Receiver completion recorded').catch(() => {});
+  setFeedback(
+    `${label} completed. The Receiver restored music to ${restoredMusicTarget}% after the 100% announcement.`,
+    true
+  );
+  return {
+    ...result,
+    ...completed,
+    musicPercent: restoredMusicTarget,
+    completed: true
+  };
+}
+
 async function sendLiveAnnouncement({
   text,
   label = 'Speak Now',
@@ -2110,6 +2916,14 @@ async function sendLiveAnnouncement({
 } = {}) {
   const source = announcementSourceById(sourceId);
   const delivery = announcementDeliveryForSource(source);
+  if (automaticAnnouncementsEnabled()) {
+    return await dispatchAutomaticAnnouncement({
+      text,
+      label,
+      safety,
+      ...delivery
+    });
+  }
   const receiverMode = receiverOperatingMode();
   const pushcutReady = pushcutAnnouncementReady();
   const transport = preferredAnnouncementTransport({
@@ -2199,15 +3013,25 @@ async function sendLiveAnnouncement({
 
 async function runImmediateWeatherCheck() {
   const mode = receiverOperatingMode();
-  if (mode === 'browser' && receiverOnline(store.state.receiver, store.now())) {
+  const automatic = automaticAnnouncementsEnabled();
+  if (
+    !automatic
+    && mode === 'browser'
+    && receiverOnline(store.state.receiver, store.now())
+  ) {
     return await runtime.sendCommand(
       'weather-check',
       { announce: true, announceStatus: true, label: 'Manual weather check' },
       'Weather check queued for Browser Receiver.'
     );
   }
-  if (mode !== 'pushcut' || !pushcutAnnouncementReady()) {
-    throw new Error(mode === 'pushcut'
+  if (
+    (!automatic && (mode !== 'pushcut' || !pushcutAnnouncementReady()))
+    || (automatic && !emailWakeOperational())
+  ) {
+    throw new Error(automatic
+      ? 'Automatic Receiver is not paired and ready. Finish its one-time setup before running an immediate weather announcement.'
+      : mode === 'pushcut'
       ? 'Pushcut mode is selected, but its announcement action is not configured. Open Pushcut on the Receiver iPhone and leave Ready For Requests visible.'
       : 'Browser Receiver mode is selected but offline. Start Browser Receiver before running an immediate weather announcement.');
   }
@@ -2233,7 +3057,7 @@ async function runImmediateWeatherCheck() {
       draft.activityLog = [
         makeLog(
           'safety',
-          'Pending weather warning replayed through Pushcut',
+          `Pending weather warning replayed through ${automatic ? 'Automatic Receiver' : 'Pushcut'}`,
           retryPlan.announcementIds.join(', '),
           store.now()
         ),
@@ -2356,6 +3180,59 @@ async function sendTransport(command) {
 }
 
 async function applyReceiverMusicTargetNow(percent = audibleMusicTarget(store.state)) {
+  if (automaticAnnouncementsEnabled()) {
+    if (!emailWakeOperational()) {
+      throw new Error('Automatic Receiver is not paired and ready.');
+    }
+    const requestedTarget = clamp(percent, 0, 100, 30);
+    emailWakeVolumeStatus = {
+      state: 'working',
+      message: `Waiting for the Receiver to apply ${requestedTarget}%...`
+    };
+    renderWhenIdle(true);
+    try {
+      const queued = await applyEmailWakeMusicVolume({
+        musicPercent: requestedTarget
+      });
+      const completed = await waitForEmailWakeCompletion(queued.eventId);
+      const appliedTarget = clamp(
+        completed.receipt?.restoredMusicPercent,
+        0,
+        100,
+        requestedTarget
+      );
+      const message =
+        `Receiver completed the ${appliedTarget}% music target. Physical output was not measured.`;
+      emailWakeVolumeStatus = {
+        state: 'completed',
+        message
+      };
+      await store.mutate(draft => {
+        draft.activityLog = [
+          makeLog(
+            'settings',
+            `Music ${appliedTarget}% automatic action completed`,
+            message,
+            store.now(),
+            {
+              eventId: queued.eventId,
+              automaticReceiverStatus: 'completed'
+            }
+          ),
+          ...(draft.activityLog || [])
+        ];
+        return draft;
+      }, 'Automatic music-volume action recorded').catch(() => {});
+      setFeedback(message, true);
+      return { ...queued, ...completed, musicPercent: appliedTarget };
+    } catch (error) {
+      emailWakeVolumeStatus = {
+        state: 'failed',
+        message: error.message || String(error)
+      };
+      throw error;
+    }
+  }
   if (receiverOperatingMode() !== 'pushcut') {
     throw new Error('Apply Music Now is available only while Pushcut Receiver mode is selected.');
   }
@@ -2454,7 +3331,10 @@ function updateScheduleFormVisibility(form) {
   const kind = form.querySelector('[data-schedule-kind]')?.value || form.dataset.kind || 'announcement';
   const announcementSource = form.querySelector('[data-announcement-source]')?.value || form.dataset.announcementSource || 'saved';
   const volumeMode = form.querySelector('[data-volume-mode]')?.value || form.dataset.volumeMode || 'global';
-  const iphoneAppleVolume = ['apple', 'spotify'].includes(kind) && activeReceiverIsIOS();
+  const iphoneAppleVolume =
+    ['apple', 'spotify'].includes(kind)
+    && activeReceiverIsIOS()
+    && !automaticAnnouncementsEnabled();
   const fixedVolume = kind === 'announcement' || iphoneAppleVolume;
   const advanceSelect = form.querySelector('[data-advance-mode]');
   const trackEndOption = advanceSelect?.querySelector('option[value="track-end"]');
@@ -2544,7 +3424,11 @@ root.addEventListener('click', event => {
     setFeedback('Save the open schedule changes before changing its structure or live status.', false);
     return;
   }
-  if (action === 'sync-pushcut-schedule' && dirtyScheduleForm()) {
+  if (
+    (action === 'sync-pushcut-schedule'
+      || action === 'sync-email-wake-schedule')
+    && dirtyScheduleForm()
+  ) {
     setFeedback('Save the open schedule changes before syncing timed announcements.', false);
     return;
   }
@@ -2558,6 +3442,18 @@ root.addEventListener('click', event => {
     }
     if (action === 'copy-spotify-redirect-uri') {
       return await copySpotifySetupValue(SPOTIFY_REDIRECT_URI, 'Spotify Redirect URI');
+    }
+    if (action === 'copy-email-wake-sender') {
+      return await copySpotifySetupValue(
+        emailWakeStatus.wakeSender,
+        'Email automation Sender'
+      );
+    }
+    if (action === 'copy-email-wake-subject') {
+      return await copySpotifySetupValue(
+        emailWakeStatus.wakeSubject,
+        'Email automation Subject'
+      );
     }
     if (action === 'choose-role') return await setRole(button.dataset.role);
     if (action === 'set-role') return await runAction('Changing device role', () => setRole(button.dataset.role));
@@ -2582,6 +3478,99 @@ root.addEventListener('click', event => {
     }
     if (action === 'now-back') {
       return selectTab(button.dataset.tab || 'control');
+    }
+    if (action === 'create-email-wake-pairing') {
+      return await runAction('Creating Receiver pairing code', async () => {
+        const result = await createEmailWakePairingCode();
+        emailWakePairing = {
+          code: String(result.pairingCode || result.code || ''),
+          expiresAt: Number(result.expiresAt || 0)
+        };
+        if (!emailWakePairing.code) {
+          throw new Error('The pairing service did not return a one-time code.');
+        }
+        setFeedback(
+          `Pairing code ${emailWakePairing.code} is ready for 10 minutes. Run ${EMAIL_WAKE_X_SHORTCUT_NAME} once on this Receiver and enter it.`,
+          true
+        );
+        return result;
+      });
+    }
+    if (action === 'check-email-wake-pairing') {
+      return await runAction('Checking Receiver pairing', async () => {
+        await refreshEmailWakeStatus();
+        if (emailWakeOperational()) {
+          emailWakePairing = { code: '', expiresAt: 0 };
+          setFeedback(
+            'Receiver pairing confirmed. Create the Email automation exactly as shown, then tap Turn On Automatic Receiver.',
+            true
+          );
+          return true;
+        }
+        if (emailWakeStatus.receiverPaired) {
+          throw new Error(
+            emailWakeStatus.note
+            || 'Pairing succeeded, but Automatic Receiver server setup still needs attention.'
+          );
+        }
+        throw new Error(
+          'Pairing is not confirmed yet. Run the installed Shortcut, enter the current six-digit code, then tap Check Pairing again.'
+        );
+      });
+    }
+    if (action === 'enable-automatic-announcements') {
+      return await runAction('Testing and turning on Automatic Receiver', async () => {
+        await refreshEmailWakeStatus();
+        if (!emailWakeOperational()) {
+          throw new Error(
+            'The Receiver has not finished pairing. Run the installed Shortcut once with a fresh pairing code, then retry.'
+          );
+        }
+        await selectSharedReceiverMode('browser');
+        if (pushcutAnnouncementReady()) {
+          await syncCurrentPushcutSchedule({
+            pushcutEnabledOverride: false
+          });
+        }
+        const verifiedPairingAt = Number(emailWakeStatus.pairedAt || 0);
+        if (!Number.isSafeInteger(verifiedPairingAt) || verifiedPairingAt <= 0) {
+          throw new Error(
+            'The Receiver pairing timestamp is missing. Create a fresh pairing code, run the installed Shortcut, then retry.'
+          );
+        }
+        await dispatchAutomaticAnnouncement({
+          text: 'Poolside Pulse automatic receiver test. The music should be silent now, this announcement should be loud and clear, and the music should return quietly after I finish.',
+          label: 'Required Automatic Receiver Test'
+        });
+        await selectAnnouncementTransport('email-wake', {
+          verifiedPairingAt
+        });
+        setFeedback(
+          `Automatic Receiver passed its signed device test and is on. Start Browser Receiver here for music, then use any Remote for announcements.`,
+          true
+        );
+        return true;
+      });
+    }
+    if (action === 'disable-automatic-announcements') {
+      return await runAction('Turning off Automatic Receiver', async () => {
+        await selectAnnouncementTransport('browser');
+        setFeedback(
+          'Automatic announcements are off. Browser Receiver will handle announcements while it stays visible.',
+          true
+        );
+        return true;
+      });
+    }
+    if (action === 'email-wake-test') {
+      return await runAction('Running Automatic Receiver test', async () => {
+        const result = await dispatchAutomaticAnnouncement({
+          text: 'Poolside Pulse automatic receiver test. The music should be silent now, this announcement should be loud and clear, and the music should return quietly after I finish.',
+          label: 'Automatic Receiver Test'
+        });
+        await refreshEmailWakeStatus();
+        return result;
+      });
     }
     if (action === 'start-receiver') {
       return await runAction('Starting receiver', async () => {
@@ -2612,12 +3601,37 @@ root.addEventListener('click', event => {
             throw new Error(`Browser Receiver was stopped because pending Pushcut schedule copies could not be cancelled safely: ${error.message || String(error)}${recoveryError ? ` Pushcut re-arm also failed: ${recoveryError}` : ' Pushcut timed announcements were re-armed.'}`);
           }
         }
+        if (automaticAnnouncementsEnabled()) {
+          try {
+            await applyReceiverMusicTargetNow(audibleMusicTarget(store.state));
+          } catch (error) {
+            await runtime.stop().catch(() => {});
+            throw new Error(
+              `Browser Receiver was stopped because the speaker iPhone did not confirm its music target: ${
+                error.message || String(error)
+              }`
+            );
+          }
+        }
         return lease;
       });
     }
     if (action === 'stop-receiver') {
       return await runAction('Stopping receiver', async () => {
         await runtime.stop();
+        if (automaticAnnouncementsEnabled()) {
+          await selectSharedReceiverMode('browser');
+          if (pushcutAnnouncementReady()) {
+            await syncCurrentPushcutSchedule({
+              pushcutEnabledOverride: false
+            });
+          }
+          setFeedback(
+            'Browser music stopped. Automatic announcements remain armed without Pushcut.',
+            true
+          );
+          return true;
+        }
         await selectSharedReceiverMode('pushcut');
         if (pushcutAnnouncementReady()) {
           await syncCurrentPushcutSchedule({
@@ -2630,6 +3644,9 @@ root.addEventListener('click', event => {
     if (action === 'prepare-pushcut-mode') {
       return await runAction('Preparing Pushcut mode', async () => {
         if (runtime.active) await runtime.stop();
+        if (automaticAnnouncementsEnabled()) {
+          await selectAnnouncementTransport('browser');
+        }
         await selectSharedReceiverMode('pushcut');
         await syncCurrentPushcutSchedule({
           pushcutEnabledOverride: true
@@ -2652,6 +3669,12 @@ root.addEventListener('click', event => {
       return await runAction('Syncing timed Pushcut announcements', () => syncCurrentPushcutSchedule({
         manual: true
       }));
+    }
+    if (action === 'sync-email-wake-schedule') {
+      return await runAction(
+        'Syncing automatic timed announcements',
+        () => syncCurrentEmailWakeSchedule({ manual: true })
+      );
     }
     if (action === 'delete-announcement-source') {
       const sourceId = String(button.dataset.id || '');
@@ -3093,7 +4116,10 @@ root.addEventListener('input', event => {
   const target = clamp(slider.value, 0, 100, 30);
   musicLevelDraft = target;
   if (customPlaybackMusicTarget(store.state) === null) {
-    audio.setMusicLevelPercent(target, { report: false });
+    audio.setMusicLevelPercent(
+      controlledBrowserGainTarget(store.state, target),
+      { report: false }
+    );
     apple.setTargetVolumePercent(target);
     spotify.setTargetVolumePercent(target);
   }
@@ -3251,7 +4277,7 @@ root.addEventListener('submit', event => {
       announcementDeliveryForSource(announcementSourceById(sourceId));
       const announcementText = String(data.get('text') || '').trim();
       if (
-        pushcutAnnouncementReady()
+        (pushcutAnnouncementReady() || automaticAnnouncementsEnabled())
         && announcementText.length > PUSHCUT_MAX_ANNOUNCEMENT_CHARACTERS
       ) {
         throw new Error(`Shorten this message to ${PUSHCUT_MAX_ANNOUNCEMENT_CHARACTERS} characters or fewer so the Receiver Shortcut can finish reliably.`);
@@ -3312,7 +4338,7 @@ root.addEventListener('submit', event => {
         actionKind === 'announcement'
         && announcementSource === 'inline'
         && scheduleSnapshot?.mode === 'time'
-        && pushcutAnnouncementReady()
+        && (pushcutAnnouncementReady() || automaticAnnouncementsEnabled())
         && inlineText.length > PUSHCUT_MAX_ANNOUNCEMENT_CHARACTERS
       ) {
         throw new Error(`Shorten this timed announcement to ${PUSHCUT_MAX_ANNOUNCEMENT_CHARACTERS} characters or fewer for reliable Pushcut playback.`);
@@ -3392,10 +4418,17 @@ root.addEventListener('submit', event => {
   }).catch(error => setFeedback(error.message || String(error), false));
 });
 
-window.addEventListener('pagehide', () => {
+window.addEventListener('pagehide', event => {
   if (role === 'command') {
     apple.disconnect();
   } else if (role === 'receiver' && runtime.active && isIOSLike()) {
+    if (automaticAnnouncementsEnabled() && event.persisted === true) {
+      // An Email personal automation may briefly background Safari while the
+      // signed Shortcut owns volume and announcement playback. Preserve the
+      // browser music lease only while iOS keeps this page in its back/forward
+      // cache. A true close or navigation still releases the Receiver below.
+      return;
+    }
     // One idempotent stop synchronously queues the atomic beacon handoff before
     // Safari suspends, then tears down audio without a duplicate release path.
     runtime.failSafeStop(

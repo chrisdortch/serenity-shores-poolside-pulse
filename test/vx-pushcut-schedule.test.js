@@ -1,13 +1,17 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { beforeEach, describe, test } from 'node:test';
 
 import { createSessionToken } from '../api/_auth.js';
 import {
   cancelPushcutXExecution,
+  createLegacyPushcutScheduleManifestStore,
   createPushcutScheduleManifestStore,
   planPushcutXSchedule,
+  PUSHCUT_X_LEGACY_SCHEDULE_MANIFEST_KEY,
   PushcutScheduleXError,
   readPushcutXScheduleStatus,
+  retireLegacyPushcutXSchedule,
   schedulePushcutXExecution,
   synchronizePushcutXSchedule,
   verifyPushcutXDelayedScheduling,
@@ -28,7 +32,8 @@ import {
   PUSHCUT_X_RECEIVER_CONTRACT
 } from '../api/_pushcut-x.js';
 import {
-  createPushcutScheduleXHandler
+  createPushcutScheduleXHandler,
+  PUSHCUT_X_LEGACY_RETIRE_CONFIRMATION
 } from '../api/pushcut-schedule-x.js';
 import {
   createPushcutRecoveryXHandler
@@ -156,6 +161,41 @@ function memoryManifestStore() {
   };
 }
 
+function legacyMemoryManifestStore(occurrences = {}) {
+  let manifest = {
+    version: 1,
+    syncedAt: NOW - 60_000,
+    horizonEnd: NOW + 24 * 60 * 60_000,
+    stateRevision: 11,
+    warnings: [],
+    occurrences: structuredClone(occurrences)
+  };
+  const writes = [];
+  let clearCount = 0;
+  return {
+    durable: true,
+    async withLock(operation) { return await operation(); },
+    async read() { return structuredClone(manifest); },
+    async write(next) {
+      manifest = structuredClone(next);
+      writes.push(structuredClone(manifest));
+      return structuredClone(manifest);
+    },
+    async clear() {
+      clearCount += 1;
+      manifest = { ...manifest, occurrences: {} };
+      return true;
+    },
+    inspect() {
+      return {
+        manifest: structuredClone(manifest),
+        writes: structuredClone(writes),
+        clearCount
+      };
+    }
+  };
+}
+
 beforeEach(() => {
   process.env.POOL_SIDE_SESSION_SECRET = SESSION_SECRET;
   process.env.POOL_SIDE_PIN = '7900';
@@ -192,6 +232,44 @@ describe('Version X Central Time occurrence planner', { concurrency: false }, ()
     const orderState = scheduleState();
     orderState.schedules[0].mode = 'order';
     assert.equal(planPushcutXSchedule(orderState, { now: NOW }).occurrences.length, 0);
+  });
+
+  test('preserves stable provider identifiers and isolates each Version X namespace', () => {
+    const state = scheduleState();
+    const stable = planPushcutXSchedule(state, {
+      now: NOW,
+      horizonDays: 7,
+      env: {}
+    }).occurrences[0];
+    const expectedStableLogicalId = createHash('sha256')
+      .update(['vx', 'active-time', 'scheduled-item', '2026-07-17', '10:30'].join('\0'))
+      .digest('hex')
+      .slice(0, 32);
+    assert.equal(stable.logicalId, expectedStableLogicalId);
+
+    const candidateA = planPushcutXSchedule(state, {
+      now: NOW,
+      horizonDays: 7,
+      env: { POOL_SIDE_X_NAMESPACE: 'candidate-a' }
+    }).occurrences[0];
+    const candidateARepeat = planPushcutXSchedule(state, {
+      now: NOW,
+      horizonDays: 7,
+      env: { POOL_SIDE_X_NAMESPACE: 'candidate-a' }
+    }).occurrences[0];
+    const candidateB = planPushcutXSchedule(state, {
+      now: NOW,
+      horizonDays: 7,
+      env: { POOL_SIDE_X_NAMESPACE: 'candidate-b' }
+    }).occurrences[0];
+
+    assert.equal(candidateA.logicalId, candidateARepeat.logicalId);
+    assert.equal(candidateA.identifier, candidateARepeat.identifier);
+    assert.notEqual(candidateA.logicalId, stable.logicalId);
+    assert.notEqual(candidateA.logicalId, candidateB.logicalId);
+    assert.notEqual(candidateA.identifier, candidateB.identifier);
+    assert.notEqual(candidateA.recoveryIdentifier, candidateB.recoveryIdentifier);
+    assert.notEqual(candidateA.eventId, candidateB.eventId);
   });
 
   test('handles Central Time DST gaps and chooses the first repeated wall time', () => {
@@ -648,6 +726,150 @@ describe('Version X Pushcut schedule synchronization', { concurrency: false }, (
   });
 });
 
+describe('Version X legacy Pushcut retirement', { concurrency: false }, () => {
+  test('exposes the legacy manifest only to an explicitly namespaced deployment', async () => {
+    assert.throws(
+      () => createLegacyPushcutScheduleManifestStore({
+        env: {
+          KV_REST_API_URL: 'https://kv.example.test',
+          KV_REST_API_TOKEN: 'kv-token'
+        }
+      }),
+      error =>
+        error instanceof PushcutScheduleXError
+        && error.code === 'legacyRetirementUnavailable'
+    );
+
+    const commands = [];
+    const store = createLegacyPushcutScheduleManifestStore({
+      env: {
+        POOL_SIDE_X_NAMESPACE: 'automatic-receiver-candidate',
+        KV_REST_API_URL: 'https://kv.example.test',
+        KV_REST_API_TOKEN: 'kv-token'
+      },
+      fetchImpl: async (_url, options) => {
+        const command = JSON.parse(options.body);
+        commands.push(command);
+        return {
+          ok: true,
+          async json() {
+            return { result: null };
+          }
+        };
+      }
+    });
+    const manifest = await store.read();
+    assert.deepEqual(manifest.occurrences, {});
+    assert.deepEqual(commands[0], [
+      'GET',
+      PUSHCUT_X_LEGACY_SCHEDULE_MANIFEST_KEY
+    ]);
+    assert.equal(commands[0][1].includes(':namespace:'), false);
+  });
+
+  test('cancels both legacy identifiers, checkpoints progress, and is idempotent', async () => {
+    const firstId = 'a'.repeat(32);
+    const secondId = 'b'.repeat(32);
+    const store = legacyMemoryManifestStore({
+      [firstId]: {
+        logicalId: firstId,
+        identifier: 'ppx-a-legacy-first',
+        recoveryIdentifier: 'ppx-r-legacy-first',
+        eventId: 'pushcut-sched-legacy-first',
+        scheduledFor: NOW + 30_000,
+        status: 'scheduled'
+      },
+      [secondId]: {
+        logicalId: secondId,
+        identifier: 'ppx-a-legacy-second',
+        recoveryIdentifier: 'ppx-r-legacy-second',
+        eventId: 'pushcut-sched-legacy-second',
+        scheduledFor: NOW + 60_000,
+        status: 'scheduled'
+      }
+    });
+    const cancelled = [];
+    const options = {
+      env: { POOL_SIDE_X_NAMESPACE: 'automatic-receiver-candidate' },
+      now: () => NOW,
+      manifestStore: store,
+      cancelExecution: async identifier => {
+        cancelled.push(identifier);
+        return { cancelled: true, status: 200 };
+      }
+    };
+    const retired = await retireLegacyPushcutXSchedule(options);
+    assert.equal(retired.legacyRetired, true);
+    assert.equal(retired.alreadyRetired, false);
+    assert.equal(retired.cancelledOccurrences, 2);
+    assert.equal(retired.cancelledExecutions, 4);
+    assert.equal(retired.remainingOccurrences, 0);
+    assert.deepEqual(cancelled, [
+      'ppx-a-legacy-first',
+      'ppx-r-legacy-first',
+      'ppx-a-legacy-second',
+      'ppx-r-legacy-second'
+    ]);
+    assert.equal(store.inspect().writes.length, 1);
+    assert.deepEqual(
+      Object.keys(store.inspect().writes[0].occurrences),
+      [secondId]
+    );
+    assert.equal(store.inspect().clearCount, 1);
+
+    const replay = await retireLegacyPushcutXSchedule(options);
+    assert.equal(replay.legacyRetired, true);
+    assert.equal(replay.alreadyRetired, true);
+    assert.equal(replay.cancelledExecutions, 0);
+    assert.equal(cancelled.length, 4);
+    assert.equal(store.inspect().clearCount, 2);
+  });
+
+  test('retains the unconfirmed legacy occurrence when cancellation fails', async () => {
+    const firstId = 'c'.repeat(32);
+    const secondId = 'd'.repeat(32);
+    const store = legacyMemoryManifestStore({
+      [firstId]: {
+        logicalId: firstId,
+        identifier: 'ppx-a-checkpoint-first',
+        recoveryIdentifier: 'ppx-r-checkpoint-first',
+        eventId: 'pushcut-sched-checkpoint-first',
+        scheduledFor: NOW + 30_000,
+        status: 'scheduled'
+      },
+      [secondId]: {
+        logicalId: secondId,
+        identifier: 'ppx-a-checkpoint-second',
+        recoveryIdentifier: 'ppx-r-checkpoint-second',
+        eventId: 'pushcut-sched-checkpoint-second',
+        scheduledFor: NOW + 60_000,
+        status: 'scheduled'
+      }
+    });
+    await assert.rejects(
+      retireLegacyPushcutXSchedule({
+        env: { POOL_SIDE_X_NAMESPACE: 'automatic-receiver-candidate' },
+        now: () => NOW,
+        manifestStore: store,
+        cancelExecution: async identifier => {
+          if (identifier === 'ppx-r-checkpoint-second') {
+            throw new PushcutScheduleXError('cancellationUncertain');
+          }
+          return { cancelled: true, status: 200 };
+        }
+      }),
+      error =>
+        error instanceof PushcutScheduleXError
+        && error.code === 'cancellationUncertain'
+    );
+    assert.deepEqual(
+      Object.keys(store.inspect().manifest.occurrences),
+      [secondId]
+    );
+    assert.equal(store.inspect().clearCount, 0);
+  });
+});
+
 describe('Version X Pushcut delayed API and session route', { concurrency: false }, () => {
   test('proves Extended with a harmless far-future recovery and immediately cancels it', async () => {
     const calls = [];
@@ -784,6 +1006,76 @@ describe('Version X Pushcut delayed API and session route', { concurrency: false
     );
     assert.equal(invalid.statusCode, 400);
     assert.equal(delayedChecks, 1);
+  });
+
+  test('runs explicit legacy retirement without reading or mutating the namespaced schedule', async () => {
+    const namespace = 'automatic-receiver-candidate';
+    const previousNamespace = process.env.POOL_SIDE_X_NAMESPACE;
+    process.env.POOL_SIDE_X_NAMESPACE = namespace;
+    try {
+      const token = createSessionToken(Date.now(), 'x');
+      assert.ok(token);
+      const cookie =
+        `poolside_vx_${namespace}_session=${encodeURIComponent(token)}`;
+      let retirements = 0;
+      const handler = createPushcutScheduleXHandler({
+        manifestStoreFactory: () => {
+          throw new Error('Legacy retirement must not open the namespaced manifest.');
+        },
+        legacyRetirer: async () => {
+          retirements += 1;
+          return {
+            version: 'x',
+            legacyRetired: true,
+            alreadyRetired: false,
+            retiredAt: NOW,
+            cancelledOccurrences: 2,
+            cancelledExecutions: 4,
+            remainingOccurrences: 0
+          };
+        },
+        stateReader: async () => {
+          throw new Error('Legacy retirement must not read canonical state.');
+        },
+        synchronizer: async () => {
+          throw new Error('Legacy retirement must not synchronize preview occurrences.');
+        }
+      });
+      const retired = await invoke(
+        handler,
+        request('POST', '/api/pushcut-schedule-x?v=x', {
+          cookie,
+          body: {
+            retireLegacy: true,
+            confirmation: PUSHCUT_X_LEGACY_RETIRE_CONFIRMATION
+          }
+        })
+      );
+      assert.equal(retired.statusCode, 200);
+      assert.equal(retired.json().legacyRetired, true);
+      assert.equal(retired.json().cancelledOccurrences, 2);
+      assert.equal(retired.json().remainingOccurrences, 0);
+      assert.equal(retirements, 1);
+
+      const invalid = await invoke(
+        handler,
+        request('POST', '/api/pushcut-schedule-x?v=x', {
+          cookie,
+          body: {
+            retireLegacy: true,
+            confirmation: 'not-confirmed'
+          }
+        })
+      );
+      assert.equal(invalid.statusCode, 400);
+      assert.equal(retirements, 1);
+    } finally {
+      if (previousNamespace === undefined) {
+        delete process.env.POOL_SIDE_X_NAMESPACE;
+      } else {
+        process.env.POOL_SIDE_X_NAMESPACE = previousNamespace;
+      }
+    }
   });
 
   test('browser client sends only the expected revision and preserves Extended errors', async () => {

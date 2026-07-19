@@ -1,0 +1,275 @@
+/*
+Poolside Pulse X Automatic Receiver
+
+Runs from one iOS Email personal automation. The wake email contains no
+command data. This Shortcut claims the next authenticated Version X command,
+downloads all announcement audio and authorizes the exact execution attempt
+before touching playback, then performs the mute-first / resume-muted sequence:
+
+M -> 0 -> Pause -> 100 -> announcement -> 0 -> Play -> M.
+
+Reclaimed attempts first restore the music bed safely. After three incomplete
+announcement attempts, the fourth and any later retry restore music without
+replaying the announcement until the server receives restoration proof.
+*/
+
+#include 'actions/device'
+#include 'actions/documents'
+#include 'actions/media'
+#include 'actions/music'
+#include 'actions/web'
+
+#define name Poolside Pulse X Automatic Receiver
+#define color blue
+#define mac false
+
+action 'ask' askForPairingCode(text prompt: 'WFAskActionPrompt'): text
+
+action 'getvalueforkey' getFloatValue(
+    dictionary dictionary: 'WFInput',
+    text key: 'WFDictionaryKey'
+): float {
+    "WFGetDictionaryValueType": "Value"
+}
+
+action 'getvalueforkey' getBooleanValue(
+    dictionary dictionary: 'WFInput',
+    text key: 'WFDictionaryKey'
+): bool {
+    "WFGetDictionaryValueType": "Value"
+}
+
+const tokenFile = getFile(
+    "Poolside Pulse X/receiver-token.txt",
+    nil,
+    false
+)
+
+@receiverToken = text("{tokenFile}")
+if @receiverToken beginsWith "ppxrx_" {
+} else {
+    @receiverToken = text("")
+}
+const receiverTokenLength = count(@receiverToken, "Characters")
+
+if receiverTokenLength != 49 {
+    const pairingCode = askForPairingCode(
+        "Enter the six-digit Receiver pairing code shown in Poolside Pulse X."
+    )
+    const pairingResponse = jsonRequest(
+        "https://poolside-pulse-x-receiver.vercel.app/api/email-wake-register-x?v=x",
+        "POST",
+        {
+            "code": "{pairingCode}"
+        },
+        nil
+    )
+    const pairingDictionary = getDictionary(pairingResponse)
+    @receiverToken = text("{pairingDictionary['token']}")
+    if @receiverToken beginsWith "ppxrx_" {
+    } else {
+        stop()
+    }
+    const pairedTokenLength = count(@receiverToken, "Characters")
+    if pairedTokenLength != 49 {
+        stop()
+    }
+    createFolder("Poolside Pulse X")
+    saveFile(
+        "Poolside Pulse X/receiver-token.txt",
+        @receiverToken,
+        true
+    )
+}
+
+/*
+Two Remotes can produce two Email automation runs at nearly the same time.
+The server grants only one playback lease. A busy run stops immediately; the
+active run sends a fresh drain email after its signed completion receipt, so
+the next queued command gets a new, short-lived background automation.
+*/
+const claimResponse = jsonRequest(
+    "https://poolside-pulse-x-receiver.vercel.app/api/email-wake-claim-x?v=x",
+    "POST",
+    {},
+    {
+        "Authorization": "Bearer {@receiverToken}"
+    }
+)
+const command = getDictionary(claimResponse)
+const pending = getBooleanValue(command, "pending")
+
+if pending != true {
+    stop()
+} else {
+    const action = getValue(command, "action")
+
+    if action.text == "volume" {
+        const volumeLevel = getFloatValue(command, "musicLevel")
+        setVolume(volumeLevel)
+
+        const volumeReceiptUrl = getValue(command, "receiptUrl")
+        const volumeMusicPercentValue = getValue(command, "musicPercent")
+        const volumeMusicPercent = number(volumeMusicPercentValue)
+        rawAction("is.workflow.actions.downloadurl", {
+            "WFURL": "${volumeReceiptUrl}",
+            "WFHTTPMethod": "POST",
+            "WFHTTPBodyType": "JSON",
+            "WFJSONValues": {
+                "status": "completed",
+                "receiverContract": "poolside-pulse-x-wake-v1",
+                "volumeRestored": true,
+                "restoredMusicPercent": "${volumeMusicPercent}",
+                "musicResumed": false
+            }
+        })
+    } else {
+        if action.text == "recover" {
+                /*
+                Recovery attempts never replay speech. They only make the
+                current Now Playing source safe and audible again. The command
+                target is applied before the network refresh so a temporary
+                restore request failure cannot leave the phone muted.
+                */
+                const recoveryFallbackLevel = getFloatValue(command, "musicLevel")
+                setVolume(0.0)
+                play()
+                wait(1)
+                setVolume(recoveryFallbackLevel)
+
+                const recoveryRestoreUrl = getValue(command, "restoreUrl")
+                const recoveryRestoreTarget = downloadURL("{recoveryRestoreUrl}")
+                const recoveryRestoreDictionary = getDictionary(recoveryRestoreTarget)
+                const recoveryMusicLevel = getFloatValue(
+                    recoveryRestoreDictionary,
+                    "musicLevel"
+                )
+                setVolume(recoveryMusicLevel)
+
+                const recoveryReceiptUrl = getValue(command, "receiptUrl")
+                const recoveryMusicPercentValue = getValue(
+                    recoveryRestoreDictionary,
+                    "musicPercent"
+                )
+                const recoveryMusicPercent = number(recoveryMusicPercentValue)
+                rawAction("is.workflow.actions.downloadurl", {
+                    "WFURL": "${recoveryReceiptUrl}",
+                    "WFHTTPMethod": "POST",
+                    "WFHTTPBodyType": "JSON",
+                    "WFJSONValues": {
+                        "status": "failed",
+                        "receiverContract": "poolside-pulse-x-wake-v1",
+                        "failureCode": "retry_exhausted_recovered",
+                        "volumeRestored": true,
+                        "restoredMusicPercent": "${recoveryMusicPercent}",
+                        "musicResumed": true
+                    }
+                })
+        } else {
+            if action.text != "announce" {
+                stop()
+            } else {
+                    const commandMusicLevel = getFloatValue(command, "musicLevel")
+                    const reclaimed = getBooleanValue(command, "reclaimed")
+
+                    /*
+                    A reclaimed attempt means an earlier automation stopped
+                    without a valid receipt. Recover the music bed first; only
+                    then prepare a fresh, attempt-bound announcement.
+                    */
+                    if reclaimed == true {
+                        setVolume(0.0)
+                        play()
+                        wait(1)
+                        setVolume(commandMusicLevel)
+                    }
+
+                    /*
+                    Download all audio and authorize this exact execution
+                    attempt before the first announcement-related volume
+                    mutation. The explicit response checks do not rely on iOS
+                    treating every non-2xx download as a stopped Shortcut.
+                    */
+                    const audioUrl = getValue(command, "audioUrl")
+                    const announcementAudio = downloadURL("{audioUrl}")
+                    const executeUrl = getValue(command, "executeUrl")
+                    const executeResponse = downloadURL("{executeUrl}")
+                    const executeDictionary = getDictionary(executeResponse)
+                    const authorized = getBooleanValue(
+                        executeDictionary,
+                        "authorized"
+                    )
+                    const authorizedContract = getValue(
+                        executeDictionary,
+                        "receiverContract"
+                    )
+                    const claimedExecutionAttemptValue = getValue(
+                        command,
+                        "executionAttempt"
+                    )
+                    const claimedExecutionAttempt = number(
+                        claimedExecutionAttemptValue
+                    )
+                    const authorizedExecutionAttemptValue = getValue(
+                        executeDictionary,
+                        "executionAttempt"
+                    )
+                    const authorizedExecutionAttempt = number(
+                        authorizedExecutionAttemptValue
+                    )
+                    if authorized != true
+                        || authorizedContract.text != "poolside-pulse-x-wake-v1"
+                        || authorizedExecutionAttempt != claimedExecutionAttempt {
+                        stop()
+                    }
+
+                    setVolume(0.0)
+                    pause()
+                    wait(1)
+                    setVolume(1.0)
+                    playSound(announcementAudio)
+
+                    /*
+                    Resume while muted, then apply the command fallback before
+                    the latest server target is fetched. That keeps music quiet
+                    and prevents a post-announcement network failure from
+                    stranding the Receiver at 0%.
+                    */
+                    setVolume(0.0)
+                    play()
+                    wait(1)
+                    setVolume(commandMusicLevel)
+
+                    const restoreUrl = getValue(command, "restoreUrl")
+                    const restoreTarget = downloadURL("{restoreUrl}")
+                    const restoreDictionary = getDictionary(restoreTarget)
+                    const musicLevel = getFloatValue(
+                        restoreDictionary,
+                        "musicLevel"
+                    )
+                    setVolume(musicLevel)
+
+                    const receiptUrl = getValue(command, "receiptUrl")
+                    const restoredMusicPercentValue = getValue(
+                        restoreDictionary,
+                        "musicPercent"
+                    )
+                    const restoredMusicPercent = number(
+                        restoredMusicPercentValue
+                    )
+                    rawAction("is.workflow.actions.downloadurl", {
+                        "WFURL": "${receiptUrl}",
+                        "WFHTTPMethod": "POST",
+                        "WFHTTPBodyType": "JSON",
+                        "WFJSONValues": {
+                            "status": "completed",
+                            "receiverContract": "poolside-pulse-x-wake-v1",
+                            "volumeRestored": true,
+                            "restoredMusicPercent": "${restoredMusicPercent}",
+                            "musicResumed": true
+                        }
+                    })
+            }
+        }
+    }
+}

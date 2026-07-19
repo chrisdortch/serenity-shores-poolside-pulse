@@ -175,6 +175,13 @@ export function createDefaultState(now = Date.now()) {
       // devices never route commands to a browser lease that Safari left
       // behind while the speaker switched to Pushcut.
       receiverMode: 'browser',
+      // Browser Receiver owns provider playback. The optional email-wake lane
+      // runs native volume and announcement actions without taking Safari out
+      // of the foreground.
+      announcementTransport: 'browser',
+      // Automatic Receiver is fail-closed until this exact pairing has
+      // completed a signed, end-to-end announcement test.
+      automaticReceiverVerifiedPairingAt: 0,
       musicProvider: 'controlled',
       musicUrl: DEFAULT_SUNO_SOURCE,
       musicLabel: 'Serenity Shores Suno playlist',
@@ -722,6 +729,18 @@ export function normalizeState(input, now = Date.now()) {
     // createDefaultState() includes receiverMode.
     delete config.receiverMode;
   }
+  config.announcementTransport =
+    config.announcementTransport === 'email-wake'
+      ? 'email-wake'
+      : 'browser';
+  const automaticReceiverVerifiedPairingAt = Number(
+    config.automaticReceiverVerifiedPairingAt
+  );
+  config.automaticReceiverVerifiedPairingAt =
+    Number.isSafeInteger(automaticReceiverVerifiedPairingAt)
+    && automaticReceiverVerifiedPairingAt > 0
+      ? automaticReceiverVerifiedPairingAt
+      : 0;
   config.musicProvider = ['apple', 'spotify'].includes(config.musicProvider) ? config.musicProvider : 'controlled';
   config.musicLevel = clamp(config.musicLevel, 0, 100, MUSIC_LEVEL_PERCENT);
   // Announcements are intentionally not user-adjustable in Version X.

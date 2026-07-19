@@ -27,6 +27,10 @@ import {
   PUSHCUT_X_RECEIVER_CONTRACT,
   pushcutXVolumeLevels
 } from './_pushcut-x.js';
+import {
+  versionXStorageKey,
+  versionXStorageNamespace
+} from './_version-x-namespace.js';
 
 export const PUSHCUT_X_SCHEDULE_TIME_ZONE = 'America/Chicago';
 // Pushcut delayed requests allow at most 30 days. Keep one day of headroom for
@@ -35,8 +39,16 @@ export const PUSHCUT_X_SCHEDULE_HORIZON_DAYS = 29;
 export const PUSHCUT_X_SCHEDULE_MIN_DELAY_SECONDS = 5;
 export const PUSHCUT_X_SCHEDULE_MAX_DELAY_SECONDS = 30 * 24 * 60 * 60;
 export const PUSHCUT_X_CANCEL_URL = 'https://api.pushcut.io/v1/cancelExecution';
-export const PUSHCUT_X_SCHEDULE_MANIFEST_KEY = 'serenity-shores-poolside-pulse:vx:pushcut-schedule:v1:manifest';
-const PUSHCUT_X_SCHEDULE_LOCK_KEY = 'serenity-shores-poolside-pulse:vx:pushcut-schedule:v1:lock';
+export const PUSHCUT_X_LEGACY_SCHEDULE_MANIFEST_KEY =
+  'serenity-shores-poolside-pulse:vx:pushcut-schedule:v1:manifest';
+const PUSHCUT_X_LEGACY_SCHEDULE_LOCK_KEY =
+  'serenity-shores-poolside-pulse:vx:pushcut-schedule:v1:lock';
+export const PUSHCUT_X_SCHEDULE_MANIFEST_KEY = versionXStorageKey(
+  PUSHCUT_X_LEGACY_SCHEDULE_MANIFEST_KEY
+);
+const PUSHCUT_X_SCHEDULE_LOCK_KEY = versionXStorageKey(
+  PUSHCUT_X_LEGACY_SCHEDULE_LOCK_KEY
+);
 const PUSHCUT_X_EXECUTE_URL = 'https://api.pushcut.io/v1/execute';
 const PUSHCUT_X_SCHEDULE_SCHEMA_VERSION = 1;
 // Keep the distributed lock beyond the route's 300-second execution ceiling.
@@ -80,6 +92,10 @@ const SAFE_ERRORS = Object.freeze({
   cancellationUncertain: Object.freeze({
     statusCode: 502,
     message: 'A pending Pushcut occurrence could not be safely cancelled. Retry schedule sync.'
+  }),
+  legacyRetirementUnavailable: Object.freeze({
+    statusCode: 409,
+    message: 'Legacy Pushcut retirement is allowed only from an isolated namespaced Version X deployment.'
   })
 });
 
@@ -205,6 +221,26 @@ function parseManifest(raw) {
   };
 }
 
+function parseLegacyManifest(raw) {
+  if (!raw) return null;
+  let value = raw;
+  if (typeof raw === 'string') {
+    try {
+      value = JSON.parse(raw);
+    } catch {
+      fail('invalid');
+    }
+  }
+  if (!isRecord(value) || !isRecord(value.occurrences)) fail('invalid');
+  const safe = parseManifest(value);
+  if (
+    !safe
+    || Object.keys(safe.occurrences).length !==
+      Object.keys(value.occurrences).length
+  ) fail('invalid');
+  return safe;
+}
+
 export function createPushcutScheduleManifestStore({
   env = process.env,
   fetchImpl = globalThis.fetch,
@@ -258,6 +294,85 @@ export function createPushcutScheduleManifestStore({
           'if redis.call("GET", KEYS[1]) == ARGV[1] then return redis.call("DEL", KEYS[1]) else return 0 end',
           '1',
           PUSHCUT_X_SCHEDULE_LOCK_KEY,
+          token
+        ], { env, fetchImpl }).catch(() => {});
+      }
+    },
+    now
+  });
+}
+
+/**
+ * The old Version X deployment stored its Pushcut manifest without a storage
+ * namespace. This store is deliberately unavailable unless the caller is
+ * running inside a namespaced Version X deployment. It is used only by the
+ * explicit one-time retirement operation and never by normal preview sync.
+ */
+export function createLegacyPushcutScheduleManifestStore({
+  env = process.env,
+  fetchImpl = globalThis.fetch,
+  now = Date.now
+} = {}) {
+  if (!versionXStorageNamespace(env)) fail('legacyRetirementUnavailable');
+  return Object.freeze({
+    durable: kvReady(env),
+    async read() {
+      if (!kvReady(env)) fail('durableUnavailable');
+      return parseLegacyManifest(await kv([
+        'GET',
+        PUSHCUT_X_LEGACY_SCHEDULE_MANIFEST_KEY
+      ], {
+        env,
+        fetchImpl
+      })) || {
+        version: PUSHCUT_X_SCHEDULE_SCHEMA_VERSION,
+        syncedAt: 0,
+        horizonEnd: 0,
+        stateRevision: 0,
+        warnings: [],
+        occurrences: {}
+      };
+    },
+    async write(manifest) {
+      if (!kvReady(env)) fail('durableUnavailable');
+      const safe = parseManifest(manifest);
+      if (!safe) fail('invalid');
+      const stored = await kv([
+        'SET',
+        PUSHCUT_X_LEGACY_SCHEDULE_MANIFEST_KEY,
+        JSON.stringify(safe)
+      ], { env, fetchImpl });
+      if (String(stored || '').toUpperCase() !== 'OK') fail('durableUnavailable');
+      return safe;
+    },
+    async clear() {
+      if (!kvReady(env)) fail('durableUnavailable');
+      await kv([
+        'DEL',
+        PUSHCUT_X_LEGACY_SCHEDULE_MANIFEST_KEY
+      ], { env, fetchImpl });
+      return true;
+    },
+    async withLock(operation) {
+      if (!kvReady(env)) fail('durableUnavailable');
+      const token = randomUUID();
+      const claimed = await kv([
+        'SET',
+        PUSHCUT_X_LEGACY_SCHEDULE_LOCK_KEY,
+        token,
+        'NX',
+        'EX',
+        String(MANIFEST_LOCK_SECONDS)
+      ], { env, fetchImpl });
+      if (String(claimed || '').toUpperCase() !== 'OK') fail('locked');
+      try {
+        return await operation();
+      } finally {
+        await kv([
+          'EVAL',
+          'if redis.call("GET", KEYS[1]) == ARGV[1] then return redis.call("DEL", KEYS[1]) else return 0 end',
+          '1',
+          PUSHCUT_X_LEGACY_SCHEDULE_LOCK_KEY,
           token
         ], { env, fetchImpl }).catch(() => {});
       }
@@ -405,8 +520,9 @@ function announcementForItem(item, state) {
   };
 }
 
-function logicalOccurrenceId(scheduleId, itemId, dateKey, time) {
-  return sha(`vx\0${scheduleId}\0${itemId}\0${dateKey}\0${time}`, 32);
+function logicalOccurrenceId(scheduleId, itemId, dateKey, time, namespace = '') {
+  const context = namespace ? `vx:${namespace}` : 'vx';
+  return sha(`${context}\0${scheduleId}\0${itemId}\0${dateKey}\0${time}`, 32);
 }
 
 function occurrenceIdentifiers(logicalId) {
@@ -423,7 +539,8 @@ function eventIdFor(logicalId, fingerprint) {
 export function planPushcutXSchedule(stateInput, {
   now = Date.now(),
   horizonDays = PUSHCUT_X_SCHEDULE_HORIZON_DAYS,
-  timeZone = PUSHCUT_X_SCHEDULE_TIME_ZONE
+  timeZone = PUSHCUT_X_SCHEDULE_TIME_ZONE,
+  env = process.env
 } = {}) {
   if (
     !isRecord(stateInput)
@@ -432,6 +549,7 @@ export function planPushcutXSchedule(stateInput, {
   ) fail('invalid');
   const safeNow = Number(now);
   if (!Number.isSafeInteger(safeNow) || safeNow < 0) fail('invalid');
+  const storageNamespace = versionXStorageNamespace(env);
   const boundedHorizonDays = Math.max(7, Math.min(29, Math.floor(Number(horizonDays) || PUSHCUT_X_SCHEDULE_HORIZON_DAYS)));
   let effectiveHorizonDays = boundedHorizonDays;
   let horizonEnd = safeNow + effectiveHorizonDays * 24 * 60 * 60 * 1000;
@@ -495,7 +613,13 @@ export function planPushcutXSchedule(stateInput, {
         || delaySeconds > PUSHCUT_X_SCHEDULE_MAX_DELAY_SECONDS
         || scheduledFor > horizonEnd
       ) continue;
-      const logicalId = logicalOccurrenceId(active.id, item.id, date.key, time);
+      const logicalId = logicalOccurrenceId(
+        active.id,
+        item.id,
+        date.key,
+        time,
+        storageNamespace
+      );
       const fingerprint = sha(JSON.stringify({
         logicalId,
         scheduledFor,
@@ -729,6 +853,81 @@ export async function readPushcutXScheduleStatus({
   return publicManifest(await manifestStore.read());
 }
 
+/**
+ * Cancels every delayed execution tracked by the pre-namespace Version X
+ * manifest, checkpointing after each occurrence and deleting that legacy
+ * manifest only after all provider cancellations are confirmed. Normal
+ * namespaced schedule state is never read or written here.
+ */
+export async function retireLegacyPushcutXSchedule({
+  env = process.env,
+  fetchImpl = globalThis.fetch,
+  now = Date.now,
+  manifestStore = createLegacyPushcutScheduleManifestStore({
+    env,
+    fetchImpl,
+    now
+  }),
+  cancelExecution = (identifier) => cancelPushcutXExecution(identifier, {
+    env,
+    fetchImpl
+  })
+} = {}) {
+  const namespace = versionXStorageNamespace(env);
+  if (!namespace) fail('legacyRetirementUnavailable');
+  if (
+    !manifestStore?.durable
+    || typeof manifestStore.read !== 'function'
+    || typeof manifestStore.write !== 'function'
+    || typeof manifestStore.clear !== 'function'
+    || typeof manifestStore.withLock !== 'function'
+  ) fail('durableUnavailable');
+
+  return await manifestStore.withLock(async () => {
+    const retiredAt = Number(now());
+    if (!Number.isSafeInteger(retiredAt) || retiredAt < 0) fail('invalid');
+    let manifest = await manifestStore.read();
+    const legacyOccurrences = Object.entries(manifest.occurrences || {});
+    let cancelledOccurrences = 0;
+    let cancelledExecutions = 0;
+
+    for (const [logicalId, occurrence] of legacyOccurrences) {
+      for (const identifier of [
+        occurrence.identifier,
+        occurrence.recoveryIdentifier
+      ]) {
+        const result = await cancelExecution(identifier);
+        if (result?.cancelled !== true) fail('cancellationUncertain');
+        cancelledExecutions += 1;
+      }
+      delete manifest.occurrences[logicalId];
+      cancelledOccurrences += 1;
+      if (Object.keys(manifest.occurrences).length > 0) {
+        manifest = await manifestStore.write({
+          ...manifest,
+          syncedAt: retiredAt,
+          occurrences: manifest.occurrences
+        });
+      } else {
+        await manifestStore.clear();
+      }
+    }
+
+    if (legacyOccurrences.length === 0) {
+      await manifestStore.clear();
+    }
+    return Object.freeze({
+      version: 'x',
+      legacyRetired: true,
+      alreadyRetired: legacyOccurrences.length === 0,
+      retiredAt,
+      cancelledOccurrences,
+      cancelledExecutions,
+      remainingOccurrences: 0
+    });
+  });
+}
+
 export async function synchronizePushcutXSchedule({
   state,
   request,
@@ -751,7 +950,8 @@ export async function synchronizePushcutXSchedule({
     const syncNow = Number(now());
     const requestedPlan = planPushcutXSchedule(state, {
       now: syncNow,
-      horizonDays
+      horizonDays,
+      env
     });
     const plan = pushcutEnabled === false
       ? Object.freeze({

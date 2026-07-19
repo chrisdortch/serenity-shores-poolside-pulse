@@ -7,8 +7,14 @@ import { after, beforeEach, describe, test } from 'node:test';
 
 import {
   createSessionToken,
-  readSession
+  readSession,
+  sessionSecurityReadiness
 } from '../api/_auth.js';
+import {
+  versionXStorageKey,
+  versionXStorageNamespace,
+  versionXStorageNamespaceReadiness
+} from '../api/_version-x-namespace.js';
 import appleMusicTokenHandler from '../api/apple-music-token.js';
 import sessionHandler from '../api/session.js';
 import stateXHandler from '../api/state-x.js';
@@ -17,6 +23,7 @@ const SESSION_SECRET = 'version-x-test-session-secret-with-sufficient-length';
 const MANAGED_ENV = [
   'POOL_SIDE_SESSION_SECRET',
   'POOL_SIDE_PIN',
+  'POOL_SIDE_X_NAMESPACE',
   'KV_REST_API_URL',
   'KV_REST_API_TOKEN',
   'APPLE_MUSIC_TEAM_ID',
@@ -24,6 +31,7 @@ const MANAGED_ENV = [
   'APPLE_MUSIC_PRIVATE_KEY',
   'APPLE_MUSIC_ALLOWED_ORIGINS',
   'VERCEL',
+  'VERCEL_ENV',
   'OPENAI_API_KEY',
   'XWEATHER_CLIENT_SECRET'
 ];
@@ -134,7 +142,80 @@ describe('Version X API isolation', { concurrency: false }, () => {
     })));
   });
 
-  test('uses distinct durable login limiter key prefixes', async () => {
+  test('isolates Version X cookies and signatures across storage namespaces', () => {
+    process.env.POOL_SIDE_X_NAMESPACE = 'candidate-a';
+    const tokenA = createSessionToken(Date.now(), 'x');
+    assert.ok(tokenA);
+    assert.ok(readSession(request('GET', '/api/session?v=x', {
+      cookie: `poolside_vx_candidate-a_session=${encodeURIComponent(tokenA)}`
+    })));
+    const finalToken = createSessionToken(Date.now(), 'final');
+    assert.ok(finalToken);
+
+    process.env.POOL_SIDE_X_NAMESPACE = 'candidate-b';
+    assert.equal(readSession(request('GET', '/api/session?v=x', {
+      cookie: `poolside_vx_candidate-b_session=${encodeURIComponent(tokenA)}`
+    })), null);
+    assert.ok(readSession(request('GET', '/api/session', {
+      cookie: `poolside_vfinal_session=${encodeURIComponent(finalToken)}`
+    })));
+  });
+
+  test('validates namespaces and requires one for branch Preview storage', async () => {
+    assert.equal(versionXStorageNamespace({}), '');
+    assert.equal(versionXStorageKey('stable-key', {}), 'stable-key');
+    assert.equal(
+      versionXStorageNamespace({ POOL_SIDE_X_NAMESPACE: 'Candidate_One' }),
+      'candidate_one'
+    );
+    assert.throws(
+      () => versionXStorageNamespace({ POOL_SIDE_X_NAMESPACE: 'candidate.one' }),
+      /POOL_SIDE_X_NAMESPACE/
+    );
+    assert.throws(
+      () => versionXStorageKey('preview-key', { VERCEL_ENV: 'preview' }),
+      /required for a Vercel Preview/
+    );
+    assert.deepEqual(
+      versionXStorageNamespaceReadiness({ VERCEL_ENV: 'preview' }),
+      {
+        ready: false,
+        required: true,
+        namespace: '',
+        reason: 'missing'
+      }
+    );
+
+    process.env.VERCEL = '1';
+    process.env.VERCEL_ENV = 'preview';
+    process.env.KV_REST_API_URL = 'https://kv.test.invalid';
+    process.env.KV_REST_API_TOKEN = 'test-kv-token';
+    assert.equal(sessionSecurityReadiness('x').ready, false);
+    assert.equal(sessionSecurityReadiness('final').ready, true);
+    const unavailable = await invoke(
+      sessionHandler,
+      request('GET', '/api/session?v=x')
+    );
+    assert.equal(unavailable.statusCode, 503);
+
+    process.env.POOL_SIDE_X_NAMESPACE = 'candidate-ready';
+    assert.equal(sessionSecurityReadiness('x').ready, true);
+    const ready = await invoke(
+      sessionHandler,
+      request('GET', '/api/session?v=x')
+    );
+    assert.equal(ready.statusCode, 200);
+
+    process.env.POOL_SIDE_X_NAMESPACE = 'not valid!';
+    assert.equal(sessionSecurityReadiness('x').ready, false);
+    const invalid = await invoke(
+      sessionHandler,
+      request('GET', '/api/session?v=x')
+    );
+    assert.equal(invalid.statusCode, 503);
+  });
+
+  test('uses distinct durable login limiter keys for every Version X namespace', async () => {
     process.env.KV_REST_API_URL = 'https://kv.test.invalid';
     process.env.KV_REST_API_TOKEN = 'test-kv-token';
     const commands = [];
@@ -152,12 +233,24 @@ describe('Version X API isolation', { concurrency: false }, () => {
     const xAttempt = await invoke(sessionHandler, request('POST', '/api/session?v=x', {
       body: { pin: '0000' }
     }));
+    process.env.POOL_SIDE_X_NAMESPACE = 'candidate-a';
+    const candidateAAttempt = await invoke(sessionHandler, request('POST', '/api/session?v=x', {
+      body: { pin: '0000' }
+    }));
+    process.env.POOL_SIDE_X_NAMESPACE = 'candidate-b';
+    const candidateBAttempt = await invoke(sessionHandler, request('POST', '/api/session?v=x', {
+      body: { pin: '0000' }
+    }));
     assert.equal(finalAttempt.statusCode, 401);
     assert.equal(xAttempt.statusCode, 401);
-    assert.equal(commands.length, 2);
+    assert.equal(candidateAAttempt.statusCode, 401);
+    assert.equal(candidateBAttempt.statusCode, 401);
+    assert.equal(commands.length, 4);
     assert.match(commands[0][3], /^poolside:vfinal:login:/);
     assert.match(commands[1][3], /^poolside:vx:login:/);
     assert.notEqual(commands[0][3], commands[1][3]);
+    assert.equal(commands[2][3], `${commands[1][3]}:namespace:candidate-a`);
+    assert.equal(commands[3][3], `${commands[1][3]}:namespace:candidate-b`);
   });
 
   test('stores only Version X state, enforces CAS revisions, and fixes announcements at 100%', async () => {

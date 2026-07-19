@@ -9,7 +9,14 @@ const TOKEN_KEY = 'poolside-pulse-vx-spotify-token';
 const PKCE_TRANSACTION_KEY = 'poolside-pulse-vx-spotify-pkce';
 const PLAYER_NAME = 'Poolside Pulse X Spotify Receiver';
 const DEFAULT_RETURN_PATH = '/#receiver';
-export const SPOTIFY_REDIRECT_URI = 'https://poolside-pulse-x.vercel.app/';
+export const SPOTIFY_STABLE_REDIRECT_URI =
+  'https://poolside-pulse-x.vercel.app/';
+export const SPOTIFY_RECEIVER_REDIRECT_URI =
+  'https://poolside-pulse-x-receiver.vercel.app/';
+export const SPOTIFY_REDIRECT_URIS = Object.freeze([
+  SPOTIFY_STABLE_REDIRECT_URI,
+  SPOTIFY_RECEIVER_REDIRECT_URI
+]);
 export const SPOTIFY_PKCE_TTL_MS = 15 * 60 * 1000;
 const SCOPES = [
   'streaming',
@@ -36,25 +43,38 @@ function storageRemove(storage, key) {
   try { storage.removeItem(key); } catch {}
 }
 
-function canonicalOrigin() {
-  return new URL(SPOTIFY_REDIRECT_URI).origin;
+function locationOrigin(candidate = globalThis.location) {
+  try {
+    return new URL(
+      candidate?.href
+      || `${candidate?.origin || ''}${candidate?.pathname || '/'}${candidate?.search || ''}${candidate?.hash || ''}`
+    ).origin;
+  } catch {
+    return '';
+  }
+}
+
+export function spotifyRedirectUri(candidate = globalThis.location) {
+  const origin = locationOrigin(candidate);
+  return SPOTIFY_REDIRECT_URIS.find(
+    redirectUri => new URL(redirectUri).origin === origin
+  ) || SPOTIFY_STABLE_REDIRECT_URI;
 }
 
 export function isCanonicalSpotifyLocation(candidate = globalThis.location) {
-  try {
-    const current = new URL(candidate?.href || `${candidate?.origin || ''}${candidate?.pathname || '/'}${candidate?.search || ''}${candidate?.hash || ''}`);
-    return current.origin === canonicalOrigin();
-  } catch {
-    return false;
-  }
+  const origin = locationOrigin(candidate);
+  return SPOTIFY_REDIRECT_URIS.some(
+    redirectUri => new URL(redirectUri).origin === origin
+  );
 }
 
 export function safeSpotifyReturnPath(input, fallback = DEFAULT_RETURN_PATH) {
   const raw = String(input || '').trim();
   if (!raw.startsWith('/') || raw.startsWith('//') || raw.includes('\\') || /[\u0000-\u001f\u007f]/.test(raw)) return fallback;
   try {
-    const parsed = new URL(raw, SPOTIFY_REDIRECT_URI);
-    if (parsed.origin !== canonicalOrigin()) return fallback;
+    const redirectUri = spotifyRedirectUri();
+    const parsed = new URL(raw, redirectUri);
+    if (parsed.origin !== new URL(redirectUri).origin) return fallback;
     for (const key of ['code', 'state', 'error', 'error_description']) parsed.searchParams.delete(key);
     return `${parsed.pathname}${parsed.search}${parsed.hash}` || fallback;
   } catch {
@@ -63,8 +83,16 @@ export function safeSpotifyReturnPath(input, fallback = DEFAULT_RETURN_PATH) {
 }
 
 function canonicalAppUrl(returnPath = DEFAULT_RETURN_PATH) {
-  return new URL(safeSpotifyReturnPath(returnPath), SPOTIFY_REDIRECT_URI).href;
+  return new URL(
+    safeSpotifyReturnPath(returnPath),
+    spotifyRedirectUri()
+  ).href;
 }
+
+// Backward-compatible UI value. Browser bundles evaluate it against the
+// current allowlisted alias; non-browser consumers safely receive the stable
+// public alias.
+export const SPOTIFY_REDIRECT_URI = spotifyRedirectUri();
 
 function clearPendingPkce() {
   storageRemove(globalThis.localStorage, PKCE_TRANSACTION_KEY);
@@ -78,7 +106,10 @@ function savePendingPkce(transaction) {
   }
 }
 
-function readPendingPkce(now = Date.now()) {
+function readPendingPkce(
+  now = Date.now(),
+  redirectUri = spotifyRedirectUri()
+) {
   const raw = storageGet(globalThis.localStorage, PKCE_TRANSACTION_KEY);
   if (!raw) return { transaction: null, reason: 'missing' };
   try {
@@ -87,7 +118,8 @@ function readPendingPkce(now = Date.now()) {
     const age = Number(now) - createdAt;
     const structurallyValid = typeof transaction?.state === 'string' && transaction.state.length >= 16
       && typeof transaction?.verifier === 'string' && transaction.verifier.length >= 43
-      && transaction.redirectUri === SPOTIFY_REDIRECT_URI
+      && SPOTIFY_REDIRECT_URIS.includes(transaction.redirectUri)
+      && transaction.redirectUri === redirectUri
       && Number.isFinite(createdAt) && createdAt > 0;
     if (!structurallyValid) return { transaction: null, reason: 'invalid' };
     if (age < -60_000 || age > SPOTIFY_PKCE_TTL_MS) return { transaction, reason: 'expired' };
@@ -463,20 +495,21 @@ export class SpotifyReceiver {
       globalThis.location.assign(canonicalUrl);
       return canonicalUrl;
     }
+    const redirectUri = spotifyRedirectUri();
     const verifier = this.random(96);
     const state = this.random(32);
     savePendingPkce({
       state,
       verifier,
       returnPath: safeReturnPath,
-      redirectUri: SPOTIFY_REDIRECT_URI,
+      redirectUri,
       createdAt: Number(this.now())
     });
     const url = new URL('https://accounts.spotify.com/authorize');
     url.searchParams.set('response_type', 'code');
     url.searchParams.set('client_id', this.clientId);
     url.searchParams.set('scope', SCOPES);
-    url.searchParams.set('redirect_uri', SPOTIFY_REDIRECT_URI);
+    url.searchParams.set('redirect_uri', redirectUri);
     url.searchParams.set('state', state);
     url.searchParams.set('code_challenge_method', 'S256');
     // A stale browser session can silently select the wrong Spotify account.
@@ -499,7 +532,8 @@ export class SpotifyReceiver {
     if (!params.has('code') && !params.has('error') && !params.has('error_description')) return false;
     const code = params.get('code');
     const oauthError = params.get('error');
-    const pending = readPendingPkce(this.now());
+    const redirectUri = spotifyRedirectUri();
+    const pending = readPendingPkce(this.now(), redirectUri);
     const returnPath = safeSpotifyReturnPath(pending.transaction?.returnPath || DEFAULT_RETURN_PATH);
     try {
       if (!isCanonicalSpotifyLocation()) {
@@ -521,7 +555,7 @@ export class SpotifyReceiver {
         client_id: this.clientId,
         grant_type: 'authorization_code',
         code,
-        redirect_uri: SPOTIFY_REDIRECT_URI,
+        redirect_uri: redirectUri,
         code_verifier: pending.transaction.verifier
       });
       const response = await fetchWithTimeout('https://accounts.spotify.com/api/token', {

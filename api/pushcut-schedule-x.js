@@ -9,6 +9,7 @@ import {
   createPushcutScheduleManifestStore,
   PushcutScheduleXError,
   readPushcutXScheduleStatus,
+  retireLegacyPushcutXSchedule,
   synchronizePushcutXSchedule,
   verifyPushcutXDelayedScheduling
 } from './_pushcut-schedule-x.js';
@@ -18,6 +19,8 @@ const MAX_REQUEST_BYTES = 4_000;
 const SYNC_RATE_LIMIT = 8;
 const STATUS_RATE_LIMIT = 60;
 const RATE_WINDOW_MS = 60_000;
+export const PUSHCUT_X_LEGACY_RETIRE_CONFIRMATION =
+  'RETIRE_LEGACY_PUSHCUT_SCHEDULE';
 
 // A first 29-day sync can create many delayed Pushcut requests. Vercel applies
 // the account's allowed maximum when this value exceeds the plan limit.
@@ -54,6 +57,7 @@ export function createPushcutScheduleXHandler({
   statusReader = readPushcutXScheduleStatus,
   synchronizer = synchronizePushcutXSchedule,
   delayedVerifier = verifyPushcutXDelayedScheduling,
+  legacyRetirer = retireLegacyPushcutXSchedule,
   stateReader = readCanonicalVersionXState
 } = {}) {
   return async function handler(req, res) {
@@ -74,10 +78,10 @@ export function createPushcutScheduleXHandler({
     }
     const session = requireSession(req, res);
     if (!session) return;
-    const manifestStore = manifestStoreFactory();
     if (req.method === 'GET') {
       if (limited(req, res, session, 'status', STATUS_RATE_LIMIT)) return;
       try {
+        const manifestStore = manifestStoreFactory();
         const status = await statusReader({ manifestStore });
         return json(res, 200, {
           ok: true,
@@ -139,6 +143,40 @@ export function createPushcutScheduleXHandler({
         });
       }
     }
+    if (body?.retireLegacy === true) {
+      if (
+        Object.keys(body).some(key => ![
+          'confirmation',
+          'retireLegacy'
+        ].includes(key))
+        || body.confirmation !== PUSHCUT_X_LEGACY_RETIRE_CONFIRMATION
+      ) {
+        return json(res, 400, {
+          ok: false,
+          error: 'The legacy Pushcut retirement request is invalid.',
+          requiresExtended: false
+        });
+      }
+      try {
+        const result = await legacyRetirer();
+        return json(res, 200, {
+          ok: true,
+          service: 'pushcut-delayed-schedule',
+          ...result,
+          requiresExtended: false,
+          note: 'Legacy unnamespaced Pushcut occurrences are retired. The isolated preview manifest was not changed.'
+        });
+      } catch (error) {
+        const safe = error instanceof PushcutScheduleXError
+          ? error
+          : new PushcutScheduleXError('providerUnavailable');
+        return json(res, safe.statusCode, {
+          ok: false,
+          error: safe.message,
+          requiresExtended: safe.requiresExtended
+        });
+      }
+    }
     const expectedRevision = Number(body?.expectedRevision ?? body?.state?.revision);
     const pushcutEnabled = body?.pushcutEnabled !== false;
     if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0) {
@@ -174,6 +212,7 @@ export function createPushcutScheduleXHandler({
       });
     }
     try {
+      const manifestStore = manifestStoreFactory();
       const result = await synchronizer({
         state: canonical.state,
         request: req,

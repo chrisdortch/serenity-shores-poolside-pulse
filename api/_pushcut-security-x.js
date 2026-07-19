@@ -3,17 +3,21 @@ import {
   createHmac,
   timingSafeEqual
 } from 'node:crypto';
+import { versionXStorageNamespace } from './_version-x-namespace.js';
 
 const CAPABILITY_VERSION = 1;
 const SCHEDULED_CAPABILITY_VERSION = 2;
+const EXECUTION_ATTEMPT_CAPABILITY_VERSION = 3;
 const CAPABILITY_CLOCK_SKEW_SECONDS = 30;
 const CAPABILITY_MAX_TTL_SECONDS = 30 * 60;
 const DEFAULT_CAPABILITY_TTL_SECONDS = 15 * 60;
 const CAPABILITY_MAX_FUTURE_SECONDS = 30 * 24 * 60 * 60;
+export const PUSHCUT_X_MAX_EXECUTION_ATTEMPT = 1_000_000;
 const EVENT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/;
-const PURPOSES = new Set(['audio', 'receipt', 'recovery', 'restore']);
+const PURPOSES = new Set(['audio', 'execute', 'receipt', 'recovery', 'restore']);
 const PURPOSE_PATHS = Object.freeze({
   audio: '/api/pushcut-audio-x',
+  execute: '/api/email-wake-execute-x',
   receipt: '/api/pushcut-receipt-x',
   recovery: '/api/pushcut-recovery-x',
   restore: '/api/pushcut-restore-x'
@@ -44,7 +48,7 @@ function signingKey(env) {
     .update(String(env?.POOL_SIDE_PIN || '7900').trim())
     .digest('hex');
   return createHash('sha256')
-    .update(`serenity-shores-poolside-pulse:vx:pushcut-capability:v1\0${secret}\0${pinBinding}`)
+    .update(`serenity-shores-poolside-pulse:vx:pushcut-capability:v1:${versionXStorageNamespace(env)}\0${secret}\0${pinBinding}`)
     .digest();
 }
 
@@ -56,7 +60,23 @@ function validPurpose(value) {
   return typeof value === 'string' && PURPOSES.has(value);
 }
 
-function payload(eventId, purpose, expiresAt, version = CAPABILITY_VERSION, notBefore = 0) {
+function payload(
+  eventId,
+  purpose,
+  expiresAt,
+  version = CAPABILITY_VERSION,
+  notBefore = 0,
+  executionAttempt = 0
+) {
+  if (version === EXECUTION_ATTEMPT_CAPABILITY_VERSION) {
+    return [
+      String(EXECUTION_ATTEMPT_CAPABILITY_VERSION),
+      purpose,
+      eventId,
+      String(executionAttempt),
+      String(expiresAt)
+    ].join('\n');
+  }
   return version === SCHEDULED_CAPABILITY_VERSION
     ? [
         String(SCHEDULED_CAPABILITY_VERSION),
@@ -73,9 +93,24 @@ function payload(eventId, purpose, expiresAt, version = CAPABILITY_VERSION, notB
       ].join('\n');
 }
 
-function signature(eventId, purpose, expiresAt, key, version = CAPABILITY_VERSION, notBefore = 0) {
+function signature(
+  eventId,
+  purpose,
+  expiresAt,
+  key,
+  version = CAPABILITY_VERSION,
+  notBefore = 0,
+  executionAttempt = 0
+) {
   return createHmac('sha256', key)
-    .update(payload(eventId, purpose, expiresAt, version, notBefore))
+    .update(payload(
+      eventId,
+      purpose,
+      expiresAt,
+      version,
+      notBefore,
+      executionAttempt
+    ))
     .digest('base64url');
 }
 
@@ -97,6 +132,7 @@ export function pushcutXCapabilityReady(env = process.env) {
 
 export function createPushcutXCapability(eventId, purpose, {
   env = process.env,
+  executionAttempt = 0,
   now = Date.now,
   ttlSeconds = DEFAULT_CAPABILITY_TTL_SECONDS,
   notBeforeMs = 0
@@ -106,7 +142,14 @@ export function createPushcutXCapability(eventId, purpose, {
   const key = signingKey(env);
   if (!key) return null;
   const nowSeconds = Math.floor(Number(now()) / 1000);
+  const requestedExecutionAttempt = Number(executionAttempt || 0);
+  if (
+    !Number.isSafeInteger(requestedExecutionAttempt)
+    || requestedExecutionAttempt < 0
+    || requestedExecutionAttempt > PUSHCUT_X_MAX_EXECUTION_ATTEMPT
+  ) return null;
   const requestedNotBefore = Math.floor(Number(notBeforeMs || 0) / 1000);
+  if (requestedExecutionAttempt > 0 && requestedNotBefore > nowSeconds) return null;
   const scheduled = requestedNotBefore > nowSeconds;
   const notBefore = scheduled ? requestedNotBefore : 0;
   if (scheduled && notBefore > nowSeconds + CAPABILITY_MAX_FUTURE_SECONDS) return null;
@@ -114,15 +157,28 @@ export function createPushcutXCapability(eventId, purpose, {
     60,
     Math.min(CAPABILITY_MAX_TTL_SECONDS, Math.floor(Number(ttlSeconds) || DEFAULT_CAPABILITY_TTL_SECONDS))
   );
-  const version = scheduled ? SCHEDULED_CAPABILITY_VERSION : CAPABILITY_VERSION;
+  const version = requestedExecutionAttempt > 0
+    ? EXECUTION_ATTEMPT_CAPABILITY_VERSION
+    : scheduled
+      ? SCHEDULED_CAPABILITY_VERSION
+      : CAPABILITY_VERSION;
   const expiresAt = (scheduled ? notBefore : nowSeconds) + boundedTtl;
   return Object.freeze({
     version,
     eventId: cleanEventId,
     purpose,
     notBefore,
+    executionAttempt: requestedExecutionAttempt,
     expiresAt,
-    signature: signature(cleanEventId, purpose, expiresAt, key, version, notBefore)
+    signature: signature(
+      cleanEventId,
+      purpose,
+      expiresAt,
+      key,
+      version,
+      notBefore,
+      requestedExecutionAttempt
+    )
   });
 }
 
@@ -134,13 +190,21 @@ export function verifyPushcutXCapability(value, purpose, {
   const eventId = String(value.eventId || '').trim();
   const version = Number(value.version || CAPABILITY_VERSION);
   const notBefore = Number(value.notBefore || 0);
+  const executionAttempt = Number(value.executionAttempt || 0);
   const expiresAt = Number(value.expiresAt);
   const suppliedSignature = String(value.signature || '');
   if (
     !validEventId(eventId)
-    || ![CAPABILITY_VERSION, SCHEDULED_CAPABILITY_VERSION].includes(version)
+    || ![
+      CAPABILITY_VERSION,
+      SCHEDULED_CAPABILITY_VERSION,
+      EXECUTION_ATTEMPT_CAPABILITY_VERSION
+    ].includes(version)
     || !Number.isSafeInteger(notBefore)
     || notBefore < 0
+    || !Number.isSafeInteger(executionAttempt)
+    || executionAttempt < 0
+    || executionAttempt > PUSHCUT_X_MAX_EXECUTION_ATTEMPT
     || !Number.isSafeInteger(expiresAt)
     || expiresAt < 1
     || !/^[A-Za-z0-9_-]{40,60}$/.test(suppliedSignature)
@@ -148,6 +212,8 @@ export function verifyPushcutXCapability(value, purpose, {
   const nowSeconds = Math.floor(Number(now()) / 1000);
   if (version === SCHEDULED_CAPABILITY_VERSION) {
     if (
+      executionAttempt !== 0
+      ||
       notBefore < 1
       || notBefore > nowSeconds + CAPABILITY_MAX_FUTURE_SECONDS + CAPABILITY_CLOCK_SKEW_SECONDS
       || nowSeconds < notBefore - CAPABILITY_CLOCK_SKEW_SECONDS
@@ -156,6 +222,11 @@ export function verifyPushcutXCapability(value, purpose, {
     ) return false;
   } else if (
     notBefore !== 0
+    || (
+      version === EXECUTION_ATTEMPT_CAPABILITY_VERSION
+        ? executionAttempt < 1
+        : executionAttempt !== 0
+    )
     || expiresAt < nowSeconds - CAPABILITY_CLOCK_SKEW_SECONDS
     || expiresAt > nowSeconds + CAPABILITY_MAX_TTL_SECONDS + CAPABILITY_CLOCK_SKEW_SECONDS
   ) return false;
@@ -163,7 +234,15 @@ export function verifyPushcutXCapability(value, purpose, {
   if (!key) return false;
   return equalText(
     suppliedSignature,
-    signature(eventId, purpose, expiresAt, key, version, notBefore)
+    signature(
+      eventId,
+      purpose,
+      expiresAt,
+      key,
+      version,
+      notBefore,
+      executionAttempt
+    )
   );
 }
 
@@ -204,6 +283,9 @@ export function createSignedPushcutXUrl(req, pathname, eventId, purpose, options
   if (capability.version === SCHEDULED_CAPABILITY_VERSION) {
     url.searchParams.set('cv', String(capability.version));
     url.searchParams.set('nbf', String(capability.notBefore));
+  } else if (capability.version === EXECUTION_ATTEMPT_CAPABILITY_VERSION) {
+    url.searchParams.set('cv', String(capability.version));
+    url.searchParams.set('a', String(capability.executionAttempt));
   }
   url.searchParams.set('exp', String(capability.expiresAt));
   url.searchParams.set('sig', capability.signature);
@@ -220,10 +302,18 @@ export function readPushcutXCapability(req) {
       version: Number(url.searchParams.get('cv') || CAPABILITY_VERSION),
       eventId: String(url.searchParams.get('eventId') || '').trim(),
       notBefore: Number(url.searchParams.get('nbf') || 0),
+      executionAttempt: Number(url.searchParams.get('a') || 0),
       expiresAt: Number(url.searchParams.get('exp')),
       signature: String(url.searchParams.get('sig') || '')
     };
   } catch {
-    return { version: 0, eventId: '', notBefore: 0, expiresAt: 0, signature: '' };
+    return {
+      version: 0,
+      eventId: '',
+      notBefore: 0,
+      executionAttempt: 0,
+      expiresAt: 0,
+      signature: ''
+    };
   }
 }

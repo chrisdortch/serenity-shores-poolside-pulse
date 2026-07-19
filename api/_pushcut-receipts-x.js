@@ -1,7 +1,12 @@
 import { normalizeFiniteAudioReference } from './_finite-audio-x.js';
+import { EMAIL_WAKE_X_RECEIVER_CONTRACT } from './_email-wake-x.js';
+import { PUSHCUT_X_MAX_EXECUTION_ATTEMPT } from './_pushcut-security-x.js';
 import { PUSHCUT_X_RECEIVER_CONTRACT } from './_pushcut-x.js';
+import { versionXStorageKey } from './_version-x-namespace.js';
 
-const RECEIPT_NAMESPACE = 'serenity-shores-poolside-pulse:vx:pushcut-receipt:v1:';
+const RECEIPT_NAMESPACE = `${versionXStorageKey(
+  'serenity-shores-poolside-pulse:vx:pushcut-receipt:v1'
+)}:`;
 const RECEIPT_KEY_PREFIX = `${RECEIPT_NAMESPACE}event:`;
 const LATEST_RECEIPT_KEY = `${RECEIPT_NAMESPACE}meta:latest-completed`;
 const RECEIVER_BUSY_KEY = `${RECEIPT_NAMESPACE}meta:receiver-busy`;
@@ -23,6 +28,10 @@ const STATUS_RANK = Object.freeze({
   completed: 4,
   failed: 4
 });
+const RECEIVER_CONTRACTS = new Set([
+  PUSHCUT_X_RECEIVER_CONTRACT,
+  EMAIL_WAKE_X_RECEIVER_CONTRACT
+]);
 const PATCH_FIELDS = new Set([
   'acceptedAt',
   'audioClaimedAt',
@@ -40,7 +49,9 @@ const PATCH_FIELDS = new Set([
   'startedAt',
   'status',
   'updatedAt',
-  'volumeRestored'
+  'volumeRestored',
+  'watchdogEmailId',
+  'watchdogScheduledFor'
 ]);
 const KV_UPDATE_SCRIPT = `
 local raw = redis.call("GET", KEYS[1])
@@ -50,6 +61,12 @@ end
 local decodedOk, current = pcall(cjson.decode, raw)
 if not decodedOk or type(current) ~= "table" then
   return ""
+end
+local expectedExecutionAttempt = tonumber(ARGV[3] or 0) or 0
+if expectedExecutionAttempt > 0
+  and (tonumber(current.executionAttempt or 0) or 0) ~= expectedExecutionAttempt
+then
+  return cjson.encode({ staleExecutionAttempt = true })
 end
 local patchOk, patch = pcall(cjson.decode, ARGV[1])
 if not patchOk or type(patch) ~= "table" then
@@ -99,17 +116,26 @@ for key, value in pairs(patch) do
   current[key] = value
 end
 local encoded = cjson.encode(current)
-local receiptTtl = redis.call("TTL", KEYS[1])
-if receiptTtl == nil or receiptTtl < 1 then
-  receiptTtl = tonumber(ARGV[2]) or 86400
+local nextStatus = tostring(current.status or "")
+local recoveryPending = tostring(current.executionMode or "") == "recovery"
+  and nextStatus ~= "completed"
+  and nextStatus ~= "failed"
+if recoveryPending then
+  redis.call("SET", KEYS[1], encoded)
+  redis.call("PERSIST", KEYS[1])
+else
+  local receiptTtl = redis.call("TTL", KEYS[1])
+  if receiptTtl == nil or receiptTtl < 1 then
+    receiptTtl = tonumber(ARGV[2]) or 86400
+  end
+  redis.call("SET", KEYS[1], encoded, "EX", receiptTtl)
 end
-redis.call("SET", KEYS[1], encoded, "EX", receiptTtl)
-if tostring(current.status or "") == "completed" or tostring(current.status or "") == "failed" then
+if nextStatus == "completed" or nextStatus == "failed" then
   if redis.call("GET", KEYS[3]) == KEYS[1] then
     redis.call("DEL", KEYS[3])
   end
 end
-if tostring(current.status or "") == "completed" then
+if nextStatus == "completed" then
   local latest = {
     eventId = current.eventId,
     status = "completed",
@@ -156,6 +182,17 @@ if not decodedOk or type(current) ~= "table" then
 end
 local status = tostring(current.status or "queued")
 local receiverContract = tostring(current.receiverContract or "")
+local executionAttempt = tonumber(current.executionAttempt or 0) or 0
+local expectedExecutionAttempt = tonumber(ARGV[5] or 0) or 0
+local executionMode = tostring(current.executionMode or "")
+local allowRecovery = tostring(ARGV[6] or "") == "1"
+local attemptMatches = receiverContract ~= tostring(ARGV[4] or "")
+  or (executionAttempt <= 0 and expectedExecutionAttempt <= 0)
+  or (executionAttempt > 0 and executionAttempt == expectedExecutionAttempt)
+local recoveryResolution = allowRecovery
+  and executionMode == "recovery"
+  and executionAttempt > 0
+  and executionAttempt == expectedExecutionAttempt
 local audioFetchedAt = tonumber(current.audioFetchedAt or 0) or 0
 local existingTarget = nil
 if type(current.restoreTargetMusicPercent) == "number" then
@@ -171,18 +208,26 @@ if existingTarget == nil
   and requestedTarget ~= nil
   and requestedTarget >= 0
   and requestedTarget <= 100
-  and audioFetchedAt > 0
-  and (status == "started" or status == "timed_out")
   and receiverContract == tostring(ARGV[4] or "")
+  and attemptMatches
+  and (
+    (audioFetchedAt > 0 and (status == "started" or status == "timed_out"))
+    or recoveryResolution
+  )
 then
   current.restoreTargetMusicPercent = requestedTarget
   current.restoreTargetResolvedAt = resolvedAt
   current.updatedAt = resolvedAt
-  local receiptTtl = redis.call("TTL", KEYS[1])
-  if receiptTtl == nil or receiptTtl < 1 then
-    receiptTtl = tonumber(ARGV[3]) or 86400
+  if executionMode == "recovery" then
+    redis.call("SET", KEYS[1], cjson.encode(current))
+    redis.call("PERSIST", KEYS[1])
+  else
+    local receiptTtl = redis.call("TTL", KEYS[1])
+    if receiptTtl == nil or receiptTtl < 1 then
+      receiptTtl = tonumber(ARGV[3]) or 86400
+    end
+    redis.call("SET", KEYS[1], cjson.encode(current), "EX", receiptTtl)
   end
-  redis.call("SET", KEYS[1], cjson.encode(current), "EX", receiptTtl)
 end
 return cjson.encode(current)
 `;
@@ -241,6 +286,95 @@ return cjson.encode({
   receipt = current
 })
 `;
+const KV_PREPARE_EMAIL_WAKE_ATTEMPT_SCRIPT = `
+local raw = redis.call("GET", KEYS[1])
+if not raw then
+  return ""
+end
+local decodedOk, current = pcall(cjson.decode, raw)
+if not decodedOk or type(current) ~= "table" then
+  return ""
+end
+local requestedAttempt = tonumber(ARGV[1] or 0) or 0
+local requestedMode = tostring(ARGV[2] or "")
+local now = tonumber(ARGV[3] or 0) or 0
+local deadlineAt = tonumber(ARGV[4] or 0) or 0
+local receiverContract = tostring(ARGV[6] or "")
+local executionLeaseUntil = tonumber(ARGV[7] or 0) or 0
+local currentAttempt = tonumber(current.executionAttempt or 0) or 0
+local currentStatus = tostring(current.status or "queued")
+local currentMode = tostring(current.executionMode or "")
+local reason = ""
+local prepared = false
+local changed = false
+if tostring(current.receiverContract or "") ~= receiverContract then
+  reason = "contract"
+elseif currentStatus == "completed" or currentStatus == "failed" then
+  reason = "terminal"
+elseif requestedAttempt < currentAttempt then
+  reason = "stale"
+elseif requestedAttempt == currentAttempt and currentAttempt > 0 then
+  if currentMode ~= "" and currentMode ~= requestedMode then
+    reason = "mode"
+  else
+    prepared = true
+  end
+else
+  current.executionAttempt = requestedAttempt
+  current.executionMode = requestedMode
+  current.executionLeaseUntil = executionLeaseUntil
+  current.providerMode = "email-wake-x"
+  current.updatedAt = now
+  current.deadlineAt = deadlineAt
+  current.watchdogEmailId = ""
+  current.watchdogScheduledFor = 0
+  current.restoreTargetMusicPercent = cjson.null
+  current.restoreTargetResolvedAt = 0
+  current.volumeRestored = false
+  current.restoredMusicPercent = cjson.null
+  current.musicResumed = false
+  current.completedAt = 0
+  current.failedAt = 0
+  current.failureCode = ""
+  if requestedMode == "recovery" then
+    current.status = "timed_out"
+    current.providerStatus = "email_wake_recovery_ready"
+  else
+    current.status = "queued"
+    current.acceptedAt = 0
+    current.startedAt = 0
+    current.audioClaimedAt = 0
+    current.audioFetchedAt = 0
+    current.audioContentType = ""
+    if requestedMode == "volume" then
+      current.providerStatus = "email_wake_volume_attempt_ready"
+    else
+      current.providerStatus = "email_wake_announcement_attempt_ready"
+    end
+  end
+  if redis.call("GET", KEYS[2]) == KEYS[1] then
+    redis.call("DEL", KEYS[2])
+  end
+  local receiptTtl = redis.call("TTL", KEYS[1])
+  if receiptTtl == nil or receiptTtl < tonumber(ARGV[5]) then
+    receiptTtl = tonumber(ARGV[5]) or 86400
+  end
+  if requestedMode == "recovery" then
+    redis.call("SET", KEYS[1], cjson.encode(current))
+    redis.call("PERSIST", KEYS[1])
+  else
+    redis.call("SET", KEYS[1], cjson.encode(current), "EX", receiptTtl)
+  end
+  prepared = true
+  changed = true
+end
+return cjson.encode({
+  prepared = prepared,
+  changed = changed,
+  reason = reason,
+  receipt = current
+})
+`;
 const KV_AUDIO_CLAIM_SCRIPT = `
 local raw = redis.call("GET", KEYS[1])
 if not raw then
@@ -253,6 +387,20 @@ end
 local now = tonumber(ARGV[1]) or 0
 local lease = tonumber(ARGV[2]) or 0
 local status = tostring(current.status or "queued")
+local receiverContract = tostring(current.receiverContract or "")
+local executionAttempt = tonumber(current.executionAttempt or 0) or 0
+local executionLeaseUntil = tonumber(current.executionLeaseUntil or 0) or 0
+local expectedExecutionAttempt = tonumber(ARGV[5] or 0) or 0
+local executionMode = tostring(current.executionMode or "")
+local emailReceiverContract = tostring(ARGV[6] or "")
+local emailAttemptMatches = receiverContract ~= emailReceiverContract
+  or (executionAttempt <= 0 and expectedExecutionAttempt <= 0)
+  or (
+    executionAttempt > 0
+    and executionAttempt == expectedExecutionAttempt
+    and executionLeaseUntil >= now
+    and (executionMode == "" or executionMode == "announcement")
+  )
 local previousClaim = tonumber(current.audioClaimedAt or 0) or 0
 local fetchedAt = tonumber(current.audioFetchedAt or 0) or 0
 local terminal = status == "completed" or status == "failed"
@@ -277,7 +425,7 @@ if busyOwner and busyOwner ~= KEYS[1] then
     end
   end
 end
-if not busy and not terminal and fetchedAt <= 0 and (previousClaim <= 0 or previousClaim + lease <= now) then
+if not busy and emailAttemptMatches and not terminal and fetchedAt <= 0 and (previousClaim <= 0 or previousClaim + lease <= now) then
   claimed = true
   reclaimed = previousClaim > 0
   current.audioClaimedAt = now
@@ -299,6 +447,7 @@ return cjson.encode({
   claimed = claimed,
   reclaimed = reclaimed,
   busy = busy,
+  stale = not emailAttemptMatches,
   receipt = current
 })
 `;
@@ -311,6 +460,10 @@ const SAFE_ERRORS = Object.freeze({
   conflict: Object.freeze({
     statusCode: 409,
     message: 'That announcement identifier is already in use.'
+  }),
+  staleExecution: Object.freeze({
+    statusCode: 409,
+    message: 'This Receiver execution attempt is stale.'
   }),
   notFound: Object.freeze({
     statusCode: 404,
@@ -457,6 +610,18 @@ function parseClaimResult(raw) {
     claimed: parsed.claimed === true,
     reclaimed: parsed.reclaimed === true,
     busy: parsed.busy === true,
+    stale: parsed.stale === true,
+    receipt: parsed.receipt
+  };
+}
+
+function parseAttemptResult(raw) {
+  const parsed = parseReceipt(raw);
+  if (!parsed || !isRecord(parsed.receipt)) return null;
+  return {
+    prepared: parsed.prepared === true,
+    changed: parsed.changed === true,
+    reason: String(parsed.reason || ''),
     receipt: parsed.receipt
   };
 }
@@ -512,7 +677,8 @@ function sanitizePatch(value, now) {
       'failedAt',
       'recoveryAcceptedAt',
       'startedAt',
-      'updatedAt'
+      'updatedAt',
+      'watchdogScheduledFor'
     ].includes(key)) {
       const timestamp = Number(item);
       if (!Number.isSafeInteger(timestamp) || timestamp < 0) throw new PushcutXReceiptError('invalid');
@@ -576,6 +742,12 @@ function baseReceipt(command, now, ttlSeconds) {
   if (!text || text.length > 900) throw new PushcutXReceiptError('invalid');
   const voice = String(command.voice || 'marin').trim().slice(0, 40) || 'marin';
   const instructions = String(command.instructions || '').trim().slice(0, 700);
+  const receiverContract = String(
+    command.receiverContract || PUSHCUT_X_RECEIVER_CONTRACT
+  ).trim();
+  if (!RECEIVER_CONTRACTS.has(receiverContract)) {
+    throw new PushcutXReceiptError('invalid');
+  }
   const requestedMusicPercent = Number(command.musicPercent);
   const scheduledFor = Number(command.scheduledFor || 0);
   if (
@@ -613,7 +785,7 @@ function baseReceipt(command, now, ttlSeconds) {
   return {
     schemaVersion: 1,
     version: 'x',
-    receiverContract: PUSHCUT_X_RECEIVER_CONTRACT,
+    receiverContract,
     eventId: command.eventId,
     commandId: String(command.commandId || command.eventId),
     action: String(command.action || 'announce'),
@@ -633,9 +805,10 @@ function baseReceipt(command, now, ttlSeconds) {
     musicPercent: Number.isFinite(requestedMusicPercent)
       ? Math.max(0, Math.min(100, requestedMusicPercent))
       : 30,
-    // All v4 announcement receipts describe the same complete sequence,
-    // including the final music resume. Legacy callers cannot weaken it.
-    resumeMusic: true,
+    // Announcement receipts always resume the bed. Version X email-wake
+    // volume commands are the one narrow exception: they change the saved
+    // physical music level without starting playback.
+    resumeMusic: String(command.action || '') === 'volume' ? false : true,
     status: 'queued',
     providerStatus: 'pending',
     providerMode: '',
@@ -646,6 +819,9 @@ function baseReceipt(command, now, ttlSeconds) {
     acceptedAt: 0,
     dispatchClaimedAt: 0,
     dispatchAttempt: 0,
+    executionAttempt: 0,
+    executionLeaseUntil: 0,
+    executionMode: '',
     startedAt: 0,
     audioClaimedAt: 0,
     audioAttempt: 0,
@@ -660,7 +836,9 @@ function baseReceipt(command, now, ttlSeconds) {
     restoreTargetResolvedAt: 0,
     volumeRestored: false,
     restoredMusicPercent: null,
-    musicResumed: false
+    musicResumed: false,
+    watchdogEmailId: '',
+    watchdogScheduledFor: 0
   };
 }
 
@@ -791,9 +969,155 @@ export async function claimPushcutXDispatch(eventId, options = {}) {
   });
 }
 
+export async function prepareEmailWakeXReceiptAttempt(
+  eventId,
+  executionAttempt,
+  options = {}
+) {
+  const deps = dependencies(options);
+  const now = Number((options.now || Date.now)());
+  const attempt = Number(executionAttempt);
+  const mode = String(options.mode || 'announcement').trim();
+  const executionLeaseUntil = Number(
+    options.leaseUntil || now + 5 * 60_000
+  );
+  if (
+    !Number.isSafeInteger(now)
+    || now < 0
+    || !Number.isSafeInteger(attempt)
+    || attempt < 1
+    || attempt > PUSHCUT_X_MAX_EXECUTION_ATTEMPT
+    || !Number.isSafeInteger(executionLeaseUntil)
+    || executionLeaseUntil <= now
+    || !['announcement', 'recovery', 'volume'].includes(mode)
+  ) {
+    throw new PushcutXReceiptError('invalid');
+  }
+  const key = receiptKey(eventId);
+  const durable = kvReady(deps.env);
+  if (!durable && storageRequired(options, deps.env)) {
+    throw new PushcutXReceiptError('unavailable');
+  }
+
+  const interpret = result => {
+    if (!result) throw new PushcutXReceiptError('notFound');
+    if (result.prepared) return result;
+    if (result.reason === 'stale') {
+      throw new PushcutXReceiptError('staleExecution');
+    }
+    throw new PushcutXReceiptError('conflict');
+  };
+
+  if (durable) {
+    const prepared = parseAttemptResult(await kv([
+      'EVAL',
+      KV_PREPARE_EMAIL_WAKE_ATTEMPT_SCRIPT,
+      '2',
+      key,
+      RECEIVER_BUSY_KEY,
+      String(attempt),
+      mode,
+      String(now),
+      String(now + RECEIPT_DEADLINE_MS),
+      String(RECEIPT_TTL_SECONDS),
+      EMAIL_WAKE_X_RECEIVER_CONTRACT,
+      String(executionLeaseUntil)
+    ], deps));
+    return { ...interpret(prepared), durable: true };
+  }
+
+  return await withMemoryLock(RECEIVER_BUSY_KEY, async () => {
+    return await withMemoryLock(key, async () => {
+      const receipts = memoryReceipts();
+      const current = receipts.get(key);
+      if (!current) throw new PushcutXReceiptError('notFound');
+      if (String(current.receiverContract || '') !== EMAIL_WAKE_X_RECEIVER_CONTRACT) {
+        throw new PushcutXReceiptError('conflict');
+      }
+      if (TERMINAL_STATUSES.has(current.status)) {
+        throw new PushcutXReceiptError('conflict');
+      }
+      const currentAttempt = Number(current.executionAttempt || 0);
+      if (attempt < currentAttempt) {
+        throw new PushcutXReceiptError('staleExecution');
+      }
+      if (attempt === currentAttempt && currentAttempt > 0) {
+        if (current.executionMode && current.executionMode !== mode) {
+          throw new PushcutXReceiptError('conflict');
+        }
+        return {
+          prepared: true,
+          changed: false,
+          reason: '',
+          receipt: current,
+          durable: false
+        };
+      }
+      const common = {
+        ...current,
+        executionAttempt: attempt,
+        executionLeaseUntil,
+        executionMode: mode,
+        providerMode: 'email-wake-x',
+        updatedAt: now,
+        deadlineAt: now + RECEIPT_DEADLINE_MS,
+        watchdogEmailId: '',
+        watchdogScheduledFor: 0,
+        restoreTargetMusicPercent: null,
+        restoreTargetResolvedAt: 0,
+        volumeRestored: false,
+        restoredMusicPercent: null,
+        musicResumed: false,
+        completedAt: 0,
+        failedAt: 0,
+        failureCode: ''
+      };
+      const receipt = mode === 'recovery'
+        ? {
+            ...common,
+            status: 'timed_out',
+            providerStatus: 'email_wake_recovery_ready'
+          }
+        : {
+            ...common,
+            status: 'queued',
+            acceptedAt: 0,
+            startedAt: 0,
+            audioClaimedAt: 0,
+            audioFetchedAt: 0,
+            audioContentType: '',
+            providerStatus: mode === 'volume'
+              ? 'email_wake_volume_attempt_ready'
+              : 'email_wake_announcement_attempt_ready'
+          };
+      receipts.set(key, receipt);
+      const busy = receipts.get(RECEIVER_BUSY_KEY);
+      const busyOwnerKey = typeof busy === 'string'
+        ? busy
+        : String(busy?.ownerKey || '');
+      if (busyOwnerKey === key) receipts.delete(RECEIVER_BUSY_KEY);
+      return {
+        prepared: true,
+        changed: true,
+        reason: '',
+        receipt,
+        durable: false
+      };
+    });
+  });
+}
+
 export async function claimPushcutXAudioGeneration(eventId, options = {}) {
   const deps = dependencies(options);
   const { now, leaseMs } = claimTiming(options, PUSHCUT_X_AUDIO_LEASE_MS);
+  const executionAttempt = Number(options.executionAttempt || 0);
+  if (
+    !Number.isSafeInteger(executionAttempt)
+    || executionAttempt < 0
+    || executionAttempt > PUSHCUT_X_MAX_EXECUTION_ATTEMPT
+  ) {
+    throw new PushcutXReceiptError('invalid');
+  }
   const key = receiptKey(eventId);
   const durable = kvReady(deps.env);
   if (!durable && storageRequired(options, deps.env)) {
@@ -810,7 +1134,9 @@ export async function claimPushcutXAudioGeneration(eventId, options = {}) {
       String(now),
       String(leaseMs),
       String(RECEIPT_TTL_SECONDS),
-      String(Math.ceil(PUSHCUT_X_RECEIVER_BUSY_LEASE_MS / 1000))
+      String(Math.ceil(PUSHCUT_X_RECEIVER_BUSY_LEASE_MS / 1000)),
+      String(executionAttempt),
+      EMAIL_WAKE_X_RECEIVER_CONTRACT
     ], deps));
     if (!claimed) throw new PushcutXReceiptError('notFound');
     return { ...claimed, durable: true };
@@ -825,7 +1151,22 @@ export async function claimPushcutXAudioGeneration(eventId, options = {}) {
       const busy = Boolean(ownerKey && ownerKey !== key);
       const previousClaim = Number(current.audioClaimedAt || 0);
       const terminal = TERMINAL_STATUSES.has(current.status);
+      const currentExecutionAttempt = Number(current.executionAttempt || 0);
+      const executionLeaseCurrent = Number(current.executionLeaseUntil || 0);
+      const emailAttemptMatches =
+        String(current.receiverContract || '') !== EMAIL_WAKE_X_RECEIVER_CONTRACT
+        || (
+          currentExecutionAttempt <= 0
+          && executionAttempt <= 0
+        )
+        || (
+          currentExecutionAttempt > 0
+          && currentExecutionAttempt === executionAttempt
+          && executionLeaseCurrent >= now
+          && ['', 'announcement'].includes(String(current.executionMode || ''))
+        );
       const canClaim = !busy
+        && emailAttemptMatches
         && !terminal
         && Number(current.audioFetchedAt || 0) <= 0
         && (previousClaim <= 0 || previousClaim + leaseMs <= now);
@@ -851,6 +1192,7 @@ export async function claimPushcutXAudioGeneration(eventId, options = {}) {
         claimed: canClaim,
         reclaimed: canClaim && previousClaim > 0,
         busy,
+        stale: !emailAttemptMatches,
         receipt,
         durable: false
       };
@@ -893,12 +1235,21 @@ export async function resolvePushcutXRestoreTarget(eventId, musicPercent, option
   const deps = dependencies(options);
   const now = Number((options.now || Date.now)());
   const target = Number(musicPercent);
+  const executionAttempt = Number(options.executionAttempt || 0);
+  const allowRecovery = options.allowRecovery === true;
+  const receiverContract = String(
+    options.receiverContract || PUSHCUT_X_RECEIVER_CONTRACT
+  ).trim();
   if (
     !Number.isSafeInteger(now)
     || now < 0
+    || !Number.isSafeInteger(executionAttempt)
+    || executionAttempt < 0
+    || executionAttempt > PUSHCUT_X_MAX_EXECUTION_ATTEMPT
     || !Number.isFinite(target)
     || target < 0
     || target > 100
+    || !RECEIVER_CONTRACTS.has(receiverContract)
   ) {
     throw new PushcutXReceiptError('invalid');
   }
@@ -917,7 +1268,9 @@ export async function resolvePushcutXRestoreTarget(eventId, musicPercent, option
       String(target),
       String(now),
       String(RECEIPT_TTL_SECONDS),
-      PUSHCUT_X_RECEIVER_CONTRACT
+      receiverContract,
+      String(executionAttempt),
+      allowRecovery ? '1' : '0'
     ], deps));
     if (!resolved) throw new PushcutXReceiptError('notFound');
     return resolved;
@@ -930,10 +1283,31 @@ export async function resolvePushcutXRestoreTarget(eventId, musicPercent, option
     const existingTarget = Number(current.restoreTargetMusicPercent);
     const targetAlreadyResolved = typeof current.restoreTargetMusicPercent === 'number'
       && Number.isFinite(existingTarget);
+    const currentExecutionAttempt = Number(current.executionAttempt || 0);
+    const attemptMatches =
+      String(current.receiverContract || '') !== EMAIL_WAKE_X_RECEIVER_CONTRACT
+      || (
+        currentExecutionAttempt <= 0
+        && executionAttempt <= 0
+      )
+      || (
+        currentExecutionAttempt > 0
+        && currentExecutionAttempt === executionAttempt
+      );
+    const recoveryResolution = allowRecovery
+      && current.executionMode === 'recovery'
+      && currentExecutionAttempt > 0
+      && currentExecutionAttempt === executionAttempt;
     const canResolve = !targetAlreadyResolved
-      && Number(current.audioFetchedAt || 0) > 0
-      && ['started', 'timed_out'].includes(current.status)
-      && String(current.receiverContract || '') === PUSHCUT_X_RECEIVER_CONTRACT;
+      && attemptMatches
+      && String(current.receiverContract || '') === receiverContract
+      && (
+        (
+          Number(current.audioFetchedAt || 0) > 0
+          && ['started', 'timed_out'].includes(current.status)
+        )
+        || recoveryResolution
+      );
     const resolved = canResolve
       ? {
           ...current,
@@ -950,6 +1324,14 @@ export async function resolvePushcutXRestoreTarget(eventId, musicPercent, option
 export async function updatePushcutXReceipt(eventId, value, options = {}) {
   const deps = dependencies(options);
   const now = Number((options.now || Date.now)());
+  const executionAttempt = Number(options.executionAttempt || 0);
+  if (
+    !Number.isSafeInteger(executionAttempt)
+    || executionAttempt < 0
+    || executionAttempt > PUSHCUT_X_MAX_EXECUTION_ATTEMPT
+  ) {
+    throw new PushcutXReceiptError('invalid');
+  }
   const patch = sanitizePatch(value, now);
   const key = receiptKey(eventId);
   const durable = kvReady(deps.env);
@@ -967,9 +1349,13 @@ export async function updatePushcutXReceipt(eventId, value, options = {}) {
       LATEST_RECEIPT_KEY,
       RECEIVER_BUSY_KEY,
       JSON.stringify(patch),
-      String(RECEIPT_TTL_SECONDS)
+      String(RECEIPT_TTL_SECONDS),
+      String(executionAttempt)
     ], deps);
     updated = parseReceipt(raw);
+    if (updated?.staleExecutionAttempt === true) {
+      throw new PushcutXReceiptError('staleExecution');
+    }
     if (!updated) throw new PushcutXReceiptError('notFound');
   } else {
     updated = await withMemoryLock(RECEIVER_BUSY_KEY, async () => {
@@ -977,6 +1363,12 @@ export async function updatePushcutXReceipt(eventId, value, options = {}) {
         const receipts = memoryReceipts();
         const current = receipts.get(key);
         if (!current) throw new PushcutXReceiptError('notFound');
+        if (
+          executionAttempt > 0
+          && Number(current.executionAttempt || 0) !== executionAttempt
+        ) {
+          throw new PushcutXReceiptError('staleExecution');
+        }
         const next = transition(current, patch);
         receipts.set(key, next);
         const busy = receipts.get(RECEIVER_BUSY_KEY);
@@ -1081,8 +1473,33 @@ export async function readLatestCompletedPushcutXReceipt(options = {}) {
     : memoryReceipts().get(LATEST_RECEIPT_KEY) || null;
 }
 
+export function pushcutXReceiptExecutionAttemptMatches(
+  receipt,
+  executionAttempt
+) {
+  if (!isRecord(receipt)) return false;
+  const expected = Number(executionAttempt || 0);
+  const current = Number(receipt.executionAttempt || 0);
+  if (
+    !Number.isSafeInteger(expected)
+    || expected < 0
+    || !Number.isSafeInteger(current)
+    || current < 0
+  ) return false;
+  return current > 0 ? expected === current : expected === 0;
+}
+
 export function verifiedPushcutXCompletion(receipt) {
   if (!isRecord(receipt)) return false;
+  if (receipt.action === 'volume') {
+    return RECEIVER_CONTRACTS.has(String(receipt.receiverContract || ''))
+      && receipt.status === 'completed'
+      && receipt.volumeRestored === true
+      && Number.isFinite(receipt.musicPercent)
+      && receipt.restoredMusicPercent === receipt.musicPercent
+      && receipt.resumeMusic === false
+      && receipt.musicResumed === false;
+  }
   const expectedMusicPercent = Number(receipt.restoreTargetMusicPercent);
   const restoreTargetResolvedAt = Number(receipt.restoreTargetResolvedAt || 0);
   const audioFetchedAt = Number(receipt.audioFetchedAt || 0);
@@ -1091,7 +1508,7 @@ export function verifiedPushcutXCompletion(receipt) {
   const restoredMusicPercent = hasRestoredMusicPercent
     ? receipt.restoredMusicPercent
     : NaN;
-  return String(receipt.receiverContract || '') === PUSHCUT_X_RECEIVER_CONTRACT
+  return RECEIVER_CONTRACTS.has(String(receipt.receiverContract || ''))
     && receipt.status === 'completed'
     && Number(receipt.voicePercent) === 100
     && Number.isFinite(expectedMusicPercent)
@@ -1143,6 +1560,8 @@ export function publicPushcutXReceipt(receipt, { durable = false } = {}) {
     failureCode: String(receipt.failureCode || ''),
     providerStatus: String(receipt.providerStatus || ''),
     providerMode: String(receipt.providerMode || ''),
+    executionAttempt: Number(receipt.executionAttempt || 0),
+    recoveryOnly: receipt.executionMode === 'recovery',
     audioReady: Boolean(receipt.audioFetchedAt),
     naturalAudio: receipt.announcementMode !== 'finite-audio' && Boolean(receipt.audioFetchedAt),
     finiteAudio: receipt.announcementMode === 'finite-audio' && Boolean(receipt.audioFetchedAt),

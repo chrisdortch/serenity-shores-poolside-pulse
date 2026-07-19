@@ -13,6 +13,7 @@ import {
   sessionVariant,
   setSessionCookie
 } from './_auth.js';
+import { versionXStorageKey } from './_version-x-namespace.js';
 
 const LOGIN_WINDOW_MS = 15 * 60 * 1000;
 const LOGIN_MAX_FAILURES = 8;
@@ -39,7 +40,9 @@ function json(res, status, body) {
 }
 
 function attemptStoreKey(ip, req) {
-  return sessionVariant(req) === 'x' ? `x:${ip}` : ip;
+  return sessionVariant(req) === 'x'
+    ? versionXStorageKey(`x:${ip}`)
+    : ip;
 }
 
 function attemptEntry(ip, req, now = Date.now()) {
@@ -65,8 +68,10 @@ function limiterKvReady() {
 
 function limiterKey(ip, req) {
   const digest = createHash('sha256').update(String(ip)).digest('hex').slice(0, 32);
-  const namespace = sessionVariant(req) === 'x' ? 'vx' : 'vfinal';
-  return `poolside:${namespace}:login:${digest}`;
+  if (sessionVariant(req) === 'x') {
+    return versionXStorageKey(`poolside:vx:login:${digest}`);
+  }
+  return `poolside:vfinal:login:${digest}`;
 }
 
 async function limiterKv(command) {

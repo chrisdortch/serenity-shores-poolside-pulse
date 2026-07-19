@@ -273,13 +273,45 @@ function pendingWeatherCoverageKnown(ids, payload) {
 }
 
 export class ReceiverRuntime {
-  constructor({ store, audio, apple, spotify = null, onStatus = () => {}, onChange = () => {} }) {
+  constructor({
+    store,
+    audio,
+    apple,
+    spotify = null,
+    onStatus = () => {},
+    onChange = () => {},
+    shouldDelegateScheduledAnnouncements = null,
+    isExternalAutomationActive = null,
+    onExternalAnnouncement = null,
+    onExternalMusicTarget = null,
+    withExternalAudioLease = null
+  }) {
     this.store = store;
     this.audio = audio;
     this.apple = apple;
     this.spotify = spotify || inactiveSpotifyReceiver();
     this.onStatus = onStatus;
     this.onChange = onChange;
+    this.shouldDelegateScheduledAnnouncements =
+      typeof shouldDelegateScheduledAnnouncements === 'function'
+        ? shouldDelegateScheduledAnnouncements
+        : () => false;
+    this.isExternalAutomationActive =
+      typeof isExternalAutomationActive === 'function'
+        ? isExternalAutomationActive
+        : async () => false;
+    this.onExternalAnnouncement =
+      typeof onExternalAnnouncement === 'function'
+        ? onExternalAnnouncement
+        : null;
+    this.onExternalMusicTarget =
+      typeof onExternalMusicTarget === 'function'
+        ? onExternalMusicTarget
+        : null;
+    this.withExternalAudioLease =
+      typeof withExternalAudioLease === 'function'
+        ? withExternalAudioLease
+        : async work => await work();
     this.deviceId = getDeviceId();
     this.sessionId = '';
     this.sessionStartedAt = 0;
@@ -288,6 +320,7 @@ export class ReceiverRuntime {
     this.safetyEventProcessing = null;
     this.inFlightEventIds = new Set();
     this.scheduleProcessing = false;
+    this.automaticScheduleHoldNotice = '';
     this.weatherTail = Promise.resolve();
     this.audioTail = Promise.resolve();
     this.volumeTail = Promise.resolve();
@@ -614,7 +647,13 @@ export class ReceiverRuntime {
   }
 
   serializeAudio(work) {
-    const job = this.audioTail.then(work, work);
+    const guardedWork = async () => {
+      if (!this.automaticReceiverEnabled()) {
+        return await work();
+      }
+      return await this.withExternalAudioLease(work);
+    };
+    const job = this.audioTail.then(guardedWork, guardedWork);
     this.audioTail = job.catch(() => {});
     return job;
   }
@@ -702,11 +741,54 @@ export class ReceiverRuntime {
     return clamp(hasPlaybackTarget ? playbackTarget : this.state.config.musicLevel, 0, 100, 30);
   }
 
+  automaticReceiverEnabled() {
+    return this.state.config?.announcementTransport === 'email-wake'
+      && Number(
+        this.state.config?.automaticReceiverVerifiedPairingAt || 0
+      ) > 0;
+  }
+
+  async applyScheduledAutomaticMusicTarget(
+    percent,
+    {
+      scheduledItemId = '',
+      scheduledRunToken = ''
+    } = {}
+  ) {
+    if (!scheduledItemId && !scheduledRunToken) return null;
+    if (!this.automaticReceiverEnabled()) return null;
+    if (!this.onExternalMusicTarget) {
+      throw new Error(
+        'Automatic scheduled music volume is unavailable on this Receiver.'
+      );
+    }
+    const target = clamp(percent, 0, 100, this.state.config.musicLevel);
+    await this.onExternalMusicTarget(target, {
+      scheduledItemId: String(scheduledItemId || ''),
+      scheduledRunToken: String(scheduledRunToken || '')
+    });
+    this.assertScheduledRunAuthorization(
+      this.state,
+      scheduledRunToken,
+      scheduledItemId
+    );
+    return target;
+  }
+
+  controlledBrowserGainTarget(percent = this.currentMusicTarget()) {
+    return this.automaticReceiverEnabled()
+      ? 100
+      : clamp(percent, 0, 100, this.state.config.musicLevel);
+  }
+
   applyConfiguredMusicTarget({ report = false, percent = null } = {}) {
     const target = percent === null || percent === undefined
       ? this.currentMusicTarget()
       : clamp(percent, 0, 100, this.state.config.musicLevel);
-    this.audio.setMusicLevelPercent?.(target, { report });
+    this.audio.setMusicLevelPercent?.(
+      this.controlledBrowserGainTarget(target),
+      { report }
+    );
     this.apple.setTargetVolumePercent?.(target);
     this.spotify.setTargetVolumePercent?.(target);
     return target;
@@ -726,7 +808,10 @@ export class ReceiverRuntime {
           ? clamp(this.state.playback.musicLevelPercent, 0, 100, target)
           : null;
       const audibleTarget = customPlaybackTarget === null ? target : customPlaybackTarget;
-      this.audio.setMusicLevelPercent?.(audibleTarget, { report: false });
+      this.audio.setMusicLevelPercent?.(
+        this.controlledBrowserGainTarget(audibleTarget),
+        { report: false }
+      );
       this.apple.setTargetVolumePercent?.(audibleTarget);
       this.spotify.setTargetVolumePercent?.(audibleTarget);
       let verification = null;
@@ -867,7 +952,9 @@ export class ReceiverRuntime {
       });
     }, HEARTBEAT_MS);
     try {
-      if (this.isOwner()) await this.audio.playUnlockTone();
+      if (this.isOwner()) {
+        await this.serializeAudio(() => this.audio.playUnlockTone());
+      }
       if (this.isOwner() && this.state.playback.intent === 'playing') {
         try {
           const restored = await this.restorePlaybackIntent();
@@ -955,6 +1042,21 @@ export class ReceiverRuntime {
     return savedReceiver;
   }
 
+  async externalAutomationBusy() {
+    if (!this.automaticReceiverEnabled()) {
+      return false;
+    }
+    try {
+      return await this.isExternalAutomationActive() === true;
+    } catch (error) {
+      this.status(
+        `Automatic Receiver status could not be confirmed, so new browser audio is waiting: ${error.message || String(error)}`,
+        false
+      );
+      return true;
+    }
+  }
+
   startLoops() {
     this.stopLoops();
     const every = (key, fn, ms) => {
@@ -962,7 +1064,14 @@ export class ReceiverRuntime {
         if (!this.active || this.loopInFlight.has(key)) return;
         this.loopInFlight.add(key);
         try {
-          if (isIOSLike() && !this.receiverAudioOperational()) {
+          const expectedAutomaticBackground =
+            this.automaticReceiverEnabled()
+            && document.visibilityState !== 'visible';
+          if (
+            isIOSLike()
+            && !this.receiverAudioOperational()
+            && !expectedAutomaticBackground
+          ) {
             await this.failSafeStop('The iPhone receiver audio session is no longer running. Audio and cloud ownership stopped; keep this page visible and tap Start Receiver again.');
             return;
           }
@@ -1108,6 +1217,13 @@ export class ReceiverRuntime {
   async onVisibilityChange() {
     if (!this.active) return;
     if (isIOSLike() && document.visibilityState !== 'visible') {
+      if (this.automaticReceiverEnabled()) {
+        this.status(
+          'Automatic Receiver is running a background iPhone action. Browser music ownership is preserved while the Shortcut finishes.',
+          true
+        );
+        return;
+      }
       await this.failSafeStop(
         'The iPhone receiver left the foreground. Browser ownership was handed to Pushcut before Safari could suspend.',
         { releaseToPushcut: true, beacon: true }
@@ -1117,7 +1233,11 @@ export class ReceiverRuntime {
     if (document.visibilityState === 'visible') {
       try {
         await this.audio.unlock();
-        if (isIOSLike() && !this.receiverAudioOperational()) {
+        if (
+          isIOSLike()
+          && document.visibilityState === 'visible'
+          && !this.receiverAudioOperational()
+        ) {
           throw new Error('the iPhone audio context did not return to the running state');
         }
       } catch (error) {
@@ -1145,6 +1265,11 @@ export class ReceiverRuntime {
 
   async heartbeat() {
     if (!this.active) return;
+    if (this.automaticReceiverEnabled()) {
+      this.applyConfiguredMusicTarget({ report: false });
+      await this.renewLeaseOnly();
+      return;
+    }
     const musicTarget = this.applyConfiguredMusicTarget({ report: false });
     let applePlayback = null;
     let appleUnavailableReason = '';
@@ -1532,6 +1657,7 @@ export class ReceiverRuntime {
       const handled = handledIds();
       const events = pendingEventsForReceiver(this.state.events, this.state.receiver, this.sessionStartedAt, handled, this.now())
         .filter(event => !SAFETY_PREEMPTION_EVENT_TYPES.has(event.type));
+      if (events.length && await this.externalAutomationBusy()) return;
       for (const event of events) {
         try {
           await this.processEvent(event);
@@ -1554,6 +1680,7 @@ export class ReceiverRuntime {
         const events = pendingEventsForReceiver(this.state.events, this.state.receiver, this.sessionStartedAt, handled, this.now())
           .filter(event => SAFETY_PREEMPTION_EVENT_TYPES.has(event.type) && !this.inFlightEventIds.has(event.id));
         if (!events.length) return;
+        if (await this.externalAutomationBusy()) return;
         for (const event of events) {
           try {
             await this.processEvent(event);
@@ -1720,6 +1847,20 @@ export class ReceiverRuntime {
     if (requestId !== this.audioRequestId) throw new Error('A newer audio command replaced this music request while its source was loading.');
     if (!this.isOwner()) throw new Error('Receiver ownership changed while the music source was loading. Nothing was played.');
     this.assertScheduledRunAuthorization(this.state, scheduledRunToken, scheduledItemId);
+    await this.applyScheduledAutomaticMusicTarget(targetPercent, {
+      scheduledItemId,
+      scheduledRunToken
+    });
+    if (requestId !== this.audioRequestId) {
+      throw new Error(
+        'A newer audio command replaced this scheduled music request while its iPhone volume was being applied.'
+      );
+    }
+    if (!this.isOwner()) {
+      throw new Error(
+        'Receiver ownership changed while the scheduled music volume was being applied. Nothing was played.'
+      );
+    }
     if (scheduledRunToken) {
       this.pendingScheduledPlayback = {
         token: String(scheduledRunToken),
@@ -1994,6 +2135,15 @@ export class ReceiverRuntime {
     );
     const targetMode = volumeMode === 'custom' ? 'custom' : 'global';
     const requestId = this.nextAudioRequest();
+    await this.applyScheduledAutomaticMusicTarget(targetPercent, {
+      scheduledItemId,
+      scheduledRunToken
+    });
+    if (requestId !== this.audioRequestId || !this.isOwner()) {
+      throw new Error(
+        'Apple Music was not started because the scheduled iPhone volume action was superseded.'
+      );
+    }
     const epoch = this.invalidateAudioRestores();
     const previousPlayback = structuredClone(this.state.playback || {});
     const previousTarget = this.currentMusicTarget(previousPlayback);
@@ -2263,6 +2413,15 @@ export class ReceiverRuntime {
     );
     const targetMode = volumeMode === 'custom' ? 'custom' : 'global';
     const requestId = this.nextAudioRequest();
+    await this.applyScheduledAutomaticMusicTarget(targetPercent, {
+      scheduledItemId,
+      scheduledRunToken
+    });
+    if (requestId !== this.audioRequestId || !this.isOwner()) {
+      throw new Error(
+        'Spotify was not started because the scheduled iPhone volume action was superseded.'
+      );
+    }
     const epoch = this.invalidateAudioRestores();
     const previousPlayback = structuredClone(this.state.playback || {});
     const previousTarget = this.currentMusicTarget(previousPlayback);
@@ -3212,6 +3371,16 @@ export class ReceiverRuntime {
   async announce(text, options = {}) {
     const message = String(text || '').trim().slice(0, 900);
     if (!message) throw new Error('Announcement text is empty.');
+    if (
+      this.automaticReceiverEnabled()
+      && this.onExternalAnnouncement
+      && options.externalTransport !== false
+    ) {
+      return await this.onExternalAnnouncement(message, {
+        ...options,
+        volumePercent: VOICE_LEVEL_PERCENT
+      });
+    }
     // Version X announcements are a fixed 100%. Keep the option on the queued
     // job for backward compatibility, but never allow stale state, a schedule
     // override, or an older Remote to weaken the announcement.
@@ -4226,11 +4395,59 @@ export class ReceiverRuntime {
     try {
       const activeSchedule = getActiveSchedule(this.state);
       if (activeSchedule?.mode === 'order') {
+        const sequence = normalizeSequenceRun(
+          this.state.sequenceRuns?.[activeSchedule.id]
+        );
+        if (
+          sequence.status === 'auto-pending'
+          && await this.externalAutomationBusy()
+        ) return;
         await this.tickOrderSchedule();
         return;
       }
       const now = this.now();
-      const due = dueTimeScheduleItems(getActiveSchedule(this.state), this.state.scheduleRuns, now);
+      const automaticAnnouncements =
+        this.automaticReceiverEnabled();
+      const allDue = dueTimeScheduleItems(
+        getActiveSchedule(this.state),
+        this.state.scheduleRuns,
+        now
+      );
+      const delegatedDue = automaticAnnouncements
+        ? allDue.filter(
+            item =>
+              String(item.action?.kind || item.type || 'announcement')
+                === 'announcement'
+          )
+        : [];
+      if (
+        delegatedDue.length
+        && this.shouldDelegateScheduledAnnouncements() !== true
+      ) {
+        const holdNotice = delegatedDue
+          .map(item => String(item.id || 'announcement'))
+          .sort()
+          .join(',');
+        if (holdNotice !== this.automaticScheduleHoldNotice) {
+          this.automaticScheduleHoldNotice = holdNotice;
+          this.status(
+            'A timed announcement is assigned to Automatic Receiver, but its durable schedule is not current. Browser fallback stayed off to prevent a duplicate; sync Automatic Announcements on Remote.',
+            false
+          );
+        }
+      } else {
+        this.automaticScheduleHoldNotice = '';
+      }
+      // Once Automatic Receiver is selected, time-based announcement rows are
+      // never replayed by Safari. Resend may still hold a previously scheduled
+      // copy even when its latest status is stale or unavailable; browser
+      // fallback would therefore create deterministic duplicate announcements.
+      const due = allDue.filter(
+        item =>
+          !automaticAnnouncements
+          || String(item.action?.kind || item.type || 'announcement') !== 'announcement'
+      );
+      if (due.length && await this.externalAutomationBusy()) return;
       for (const dueItem of due) {
       const dateParts = new Intl.DateTimeFormat('en-US', { timeZone: 'America/Chicago', year: 'numeric', month: '2-digit', day: '2-digit' })
         .formatToParts(new Date(now));

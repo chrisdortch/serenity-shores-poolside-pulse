@@ -1,7 +1,10 @@
 import { requireSession, sessionVariant } from './_auth.js';
+import { versionXStorageKey } from './_version-x-namespace.js';
 
 const X_STATE_VERSION = 'x';
-const X_STATE_KEY = 'serenity-shores-poolside-radio-vx-20260714';
+const X_STATE_KEY = versionXStorageKey(
+  'serenity-shores-poolside-radio-vx-20260714'
+);
 const KV_REQUEST_TIMEOUT_MS = 8_000;
 const MAX_REQUEST_BYTES = 1_100_000;
 const MAX_STATE_BYTES = 1_000_000;

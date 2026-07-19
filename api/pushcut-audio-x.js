@@ -53,9 +53,17 @@ export function createPushcutAudioXHandler({
 
     let receipt;
     try {
-      const claim = await claimPushcutXAudioGeneration(capability.eventId);
+      const claim = await claimPushcutXAudioGeneration(capability.eventId, {
+        executionAttempt: capability.executionAttempt
+      });
       receipt = claim.receipt;
       if (!claim.claimed) {
+        if (claim.stale) {
+          return json(res, 409, {
+            ok: false,
+            error: 'This Receiver execution attempt is stale.'
+          });
+        }
         if (claim.busy) {
           res.setHeader('Retry-After', '3');
           return json(res, 409, {
@@ -114,6 +122,8 @@ export function createPushcutAudioXHandler({
         audioClaimedAt: 0,
         audioFetchedAt: Date.now(),
         audioContentType: audio.contentType
+      }, {
+        executionAttempt: capability.executionAttempt
       });
 
       res.statusCode = 200;
@@ -151,6 +161,8 @@ export function createPushcutAudioXHandler({
         audioClaimedAt: 0,
         failedAt: Date.now(),
         failureCode
+      }, {
+        executionAttempt: capability.executionAttempt
       }).catch(() => receipt);
       const statusCode = naturalError?.statusCode
         || finiteError?.statusCode

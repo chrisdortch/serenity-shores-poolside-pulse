@@ -19,7 +19,8 @@ No other Serenity Shores repository, Vercel project, database namespace, domain,
 - Plays Apple Music URLs through either the compatibility MusicKit web receiver or the recommended Poolside Pulse X Music Receiver Mac app.
 - Plays Spotify URLs through an isolated Version X PKCE receiver after the exact Version X redirect URI is registered.
 - Generates natural resort-style announcement audio on the server and delivers it to the Receiver through one-time signed URLs.
-- Supports short, downloadable Suno/direct announcement clips in Browser and Pushcut modes only when their actual media duration is no longer than 45 seconds.
+- Uses the preferred **Automatic Receiver** path on an iPhone: one signed Shortcut is woken by an iOS Email automation, downloads the complete announcement before touching playback, runs music target → 0% → announcement 100% → 0% → resume → latest music target, and returns a signed completion receipt. Pushcut does not need to be open.
+- Supports short, downloadable Suno/direct announcement clips when their actual media duration is no longer than 45 seconds.
 - On the two-iPhone Pushcut path, uses a dynamic Shortcut contract: music follows the shared 0–100 slider, reaches 0% during speech, every announcement plays at 100%, and the same music is restored to the slider target only after playback completes.
 - Provides one 0–100 music control. Announcement volume is fixed at 100% for live, saved, weather, safety, and scheduled speech.
 - Lets scheduled music inherit the shared music level or use a custom 0–100 level. Scheduled announcements are always 100%.
@@ -37,7 +38,7 @@ Apple Music playback also requires an active Apple Music subscription on the App
 
 The dedicated Apple configuration is ready: Team ID `HHX689967A`, Key ID `8G28BYBZT2`, and Media ID `media.com.serenityshores.poolsidepulsex`. The `.p8` private key stays outside this repository and is used only as a protected server environment variable.
 
-The remaining owner inputs are the exact `https://music.apple.com/...` song, album, or playlist URLs to save and an active Apple Music subscription in Music.app on the receiver Mac.
+The remaining deployment inputs are a Resend API key, the email account present in Apple Mail on the Receiver iPhone, the exact Spotify Receiver redirect URI, the desired music URLs, and active Apple Music/Spotify subscriptions on the speaker Receiver.
 
 Apple’s detailed setup reference is [Create a media identifier and private key](https://developer.apple.com/help/account/capabilities/create-a-media-identifier-and-private-key). Poolside Pulse generates short-lived MusicKit developer tokens on the server; the `.p8` private key is never sent to the browser.
 
@@ -46,29 +47,44 @@ Apple’s detailed setup reference is [Create a media identifier and private key
 ```dotenv
 POOL_SIDE_PIN=
 POOL_SIDE_SESSION_SECRET=
+# Use a unique value for an isolated Preview deployment.
+POOL_SIDE_X_NAMESPACE=
 KV_REST_API_URL=
 KV_REST_API_TOKEN=
+
+OPENAI_API_KEY=
 
 APPLE_MUSIC_TEAM_ID=
 APPLE_MUSIC_KEY_ID=
 APPLE_MUSIC_MEDIA_ID=
 APPLE_MUSIC_PRIVATE_KEY=
-APPLE_MUSIC_ALLOWED_ORIGINS=https://poolside-pulse-x.vercel.app
+APPLE_MUSIC_ALLOWED_ORIGINS=https://poolside-pulse-x.vercel.app,https://poolside-pulse-x-receiver.vercel.app
+
+RESEND_API_KEY_X=
+RECEIVER_WAKE_EMAIL_X=
+RECEIVER_WAKE_FROM_X=Poolside Pulse X <onboarding@resend.dev>
+RECEIVER_WAKE_SUBJECT_X=Poolside Pulse X Wake
+
+PUSHCUT_PUBLIC_BASE_URL_X=https://poolside-pulse-x-receiver.vercel.app
 ```
 
 `APPLE_MUSIC_PRIVATE_KEY` is the secret PEM content from the dedicated `.p8` key. Configure it only as a protected server environment variable. `APPLE_MUSIC_ALLOWED_ORIGINS` is a comma-separated allowlist and must include each exact preview/production origin that will request a developer token.
 
+The Resend key must allow send, schedule, and cancel operations. When using Resend’s test sender, `RECEIVER_WAKE_EMAIL_X` must be the email address associated with that Resend account. That same account must receive messages in Apple Mail on the Receiver iPhone. The API key and private keys are server secrets; never paste them into the app or a Shortcut.
+
+`OPENAI_API_KEY` is required for the natural announcement voice. If generation is unavailable, Version X reports a failure and does not fall back to computer speech.
+
 Also supported:
 
-- `OPENAI_API_KEY` for the required natural announcement voice. If generation is unavailable, Version X reports a failure and does not fall back to computer speech.
 - `PUSHCUT_API_KEY_X` for the Version X Receiver automation.
-- `PUSHCUT_PUBLIC_BASE_URL_X=https://poolside-pulse-x.vercel.app` so signed Receiver links always use the stable Version X alias.
 - `PUSHCUT_ANNOUNCE_SHORTCUT_X` and `PUSHCUT_RECOVERY_SHORTCUT_X` only when deliberately overriding the default **Poolside Pulse X Announcement** and **Poolside Pulse X Recovery** names. Existing legacy names remain supported as overrides.
 - `XWEATHER_CLIENT_ID` and `XWEATHER_CLIENT_SECRET` as an optional weather supplement.
 
 Production requires durable KV, a dedicated session secret, and a valid access code. The receiver refuses to claim operational ownership without durable synchronization.
 
-## Recommended exact-volume operation
+## Optional Mac exact-volume operation
+
+This is the measured software-gain option when a compatible Mac is available. It is not required for the recommended two-iPhone Automatic Receiver setup below.
 
 Use the dedicated Mac receiver for Apple Music, Suno/direct audio, spoken announcements, and schedules. Use the same Version X URL from any phone, tablet, or computer for commands.
 
@@ -85,18 +101,36 @@ The checked-in build script creates a personal, ad-hoc signed app for this Mac. 
 
 Use two separate iPhones:
 
-Choose one Receiver mode at a time. iOS cannot keep both Version X’s Browser Receiver and Pushcut’s Automation Server in the foreground.
+### A. Automatic Receiver mode — recommended
 
-### A. Browser Receiver mode
+Use this for Remote-controlled Suno/direct, Apple Music, or Spotify beds plus loud on-demand, weather, saved, Order, and timed announcements. Safari remains visible for music. A background Email automation runs the signed Receiver Shortcut for announcements, so Pushcut does not need to be open.
+
+On the iPhone connected to the speakers:
+
+1. Open the permanent [Poolside Pulse X Receiver](https://poolside-pulse-x-receiver.vercel.app/#receiver), enter the access code, and choose **Speaker Receiver**.
+2. Tap [Install Poolside Pulse X Automatic Receiver](https://poolside-pulse-x-receiver.vercel.app/shortcuts/poolside-pulse-x-automatic-receiver.shortcut).
+3. In Safari, tap the **Downloads** arrow → `Poolside Pulse X Automatic Receiver.shortcut` → **Add Shortcut**, then return to Poolside Pulse.
+4. Tap **Create Pairing Code**, run the installed Shortcut once, enter the six-digit code, return to Poolside Pulse, and tap **Check Pairing**.
+5. Confirm the Receiver email address shown in Poolside Pulse receives messages in Apple Mail on this iPhone.
+6. Open Shortcuts → **Automation** → **+** → **Email**. Enter the exact mailbox-only **Sender** and **Subject Contains** values shown in Poolside Pulse. Choose **Run Immediately**, then tap **Next**.
+7. Choose **Poolside Pulse X Automatic Receiver**. If it is not listed, choose **New Blank Automation → Add Action → Run Shortcut**, select **Poolside Pulse X Automatic Receiver**, and tap **Done**.
+8. Return to Poolside Pulse, tap **Start Receiver**, prepare/authorize Apple Music or Spotify if used, and start the music bed.
+9. Tap **Test & Turn On Automatic Receiver**. Music must become silent, the natural voice must play loudly, and the same music must resume at the saved target before the app enables background or timed announcements.
+
+On each other iPhone, open the same URL, choose **Remote Control**, and use Music, Announce, Weather, and Schedule. Remote iPhones do not install a Shortcut, configure Pushcut, or hold Apple/Spotify authorization.
+
+The Email automation wake contains no command, audio URL, access code, or Receiver credential. The Shortcut claims one authenticated queued command and returns a signed receipt. Timed announcement emails use a rolling 29-day horizon with an unattended renewal wake. The Schedule page shows whether the saved plan is current, its expiration, and its next renewal; do not rely on a warning or stale status.
+
+### B. Browser Receiver mode — foreground fallback
 
 Use this for app-controlled Suno/direct, Apple Music, or Spotify playback and browser-owned schedules.
 
 1. **Receiver iPhone:** connect it to the speakers and power, turn off Low Power Mode, set **Settings → Display & Brightness → Auto-Lock → Never**, and keep Version X visible. Choose **Speaker Receiver**, prepare the selected provider, then tap **Start Receiver** and its Connect action.
 2. **Command iPhone:** use Version X in **Remote Control** mode.
 
-The Receiver page shows Apple Music and Spotify setup separately; Spotify login is available before receiver ownership, and its Connect step becomes available after **Start Receiver**. Do not switch apps, lock, or hide Version X. It intentionally stops every audio path and releases cloud ownership when an iPhone Browser Receiver leaves the foreground. Pushcut announcements are not available while Pushcut is backgrounded.
+The Receiver page shows Apple Music and Spotify setup separately; Spotify login is available before receiver ownership, and its Connect step becomes available after **Start Receiver**. Do not switch apps, lock, or hide Version X. Without Automatic Receiver enabled, hiding the page stops every audio path and releases cloud ownership.
 
-### B. Pushcut announcement mode
+### C. Pushcut announcement mode — legacy fallback
 
 Use this for dependable remote natural-voice or short finite-audio announcements over a background-capable music session. Music follows the Remote slider; announcements are fixed at 100%.
 

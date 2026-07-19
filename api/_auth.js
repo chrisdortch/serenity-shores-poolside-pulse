@@ -4,6 +4,10 @@ import {
   randomBytes,
   timingSafeEqual
 } from 'node:crypto';
+import {
+  versionXStorageNamespace,
+  versionXStorageNamespaceReadiness
+} from './_version-x-namespace.js';
 
 const SESSION_TTL_SECONDS = 24 * 60 * 60;
 const SESSION_RENEW_AFTER_SECONDS = 12 * 60 * 60;
@@ -50,7 +54,15 @@ function sessionContext(reqOrVariant) {
   const variant = typeof reqOrVariant === 'string'
     ? (reqOrVariant.trim().toLowerCase() === 'x' ? 'x' : DEFAULT_SESSION_VARIANT)
     : sessionVariant(reqOrVariant);
-  return SESSION_CONTEXTS[variant];
+  const context = SESSION_CONTEXTS[variant];
+  if (variant !== 'x') return context;
+  const namespace = versionXStorageNamespace();
+  if (!namespace) return context;
+  return Object.freeze({
+    ...context,
+    cookie: `poolside_vx_${namespace}_session`,
+    secretContext: `${context.secretContext}:namespace:${namespace}`
+  });
 }
 
 function json(res, status, body) {
@@ -134,13 +146,22 @@ function trimRateLimits(now) {
 export function sessionSecurityReadiness(reqOrVariant) {
   const configuredPin = String(process.env.POOL_SIDE_PIN || '').trim();
   const production = process.env.VERCEL === '1';
+  const variant = typeof reqOrVariant === 'string'
+    ? (reqOrVariant.trim().toLowerCase() === 'x' ? 'x' : DEFAULT_SESSION_VARIANT)
+    : sessionVariant(reqOrVariant);
+  const namespaceReady = variant !== 'x'
+    || versionXStorageNamespaceReadiness().ready;
   const pinReady = production
     ? validProductionPin(configuredPin)
     : (!configuredPin || configuredPin.length <= 64);
-  const signingReady = Boolean(sessionSigningKey(reqOrVariant));
+  let signingReady = false;
+  if (namespaceReady) {
+    try { signingReady = Boolean(sessionSigningKey(variant)); }
+    catch {}
+  }
   const limiterReady = !production || Boolean(process.env.KV_REST_API_URL && process.env.KV_REST_API_TOKEN);
   return {
-    ready: signingReady && pinReady && limiterReady,
+    ready: namespaceReady && signingReady && pinReady && limiterReady,
     signingReady,
     pinReady,
     limiterReady,

@@ -3,10 +3,14 @@ import { readFileSync } from 'node:fs';
 import { describe, test } from 'node:test';
 
 import {
+  SPOTIFY_RECEIVER_REDIRECT_URI,
   SPOTIFY_REDIRECT_URI,
+  SPOTIFY_REDIRECT_URIS,
+  SPOTIFY_STABLE_REDIRECT_URI,
   SpotifyReceiver,
   isCanonicalSpotifyLocation,
-  safeSpotifyReturnPath
+  safeSpotifyReturnPath,
+  spotifyRedirectUri
 } from '../src/vx/spotify-receiver.js';
 
 const VX_PKCE_KEY = 'poolside-pulse-vx-spotify-pkce';
@@ -211,6 +215,137 @@ describe('Version X Spotify receiver isolation', { concurrency: false }, () => {
     }
   });
 
+  test('uses same-origin PKCE on the dedicated Receiver alias', async () => {
+    const env = browserEnvironment(
+      'https://poolside-pulse-x-receiver.vercel.app/#receiver'
+    );
+    const otherVersions = seedOtherVersionStorage(env);
+    try {
+      const receiver = new SpotifyReceiver({
+        clientId: 'client-id',
+        now: () => 1_000,
+        random: length =>
+          length === 96 ? 'v'.repeat(96) : 's'.repeat(32),
+        pkceChallenge: async verifier => `challenge-${verifier.length}`
+      });
+
+      await receiver.beginLogin('/#receiver');
+
+      const authorization = new URL(env.assigned);
+      const pending = JSON.parse(env.localStorage.getItem(VX_PKCE_KEY));
+      assert.equal(
+        spotifyRedirectUri(),
+        'https://poolside-pulse-x-receiver.vercel.app/'
+      );
+      assert.equal(isCanonicalSpotifyLocation(), true);
+      assert.equal(
+        authorization.searchParams.get('redirect_uri'),
+        'https://poolside-pulse-x-receiver.vercel.app/'
+      );
+      assert.equal(
+        pending.redirectUri,
+        'https://poolside-pulse-x-receiver.vercel.app/'
+      );
+      assert.equal(pending.returnPath, '/#receiver');
+      assertOtherVersionStorageUnchanged(env, otherVersions);
+    } finally {
+      env.restore();
+    }
+  });
+
+  test('exchanges a Receiver-alias callback with the identical redirect URI', async () => {
+    const state = 's'.repeat(32);
+    const verifier = 'v'.repeat(96);
+    const env = browserEnvironment(
+      `https://poolside-pulse-x-receiver.vercel.app/?code=spotify-code&state=${state}`
+    );
+    const originalFetch = globalThis.fetch;
+    let tokenRequest = null;
+    env.localStorage.setItem(VX_PKCE_KEY, JSON.stringify({
+      state,
+      verifier,
+      returnPath: '/#receiver',
+      redirectUri: 'https://poolside-pulse-x-receiver.vercel.app/',
+      createdAt: 1_000
+    }));
+    globalThis.fetch = async (url, options = {}) => {
+      const href = String(url);
+      if (href === 'https://accounts.spotify.com/api/token') {
+        tokenRequest = options;
+        return response(200, {
+          access_token: 'receiver-alias-access-token',
+          refresh_token: 'receiver-alias-refresh-token',
+          expires_in: 3_600
+        });
+      }
+      if (href === 'https://api.spotify.com/v1/me') {
+        return response(200, {
+          display_name: 'Candidate Receiver',
+          product: 'premium',
+          id: 'candidate-account'
+        });
+      }
+      if (href === 'https://api.spotify.com/v1/me/player/devices') {
+        return response(200, { devices: [] });
+      }
+      throw new Error(`Unexpected Spotify request: ${href}`);
+    };
+    try {
+      const receiver = new SpotifyReceiver({
+        clientId: 'client-id',
+        now: () => 2_000
+      });
+      assert.equal(await receiver.completeLoginFromCallback(), true);
+
+      const body = new URLSearchParams(tokenRequest.body);
+      assert.equal(
+        body.get('redirect_uri'),
+        'https://poolside-pulse-x-receiver.vercel.app/'
+      );
+      assert.equal(body.get('code_verifier'), verifier);
+      assert.equal(env.replacements.at(-1), '/#receiver');
+    } finally {
+      globalThis.fetch = originalFetch;
+      env.restore();
+    }
+  });
+
+  test('rejects a PKCE transaction created for the other allowlisted alias', async () => {
+    const state = 's'.repeat(32);
+    const env = browserEnvironment(
+      `https://poolside-pulse-x-receiver.vercel.app/?code=spotify-code&state=${state}`
+    );
+    const originalFetch = globalThis.fetch;
+    let fetchCalled = false;
+    env.localStorage.setItem(VX_PKCE_KEY, JSON.stringify({
+      state,
+      verifier: 'v'.repeat(96),
+      returnPath: '/#receiver',
+      redirectUri: 'https://poolside-pulse-x.vercel.app/',
+      createdAt: 1_000
+    }));
+    globalThis.fetch = async () => {
+      fetchCalled = true;
+      throw new Error('A mismatched-origin callback must not exchange a code.');
+    };
+    try {
+      const receiver = new SpotifyReceiver({
+        clientId: 'client-id',
+        now: () => 2_000
+      });
+      await assert.rejects(
+        receiver.completeLoginFromCallback(),
+        /could not be matched to this device/i
+      );
+      assert.equal(fetchCalled, false);
+      assert.equal(env.localStorage.getItem(VX_PKCE_KEY), null);
+      assert.equal(env.replacements.at(-1), '/#receiver');
+    } finally {
+      globalThis.fetch = originalFetch;
+      env.restore();
+    }
+  });
+
   test('canonicalizes login before creating PKCE data and rejects external return paths', async () => {
     const env = browserEnvironment('https://version-x-preview.vercel.app/#receiver');
     const otherVersions = seedOtherVersionStorage(env);
@@ -222,6 +357,16 @@ describe('Version X Spotify receiver isolation', { concurrency: false }, () => {
       assert.equal(env.localStorage.getItem(VX_PKCE_KEY), null);
       assert.equal(isCanonicalSpotifyLocation(), false);
       assert.equal(safeSpotifyReturnPath('//attacker.example/steal'), '/#receiver');
+      assert.equal(
+        spotifyRedirectUri(),
+        'https://poolside-pulse-x.vercel.app/'
+      );
+      assert.equal(
+        spotifyRedirectUri({
+          href: 'https://poolside-pulse-x-receiver.vercel.app.attacker.example/'
+        }),
+        'https://poolside-pulse-x.vercel.app/'
+      );
       assertOtherVersionStorageUnchanged(env, otherVersions);
     } finally {
       env.restore();
@@ -380,6 +525,18 @@ describe('Version X receiver-mode and setup UI hardening', () => {
     assert.match(VX_CORE_SOURCE, /export const DEFAULT_SPOTIFY_CLIENT_ID = '7e086716aaea4ce98051287b552a676c'/);
     assert.match(VX_APP_SOURCE, /const SPOTIFY_CLIENT_ID = DEFAULT_SPOTIFY_CLIENT_ID/);
     assert.equal(SPOTIFY_REDIRECT_URI, 'https://poolside-pulse-x.vercel.app/');
+    assert.equal(
+      SPOTIFY_STABLE_REDIRECT_URI,
+      'https://poolside-pulse-x.vercel.app/'
+    );
+    assert.equal(
+      SPOTIFY_RECEIVER_REDIRECT_URI,
+      'https://poolside-pulse-x-receiver.vercel.app/'
+    );
+    assert.deepEqual(SPOTIFY_REDIRECT_URIS, [
+      'https://poolside-pulse-x.vercel.app/',
+      'https://poolside-pulse-x-receiver.vercel.app/'
+    ]);
     assert.match(VX_APP_SOURCE, /import \{ SPOTIFY_REDIRECT_URI, SpotifyReceiver \} from '\.\/spotify-receiver\.js'/);
     assert.match(VX_APP_SOURCE, /const SPOTIFY_DEVELOPER_DASHBOARD_URL = 'https:\/\/developer\.spotify\.com\/dashboard'/);
     assert.match(VX_APP_SOURCE, /including the trailing slash/);
@@ -426,7 +583,8 @@ describe('Version X receiver-mode and setup UI hardening', () => {
     const scheduleSource = VX_APP_SOURCE.slice(scheduleStart, scheduleEnd);
 
     assert.match(announceSource, /const browserReady = operatingMode === 'browser' && receiverOnline/);
-    assert.match(announceSource, /const announcementReady = browserReady \|\| pushcutSelectedReady/);
+    assert.match(announceSource, /const legacyAnnouncementReady = browserReady \|\| pushcutSelectedReady/);
+    assert.match(announceSource, /const announcementReady = automaticReady \|\| legacyAnnouncementReady/);
     assert.match(announceSource, /Browser Receiver is selected but offline/);
     assert.match(announceSource, /type="submit" class="primary" \$\{announcementReady \? '' : 'disabled'\}>Speak Now/);
     assert.match(announceSource, /data-action="saved-announcement"[\s\S]*announcementReady \? '' : 'disabled'/);

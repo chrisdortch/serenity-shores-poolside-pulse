@@ -16,6 +16,14 @@ const recoveryUnsignedPath = resolve(
   toolsDirectory,
   'Poolside Pulse X Recovery_unsigned.shortcut'
 );
+const automaticReceiverUnsignedPath = resolve(
+  toolsDirectory,
+  'Poolside Pulse X Automatic Receiver_unsigned.shortcut'
+);
+const automaticReceiverSourcePath = resolve(
+  toolsDirectory,
+  'poolside-pulse-x-automatic-receiver.cherri'
+);
 const announcementSignedPath = resolve(
   projectDirectory,
   'public/shortcuts/poolside-pulse-x-announcement.shortcut'
@@ -23,6 +31,10 @@ const announcementSignedPath = resolve(
 const recoverySignedPath = resolve(
   projectDirectory,
   'public/shortcuts/poolside-pulse-x-recovery.shortcut'
+);
+const automaticReceiverSignedPath = resolve(
+  projectDirectory,
+  'public/shortcuts/poolside-pulse-x-automatic-receiver.shortcut'
 );
 const manifestPath = resolve(toolsDirectory, 'manifest.json');
 
@@ -40,6 +52,17 @@ function actionIdentifiers(workflow) {
 
 function actionOutputUuid(value) {
   return value?.Value?.OutputUUID || value?.Value?.Variable?.Value?.OutputUUID || '';
+}
+
+function referencedOutputUuids(value, found = new Set()) {
+  if (Array.isArray(value)) {
+    for (const item of value) referencedOutputUuids(item, found);
+    return found;
+  }
+  if (!value || typeof value !== 'object') return found;
+  if (typeof value.OutputUUID === 'string') found.add(value.OutputUUID);
+  for (const nested of Object.values(value)) referencedOutputUuids(nested, found);
+  return found;
 }
 
 function getValueAction(workflow, key) {
@@ -68,8 +91,13 @@ function verifySignedFile(path, expectedHash) {
   assert.equal(createHash('sha256').update(file).digest('hex'), expectedHash);
 }
 
+function sha256File(path) {
+  return createHash('sha256').update(readFileSync(path)).digest('hex');
+}
+
 const announcement = readPlist(announcementUnsignedPath);
 const recovery = readPlist(recoveryUnsignedPath);
+const automaticReceiver = readPlist(automaticReceiverUnsignedPath);
 const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
 
 assert.deepEqual(actionIdentifiers(announcement), [
@@ -206,9 +234,261 @@ assert.equal(
   1
 );
 
-const serializedWorkflows = JSON.stringify([announcement, recovery]);
+const automaticActions = automaticReceiver.WFWorkflowActions;
+assert.equal(automaticActions.length, 121);
+
+assert.equal(
+  automaticActions[0].WFWorkflowActionParameters.WFGetFilePath,
+  'Poolside Pulse X/receiver-token.txt'
+);
+assert.equal(automaticActions[0].WFWorkflowActionParameters.WFFileErrorIfNotFound, false);
+assert.equal(automaticActions[3].WFWorkflowActionParameters.WFCondition, 8);
+assert.equal(
+  automaticActions[3].WFWorkflowActionParameters.WFConditionalActionString,
+  'ppxrx_'
+);
+assert.equal(automaticActions[10].WFWorkflowActionParameters.WFCountType, 'Characters');
+assert.equal(automaticActions[11].WFWorkflowActionParameters.WFNumberValue, 49);
+assert.match(
+  automaticActions[12].WFWorkflowActionParameters.WFAskActionPrompt,
+  /six-digit Receiver pairing code/
+);
+assert.equal(
+  automaticActions[13].WFWorkflowActionParameters.WFURL,
+  'https://poolside-pulse-x-receiver.vercel.app/api/email-wake-register-x?v=x'
+);
+assert.equal(automaticActions[13].WFWorkflowActionParameters.WFHTTPMethod, 'POST');
+assert.equal(automaticActions[17].WFWorkflowActionParameters.WFCondition, 8);
+assert.equal(
+  automaticActions[17].WFWorkflowActionParameters.WFConditionalActionString,
+  'ppxrx_'
+);
+assert.equal(automaticActions[19].WFWorkflowActionIdentifier, 'is.workflow.actions.exit');
+assert.equal(automaticActions[23].WFWorkflowActionParameters.WFCountType, 'Characters');
+assert.equal(automaticActions[24].WFWorkflowActionParameters.WFNumberValue, 49);
+assert.equal(automaticActions[25].WFWorkflowActionIdentifier, 'is.workflow.actions.exit');
+assert.equal(
+  automaticActions[30].WFWorkflowActionParameters.WFFileDestinationPath,
+  'Poolside Pulse X/receiver-token.txt'
+);
+assert.equal(automaticActions[30].WFWorkflowActionParameters.WFSaveFileOverwrite, true);
+assert.equal(
+  automaticActions[34].WFWorkflowActionParameters.WFURL,
+  'https://poolside-pulse-x-receiver.vercel.app/api/email-wake-claim-x?v=x'
+);
+assert.equal(automaticActions[34].WFWorkflowActionParameters.WFHTTPMethod, 'POST');
+assert.match(
+  JSON.stringify(automaticActions[34].WFWorkflowActionParameters.WFHTTPHeaders),
+  /Authorization/
+);
+assert.match(
+  JSON.stringify(automaticActions[34].WFWorkflowActionParameters.WFHTTPHeaders),
+  /Bearer/
+);
+assert.equal(
+  automaticActions.filter(
+    action => action.WFWorkflowActionIdentifier === 'is.workflow.actions.repeat.count'
+  ).length,
+  0,
+  'Automatic Receiver must handle one command per background automation'
+);
+assert.equal(automaticActions[36].WFWorkflowActionParameters.WFDictionaryKey, 'pending');
+assert.equal(automaticActions[38].WFWorkflowActionIdentifier, 'is.workflow.actions.exit');
+assert.ok(getValueAction(automaticReceiver, 'pending'));
+assert.ok(getValueAction(automaticReceiver, 'action'));
+assert.ok(getValueAction(automaticReceiver, 'audioUrl'));
+assert.ok(getValueAction(automaticReceiver, 'executeUrl'));
+assert.ok(getValueAction(automaticReceiver, 'restoreUrl'));
+assert.ok(getValueAction(automaticReceiver, 'receiptUrl'));
+assert.ok(getValueAction(automaticReceiver, 'reclaimed'));
+
+// Recovery-only attempts never replay speech. They resume while muted,
+// applies the command fallback before networking, fetches the latest target,
+// and then records a truthful recovered failure.
+assert.equal(automaticActions[51].WFWorkflowActionParameters.WFVolume, 0);
+assert.equal(automaticActions[52].WFWorkflowActionParameters.WFPlayPauseBehavior, 'Play');
+assert.equal(automaticActions[53].WFWorkflowActionParameters.WFDelayTime, 1);
+assert.equal(
+  actionOutputUuid(automaticActions[54].WFWorkflowActionParameters.WFVolume),
+  automaticActions[50].WFWorkflowActionParameters.UUID
+);
+assert.equal(
+  actionOutputUuid(automaticActions[59].WFWorkflowActionParameters.WFVolume),
+  automaticActions[58].WFWorkflowActionParameters.UUID
+);
+for (const action of automaticActions.slice(50, 64)) {
+  assert.notEqual(
+    action.WFWorkflowActionParameters?.WFVolume,
+    1,
+    'Recovery-only flow must never set the Receiver to 100%'
+  );
+  assert.notEqual(
+    action.WFWorkflowActionParameters?.WFPlayPauseBehavior,
+    'Pause',
+    'Recovery-only flow must never pause the music bed'
+  );
+  assert.notEqual(
+    action.WFWorkflowActionIdentifier,
+    'is.workflow.actions.playsound',
+    'Recovery-only flow must never replay announcement audio'
+  );
+}
+
+// Unknown action types stop instead of falling into announcement playback.
+assert.equal(automaticActions[65].WFWorkflowActionParameters.WFCondition, 5);
+assert.equal(
+  automaticActions[65].WFWorkflowActionParameters.WFConditionalActionString,
+  'announce'
+);
+assert.equal(automaticActions[66].WFWorkflowActionIdentifier, 'is.workflow.actions.exit');
+
+// A reclaimed attempt first repairs the bed at the command fallback level.
+assert.equal(automaticActions[71].WFWorkflowActionParameters.WFVolume, 0);
+assert.equal(automaticActions[72].WFWorkflowActionParameters.WFPlayPauseBehavior, 'Play');
+assert.equal(automaticActions[73].WFWorkflowActionParameters.WFDelayTime, 1);
+assert.equal(
+  actionOutputUuid(automaticActions[74].WFWorkflowActionParameters.WFVolume),
+  automaticActions[68].WFWorkflowActionParameters.UUID
+);
+
+// Normal attempts download all audio, then authorize this exact attempt,
+// before the first announcement-related volume or playback mutation.
+assert.equal(automaticActions[79].WFWorkflowActionParameters.CustomOutputName, 'announcementAudio');
+assert.equal(automaticActions[79].WFWorkflowActionParameters.WFHTTPMethod, 'GET');
+assert.ok(
+  referencedOutputUuids(automaticActions[79].WFWorkflowActionParameters)
+    .has(automaticActions[78].WFWorkflowActionParameters.UUID)
+);
+assert.equal(automaticActions[81].WFWorkflowActionParameters.WFHTTPMethod, 'GET');
+assert.ok(
+  referencedOutputUuids(automaticActions[81].WFWorkflowActionParameters)
+    .has(automaticActions[80].WFWorkflowActionParameters.UUID)
+);
+assert.equal(automaticActions[81].WFWorkflowActionParameters.CustomOutputName, 'executeResponse');
+assert.equal(automaticActions[82].WFWorkflowActionParameters.CustomOutputName, 'executeDictionary');
+assert.equal(automaticActions[83].WFWorkflowActionParameters.WFDictionaryKey, 'authorized');
+assert.equal(automaticActions[84].WFWorkflowActionParameters.WFDictionaryKey, 'receiverContract');
+assert.equal(automaticActions[85].WFWorkflowActionParameters.WFDictionaryKey, 'executionAttempt');
+assert.equal(automaticActions[87].WFWorkflowActionParameters.WFDictionaryKey, 'executionAttempt');
+assert.equal(
+  automaticActions[89].WFWorkflowActionParameters.WFConditions.Value
+    .WFActionParameterFilterPrefix,
+  0
+);
+const authorizationConditions =
+  automaticActions[89].WFWorkflowActionParameters.WFConditions.Value
+    .WFActionParameterFilterTemplates;
+assert.equal(authorizationConditions.length, 3);
+assert.ok(
+  referencedOutputUuids(authorizationConditions)
+    .has(automaticActions[83].WFWorkflowActionParameters.UUID)
+);
+assert.ok(
+  referencedOutputUuids(authorizationConditions)
+    .has(automaticActions[84].WFWorkflowActionParameters.UUID)
+);
+assert.ok(
+  referencedOutputUuids(authorizationConditions)
+    .has(automaticActions[86].WFWorkflowActionParameters.UUID)
+);
+assert.ok(
+  referencedOutputUuids(authorizationConditions)
+    .has(automaticActions[88].WFWorkflowActionParameters.UUID)
+);
+assert.equal(automaticActions[90].WFWorkflowActionIdentifier, 'is.workflow.actions.exit');
+
+assert.equal(automaticActions[94].WFWorkflowActionParameters.WFVolume, 0);
+assert.equal(automaticActions[95].WFWorkflowActionParameters.WFPlayPauseBehavior, 'Pause');
+assert.equal(automaticActions[96].WFWorkflowActionParameters.WFDelayTime, 1);
+assert.equal(automaticActions[97].WFWorkflowActionParameters.WFVolume, 1);
+assert.equal(
+  actionOutputUuid(automaticActions[98].WFWorkflowActionParameters.WFInput),
+  automaticActions[79].WFWorkflowActionParameters.UUID
+);
+assert.equal(automaticActions[99].WFWorkflowActionParameters.WFVolume, 0);
+assert.equal(automaticActions[100].WFWorkflowActionParameters.WFPlayPauseBehavior, 'Play');
+assert.equal(automaticActions[101].WFWorkflowActionParameters.WFDelayTime, 1);
+assert.equal(
+  actionOutputUuid(automaticActions[102].WFWorkflowActionParameters.WFVolume),
+  automaticActions[68].WFWorkflowActionParameters.UUID
+);
+assert.ok(
+  referencedOutputUuids(automaticActions[104].WFWorkflowActionParameters)
+    .has(automaticActions[103].WFWorkflowActionParameters.UUID)
+);
+assert.equal(
+  actionOutputUuid(automaticActions[107].WFWorkflowActionParameters.WFVolume),
+  automaticActions[106].WFWorkflowActionParameters.UUID
+);
+
+for (const receiptIndex of [47, 63, 111]) {
+  const receipt = automaticActions[receiptIndex];
+  assert.equal(receipt.WFWorkflowActionParameters.WFHTTPMethod, 'POST');
+  assert.equal(receipt.WFWorkflowActionParameters.WFHTTPBodyType, 'JSON');
+  const values = dictionaryValues(receipt);
+  assert.equal(values.receiverContract, 'poolside-pulse-x-wake-v1');
+  assert.equal(values.volumeRestored, true);
+}
+assert.equal(dictionaryValues(automaticActions[47]).musicResumed, false);
+assert.equal(dictionaryValues(automaticActions[47]).status, 'completed');
+assert.equal(dictionaryValues(automaticActions[63]).status, 'failed');
+assert.equal(
+  dictionaryValues(automaticActions[63]).failureCode,
+  'retry_exhausted_recovered'
+);
+assert.equal(dictionaryValues(automaticActions[63]).musicResumed, true);
+assert.equal(dictionaryValues(automaticActions[111]).status, 'completed');
+assert.equal(dictionaryValues(automaticActions[111]).musicResumed, true);
+
+const automaticConditionalGroups = new Map();
+for (const action of automaticActions.filter(
+  (entry) => entry.WFWorkflowActionIdentifier === 'is.workflow.actions.conditional'
+)) {
+  const { GroupingIdentifier, WFControlFlowMode } = action.WFWorkflowActionParameters;
+  assert.ok(GroupingIdentifier, 'Automatic Receiver conditional is missing its group identifier');
+  const modes = automaticConditionalGroups.get(GroupingIdentifier) || [];
+  modes.push(WFControlFlowMode);
+  automaticConditionalGroups.set(GroupingIdentifier, modes);
+}
+assert.equal(automaticConditionalGroups.size, 10);
+const automaticConditionalModes = [...automaticConditionalGroups.values()]
+  .map(modes => modes.join(','))
+  .sort();
+assert.deepEqual(
+  automaticConditionalModes,
+  [
+    '0,1,2',
+    '0,1,2',
+    '0,1,2',
+    '0,1,2',
+    '0,1,2',
+    '0,1,2',
+    '0,2',
+    '0,2',
+    '0,2',
+    '0,2'
+  ]
+);
+
+assert.equal(manifest.receiverContract, 'poolside-pulse-x-audio-v4');
+assert.equal(manifest.automaticReceiverContract, 'poolside-pulse-x-wake-v1');
+assert.equal(
+  sha256File(automaticReceiverSourcePath),
+  manifest.signedFiles.automaticReceiver.sourceSha256
+);
+assert.equal(
+  sha256File(automaticReceiverUnsignedPath),
+  manifest.signedFiles.automaticReceiver.unsignedSha256
+);
+assert.equal(
+  manifest.signedFiles.automaticReceiver.signedFromUnsignedSha256,
+  manifest.signedFiles.automaticReceiver.unsignedSha256
+);
+
+const serializedWorkflows = JSON.stringify([announcement, recovery, automaticReceiver]);
 for (const forbidden of [
   'api.pushcut.io',
+  'pushcut',
   'PUSHCUT_API_KEY',
   'APPLE_MUSIC_PRIVATE_KEY',
   'BEGIN PRIVATE KEY'
@@ -218,9 +498,14 @@ for (const forbidden of [
 
 verifySignedFile(announcementSignedPath, manifest.signedFiles.announcement.sha256);
 verifySignedFile(recoverySignedPath, manifest.signedFiles.recovery.sha256);
+verifySignedFile(
+  automaticReceiverSignedPath,
+  manifest.signedFiles.automaticReceiver.sha256
+);
 
 console.log(
   `Verified ${announcementActions.length} announcement actions, ` +
-    `${recoveryActions.length} recovery actions, three unique conditional groups, ` +
-    'the v4 completion receipt, and both Apple signatures.'
+    `${recoveryActions.length} recovery actions, ` +
+    `${automaticActions.length} automatic Receiver actions, mute-first ordering, ` +
+    'v4 and wake-v1 receipts, and all three Apple signatures.'
 );
