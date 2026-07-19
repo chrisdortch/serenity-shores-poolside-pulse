@@ -1640,7 +1640,7 @@ select:focus-visible {
   padding: 12px 14px;
   border: 1px solid var(--line);
   border-radius: 8px;
-  background: var(--paper-soft);
+  background: var(--teal-50);
 }
 
 .roleAddressGuide p,
