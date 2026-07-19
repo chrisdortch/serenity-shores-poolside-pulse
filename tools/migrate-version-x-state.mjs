@@ -114,6 +114,7 @@ export function prepareVersionXStateMigration(sourceState, now = Date.now()) {
     ...sourceState,
     config: {
       ...(sourceState.config || {}),
+      receiverMode: 'browser',
       announcementTransport: 'browser',
       automaticReceiverVerifiedPairingAt: 0
     },

@@ -16,6 +16,7 @@ describe('Version X isolated state migration', () => {
         musicLevel: 30,
         musicProvider: 'apple',
         appleUrl: 'https://music.apple.com/us/playlist/example/pl.u-example',
+        receiverMode: 'pushcut',
         announcementTransport: 'email-wake',
         automaticReceiverVerifiedPairingAt: NOW - 5_000
       },
@@ -51,6 +52,7 @@ describe('Version X isolated state migration', () => {
 
     assert.equal(migrated.config.musicLevel, 30);
     assert.equal(migrated.config.musicProvider, 'apple');
+    assert.equal(migrated.config.receiverMode, 'browser');
     assert.equal(migrated.config.announcementTransport, 'browser');
     assert.equal(migrated.config.automaticReceiverVerifiedPairingAt, 0);
     assert.equal(migrated.announcements.length, 1);
@@ -67,6 +69,7 @@ describe('Version X isolated state migration', () => {
     assert.deepEqual(migrated.weather.pendingAnnouncementIds, []);
     assert.notEqual(migrated, source);
     assert.equal(source.receiver.status, 'online');
+    assert.equal(source.config.receiverMode, 'pushcut');
     assert.equal(source.config.announcementTransport, 'email-wake');
     assert.equal(
       source.config.automaticReceiverVerifiedPairingAt,
