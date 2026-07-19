@@ -1,0 +1,11 @@
+{
+  "name": "Poolside Pulse X Automatic Receiver",
+  "short_name": "Pulse X Receiver",
+  "description": "Poolside Pulse X speaker receiver for Suno, Apple Music, Spotify, natural announcements, schedules, and weather alerts.",
+  "start_url": "/#receiver",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#f5f7f3",
+  "theme_color": "#0c2533",
+  "orientation": "portrait-primary"
+}

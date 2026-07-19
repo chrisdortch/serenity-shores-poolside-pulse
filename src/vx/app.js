@@ -81,6 +81,7 @@ const TAB_KEY = 'poolside-pulse-vx-tab';
 const PREVIOUS_TAB_KEY = 'poolside-pulse-vx-previous-tab';
 const SCHEDULE_SELECTION_KEY = 'poolside-pulse-vx-schedule-selection';
 const PUSHCUT_RUN_SERVER_URL = 'pushcut://open/runServer';
+const RECEIVER_TEST_HOST = 'poolside-pulse-x-receiver.vercel.app';
 const SPOTIFY_CLIENT_ID = DEFAULT_SPOTIFY_CLIENT_ID;
 const SPOTIFY_DEVELOPER_DASHBOARD_URL = 'https://developer.spotify.com/dashboard';
 const SCHEDULE_STRUCTURAL_ACTIONS = new Set([
@@ -1134,31 +1135,52 @@ function iphoneReceiverModePanel({ owned = false } = {}) {
       ? '<button type="button" data-action="prepare-pushcut-mode" class="secondary">Retry Pushcut Preparation</button>'
       : `<a href="${PUSHCUT_RUN_SERVER_URL}" class="shortcutLink">Open Pushcut Server</a>`;
   return `
-    <section class="workspacePanel receiverModePanel">
-      <div class="sectionHeading"><div><p class="kicker">Recommended Receiver</p><h2>Automatic music + loud announcements</h2></div><span class="fixedMix">Music ${musicTarget} · Announcement 100</span></div>
-      <div class="capabilityCard ${automaticEnabled && automaticReady && browserActive ? 'verified' : 'limited'}">
-        <span>Automatic Receiver · no Pushcut foreground</span>
-        <strong>${automaticEnabled && automaticReady ? browserActive ? 'Automatic Receiver is verified and ready' : 'Automation verified · start Browser Receiver' : automaticReady ? 'Paired · run the required Receiver Test' : automaticSetupIssues ? 'Automatic Receiver server setup needs attention' : emailWakeStatus.ready ? 'Finish the one-time Receiver setup' : 'Checking Automatic Receiver service'}</strong>
-        <p>Keep this Version X page visible for Suno, Apple Music, Spotify, and music schedule rows. A background iPhone automation handles music ${musicTarget}% → 0%, announcement 100%, then restores ${musicTarget}%—without leaving Pushcut open.</p>
-        ${automaticSetupIssues ? `<ul class="scheduleSyncWarnings automaticSetupIssues">${automaticSetupIssues}</ul>` : ''}
-        <ol class="receiverSetupSteps">
-          <li>Tap <a href="${EMAIL_WAKE_X_SHORTCUT_INSTALL_URL}" class="shortcutLink">Install ${EMAIL_WAKE_X_SHORTCUT_NAME}</a>.</li>
-          <li>In Safari, tap the <strong>Downloads</strong> arrow → <code>Poolside Pulse X Automatic Receiver.shortcut</code> → <strong>Add Shortcut</strong>, then return here.</li>
-          <li>Tap <strong>Create Pairing Code</strong>, run the installed Shortcut once, enter the six-digit code, return here, then tap <strong>Check Pairing</strong>.${pairingVisible ? ` <strong class="pairingCode">${escapeHtml(emailWakePairing.code)}</strong>` : ''}</li>
-          <li>Confirm <code>${escapeHtml(wakeRecipient)}</code> receives messages in Apple Mail on this Receiver iPhone.</li>
-          <li>On this Receiver: Shortcuts → Automation → <strong>+</strong> → <strong>Email</strong>. Set Sender to <code>${escapeHtml(wakeSender)}</code>${emailWakeStatus.wakeSender ? ` <button type="button" data-action="copy-email-wake-sender" class="secondary">Copy</button>` : ''}, Subject Contains to <code>${escapeHtml(wakeSubject)}</code>${emailWakeStatus.wakeSubject ? ` <button type="button" data-action="copy-email-wake-subject" class="secondary">Copy</button>` : ''}, choose <strong>Run Immediately</strong>, then tap Next.</li>
-          <li>Choose <strong>${EMAIL_WAKE_X_SHORTCUT_NAME}</strong>. If it is not listed, choose New Blank Automation → Add Action → Run Shortcut → <strong>${EMAIL_WAKE_X_SHORTCUT_NAME}</strong>. Tap Done.</li>
-          <li>Start Browser Receiver and music, then tap <strong>Test &amp; Turn On Automatic Receiver</strong>. Version X stays on Browser announcements unless the iPhone returns a signed end-to-end completion.</li>
-        </ol>
-        <div class="stackedActions">
-          <button type="button" data-action="create-email-wake-pairing" class="secondary" ${emailWakeStatus.ready ? '' : 'disabled'}>Create Pairing Code</button>
-          ${!automaticReady && emailWakeStatus.ready ? '<button type="button" data-action="check-email-wake-pairing" class="secondary">Check Pairing</button>' : ''}
-          <button type="button" data-action="${automaticEnabled ? 'disable-automatic-announcements' : 'enable-automatic-announcements'}" class="${automaticEnabled ? 'secondary' : 'primary'}" ${automaticReady ? '' : 'disabled'}>${automaticEnabled ? 'Use Browser Announcements Instead' : 'Test & Turn On Automatic Receiver'}</button>
-          ${automaticEnabled && automaticReady ? '<button type="button" data-action="email-wake-test" class="secondary">Run Receiver Test</button>' : ''}
-        </div>
-        <small>${emailWakeStatus.note ? escapeHtml(emailWakeStatus.note) : automaticReady ? 'The Receiver token is revocable, the email carries no command or credential, and every action waits for a signed completion receipt.' : 'Pairing and the Email automation are required once on the speaker iPhone only. Remote iPhones need no Shortcut or Pushcut setup.'}</small>
+    <section class="workspacePanel receiverModePanel automaticReceiverWizard" aria-labelledby="automaticReceiverSetupTitle" data-build-label="receiver-test">
+      <div class="sectionHeading receiverTestHeading">
+        <div><p class="kicker">Receiver Test · Version X candidate</p><h2 id="automaticReceiverSetupTitle">Automatic Receiver setup</h2></div>
+        <span class="fixedMix">Music ${musicTarget} · Announcement 100</span>
       </div>
-      <div class="settingsGrid">
+      <div class="setupStatus ${automaticEnabled && automaticReady && browserActive ? 'verified' : 'limited'}" aria-live="polite">
+        <strong>${automaticEnabled && automaticReady ? browserActive ? 'Automatic Receiver is verified and ready' : 'Automation verified · start Browser Receiver' : automaticReady ? 'Paired · run the required Receiver Test' : automaticSetupIssues ? 'Automatic Receiver server setup needs attention' : emailWakeStatus.ready ? 'Finish the four one-time steps' : 'Checking Automatic Receiver service'}</strong>
+        <span>Automatic Receiver · no Pushcut foreground</span>
+      </div>
+      <p class="setupLead">Do these four steps once on the iPhone connected to the speakers. Keep this Receiver Test page visible for Suno, Apple Music, Spotify, and scheduled music; the background automation handles music ${musicTarget}% → 0% → announcement 100% → restore ${musicTarget}%.</p>
+      ${automaticSetupIssues ? `<ul class="scheduleSyncWarnings automaticSetupIssues">${automaticSetupIssues}</ul>` : ''}
+      <ol class="receiverSetupSteps automaticSetupSteps">
+        <li class="setupStep">
+          <div class="setupStepHeading"><span class="setupStepNumber" aria-hidden="true">1</span><div><strong>Install Shortcut</strong><small>Download and add the signed Receiver Shortcut.</small></div></div>
+          <a href="${EMAIL_WAKE_X_SHORTCUT_INSTALL_URL}" class="shortcutLink setupAction">Install ${EMAIL_WAKE_X_SHORTCUT_NAME}</a>
+          <small>In Safari, tap the <strong>Downloads</strong> arrow → <code>Poolside Pulse X Automatic Receiver.shortcut</code> → <strong>Add Shortcut</strong>, then return here.</small>
+        </li>
+        <li class="setupStep ${automaticReady ? 'complete' : ''}">
+          <div class="setupStepHeading"><span class="setupStepNumber" aria-hidden="true">2</span><div><strong>Pair Receiver</strong><small>Link only this speaker iPhone.</small></div></div>
+          <div class="setupStepActions">
+            <button type="button" data-action="create-email-wake-pairing" class="secondary" ${emailWakeStatus.ready ? '' : 'disabled'}>Create Pairing Code</button>
+            ${!automaticReady && emailWakeStatus.ready ? '<button type="button" data-action="check-email-wake-pairing" class="secondary">Check Pairing</button>' : '<span class="stepComplete">Paired</span>'}
+          </div>
+          <small>Run the installed Shortcut once, enter the six-digit code, return here, then tap <strong>Check Pairing</strong>.${pairingVisible ? ` <strong class="pairingCode">${escapeHtml(emailWakePairing.code)}</strong>` : ''}</small>
+        </li>
+        <li class="setupStep ${automaticEnabled ? 'complete' : ''}">
+          <div class="setupStepHeading"><span class="setupStepNumber" aria-hidden="true">3</span><div><strong>Create Email Automation</strong><small>One background trigger on this Receiver.</small></div></div>
+          <details class="setupInstructions">
+            <summary>Create Email Automation</summary>
+            <div class="setupInstructionBody">
+              <p>Confirm <code>${escapeHtml(wakeRecipient)}</code> receives messages in Apple Mail on this Receiver iPhone.</p>
+              <p>Shortcuts → Automation → <strong>+</strong> → <strong>Email</strong>. Set Sender to <code>${escapeHtml(wakeSender)}</code>${emailWakeStatus.wakeSender ? ` <button type="button" data-action="copy-email-wake-sender" class="secondary compactAction">Copy</button>` : ''}, Subject Contains to <code>${escapeHtml(wakeSubject)}</code>${emailWakeStatus.wakeSubject ? ` <button type="button" data-action="copy-email-wake-subject" class="secondary compactAction">Copy</button>` : ''}, choose <strong>Run Immediately</strong>, then tap Next.</p>
+              <p>Choose <strong>${EMAIL_WAKE_X_SHORTCUT_NAME}</strong>. If it is not listed, choose New Blank Automation → Add Action → Run Shortcut → <strong>${EMAIL_WAKE_X_SHORTCUT_NAME}</strong>. Tap Done.</p>
+            </div>
+          </details>
+        </li>
+        <li class="setupStep ${automaticEnabled && automaticReady ? 'complete' : ''}">
+          <div class="setupStepHeading"><span class="setupStepNumber" aria-hidden="true">4</span><div><strong>Test &amp; Turn On</strong><small>Version X enables automation only after a signed completion.</small></div></div>
+          <button type="button" data-action="${automaticEnabled ? 'disable-automatic-announcements' : 'enable-automatic-announcements'}" class="${automaticEnabled ? 'secondary' : 'primary'} setupAction" ${automaticReady ? '' : 'disabled'}>${automaticEnabled ? 'Use Browser Announcements Instead' : 'Test & Turn On Automatic Receiver'}</button>
+          ${automaticEnabled && automaticReady ? '<button type="button" data-action="email-wake-test" class="secondary setupAction">Run Receiver Test Again</button>' : ''}
+          <small>Start Browser Receiver and music first. Version X stays on Browser announcements unless the iPhone returns a signed end-to-end completion.</small>
+        </li>
+      </ol>
+      <small class="setupFootnote">${emailWakeStatus.note ? escapeHtml(emailWakeStatus.note) : automaticReady ? 'The Receiver token is revocable, the email carries no command or credential, and every action waits for a signed completion receipt.' : 'Pairing and the Email automation are required once on the speaker iPhone only. Remote iPhones need no Shortcut or Pushcut setup.'}</small>
+      <details class="receiverDetailDisclosure">
+        <summary>Browser music receiver &amp; account controls</summary>
         <div class="capabilityCard ${browserActive ? 'verified' : 'limited'}">
           <span>Mode 1 · remote music control · Receiver browser</span>
           <strong>${browserActive ? 'Browser Receiver is active' : browserSelected ? 'Browser Receiver selected · tap Start Receiver' : 'Browser Receiver is not selected'}</strong>
@@ -1169,6 +1191,9 @@ function iphoneReceiverModePanel({ owned = false } = {}) {
           </div>
           <small>Spotify login is available before Start Receiver. Its Connect step becomes available after this device owns the live receiver.</small>
         </div>
+      </details>
+      <details class="legacyFallback">
+        <summary>Legacy fallback · Pushcut</summary>
         <div class="capabilityCard ${pushcutSelected && pushcutOperational ? 'verified' : 'limited'}">
           <span>Mode 2 · remote Pushcut announcements · legacy fallback</span>
           <strong>${pushcutOperational ? 'Pushcut is connected and verified' : pushcutStatus.connectedReady ? 'Pushcut connected; run the receiver test' : pushcutAnnouncementReady() ? 'Pushcut configured; receiver not verified' : 'Open Pushcut Server'}</strong>
@@ -1176,7 +1201,7 @@ function iphoneReceiverModePanel({ owned = false } = {}) {
           <div class="stackedActions">${pushcutModeAction}</div>
           <small>${browserActive ? 'Stop Receiver first so Version X can safely re-arm timed Pushcut announcements before Safari leaves the foreground.' : browserSelected ? 'Prepare Pushcut Mode before opening Pushcut so Remote commands do not route to a stale Browser Receiver lease.' : pushcutScheduleStatus.error ? `Pushcut schedule preparation needs attention: ${escapeHtml(pushcutScheduleStatus.error)}` : pushcutOperational ? 'Pushcut schedule ownership is prepared and the receiver has returned a recent signed completion receipt.' : 'Keep Ready For Requests visible. Each Remote announcement waits for its own signed completion receipt and reports a real failure if Pushcut is unavailable; Receiver Test is optional.'}</small>
         </div>
-      </div>
+      </details>
     </section>`;
 }
 
@@ -1288,7 +1313,7 @@ async function bootstrapAuthenticatedApp() {
 
 async function bootstrap() {
   document.documentElement.dataset.poolsideVersion = VERSION;
-  document.title = 'Lake123 - Poolside Pulse - Version X';
+  document.title = 'Lake123 - Poolside Pulse - Receiver Test - Version X';
   render();
   try {
     const session = await sessionStatus();
@@ -1311,6 +1336,7 @@ function renderLoading() {
         <div class="brandSeal">PP</div>
         <p class="kicker">Lake123</p>
         <h1>Poolside Pulse</h1>
+        <p class="candidateBanner">${escapeHtml(receiverTestBuildLabel())}</p>
         <p>Starting the Version X receiver and command system...</p>
         <div class="loadingBar" aria-hidden="true"><span></span></div>
       </section>
@@ -1324,6 +1350,7 @@ function renderLogin() {
         <div class="brandSeal">PP</div>
         <p class="kicker">Lake123</p>
         <h1>Poolside Pulse</h1>
+        <p class="candidateBanner">${escapeHtml(receiverTestBuildLabel())}</p>
         <p class="lead">Private pool audio control</p>
         <form data-form="login" class="accessForm">
           <label for="accessPin">Access code</label>
@@ -1341,7 +1368,7 @@ function renderRolePicker() {
     <main class="centerStage roleStage">
       <section class="rolePanel">
         <div class="brandSeal">PP</div>
-        <p class="kicker">Poolside Pulse Version X</p>
+        <p class="kicker">Poolside Pulse · ${escapeHtml(receiverTestBuildLabel())}</p>
         <h1>What is this device?</h1>
         <p class="lead">${native ? 'This Mac app is the always-on Apple Music speaker receiver. Use any phone or tablet for commands.' : 'For iPhone operation, use two separate iPhones: one stays on the speakers and one sends commands.'}</p>
         <div class="roleChoices">
@@ -1391,12 +1418,18 @@ function shellStatus() {
     </div>`;
 }
 
+function receiverTestBuildLabel() {
+  return location.hostname === RECEIVER_TEST_HOST
+    ? 'Automatic Receiver Test Build'
+    : 'Receiver Test · Version X';
+}
+
 function renderHeader() {
   return `
-    <header class="appHeader">
+    <header class="appHeader" data-build-label="receiver-test">
       <div class="brandLockup">
         <div class="brandSeal small">PP</div>
-        <div><span>Lake123</span><strong>Poolside Pulse</strong><small>Version X</small></div>
+        <div><span>Lake123</span><strong>Poolside Pulse</strong><small class="candidateBuild">${escapeHtml(receiverTestBuildLabel())}</small></div>
       </div>
       ${shellStatus()}
       <div class="deviceMode roleBadge" aria-label="Device role"><span>${role === 'receiver' ? 'Speaker Receiver' : 'Remote Control'}</span></div>
@@ -1591,13 +1624,13 @@ function renderReceiver() {
         <small>${automaticMode ? `Automatic Receiver runs ${audibleTarget}% music → 0% → announcement 100% → 0% → resume → restore ${audibleTarget}%. Physical speaker loudness is not measured.` : pushcutMode ? `The Receiver Shortcut pauses music, sets 100% for speech, waits for playback completion, then restores ${audibleTarget}% and resumes. Physical loudness is not measured.` : policy.exact ? `The receiver has verified this music level. Announcements are fixed at ${VOICE_LEVEL_PERCENT}%.` : activeReceiverIsIOS() && ['apple', 'spotify'].includes(activeProvider) ? `${activeProvider === 'spotify' ? 'Spotify' : 'Apple Music'} uses physical iPhone/speaker loudness in Browser mode and pauses completely before voice.` : 'External music volume is not software-verified here. It pauses completely before voice or Suno plays.'}</small>
       </div>
     </section>
-    ${isIOSLike() ? iphoneReceiverModePanel({ owned }) : ''}
+    ${iphoneReceiverModePanel({ owned })}
     ${native ? '<div class="callout"><strong>One shared speaker output</strong><p>Choose the pool speaker in macOS Control Center > Sound. Do not select a Music.app-only AirPlay destination: Music.app and spoken announcements must use the same Mac system output.</p></div>' : ''}
     ${other ? `<div class="callout warning"><strong>Takeover protection</strong><p>Starting here will stop commands from targeting ${escapeHtml(receiver.name || 'the other receiver')}. Only take over if that device is no longer connected to the speakers.</p></div>` : ''}
-    <section class="readinessPanel">
-      <div class="sectionHeading"><div><p class="kicker">Live readiness</p><h2>Everything that must stay healthy</h2></div><span class="score">${readiness.filter(([, ok]) => ok).length}/${readiness.length}</span></div>
+    <details class="readinessPanel receiverDiagnostics">
+      <summary><span><span class="kicker">Live readiness</span><strong>Receiver diagnostics</strong></span><span class="score">${readiness.filter(([, ok]) => ok).length}/${readiness.length}</span></summary>
       <div class="readinessGrid">${readiness.map(([label, ok, detail]) => `<div class="readinessItem ${ok ? 'pass' : 'todo'}"><span>${ok ? 'Ready' : 'Check'}</span><strong>${escapeHtml(label)}</strong><small>${escapeHtml(detail)}</small></div>`).join('')}</div>
-    </section>
+    </details>
     ${playbackCard()}
     <section class="weatherStrip ${store.state.weather.tornadoActive || store.state.weather.lightningActive ? 'dangerState' : store.state.weather.windActive ? 'warningState' : ''}">
       <div><p class="kicker">Weather guard</p><h2>${store.state.weather.tornadoActive ? 'Tornado warning active' : store.state.weather.lightningActive ? 'Lightning hold active' : store.state.weather.windActive ? 'Strong wind active' : receiverOperatingMode() === 'browser' ? 'Monitoring every two minutes' : receiverOperatingMode() === 'pushcut' ? 'Immediate manual checks ready' : 'Start a receiver to monitor'}</h2><p>${escapeHtml(store.state.weather.status)}</p></div>
@@ -2324,7 +2357,7 @@ function renderApp() {
       ${feedbackBanner()}
       <main class="content">${renderContent()}</main>
     </div>
-    <footer class="appFooter"><span>Poolside Pulse Version X</span><span>${footerMix} · Weather every 2 minutes</span></footer>`;
+    <footer class="appFooter"><span>Poolside Pulse · Receiver Test · Version X</span><span>${footerMix} · Weather every 2 minutes</span></footer>`;
 }
 
 function formIdentity(form) {

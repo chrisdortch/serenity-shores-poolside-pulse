@@ -358,6 +358,20 @@ select:focus-visible {
   font-size: clamp(1.75rem, 5vw, 2.1rem);
 }
 
+.candidateBanner {
+  width: fit-content;
+  margin: 0 auto 12px;
+  border: 1px solid #d0a85e;
+  border-radius: 999px;
+  padding: 5px 10px;
+  background: #fff6df;
+  color: #70440e;
+  font-size: 0.7rem;
+  font-weight: 850;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
 .accessForm {
   display: grid;
   gap: 14px;
@@ -690,8 +704,9 @@ select:focus-visible {
   scrollbar-width: none;
   border-bottom: 1px solid var(--line);
   padding: 5px max(18px, env(safe-area-inset-right)) 0 max(18px, env(safe-area-inset-left));
-  background: rgba(255, 255, 255, 0.97);
+  background: var(--paper);
   box-shadow: 0 3px 10px rgba(12, 37, 51, 0.05);
+  isolation: isolate;
 }
 
 .tabs::-webkit-scrollbar {
@@ -1571,6 +1586,280 @@ select:focus-visible {
 
 .capabilityCard.limited {
   border-left-color: var(--amber-800);
+}
+
+/* Version X Automatic Receiver test setup */
+.receiverHero + .receiverModePanel,
+.receiverModePanel + .receiverDiagnostics {
+  margin-top: 18px;
+}
+
+.automaticReceiverWizard {
+  border-top: 5px solid var(--teal-700);
+  background: #fbfdfc;
+}
+
+.receiverTestHeading {
+  align-items: flex-start;
+}
+
+.setupStatus {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border: 1px solid #dcc28e;
+  border-radius: 8px;
+  padding: 10px 12px;
+  background: #fffaf1;
+  color: var(--amber-800);
+}
+
+.setupStatus > span {
+  flex: 0 0 auto;
+  font-size: 0.72rem;
+  font-weight: 800;
+}
+
+.setupStatus.verified {
+  border-color: #8fbea3;
+  background: #f0f8f3;
+  color: var(--green-700);
+}
+
+.setupLead {
+  margin: 13px 0 0;
+  color: var(--muted-strong);
+  font-size: 0.9rem;
+}
+
+.automaticSetupSteps {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin: 16px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.setupStep {
+  min-width: 0;
+  display: grid;
+  align-content: start;
+  gap: 11px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 15px;
+  background: var(--paper);
+}
+
+.setupStep.complete {
+  border-color: #9fc5ad;
+  background: #f6fbf7;
+}
+
+.setupStepHeading {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.setupStepHeading > div {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.setupStepHeading strong {
+  color: var(--navy-950);
+  font-size: 1rem;
+}
+
+.setupStepHeading small,
+.setupStep > small,
+.setupFootnote {
+  color: var(--muted-strong);
+  font-size: 0.78rem;
+}
+
+.setupStepNumber {
+  width: 34px;
+  height: 34px;
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--teal-700);
+  color: #fff;
+  font-size: 0.88rem;
+  font-weight: 850;
+}
+
+.setupStep.complete .setupStepNumber {
+  background: var(--green-700);
+}
+
+.setupAction,
+.setupStepActions > * {
+  width: 100%;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.setupStepActions {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.stepComplete {
+  min-height: 44px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid #9fc5ad;
+  border-radius: var(--control-radius);
+  padding: 9px 12px;
+  background: var(--green-100);
+  color: var(--green-700);
+  font-weight: 800;
+}
+
+.setupInstructions,
+.receiverDetailDisclosure,
+.legacyFallback {
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--paper);
+}
+
+.setupInstructions > summary,
+.receiverDetailDisclosure > summary,
+.legacyFallback > summary {
+  min-height: 48px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 13px;
+  color: var(--navy-900);
+  font-weight: 800;
+  cursor: pointer;
+  list-style: none;
+  overflow-wrap: anywhere;
+}
+
+.setupInstructions > summary {
+  border: 1px solid var(--teal-700);
+  border-radius: 8px;
+  background: var(--teal-700);
+  color: #fff;
+}
+
+.setupInstructions > summary::-webkit-details-marker,
+.receiverDetailDisclosure > summary::-webkit-details-marker,
+.legacyFallback > summary::-webkit-details-marker,
+.receiverDiagnostics > summary::-webkit-details-marker {
+  display: none;
+}
+
+.setupInstructions > summary::after,
+.receiverDetailDisclosure > summary::after,
+.legacyFallback > summary::after,
+.receiverDiagnostics > summary::after {
+  flex: 0 0 auto;
+  content: "+";
+  font-size: 1.15rem;
+  line-height: 1;
+}
+
+.setupInstructions[open] > summary::after,
+.receiverDetailDisclosure[open] > summary::after,
+.legacyFallback[open] > summary::after,
+.receiverDiagnostics[open] > summary::after {
+  content: "−";
+}
+
+.setupInstructionBody {
+  padding: 12px 2px 0;
+  overflow-wrap: anywhere;
+}
+
+.setupInstructionBody p:last-child {
+  margin-bottom: 0;
+}
+
+.compactAction {
+  min-height: 34px;
+  padding: 6px 10px;
+  font-size: 0.76rem;
+}
+
+.setupFootnote {
+  display: block;
+  margin-top: 12px;
+}
+
+.receiverDetailDisclosure,
+.legacyFallback {
+  margin-top: 12px;
+  background: #f7faf8;
+}
+
+.legacyFallback {
+  border-color: #dfc28a;
+  background: #fffaf1;
+}
+
+.receiverDetailDisclosure > .capabilityCard,
+.legacyFallback > .capabilityCard {
+  margin: 0 12px 12px;
+}
+
+.receiverDiagnostics {
+  padding: 0;
+  overflow: hidden;
+}
+
+.receiverDiagnostics > summary {
+  min-height: 64px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 15px clamp(18px, 3vw, 26px);
+  cursor: pointer;
+  list-style: none;
+}
+
+.receiverDiagnostics > summary > span:first-child {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+
+.receiverDiagnostics > summary .kicker {
+  margin: 0;
+}
+
+.receiverDiagnostics > summary strong {
+  color: var(--navy-950);
+  font-size: 1.05rem;
+}
+
+.receiverDiagnostics > summary::after {
+  color: var(--teal-700);
+}
+
+.receiverDiagnostics[open] > summary {
+  border-bottom: 1px solid var(--line);
+}
+
+.receiverDiagnostics .readinessGrid {
+  margin: 16px clamp(18px, 3vw, 26px) clamp(18px, 3vw, 26px);
 }
 
 /* Announcements and safety */
@@ -2680,6 +2969,10 @@ select:focus-visible {
     grid-template-columns: 1fr;
   }
 
+  .automaticSetupSteps {
+    grid-template-columns: 1fr;
+  }
+
   .mixMeter {
     grid-template-columns: repeat(2, minmax(0, 1fr));
     border-top: 1px solid var(--line);
@@ -2835,6 +3128,10 @@ select:focus-visible {
     min-width: 0;
     min-height: 44px;
     padding: 6px 8px;
+    font-size: 0.74rem;
+    line-height: 1.1;
+    white-space: normal;
+    overflow-wrap: anywhere;
   }
 
   .centerStage {
@@ -2888,6 +3185,39 @@ select:focus-visible {
   .sectionHeading {
     align-items: start;
     margin-bottom: 16px;
+  }
+
+  .receiverModePanel .sectionHeading,
+  .setupStatus {
+    display: grid;
+    grid-template-columns: 1fr;
+  }
+
+  .receiverModePanel .fixedMix,
+  .setupStatus > span {
+    width: fit-content;
+    min-width: 0;
+  }
+
+  .receiverModePanel :is(button, .shortcutLink, summary) {
+    min-width: 0;
+    max-width: 100%;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+
+  .receiverSetupSteps code {
+    word-break: break-word;
+    overflow-wrap: anywhere;
+  }
+
+  .setupStepActions {
+    grid-template-columns: 1fr;
+  }
+
+  .receiverDetailDisclosure > .capabilityCard,
+  .legacyFallback > .capabilityCard {
+    margin-inline: 9px;
   }
 
   .splitHeading {
@@ -3086,8 +3416,7 @@ select:focus-visible {
 }
 
 @media (max-width: 370px) {
-  .brandLockup span,
-  .brandLockup small {
+  .brandLockup span {
     display: none;
   }
 
@@ -3096,7 +3425,16 @@ select:focus-visible {
   }
 
   .brandLockup strong {
-    max-width: 116px;
+    max-width: 108px;
+  }
+
+  .brandLockup .candidateBuild {
+    display: block;
+    max-width: 120px;
+    overflow: hidden;
+    font-size: 0.6rem;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .deviceMode button {

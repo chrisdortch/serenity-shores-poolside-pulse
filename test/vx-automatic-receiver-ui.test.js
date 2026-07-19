@@ -10,13 +10,21 @@ const README_SOURCE = readFileSync(
   new URL('../README.md', import.meta.url),
   'utf8'
 );
+const CSS_SOURCE = readFileSync(
+  new URL('../src/vx.css', import.meta.url),
+  'utf8'
+);
+const HTML_SOURCE = readFileSync(
+  new URL('../index.html', import.meta.url),
+  'utf8'
+);
 
-function sourceBetween(startMarker, endMarker) {
-  const start = APP_SOURCE.indexOf(startMarker);
-  const end = APP_SOURCE.indexOf(endMarker, start + startMarker.length);
+function sourceBetween(startMarker, endMarker, source = APP_SOURCE) {
+  const start = source.indexOf(startMarker);
+  const end = source.indexOf(endMarker, start + startMarker.length);
   assert.ok(start >= 0, `Missing source marker: ${startMarker}`);
   assert.ok(end > start, `Missing source marker: ${endMarker}`);
-  return APP_SOURCE.slice(start, end);
+  return source.slice(start, end);
 }
 
 describe('Version X Automatic Receiver UI and routing contract', () => {
@@ -40,10 +48,104 @@ describe('Version X Automatic Receiver UI and routing contract', () => {
     assert.match(panel, /automaticSetupIssues/);
     assert.match(panel, /Remote iPhones need no Shortcut or Pushcut setup/);
     assert.match(panel, /Paired · run the required Receiver Test/);
-    assert.match(panel, /Test &amp; Turn On Automatic Receiver/);
+    assert.match(panel, /Test & Turn On Automatic Receiver/);
     assert.match(
       panel,
       /stays on Browser announcements unless the iPhone returns a signed end-to-end completion/
+    );
+  });
+
+  test('puts a four-action setup wizard first and keeps legacy Pushcut collapsed', () => {
+    const panel = sourceBetween(
+      'function iphoneReceiverModePanel',
+      'function updateLiveStatus'
+    );
+    const expectedOrder = [
+      'automaticReceiverWizard',
+      '<strong>Install Shortcut</strong>',
+      '<strong>Pair Receiver</strong>',
+      '<strong>Create Email Automation</strong>',
+      '<strong>Test &amp; Turn On</strong>',
+      '<details class="legacyFallback">'
+    ];
+    let previous = -1;
+    for (const marker of expectedOrder) {
+      const next = panel.indexOf(marker);
+      assert.ok(next > previous, `${marker} must appear in wizard order`);
+      previous = next;
+    }
+
+    assert.match(panel, /Receiver Test · Version X candidate/);
+    assert.match(panel, /Finish the four one-time steps/);
+    assert.match(panel, /class="shortcutLink setupAction"/);
+    assert.match(panel, /class="setupInstructions"/);
+    assert.match(panel, /class="receiverDetailDisclosure"/);
+    assert.match(panel, /<details class="legacyFallback">\s*<summary>Legacy fallback · Pushcut<\/summary>/);
+    assert.doesNotMatch(panel, /<details class="legacyFallback"[^>]*\sopen/);
+  });
+
+  test('labels the candidate host as the Automatic Receiver Test Build on every Speaker Receiver', () => {
+    const buildLabel = sourceBetween(
+      'function receiverTestBuildLabel',
+      'function renderHeader'
+    );
+    const header = sourceBetween('function renderHeader', 'function tabs');
+    const receiver = sourceBetween('function renderReceiver', 'function providerSelector');
+
+    assert.match(APP_SOURCE, /const RECEIVER_TEST_HOST = 'poolside-pulse-x-receiver\.vercel\.app'/);
+    assert.match(APP_SOURCE, /Poolside Pulse - Receiver Test - Version X/);
+    assert.match(buildLabel, /location\.hostname === RECEIVER_TEST_HOST/);
+    assert.match(buildLabel, /Automatic Receiver Test Build/);
+    assert.match(buildLabel, /Receiver Test · Version X/);
+    assert.match(header, /data-build-label="receiver-test"/);
+    assert.match(header, /receiverTestBuildLabel\(\)/);
+    assert.match(
+      HTML_SOURCE,
+      /<title>Lake123 - Poolside Pulse - Automatic Receiver Test Build - Version X<\/title>/
+    );
+    assert.match(receiver, /\$\{iphoneReceiverModePanel\(\{ owned \}\)\}/);
+    assert.doesNotMatch(
+      receiver,
+      /isIOSLike\(\) \? iphoneReceiverModePanel/
+    );
+  });
+
+  test('uses an opaque sticky nav and narrow-screen controls that cannot bleed or overflow', () => {
+    const tabsRule = sourceBetween('.tabs {', '.tabs::-webkit-scrollbar', CSS_SOURCE);
+    const mobileRule = sourceBetween(
+      '@media (max-width: 600px) {',
+      '@media (prefers-contrast: more)',
+      CSS_SOURCE
+    );
+
+    assert.match(tabsRule, /position:\s*sticky/);
+    assert.match(tabsRule, /top:\s*calc\(var\(--header-height\)/);
+    assert.match(tabsRule, /background:\s*var\(--paper\)/);
+    assert.match(tabsRule, /isolation:\s*isolate/);
+    assert.doesNotMatch(tabsRule, /background:\s*rgba/);
+    assert.match(mobileRule, /\.receiverModePanel \.sectionHeading/);
+    assert.match(mobileRule, /grid-template-columns:\s*1fr/);
+    assert.match(
+      mobileRule,
+      /\.receiverModePanel :is\(button, \.shortcutLink, summary\)/
+    );
+    assert.match(mobileRule, /min-width:\s*0/);
+    assert.match(mobileRule, /max-width:\s*100%/);
+    assert.match(mobileRule, /white-space:\s*normal/);
+    assert.match(mobileRule, /overflow-wrap:\s*anywhere/);
+  });
+
+  test('collapses secondary diagnostics to keep the Receiver page short', () => {
+    const receiver = sourceBetween('function renderReceiver', 'function providerSelector');
+
+    assert.match(
+      receiver,
+      /<details class="readinessPanel receiverDiagnostics">/
+    );
+    assert.match(receiver, /<strong>Receiver diagnostics<\/strong>/);
+    assert.doesNotMatch(
+      receiver,
+      /<details class="readinessPanel receiverDiagnostics"[^>]*\sopen/
     );
   });
 
