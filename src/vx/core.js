@@ -119,12 +119,8 @@ export const DEFAULT_ANNOUNCEMENT_SOURCES = [
 ];
 
 export const DEFAULT_SCHEDULE = [
-  { id: 'open-welcome', label: 'Pool Open Welcome', type: 'announcement', time: '09:05', announcementId: 'welcome', enabled: true, days: [0, 1, 2, 3, 4, 5, 6] },
-  { id: 'ten-welcome', label: '10am Welcome', type: 'announcement', time: '10:00', announcementId: 'welcome', enabled: true, days: [0, 1, 2, 3, 4, 5, 6] },
-  { id: 'midday-safety', label: 'Midday Safety', type: 'announcement', time: '12:30', announcementId: 'no-glass', enabled: true, days: [0, 1, 2, 3, 4, 5, 6] },
-  { id: 'afternoon-hydration', label: 'Afternoon Hydration', type: 'announcement', time: '15:00', announcementId: 'hydrate', enabled: true, days: [0, 1, 2, 3, 4, 5, 6] },
-  { id: 'closing-15', label: 'Closing in 15', type: 'announcement', time: '21:45', announcementId: 'closing-15', enabled: true, days: [0, 1, 2, 3, 4, 5, 6] },
-  { id: 'closing-5', label: 'Closing in 5', type: 'announcement', time: '21:55', announcementId: 'closing-5', enabled: true, days: [0, 1, 2, 3, 4, 5, 6] }
+  { id: 'open-welcome', label: 'Pool Open Welcome', type: 'announcement', time: '10:00', announcementId: 'welcome', enabled: true, days: [0, 1, 2, 3, 4, 5, 6] },
+  { id: 'quiet-hours-stop', label: 'Quiet Hours', type: 'stop', time: '22:00', enabled: true, days: [0, 1, 2, 3, 4, 5, 6] }
 ];
 
 export const DEFAULT_SCHEDULE_ID = 'daily-schedule';
@@ -346,6 +342,7 @@ function normalizeTime(value, fallback = '12:00') {
 
 function scheduleActionKind(item) {
   const requested = String(item?.action?.kind ?? item?.kind ?? item?.type ?? '').toLowerCase();
+  if (['stop', 'quiet', 'quiet-hours'].includes(requested)) return 'stop';
   if (requested === 'apple') return 'apple';
   if (requested === 'spotify') return 'spotify';
   if (['controlled', 'suno', 'direct', 'audio'].includes(requested)) return 'controlled';
@@ -359,6 +356,7 @@ function scheduleItemOrder(item, index = 0) {
 export function normalizeScheduleItem(item, index = 0) {
   const source = item && typeof item === 'object' ? item : {};
   const kind = scheduleActionKind(source);
+  const stop = kind === 'stop';
   const actionSource = source.action && typeof source.action === 'object' ? source.action : {};
   const volumeSource = source.volume && typeof source.volume === 'object' ? source.volume : {};
   const advanceSource = source.advance && typeof source.advance === 'object' ? source.advance : {};
@@ -368,11 +366,11 @@ export function normalizeScheduleItem(item, index = 0) {
     ? 'inline'
     : 'saved';
   const requestedAdvanceMode = String(advanceSource.mode ?? source.advanceMode ?? '').toLowerCase();
-  const defaultAdvanceMode = kind === 'announcement' ? 'complete' : 'manual';
+  const defaultAdvanceMode = kind === 'announcement' || stop ? 'complete' : 'manual';
   // Speech has one truthful completion gate: the announcement promise resolves
   // after spoken audio finishes. Persisted legacy values must not turn speech
   // into an unsupported timer, track-end, or manual gate.
-  const advanceMode = kind === 'announcement'
+  const advanceMode = kind === 'announcement' || stop
     ? 'complete'
     : ['complete', 'track-end', 'duration', 'manual'].includes(requestedAdvanceMode)
       ? requestedAdvanceMode
@@ -380,11 +378,15 @@ export function normalizeScheduleItem(item, index = 0) {
   // Version X has one announcement level: 100%. Only music items may keep a
   // custom level. This prevents a legacy/custom schedule row from quietly
   // weakening a safety or manager announcement.
-  const volumeMode = kind !== 'announcement'
+  const volumeMode = kind !== 'announcement' && !stop
     && String(volumeSource.mode ?? source.volumeMode ?? '').toLowerCase() === 'custom'
       ? 'custom'
       : 'global';
-  const defaultPercent = kind === 'announcement' ? VOICE_LEVEL_PERCENT : MUSIC_LEVEL_PERCENT;
+  const defaultPercent = kind === 'announcement'
+    ? VOICE_LEVEL_PERCENT
+    : stop
+      ? 0
+      : MUSIC_LEVEL_PERCENT;
   const time = normalizeTime(source.position?.time ?? source.time);
   const order = scheduleItemOrder(source, index);
   const announcementId = boundedString(actionSource.announcementId ?? source.announcementId, 120);
@@ -400,26 +402,30 @@ export function normalizeScheduleItem(item, index = 0) {
     position: { time, order },
     action: {
       kind,
-      announcementSource,
-      announcementId,
-      sourceId,
-      text: boundedString(inferredInlineText, 900),
-      url
+      announcementSource: stop ? '' : announcementSource,
+      announcementId: stop ? '' : announcementId,
+      sourceId: stop ? '' : sourceId,
+      text: stop ? '' : boundedString(inferredInlineText, 900),
+      url: stop ? '' : url
     },
     volume: {
       mode: volumeMode,
-      percent: kind === 'announcement'
+      percent: stop
+        ? 0
+        : kind === 'announcement'
         ? VOICE_LEVEL_PERCENT
         : clamp(volumeSource.percent ?? source.volumePercent, 0, 100, defaultPercent)
     },
     advance: {
       mode: advanceMode,
-      durationSeconds: clamp(
-        advanceSource.durationSeconds ?? source.durationSeconds,
-        SCHEDULE_DURATION_MIN_SECONDS,
-        SCHEDULE_DURATION_MAX_SECONDS,
-        SCHEDULE_DURATION_DEFAULT_SECONDS
-      )
+      durationSeconds: stop
+        ? SCHEDULE_DURATION_DEFAULT_SECONDS
+        : clamp(
+            advanceSource.durationSeconds ?? source.durationSeconds,
+            SCHEDULE_DURATION_MIN_SECONDS,
+            SCHEDULE_DURATION_MAX_SECONDS,
+            SCHEDULE_DURATION_DEFAULT_SECONDS
+          )
     }
   };
 
@@ -430,8 +436,8 @@ export function normalizeScheduleItem(item, index = 0) {
     type: kind,
     time,
     order,
-    announcementId,
-    url
+    announcementId: stop ? '' : announcementId,
+    url: stop ? '' : url
   };
 }
 
@@ -531,6 +537,7 @@ export function getActiveSchedule(state) {
 
 export function effectiveScheduleItemVolume(item, config = {}) {
   const kind = scheduleActionKind(item);
+  if (kind === 'stop') return 0;
   if (kind === 'announcement') return VOICE_LEVEL_PERCENT;
   const volume = item?.volume && typeof item.volume === 'object' ? item.volume : {};
   if (String(volume.mode ?? item?.volumeMode ?? '').toLowerCase() === 'custom') {

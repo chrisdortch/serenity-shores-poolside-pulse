@@ -61,6 +61,65 @@ describe('Poolside Pulse Version X state isolation and volume model', () => {
     assert.equal(effectiveScheduleItemVolume(customItem, { voiceLevel: 63 }), 100);
   });
 
+  test('normalizes stop and quiet-hours aliases to a zero-volume terminal action', () => {
+    for (const requestedKind of ['stop', 'quiet', 'quiet-hours']) {
+      const item = normalizeScheduleItem({
+        id: `test-${requestedKind}`,
+        type: requestedKind,
+        time: '22:00',
+        announcementId: 'welcome',
+        sourceId: 'natural-voice',
+        url: 'https://media.example/should-not-survive.mp3',
+        provider: 'spotify',
+        action: {
+          kind: requestedKind,
+          announcementSource: 'inline',
+          announcementId: 'welcome',
+          sourceId: 'natural-voice',
+          text: 'This must not play.',
+          url: 'https://media.example/should-not-survive.mp3',
+          provider: 'spotify'
+        },
+        volume: { mode: 'custom', percent: 88 },
+        advance: { mode: 'manual', durationSeconds: 77 }
+      });
+
+      assert.equal(item.action.kind, 'stop');
+      assert.equal(item.action.announcementSource, '');
+      assert.equal(item.action.announcementId, '');
+      assert.equal(item.action.sourceId, '');
+      assert.equal(item.action.text, '');
+      assert.equal(item.action.url, '');
+      assert.equal(item.action.provider, undefined);
+      assert.deepEqual(item.volume, { mode: 'global', percent: 0 });
+      assert.deepEqual(item.advance, { mode: 'complete', durationSeconds: 300 });
+      assert.equal(item.type, 'stop');
+      assert.equal(item.time, '22:00');
+      assert.equal(item.announcementId, '');
+      assert.equal(item.url, '');
+      assert.equal(effectiveScheduleItemVolume(item, { musicLevel: 100, voiceLevel: 100 }), 0);
+    }
+  });
+
+  test('uses a safe Time-mode default of a 10 AM welcome and 10 PM stop', () => {
+    const state = createDefaultState(1);
+    const schedule = state.schedules[0];
+
+    assert.equal(schedule.mode, 'time');
+    assert.equal(schedule.items.length, 2);
+    assert.deepEqual(schedule.items.map(item => [item.time, item.type]), [
+      ['10:00', 'announcement'],
+      ['22:00', 'stop']
+    ]);
+    assert.equal(schedule.items[0].announcementId, 'welcome');
+    assert.equal(schedule.items[1].volume.percent, 0);
+    assert.equal(schedule.items[1].advance.mode, 'complete');
+    assert.deepEqual(state.schedule.map(item => [item.time, item.type, item.url, item.announcementId]), [
+      ['10:00', 'announcement', '', 'welcome'],
+      ['22:00', 'stop', '', '']
+    ]);
+  });
+
   test('accepts Apple Music web URLs and rejects Spotify, open.apple.com, and arbitrary URLs', () => {
     assert.equal(isAppleMusicUrl('https://music.apple.com/us/album/example/123'), true);
     assert.equal(isAppleMusicUrl('https://music.apple.com/gb/song/example/456'), true);

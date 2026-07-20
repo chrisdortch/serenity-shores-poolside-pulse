@@ -308,6 +308,53 @@ describe('Version X Apple and Spotify runtime integration', { concurrency: false
     assert.equal(store.state.scheduleRuns['spotify-time-item'].status, 'completed');
   });
 
+  test('runs a due Time quiet-hours stop and records it exactly once', async () => {
+    const { runtime, store, appleAudible, spotifyAudible, audioState } = harness();
+    const parts = new Intl.DateTimeFormat('en-US', {
+      timeZone: 'America/Chicago',
+      hour: '2-digit',
+      minute: '2-digit',
+      hourCycle: 'h23'
+    }).formatToParts(new Date(NOW));
+    const values = Object.fromEntries(parts.map(part => [part.type, part.value]));
+    const time = `${values.hour}:${values.minute}`;
+    store.state.schedules = [{
+      id: 'time-quiet-hours',
+      name: 'Quiet Hours',
+      mode: 'time',
+      enabled: true,
+      items: [{
+        id: 'quiet-hours-item',
+        label: 'Stop Music / Quiet Hours',
+        enabled: true,
+        type: 'stop',
+        time,
+        position: { time },
+        action: { kind: 'stop' },
+        volume: { mode: 'global', percent: 0 },
+        advance: { mode: 'complete', durationSeconds: 300 }
+      }]
+    }];
+    store.state.activeScheduleId = 'time-quiet-hours';
+    store.state.scheduleRuns = {};
+    store.state.playback = { ...store.state.playback, provider: 'spotify', intent: 'playing' };
+    runtime.physicalProvider = 'spotify';
+    appleAudible.value = true;
+    spotifyAudible.value = true;
+    audioState.controlledAudible = true;
+
+    await runtime.tickSchedule();
+
+    assert.equal(appleAudible.value, false);
+    assert.equal(spotifyAudible.value, false);
+    assert.equal(audioState.controlledAudible, false);
+    assert.equal(store.state.playback.intent, 'stopped');
+    assert.equal(store.state.scheduleRuns['quiet-hours-item'].status, 'completed');
+
+    await runtime.tickSchedule();
+    assert.equal(store.state.scheduleRuns['quiet-hours-item'].status, 'completed');
+  });
+
   test('routes Order Spotify items and rejects unsupported track-end before playback', async () => {
     const { runtime } = harness();
     runtime.assertExternalAudioIntent = () => true;
@@ -343,6 +390,36 @@ describe('Version X Apple and Spotify runtime integration', { concurrency: false
       /does not provide a schedule-safe track-end event/i
     );
     assert.equal(received, null);
+  });
+
+  test('routes an Order quiet-hours stop and advances immediately', async () => {
+    const { runtime, store, appleAudible, spotifyAudible, audioState } = harness();
+    runtime.assertExternalAudioIntent = () => true;
+    runtime.completeOrderGate = async (_scheduleId, _token, status) => status;
+    store.state.playback = { ...store.state.playback, provider: 'apple', intent: 'playing' };
+    runtime.physicalProvider = 'apple';
+    appleAudible.value = true;
+    spotifyAudible.value = true;
+    audioState.controlledAudible = true;
+
+    const result = await runtime.executeOrderItem({
+      scheduleId: 'order-quiet-hours',
+      token: 'order-stop-token',
+      item: {
+        id: 'order-stop-item',
+        label: 'Stop all music',
+        type: 'stop',
+        action: { kind: 'stop' },
+        volume: { mode: 'global', percent: 0 },
+        advance: { mode: 'complete', durationSeconds: 300 }
+      }
+    });
+
+    assert.deepEqual(result, { continue: true, status: 'auto-pending' });
+    assert.equal(appleAudible.value, false);
+    assert.equal(spotifyAudible.value, false);
+    assert.equal(audioState.controlledAudible, false);
+    assert.equal(store.state.playback.intent, 'stopped');
   });
 
   test('passes the selected finite source through both Order and Time announcements', async () => {

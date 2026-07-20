@@ -2374,6 +2374,89 @@ describe('Version X email schedule manifest', { concurrency: false }, () => {
     assert.equal(removed.length, 1);
   });
 
+  test('turns a planned quiet-hours occurrence into a zero-volume Shortcut command', async () => {
+    let manifest = {
+      schemaVersion: 1,
+      version: 'x',
+      transport: 'email-wake-x',
+      syncedAt: 0,
+      horizonEnd: 0,
+      stateRevision: 0,
+      warnings: [],
+      occurrences: {}
+    };
+    const manifestStore = {
+      durable: true,
+      async withLock(operation) { return await operation(); },
+      async read() { return structuredClone(manifest); },
+      async write(next) {
+        manifest = structuredClone(next);
+        return structuredClone(manifest);
+      }
+    };
+    const queued = [];
+    const result = await synchronizeEmailWakeXSchedule({
+      state: {
+        activeScheduleId: 'daily',
+        schedules: [{
+          id: 'daily',
+          mode: 'time',
+          enabled: true,
+          items: [{
+            id: 'quiet-hours',
+            enabled: true,
+            action: { kind: 'stop' }
+          }]
+        }]
+      }
+    }, {
+      env: configuredEnv(),
+      now: () => NOW,
+      manifestStore,
+      planner: (_state, options) => {
+        assert.equal(options.includeStops, true);
+        return {
+          horizonEnd: NOW + 29 * 24 * 60 * 60 * 1000,
+          stateRevision: 8,
+          warnings: [],
+          occurrences: [{
+            logicalId: 'logical-quiet-hours-0001',
+            fingerprint: 'fingerprint-quiet-hours-0001',
+            scheduleId: 'daily',
+            itemId: 'quiet-hours',
+            action: 'volume',
+            scheduledFor: NOW + 60_000,
+            label: 'Stop Music / Quiet Hours',
+            musicPercent: 0
+          }]
+        };
+      },
+      createReceipt: async command => ({ receipt: { eventId: command.eventId }, durable: true }),
+      updateReceipt: async () => ({}),
+      enqueueCommand: async command => {
+        queued.push(command);
+        return { created: true, item: { command }, durable: true };
+      },
+      activateCommand: async () => ({ item: {}, durable: true }),
+      removeCommand: async () => true,
+      sendWake: async () => ({ emailId: 'quiet-hours-email-id-12345678', provider: 'resend' }),
+      sendMaintenanceWake: async () => ({ emailId: 'quiet-hours-maintenance-id-12345678', provider: 'resend' }),
+      cancelWake: async () => true,
+      cancelMaintenanceWake: async () => true,
+      wait: async () => {}
+    });
+
+    assert.equal(result.scheduled, 1);
+    assert.equal(result.musicBrowserCount, 0);
+    assert.equal(result.announcementScheduledCount, 0);
+    assert.equal(result.volumeScheduledCount, 1);
+    assert.equal(queued.length, 1);
+    assert.equal(queued[0].action, 'volume');
+    assert.equal(queued[0].musicPercent, 0);
+    assert.equal(queued[0].resumeMusic, false);
+    assert.equal(queued[0].source, 'schedule');
+  });
+
   test('drops an elapsed manifest entry without racing its queued receiver command', async () => {
     const elapsedEventId = 'email-wake-x-sched-elapsed-0001';
     let manifest = {

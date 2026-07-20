@@ -254,24 +254,34 @@ function requestedScheduleBedProvider(value) {
   return X_BED_PROVIDER_ALIASES.has(requested) ? X_BED_PROVIDER_ALIASES.get(requested) : null;
 }
 
+function requestedScheduleStop(value) {
+  if (!isRecord(value)) return false;
+  const action = isRecord(value.action) ? value.action : {};
+  const requested = boundedString(action.kind ?? value.kind ?? value.type, 40).toLowerCase();
+  return ['stop', 'quiet', 'quiet-hours'].includes(requested);
+}
+
 function sanitizeScheduleItem(value, original, validSourceIds) {
   const clean = isRecord(value) ? safeClone(value) : {};
   const source = isRecord(original) ? original : clean;
+  const stop = requestedScheduleStop(source);
   const bedProvider = requestedScheduleBedProvider(source);
   const action = isRecord(clean.action) ? clean.action : {};
   const originalAction = isRecord(source.action) ? source.action : {};
   const sourceId = boundedString(originalAction.sourceId ?? source.sourceId, 120);
   const nextAction = {
     ...action,
+    ...(stop ? { kind: 'stop' } : {}),
     ...(bedProvider ? { kind: bedProvider } : {}),
-    ...(!bedProvider && sourceId && validSourceIds.has(sourceId) ? { sourceId } : {})
+    ...(!stop && !bedProvider && sourceId && validSourceIds.has(sourceId) ? { sourceId } : {})
   };
-  if (bedProvider) {
+  if (stop || bedProvider) {
     delete nextAction.announcementSource;
     delete nextAction.announcementId;
     delete nextAction.text;
     delete nextAction.sourceId;
   }
+  if (stop) delete nextAction.url;
   const originalVolume = isRecord(source.volume) ? source.volume : {};
   const originalAdvance = isRecord(source.advance) ? source.advance : {};
   const requestedAdvanceMode = boundedString(originalAdvance.mode ?? source.advanceMode, 40).toLowerCase();
@@ -281,6 +291,16 @@ function sanitizeScheduleItem(value, original, validSourceIds) {
   return {
     ...clean,
     action: nextAction,
+    ...(stop ? {
+      type: 'stop',
+      url: '',
+      announcementId: '',
+      volume: { mode: 'global', percent: 0 },
+      advance: {
+        mode: 'complete',
+        durationSeconds: 5 * 60
+      }
+    } : {}),
     ...(bedProvider ? {
       type: bedProvider,
       volume: {

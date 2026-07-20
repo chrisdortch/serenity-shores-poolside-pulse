@@ -89,6 +89,21 @@ export function emailWakeXMaintenanceEventId(
 
 function commandFor(occurrence, now, env = process.env) {
   const eventId = emailWakeXScheduleEventId(occurrence, env);
+  if (occurrence.action === 'volume') {
+    return Object.freeze({
+      schemaVersion: 1,
+      version: 'x',
+      action: 'volume',
+      commandId: eventId,
+      eventId,
+      issuedAt: now,
+      scheduledFor: occurrence.scheduledFor,
+      source: 'schedule',
+      receiverContract: EMAIL_WAKE_X_RECEIVER_CONTRACT,
+      musicPercent: 0,
+      resumeMusic: false
+    });
+  }
   return Object.freeze({
     schemaVersion: 1,
     version: 'x',
@@ -122,6 +137,7 @@ function manifestEntry(occurrence, command, emailId, now) {
     emailId,
     scheduleId: occurrence.scheduleId,
     itemId: occurrence.itemId,
+    action: command.action,
     scheduledFor: occurrence.scheduledFor,
     status: 'scheduled',
     updatedAt: now
@@ -133,6 +149,8 @@ function publicManifest(manifest) {
   const scheduled = occurrences
     .filter(item => item.status === 'scheduled' && Number(item.scheduledFor || 0) > 0)
     .sort((left, right) => left.scheduledFor - right.scheduledFor);
+  const scheduledVolume = scheduled.filter(item => item.action === 'volume');
+  const scheduledAnnouncements = scheduled.filter(item => item.action !== 'volume');
   return Object.freeze({
     version: 'x',
     transport: 'email-wake-x',
@@ -144,7 +162,8 @@ function publicManifest(manifest) {
     sourceFingerprint: String(manifest?.sourceFingerprint || ''),
     occurrenceCount: occurrences.length,
     scheduledCount: scheduled.length,
-    announcementScheduledCount: scheduled.length,
+    announcementScheduledCount: scheduledAnnouncements.length,
+    volumeScheduledCount: scheduledVolume.length,
     musicBrowserCount: Number(manifest?.musicBrowserCount || 0),
     maintenanceScheduled: manifest?.maintenance?.status === 'scheduled',
     maintenanceScheduledFor: Number(manifest?.maintenance?.scheduledFor || 0),
@@ -271,7 +290,8 @@ export async function synchronizeEmailWakeXSchedule({
     const syncNow = Number(now());
     const requestedPlan = planner(state, {
       now: syncNow,
-      horizonDays
+      horizonDays,
+      includeStops: true
     });
     const plan = enabled === false
       ? {

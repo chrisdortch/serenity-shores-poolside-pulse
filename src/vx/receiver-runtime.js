@@ -4174,6 +4174,14 @@ export class ReceiverRuntime {
       return { continue: status === 'auto-pending', status };
     }
 
+    if (kind === 'stop') {
+      this.assertExternalAudioIntent(externalIntentGeneration);
+      await this.stopMusic({ skipOrderFailure: true });
+      this.assertExternalAudioIntent(externalIntentGeneration, 'A newer audio command replaced this Order quiet-hours stop.');
+      const status = await this.completeOrderGate(scheduleId, token, 'auto-pending', 'all music stopped', externalIntentGeneration);
+      return { continue: status === 'auto-pending', status };
+    }
+
     const url = String(item.action?.url || item.url || '').trim();
     if (!url) throw new Error('This Order music item has no source URL.');
     if (['apple', 'spotify'].includes(kind) && advanceMode === 'track-end') {
@@ -4416,8 +4424,9 @@ export class ReceiverRuntime {
       const delegatedDue = automaticAnnouncements
         ? allDue.filter(
             item =>
-              String(item.action?.kind || item.type || 'announcement')
-                === 'announcement'
+              ['announcement', 'stop'].includes(
+                String(item.action?.kind || item.type || 'announcement')
+              )
           )
         : [];
       if (
@@ -4445,7 +4454,9 @@ export class ReceiverRuntime {
       const due = allDue.filter(
         item =>
           !automaticAnnouncements
-          || String(item.action?.kind || item.type || 'announcement') !== 'announcement'
+          || !['announcement', 'stop'].includes(
+            String(item.action?.kind || item.type || 'announcement')
+          )
       );
       if (due.length && await this.externalAutomationBusy()) return;
       for (const dueItem of due) {
@@ -4517,7 +4528,8 @@ export class ReceiverRuntime {
       }
       let playbackCompleted = false;
       try {
-        if (item.type === 'announcement') {
+        const itemKind = String(item.action?.kind || item.type || 'announcement');
+        if (itemKind === 'announcement') {
           const resolved = resolveScheduleAnnouncementText(item, this.state.announcements);
           const announcementId = item.action?.announcementId || item.announcementId || '';
           const text = item.action?.announcementSource === 'inline'
@@ -4531,14 +4543,16 @@ export class ReceiverRuntime {
             volumePercent: effectiveScheduleItemVolume(item, this.state.config),
             ...this.announcementDeliveryForScheduleItem(item)
           });
-        } else if (item.type === 'apple') {
+        } else if (itemKind === 'stop') {
+          await this.stopMusic({ skipOrderFailure: true });
+        } else if (itemKind === 'apple') {
           await this.playAppleMusic(item.url || item.action?.url || this.state.config.appleUrl, {
             volumePercent: effectiveScheduleItemVolume(item, this.state.config),
             volumeMode: item.volume?.mode,
             scheduledItemId: item.id,
             scheduledRunToken: timeRunToken
           });
-        } else if (item.type === 'spotify') {
+        } else if (itemKind === 'spotify') {
           await this.playSpotify(item.url || item.action?.url || this.state.config.spotifyUrl, {
             volumePercent: effectiveScheduleItemVolume(item, this.state.config),
             volumeMode: item.volume?.mode,

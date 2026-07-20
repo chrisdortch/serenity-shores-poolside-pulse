@@ -540,7 +540,8 @@ export function planPushcutXSchedule(stateInput, {
   now = Date.now(),
   horizonDays = PUSHCUT_X_SCHEDULE_HORIZON_DAYS,
   timeZone = PUSHCUT_X_SCHEDULE_TIME_ZONE,
-  env = process.env
+  env = process.env,
+  includeStops = false
 } = {}) {
   if (
     !isRecord(stateInput)
@@ -567,7 +568,10 @@ export function planPushcutXSchedule(stateInput, {
     });
   }
   const enabledAnnouncementCount = (active.items || [])
-    .filter(item => item.enabled !== false && item.action?.kind === 'announcement')
+    .filter(item => item.enabled !== false && (
+      item.action?.kind === 'announcement'
+      || (includeStops === true && item.action?.kind === 'stop')
+    ))
     .length;
   if (enabledAnnouncementCount > 0) {
     const capacityHorizonDays = Math.max(
@@ -583,9 +587,13 @@ export function planPushcutXSchedule(stateInput, {
   const dates = localDates(safeNow, effectiveHorizonDays, timeZone);
   const occurrences = [];
   for (const item of active.items || []) {
-    if (item.enabled === false || item.action?.kind !== 'announcement') continue;
-    const announcement = announcementForItem(item, state);
-    if (announcement.warning) {
+    const actionKind = String(item.action?.kind || item.type || 'announcement');
+    const isStop = includeStops === true && actionKind === 'stop';
+    if (item.enabled === false || (actionKind !== 'announcement' && !isStop)) continue;
+    const announcement = isStop
+      ? null
+      : announcementForItem(item, state);
+    if (announcement?.warning) {
       warnings.push(announcement.warning);
       continue;
     }
@@ -623,17 +631,18 @@ export function planPushcutXSchedule(stateInput, {
       const fingerprint = sha(JSON.stringify({
         logicalId,
         scheduledFor,
-        text: announcement.text,
-        label: announcement.label,
-        delivery: announcement.delivery,
-        voice: announcement.source.voice || '',
-        instructions: announcement.source.instructions || '',
+        action: isStop ? 'volume' : 'announce',
+        text: announcement?.text || '',
+        label: announcement?.label || item.label,
+        delivery: announcement?.delivery || null,
+        voice: announcement?.source?.voice || '',
+        instructions: announcement?.source?.instructions || '',
         receiverContract: PUSHCUT_X_RECEIVER_CONTRACT,
-        musicPercent: levels.musicPercent
+        musicPercent: isStop ? 0 : levels.musicPercent
       }), 48);
       const ids = occurrenceIdentifiers(logicalId);
-      const finiteSeconds = Number(announcement.delivery.announcementDurationSeconds || 0);
-      const recoverySeconds = announcement.delivery.announcementMode === 'finite-audio'
+      const finiteSeconds = Number(announcement?.delivery?.announcementDurationSeconds || 0);
+      const recoverySeconds = announcement?.delivery?.announcementMode === 'finite-audio'
         ? Math.max(12, Math.min(60, finiteSeconds + 8))
         : NATURAL_RECOVERY_SECONDS;
       occurrences.push(Object.freeze({
@@ -647,15 +656,16 @@ export function planPushcutXSchedule(stateInput, {
         recoveryFor: scheduledFor + recoverySeconds * 1000,
         delaySeconds,
         recoveryDelaySeconds: delaySeconds + recoverySeconds,
-        text: announcement.text,
-        label: announcement.label,
-        voice: bounded(announcement.source.voice, 40) || 'marin',
-        instructions: bounded(announcement.source.instructions, 700),
+        action: isStop ? 'volume' : 'announce',
+        text: announcement?.text || '',
+        label: announcement?.label || bounded(item.label, 80) || 'Quiet hours',
+        voice: bounded(announcement?.source?.voice, 40) || 'marin',
+        instructions: bounded(announcement?.source?.instructions, 700),
         voicePercent: levels.voicePercent,
-        musicPercent: levels.musicPercent,
+        musicPercent: isStop ? 0 : levels.musicPercent,
         announcementLevel: levels.announcementLevel,
-        musicLevel: levels.musicLevel,
-        ...announcement.delivery
+        musicLevel: isStop ? 0 : levels.musicLevel,
+        ...(announcement?.delivery || {})
       }));
       if (occurrences.length > MAX_PLAN_OCCURRENCES) fail('invalid');
     }

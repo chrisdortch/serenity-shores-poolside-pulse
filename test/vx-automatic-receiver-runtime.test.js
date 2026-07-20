@@ -565,6 +565,42 @@ describe('Version X Automatic Receiver runtime routing', { concurrency: false },
     }
   });
 
+  test('delegates a timed quiet-hours stop exclusively to the Automatic Receiver', async () => {
+    const { runtime, store } = harness({
+      owner: true,
+      delegationStatus: { operational: true, enabled: true, current: true, error: '' }
+    });
+    const time = dueTime();
+    store.state.schedules = [{
+      id: 'automatic-quiet-hours',
+      name: 'Automatic Quiet Hours',
+      mode: 'time',
+      enabled: true,
+      items: [{
+        id: 'automatic-stop',
+        label: 'Stop Music / Quiet Hours',
+        enabled: true,
+        type: 'stop',
+        time,
+        position: { time },
+        action: { kind: 'stop' },
+        volume: { mode: 'global', percent: 0 }
+      }]
+    }];
+    store.state.activeScheduleId = 'automatic-quiet-hours';
+    store.state.scheduleRuns = {};
+    let browserStops = 0;
+    runtime.stopMusic = async () => {
+      browserStops += 1;
+      return true;
+    };
+
+    await runtime.tickSchedule();
+
+    assert.equal(browserStops, 0);
+    assert.equal(store.state.scheduleRuns['automatic-stop'], undefined);
+  });
+
   test('does not process pending browser events while the Receiver Shortcut owns audio', async () => {
     const { runtime, store, automation } = harness({
       owner: true,

@@ -234,6 +234,38 @@ describe('Version X Central Time occurrence planner', { concurrency: false }, ()
     assert.equal(planPushcutXSchedule(orderState, { now: NOW }).occurrences.length, 0);
   });
 
+  test('adds quiet-hours volume occurrences only for the Automatic Receiver planner', () => {
+    const state = scheduleState();
+    state.schedules[0].items.push({
+      id: 'quiet-hours',
+      label: 'Stop Music / Quiet Hours',
+      enabled: true,
+      days: [5],
+      position: { time: '10:45', order: 2 },
+      action: { kind: 'stop' },
+      volume: { mode: 'global', percent: 0 },
+      advance: { mode: 'complete', durationSeconds: 300 }
+    });
+
+    const pushcutPlan = planPushcutXSchedule(state, {
+      now: NOW,
+      horizonDays: 7
+    });
+    assert.equal(pushcutPlan.occurrences.length, 1);
+
+    const automaticPlan = planPushcutXSchedule(state, {
+      now: NOW,
+      horizonDays: 7,
+      includeStops: true
+    });
+    assert.equal(automaticPlan.occurrences.length, 2);
+    const quiet = automaticPlan.occurrences.find(item => item.itemId === 'quiet-hours');
+    assert.equal(quiet.action, 'volume');
+    assert.equal(quiet.musicPercent, 0);
+    assert.equal(quiet.musicLevel, 0);
+    assert.equal(quiet.scheduledFor, Date.parse('2026-07-17T15:45:00.000Z'));
+  });
+
   test('preserves stable provider identifiers and isolates each Version X namespace', () => {
     const state = scheduleState();
     const stable = planPushcutXSchedule(state, {

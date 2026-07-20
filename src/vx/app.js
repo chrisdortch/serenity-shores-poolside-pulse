@@ -101,6 +101,7 @@ const SCHEDULE_STRUCTURAL_ACTIONS = new Set([
   'play-next-schedule',
   'reset-order-schedule'
 ]);
+const SCHEDULE_NATIVE_CONTROL_LOCK_MS = 2 * 60_000;
 
 let authenticated = false;
 let authChecked = false;
@@ -111,6 +112,10 @@ let busy = false;
 let takeoverTarget = null;
 let renderQueued = false;
 let renderQueuedForce = false;
+let deferredRenderPending = false;
+let deferredRenderForce = false;
+let scheduleControlInteractionUntil = 0;
+let scheduleControlInteractionTimer = null;
 let actionSettled = Promise.resolve();
 let settleCurrentAction = null;
 let queuedMusicLevel = null;
@@ -124,6 +129,7 @@ let pendingTab = '';
 let previousTab = localStorage.getItem(PREVIOUS_TAB_KEY) || '';
 let selectedScheduleId = localStorage.getItem(SCHEDULE_SELECTION_KEY) || '';
 let scheduleDeletePending = '';
+let pendingOpenScheduleItemId = '';
 let draggedScheduleItemId = '';
 let draggedScheduleTargetId = '';
 let pushcutStatus = {
@@ -195,6 +201,9 @@ let emailWakeScheduleStatus = {
   current: false,
   sourceFingerprint: '',
   scheduledCount: 0,
+  announcementScheduledCount: 0,
+  volumeScheduledCount: 0,
+  musicBrowserCount: 0,
   occurrenceCount: 0,
   nextScheduledFor: 0,
   maintenanceScheduled: false,
@@ -274,6 +283,52 @@ function focusedEditor() {
   return !!active && ['INPUT', 'TEXTAREA', 'SELECT'].includes(active.tagName);
 }
 
+function scheduleNativeControl(target) {
+  return target?.closest?.(
+    'details[data-persist-open^="schedule-"] > summary, form[data-form="schedule-settings"] select, form[data-form="schedule-item"] select, form[data-form="schedule-item"] input[type="time"]'
+  ) || null;
+}
+
+function scheduleControlInteractionActive() {
+  return scheduleControlInteractionUntil > Date.now();
+}
+
+function flushDeferredRenderIfIdle() {
+  if (focusedEditor() || scheduleControlInteractionActive() || !deferredRenderPending) return;
+  const force = deferredRenderForce;
+  deferredRenderPending = false;
+  deferredRenderForce = false;
+  renderWhenIdle(force);
+}
+
+function clearScheduleControlInteraction({ delayMs = 0 } = {}) {
+  clearTimeout(scheduleControlInteractionTimer);
+  scheduleControlInteractionTimer = null;
+  if (delayMs > 0) {
+    scheduleControlInteractionUntil = Date.now() + delayMs;
+    scheduleControlInteractionTimer = setTimeout(() => {
+      scheduleControlInteractionTimer = null;
+      scheduleControlInteractionUntil = 0;
+      flushDeferredRenderIfIdle();
+    }, delayMs);
+    return;
+  }
+  scheduleControlInteractionUntil = 0;
+  queueMicrotask(flushDeferredRenderIfIdle);
+}
+
+function beginScheduleControlInteraction(target) {
+  if (!scheduleNativeControl(target)) return false;
+  clearTimeout(scheduleControlInteractionTimer);
+  scheduleControlInteractionUntil = Date.now() + SCHEDULE_NATIVE_CONTROL_LOCK_MS;
+  scheduleControlInteractionTimer = setTimeout(() => {
+    scheduleControlInteractionTimer = null;
+    scheduleControlInteractionUntil = 0;
+    flushDeferredRenderIfIdle();
+  }, SCHEDULE_NATIVE_CONTROL_LOCK_MS);
+  return true;
+}
+
 function renderWhenIdle(force = false) {
   renderQueuedForce = renderQueuedForce || force;
   if (renderQueued) return;
@@ -286,10 +341,14 @@ function renderWhenIdle(force = false) {
       updateLiveStatus();
       return;
     }
-    if (!shouldForce && focusedEditor()) {
+    if (focusedEditor() || scheduleControlInteractionActive()) {
+      deferredRenderPending = true;
+      deferredRenderForce = deferredRenderForce || shouldForce;
       updateLiveStatus();
       return;
     }
+    deferredRenderPending = false;
+    deferredRenderForce = false;
     render();
   });
 }
@@ -488,6 +547,9 @@ function setPushcutScheduleStatus(payload = {}, {
     syncedAt: Number(payload.syncedAt || 0),
     horizonEnd: Number(payload.horizonEnd || 0),
     scheduledCount: Number(payload.scheduledCount || 0),
+    announcementScheduledCount: Number(payload.announcementScheduledCount || 0),
+    volumeScheduledCount: Number(payload.volumeScheduledCount || 0),
+    musicBrowserCount: Number(payload.musicBrowserCount || 0),
     occurrenceCount: Number(payload.occurrenceCount || 0),
     nextScheduledFor: Number(payload.nextScheduledFor || 0),
     maintenanceScheduled: payload.maintenanceScheduled === true,
@@ -776,12 +838,12 @@ async function syncCurrentEmailWakeSchedule({
       }
       if (manual) {
         const message = !requestedEnabled
-          ? 'Automatic timed announcements are paused; Browser music scheduling is unchanged.'
+          ? 'The background automatic schedule is paused; Browser music scheduling is unchanged.'
           : result.scheduledCount
-            ? `${result.scheduledCount} automatic announcement ${
+            ? `${result.scheduledCount} background schedule ${
                 result.scheduledCount === 1 ? 'occurrence is' : 'occurrences are'
               } synced through ${formatClock(result.horizonEnd)}.`
-            : 'The live Time schedule has no enabled automatic announcement occurrences.';
+            : 'The live Time schedule has no enabled background announcement or quiet-hours occurrences.';
         setFeedback(message, true);
       }
       return result;
@@ -2012,12 +2074,14 @@ function formatScheduleTime(value) {
 function scheduleKindLabel(item) {
   const kind = scheduleItemKind(item);
   if (kind === 'announcement') return item.action?.announcementSource === 'inline' ? 'Custom announcement' : 'Saved announcement';
+  if (kind === 'stop') return 'Stop music · quiet hours';
   return kind === 'apple' ? 'Apple Music' : kind === 'spotify' ? 'Spotify' : 'Suno / Direct';
 }
 
 function scheduleVolumeLabel(item) {
   const percent = effectiveScheduleItemVolume(item, store.state.config);
   if (scheduleItemKind(item) === 'announcement') return `Announcement ${VOICE_LEVEL_PERCENT}%`;
+  if (scheduleItemKind(item) === 'stop') return 'Quiet · music stopped';
   return ['apple', 'spotify'].includes(scheduleItemKind(item))
     ? (
         automaticAnnouncementsEnabled()
@@ -2033,6 +2097,7 @@ function scheduleVolumeLabel(item) {
 
 function scheduleAdvanceLabel(item) {
   if (scheduleItemKind(item) === 'announcement') return 'Completes after speech';
+  if (scheduleItemKind(item) === 'stop') return 'Completes after music stops';
   const mode = item.advance?.mode || 'manual';
   if (mode === 'duration') return `${Math.max(1, Math.round(Number(item.advance?.durationSeconds || 300) / 60))} min segment`;
   if (mode === 'track-end') return 'Advance at track end';
@@ -2047,13 +2112,14 @@ function renderWeekdayControls(days = []) {
 
 function renderScheduleRow(item, schedule, index) {
   const kind = scheduleItemKind(item);
+  const stopItem = kind === 'stop';
   const pushcutOnly = receiverOperatingMode() === 'pushcut';
   const playNowDisabled = pushcutOnly && kind !== 'announcement';
   const iphoneAppleVolume =
     ['apple', 'spotify'].includes(kind)
     && activeReceiverIsIOS()
     && !automaticAnnouncementsEnabled();
-  const fixedVolume = kind === 'announcement' || iphoneAppleVolume;
+  const fixedVolume = kind === 'announcement' || stopItem || iphoneAppleVolume;
   const announcementSource = item.action?.announcementSource || 'saved';
   const savedAnnouncement = store.state.announcements.find(entry => entry.id === (item.action?.announcementId || item.announcementId));
   const announcementSourceId = item.action?.sourceId || savedAnnouncement?.sourceId || 'natural-voice';
@@ -2085,7 +2151,7 @@ function renderScheduleRow(item, schedule, index) {
             ${schedule.mode === 'order'
               ? `<label>Order 1-100<input name="order" type="number" min="1" max="100" step="1" value="${escapeAttr(item.position?.order ?? item.order ?? index + 1)}" required /></label>`
               : `<label>Time<input name="time" type="time" value="${escapeAttr(item.position?.time || item.time || '12:00')}" required /></label>${renderWeekdayControls(item.days)}`}
-            <label>Action<select name="kind" data-schedule-kind><option value="announcement" ${kind === 'announcement' ? 'selected' : ''}>Announcement</option><option value="controlled" ${kind === 'controlled' ? 'selected' : ''}>Suno / direct audio</option><option value="apple" ${kind === 'apple' ? 'selected' : ''}>Apple Music</option><option value="spotify" ${kind === 'spotify' ? 'selected' : ''}>Spotify</option></select></label>
+            <label>Action<select name="kind" data-schedule-kind><option value="announcement" ${kind === 'announcement' ? 'selected' : ''}>Announcement</option><option value="controlled" ${kind === 'controlled' ? 'selected' : ''}>Suno / direct audio</option><option value="apple" ${kind === 'apple' ? 'selected' : ''}>Apple Music</option><option value="spotify" ${kind === 'spotify' ? 'selected' : ''}>Spotify</option><option value="stop" ${stopItem ? 'selected' : ''}>Stop music · quiet hours</option></select></label>
             <div class="conditionalFields announcementFields" data-show-schedule-kind="announcement" ${kind === 'announcement' ? '' : 'hidden'}>
               <label>Announcement source<select name="announcementSource" data-announcement-source><option value="saved" ${announcementSource === 'saved' ? 'selected' : ''}>Saved announcement</option><option value="inline" ${announcementSource === 'inline' ? 'selected' : ''}>Custom for this schedule only</option></select></label>
               <label data-show-announcement-source="saved" ${announcementSource === 'saved' ? '' : 'hidden'}>Saved message<select name="announcementId">${announcementOptions(item.action?.announcementId || item.announcementId)}</select></label>
@@ -2093,9 +2159,12 @@ function renderScheduleRow(item, schedule, index) {
               <label>Playback source<select name="sourceId">${announcementSourceOptions(announcementSourceId)}</select><small>Natural Voice or a saved finite clip. Apple Music and Spotify catalog items are disabled for announcement use on one iPhone.</small></label>
               <div class="fixedVoiceNote"><strong>Announcement ${VOICE_LEVEL_PERCENT}%</strong><span>Music reaches ${DUCK_LEVEL_PERCENT}% before speech starts. Playback resumes at the music slider target only after the announcement finishes.</span></div>
             </div>
-            <div class="conditionalFields musicFields" data-show-schedule-kind="music" ${kind === 'announcement' ? 'hidden' : ''}>
-              <label>Music URL<input name="url" type="url" value="${escapeAttr(item.action?.url || item.url || '')}" placeholder="Apple Music, Spotify, Suno, or direct HTTPS audio URL" ${kind === 'announcement' ? '' : 'required'} /></label>
+            <div class="conditionalFields musicFields" data-show-schedule-kind="music" ${kind === 'announcement' || stopItem ? 'hidden' : ''}>
+              <label>Music URL<input name="url" type="url" value="${escapeAttr(item.action?.url || item.url || '')}" placeholder="Apple Music, Spotify, Suno, or direct HTTPS audio URL" ${kind === 'announcement' || stopItem ? '' : 'required'} /></label>
               ${schedule.mode === 'order' ? `<label>Advance<select name="advanceMode" data-advance-mode><option value="manual" ${advanceMode === 'manual' ? 'selected' : ''}>Manually with Play Next</option><option value="track-end" ${advanceMode === 'track-end' ? 'selected' : ''} ${['apple', 'spotify'].includes(kind) ? 'disabled' : ''}>At direct track end (Suno/direct only)</option><option value="duration" ${advanceMode === 'duration' ? 'selected' : ''}>After a duration</option><option value="complete" ${advanceMode === 'complete' ? 'selected' : ''}>Immediately after playback starts</option></select></label><label data-show-advance-mode="duration" ${advanceMode === 'duration' ? '' : 'hidden'}>Duration seconds<input name="durationSeconds" type="number" min="1" max="86400" step="1" value="${escapeAttr(item.advance?.durationSeconds || 300)}" /></label>` : ''}
+            </div>
+            <div class="conditionalFields stopFields" data-show-schedule-kind="stop" ${stopItem ? '' : 'hidden'}>
+              <div class="fixedVoiceNote"><strong>Quiet hours</strong><span>Stops Suno, Apple Music, or Spotify and leaves the Receiver quiet until a later schedule item or Remote command starts music.</span></div>
             </div>
             <div class="conditionalFields scheduleVolumeFields" data-standard-volume-fields ${fixedVolume ? 'hidden' : ''}>
               <label>Volume<select name="volumeMode" data-volume-mode ${fixedVolume ? 'disabled' : ''}><option value="global" ${volumeMode === 'global' ? 'selected' : ''}>Use shared volume</option><option value="custom" ${volumeMode === 'custom' ? 'selected' : ''}>Custom for this item</option></select><small>${automaticAnnouncementsEnabled() ? `Before each music row starts, Automatic Receiver applies its ${volumeMode === 'custom' ? `${itemVolume}% custom` : `${store.state.config.musicLevel}% shared`} iPhone media target.` : `Shared music is ${store.state.config.musicLevel}%.`}</small></label>
@@ -2158,22 +2227,22 @@ function renderSchedule() {
     );
   const automaticScheduleNeedsAttention = !automaticScheduleReady;
   const automaticScheduleSummary = emailWakeScheduleStatus.syncing
-    ? 'Syncing the rolling automatic announcement window now...'
+    ? 'Syncing the rolling background schedule now...'
     : emailWakeScheduleStatus.error
       ? emailWakeScheduleStatus.error
       : !emailWakeScheduleStatus.checked
         ? 'Automatic schedule status has not been checked yet.'
         : !emailWakeScheduleStatus.enabled
-          ? 'Automatic timed announcements are paused on the server. Sync them now before relying on this schedule.'
+          ? 'Background announcements and quiet hours are paused on the server. Sync them now before relying on this schedule.'
           : !emailWakeScheduleStatus.current
             ? 'The saved schedule is newer than the durable automatic announcement plan. Sync it now.'
             : !emailWakeScheduleStatus.syncedAt
-              ? 'Automatic timed announcements have not been synced from this Remote yet.'
+              ? 'The background automatic schedule has not been synced from this Remote yet.'
               : !automaticScheduleHorizonHealthy
-                ? `The automatic announcement window expires soon at ${formatClock(emailWakeScheduleStatus.horizonEnd)}. Sync it now.`
+                ? `The background automatic window expires soon at ${formatClock(emailWakeScheduleStatus.horizonEnd)}. Sync it now.`
                 : emailWakeScheduleStatus.scheduledCount > 0
                   && !emailWakeScheduleStatus.maintenanceScheduled
-                  ? 'Announcement occurrences are synced, but automatic renewal is not confirmed. Sync them now.'
+                  ? 'Background occurrences are synced, but automatic renewal is not confirmed. Sync them now.'
                   : `${emailWakeScheduleStatus.scheduledCount} occurrence${
                       emailWakeScheduleStatus.scheduledCount === 1 ? '' : 's'
                     } synced through ${formatClock(emailWakeScheduleStatus.horizonEnd)}. Next: ${formatClock(emailWakeScheduleStatus.nextScheduledFor)}.${
@@ -2204,13 +2273,13 @@ function renderSchedule() {
                   : 'Ready · No enabled items';
   const deleteArmed = scheduleDeletePending === schedule.id;
   return `
-    <section class="pageHeading"><p class="kicker">Saved schedules</p><h1>Build the day in seconds.</h1><p>Create as many schedules as you need. ${browserReady && automaticReady ? 'Time schedules run Suno, Apple Music, and Spotify rows in the Receiver browser; announcement rows use the background Automatic Receiver.' : browserReady ? 'Time schedules run all enabled music and announcement items while Browser Receiver remains visible.' : pushcutSelectedReady ? 'Pushcut can run synced timed announcements; mixed music-provider schedules require Browser Receiver.' : 'Saved items remain inactive until the selected receiver path is ready.'} Order schedules are numbered cue lists controlled with Play Next in Browser Receiver mode.</p></section>
+    <section class="pageHeading"><p class="kicker">Saved schedules</p><h1>Build the day in seconds.</h1><p>Create as many schedules as you need. ${automaticReady ? 'Time-scheduled announcement and quiet-hours Stop rows use the background Automatic Receiver; Suno, Apple Music, and Spotify rows also need the visible Browser Receiver.' : browserReady ? 'Time schedules run all enabled music, announcement, and Stop items while Browser Receiver remains visible.' : pushcutSelectedReady ? 'Pushcut can run synced timed announcements; mixed music-provider schedules require Browser Receiver.' : 'Saved items remain inactive until the selected receiver path is ready.'} Order schedules are numbered cue lists controlled with Play Next in Browser Receiver mode.</p></section>
     ${automatic ? `<div class="callout ${automaticScheduleNeedsAttention ? 'warning' : ''}">
       <strong>${automaticScheduleReady ? 'Automatic mixed schedule is ready' : 'Automatic schedule needs attention'}</strong>
       <p>${escapeHtml(automaticScheduleSummary)}</p>
-      <p>Music rows run in this visible Receiver browser. Timed Natural Voice and finite Suno/direct announcement clips wake the background Receiver Shortcut, so they do not play twice in Safari.</p>
+      <p>Music rows run in this visible Receiver browser. Timed Natural Voice, finite Suno/direct announcement clips, and quiet-hours Stop rows wake the background Receiver Shortcut, so they do not play twice in Safari.</p>
       ${automaticScheduleWarnings ? `<ul class="scheduleSyncWarnings">${automaticScheduleWarnings}</ul>` : ''}
-      <button type="button" data-action="sync-email-wake-schedule" class="secondary" ${role !== 'command' || emailWakeScheduleStatus.syncing || !automaticReady ? 'disabled' : ''}>${emailWakeScheduleStatus.syncing ? 'Syncing…' : 'Sync Automatic Announcements Now'}</button>
+      <button type="button" data-action="sync-email-wake-schedule" class="secondary" ${role !== 'command' || emailWakeScheduleStatus.syncing || !automaticReady ? 'disabled' : ''}>${emailWakeScheduleStatus.syncing ? 'Syncing…' : 'Sync Automatic Schedule Now'}</button>
     </div>` : pushcutReady && browserReady ? `<div class="callout">
       <strong>Browser Receiver owns this schedule</strong>
       <p>Mixed Suno, Apple Music, Spotify, and announcement items run here while the Receiver keeps Version X visible. Version X automatically cancels Pushcut timed copies in this mode so an announcement cannot play twice.</p>
@@ -2228,11 +2297,11 @@ function renderSchedule() {
       </div>
       <form data-form="schedule-settings" data-id="${escapeAttr(schedule.id)}" class="scheduleSettings">
         <label>Schedule name<input name="name" value="${escapeAttr(schedule.name)}" maxlength="80" required /></label>
-        <label>Run by<select name="mode"><option value="time" ${schedule.mode === 'time' ? 'selected' : ''}>Time</option><option value="order" ${schedule.mode === 'order' ? 'selected' : ''}>Order 1-100</option></select></label>
+        <label>Run by<select name="mode" data-schedule-mode aria-describedby="scheduleModeHelp"><option value="time" ${schedule.mode === 'time' ? 'selected' : ''}>Time</option><option value="order" ${schedule.mode === 'order' ? 'selected' : ''}>Order 1-100</option></select><small id="scheduleModeHelp">Time runs automatically in Central Time. Choose Time, then expand each item to set its clock time and days.</small></label>
         <label class="checkLabel"><input name="enabled" type="checkbox" ${schedule.enabled ? 'checked' : ''} /> Schedule is enabled</label>
         <div class="scheduleSettingsActions"><button type="submit" class="primary">Save Schedule</button>${isLiveSchedule ? '<span class="liveScheduleBadge">Live schedule</span>' : '<button type="button" data-action="activate-schedule-set" class="warningButton">Make This the Live Schedule</button>'}<button type="button" data-action="duplicate-schedule-set" class="secondary">Duplicate</button>${deleteArmed ? `<button type="button" data-action="confirm-delete-schedule-set" class="danger">Confirm Delete</button><button type="button" data-action="cancel-delete-schedule-set" class="secondary">Cancel</button>` : '<button type="button" data-action="delete-schedule-set" class="textDanger">Delete Schedule</button>'}</div>
       </form>
-      ${schedule.mode === 'order' ? `<div class="orderRunner ${isLiveSchedule ? 'live' : 'inactive'}"><div><span>${isLiveSchedule ? 'Live order position' : 'Order schedule is not live'}</span><strong>${escapeHtml(orderStatus)}</strong><small>${operatingMode === 'pushcut' ? 'Pushcut can play individual announcement rows, but a mixed Order schedule requires Browser Receiver mode.' : browserReady ? automaticReady ? 'Announcement steps use the background Receiver and advance after its signed completion. Music follows each item’s Advance setting.' : 'Announcements advance after speech. Music follows each item’s Advance setting; manual items wait for Play Next. The final item never loops back by itself.' : 'Start Browser Receiver before using Play Next.'}</small></div><div class="orderRunnerActions"><button type="button" data-action="play-next-schedule" class="primary" ${isLiveSchedule && enabledItems.length > 0 && !orderBusy && sequenceRun.status !== 'complete' && browserReady ? '' : 'disabled'}>${sequenceRun.status === 'failed' ? 'Retry Next' : browserReady ? 'Play Next' : 'Browser Receiver Required'}</button><button type="button" data-action="reset-order-schedule" class="secondary" ${isLiveSchedule && browserReady ? '' : 'disabled'}>Reset to 1</button></div></div>` : `<div class="timeRunner ${isLiveSchedule ? 'live' : 'inactive'}"><strong>${isLiveSchedule ? 'Live automatic Time schedule' : 'Saved Time schedule · not live'}</strong><span>${isLiveSchedule ? browserReady ? automaticReady ? 'Music runs in the visible Receiver browser; announcement occurrences run once through the background Shortcut.' : 'All enabled music and announcement items run at or shortly after their scheduled Central Time while Browser Receiver stays visible.' : pushcutSelectedReady ? 'Pushcut runs timed announcement items only. Music items require Browser Receiver mode.' : 'The selected receiver is offline; no scheduled item can run until it is ready.' : 'Editing this schedule does not interrupt the current live schedule. Choose Make This the Live Schedule when it is ready.'}</span></div>`}
+      ${schedule.mode === 'order' ? `<div class="orderRunner ${isLiveSchedule ? 'live' : 'inactive'}"><div><span>${isLiveSchedule ? 'Live order position' : 'Order schedule is not live'}</span><strong>${escapeHtml(orderStatus)}</strong><small>${operatingMode === 'pushcut' ? 'Pushcut can play individual announcement rows, but a mixed Order schedule requires Browser Receiver mode.' : browserReady ? automaticReady ? 'Announcement steps use the background Receiver and advance after its signed completion. Music follows each item’s Advance setting.' : 'Announcements advance after speech. Music follows each item’s Advance setting; manual items wait for Play Next. The final item never loops back by itself.' : 'Start Browser Receiver before using Play Next.'}</small></div><div class="orderRunnerActions"><button type="button" data-action="play-next-schedule" class="primary" ${isLiveSchedule && enabledItems.length > 0 && !orderBusy && sequenceRun.status !== 'complete' && browserReady ? '' : 'disabled'}>${sequenceRun.status === 'failed' ? 'Retry Next' : browserReady ? 'Play Next' : 'Browser Receiver Required'}</button><button type="button" data-action="reset-order-schedule" class="secondary" ${isLiveSchedule && browserReady ? '' : 'disabled'}>Reset to 1</button></div></div>` : `<div class="timeRunner ${isLiveSchedule ? 'live' : 'inactive'}"><strong>${isLiveSchedule ? 'Live automatic Time schedule' : 'Saved Time schedule · not live'}</strong><span>${isLiveSchedule ? automaticReady ? browserReady ? 'Music runs in the visible Receiver browser; announcement and quiet-hours Stop rows run once through the background Shortcut.' : 'Background announcement and quiet-hours Stop rows remain automatic. Start Browser Receiver for Suno, Apple Music, and Spotify rows.' : browserReady ? 'All enabled music, announcement, and Stop items run at or shortly after their scheduled Central Time while Browser Receiver stays visible.' : pushcutSelectedReady ? 'Pushcut runs timed announcement items only. Music and Stop items require Browser Receiver mode.' : 'The selected receiver is offline; no scheduled item can run until it is ready.' : 'Expand an item to set its Time and days. Editing this schedule does not interrupt the current live schedule until you make it live.'}</span></div>`}
       <div class="scheduleList">${items.map((item, index) => renderScheduleRow(item, schedule, index)).join('')}</div>
       <button type="button" data-action="add-schedule-item" class="secondary addButton">+ Add Schedule Item</button>
     </section>
@@ -2448,6 +2517,19 @@ function render({ preserveDetails = true, preserveForms = true } = {}) {
   for (const key of openDetails) {
     const detail = root.querySelector(`details[data-persist-open="${CSS.escape(key)}"]`);
     if (detail) detail.open = true;
+  }
+  if (pendingOpenScheduleItemId) {
+    const detail = root.querySelector(
+      `details[data-persist-open="schedule-${CSS.escape(pendingOpenScheduleItemId)}"]`
+    );
+    if (detail) {
+      detail.open = true;
+      pendingOpenScheduleItemId = '';
+      requestAnimationFrame(() => {
+        detail.scrollIntoView({ block: 'center', behavior: 'smooth' });
+        detail.querySelector('input[name="label"]')?.focus({ preventScroll: true });
+      });
+    }
   }
   restoreDirtyFormDrafts(dirtyDrafts);
   if (focusedKey) root.querySelector(`[data-focus-key="${CSS.escape(focusedKey)}"]`)?.focus({ preventScroll: true });
@@ -3341,6 +3423,11 @@ async function playScheduleItem(id, scheduleId = activeSavedSchedule().id) {
       volumePercent: effectiveScheduleItemVolume(item, store.state.config),
       sourceId: item.action?.sourceId || savedAnnouncement?.sourceId || 'natural-voice'
     });
+  } else if (kind === 'stop') {
+    await runtime.sendCommand('stop-music', {
+      label: item.label || 'Quiet hours',
+      scheduledItemId: item.id
+    }, `Quiet-hours schedule item sent: ${item.label}.`);
   } else if (kind === 'apple') {
     await runtime.sendCommand('play-apple', {
       url: item.action?.url || item.url || store.state.config.appleUrl,
@@ -3371,13 +3458,14 @@ async function playScheduleItem(id, scheduleId = activeSavedSchedule().id) {
 function updateScheduleFormVisibility(form) {
   if (!form) return;
   const kind = form.querySelector('[data-schedule-kind]')?.value || form.dataset.kind || 'announcement';
+  const stopItem = kind === 'stop';
   const announcementSource = form.querySelector('[data-announcement-source]')?.value || form.dataset.announcementSource || 'saved';
   const volumeMode = form.querySelector('[data-volume-mode]')?.value || form.dataset.volumeMode || 'global';
   const iphoneAppleVolume =
     ['apple', 'spotify'].includes(kind)
     && activeReceiverIsIOS()
     && !automaticAnnouncementsEnabled();
-  const fixedVolume = kind === 'announcement' || iphoneAppleVolume;
+  const fixedVolume = kind === 'announcement' || stopItem || iphoneAppleVolume;
   const advanceSelect = form.querySelector('[data-advance-mode]');
   const trackEndOption = advanceSelect?.querySelector('option[value="track-end"]');
   if (trackEndOption) trackEndOption.disabled = ['apple', 'spotify'].includes(kind);
@@ -3388,10 +3476,14 @@ function updateScheduleFormVisibility(form) {
   form.dataset.volumeMode = volumeMode;
   form.dataset.advanceMode = advanceMode;
   const musicUrl = form.querySelector('input[name="url"]');
-  if (musicUrl) musicUrl.required = kind !== 'announcement';
+  if (musicUrl) musicUrl.required = kind !== 'announcement' && !stopItem;
   for (const field of form.querySelectorAll('[data-show-schedule-kind]')) {
     const expected = field.dataset.showScheduleKind;
-    field.hidden = expected === 'announcement' ? kind !== 'announcement' : kind === 'announcement';
+    field.hidden = expected === 'announcement'
+      ? kind !== 'announcement'
+      : expected === 'stop'
+        ? !stopItem
+        : kind === 'announcement' || stopItem;
   }
   for (const field of form.querySelectorAll('[data-show-announcement-source]')) {
     field.hidden = field.dataset.showAnnouncementSource !== announcementSource;
@@ -3956,25 +4048,32 @@ root.addEventListener('click', event => {
     }
     if (action === 'add-schedule-item') {
       const scheduleId = activeSavedSchedule().id;
-      return await runAction('Adding schedule item', () => store.mutate(draft => {
-        const schedule = (draft.schedules || []).find(entry => entry.id === scheduleId);
-        if (!schedule) throw new Error('The selected schedule no longer exists.');
-        if ((schedule.items || []).length >= 100) throw new Error('A schedule can contain up to 100 items.');
-        const nextOrder = (schedule.items || []).length + 1;
-        schedule.items ||= [];
-        schedule.items.push({
-          id: makeId('schedule-item'),
-          label: 'New Schedule Item',
-          enabled: false,
-          days: [0, 1, 2, 3, 4, 5, 6],
-          position: { time: '12:00', order: nextOrder },
-          action: { kind: 'announcement', announcementSource: 'inline', announcementId: '', text: '', url: '' },
-          volume: { mode: 'global', percent: VOICE_LEVEL_PERCENT },
-          advance: { mode: 'complete', durationSeconds: 300 }
-        });
-        resetScheduleSequence(draft, scheduleId);
-        return draft;
-      }, 'Schedule item added'));
+      const itemId = makeId('schedule-item');
+      pendingOpenScheduleItemId = itemId;
+      try {
+        return await runAction('Adding schedule item', () => store.mutate(draft => {
+          const schedule = (draft.schedules || []).find(entry => entry.id === scheduleId);
+          if (!schedule) throw new Error('The selected schedule no longer exists.');
+          if ((schedule.items || []).length >= 100) throw new Error('A schedule can contain up to 100 items.');
+          const nextOrder = (schedule.items || []).length + 1;
+          schedule.items ||= [];
+          schedule.items.push({
+            id: itemId,
+            label: 'New Schedule Item',
+            enabled: false,
+            days: [0, 1, 2, 3, 4, 5, 6],
+            position: { time: '12:00', order: nextOrder },
+            action: { kind: 'announcement', announcementSource: 'inline', announcementId: '', text: '', url: '' },
+            volume: { mode: 'global', percent: VOICE_LEVEL_PERCENT },
+            advance: { mode: 'complete', durationSeconds: 300 }
+          });
+          resetScheduleSequence(draft, scheduleId);
+          return draft;
+        }, 'Schedule item added'));
+      } catch (error) {
+        if (pendingOpenScheduleItemId === itemId) pendingOpenScheduleItemId = '';
+        throw error;
+      }
     }
     if (action === 'delete-schedule-item') {
       const id = String(button.dataset.id || '');
@@ -4096,6 +4195,9 @@ root.addEventListener('drop', event => {
 root.addEventListener('dragend', clearScheduleDragState);
 
 root.addEventListener('pointerdown', event => {
+  if (!beginScheduleControlInteraction(event.target) && scheduleControlInteractionActive()) {
+    clearScheduleControlInteraction();
+  }
   const handle = event.target.closest?.('[data-drag-schedule-item]');
   if (!handle || event.pointerType === 'mouse' || busy || dirtyScheduleForm()) return;
   draggedScheduleItemId = String(handle.dataset.dragScheduleItem || '');
@@ -4124,6 +4226,14 @@ root.addEventListener('pointerup', event => {
 
 root.addEventListener('pointercancel', clearScheduleDragState);
 
+root.addEventListener('focusin', event => {
+  beginScheduleControlInteraction(event.target);
+});
+
+root.addEventListener('focusout', () => {
+  setTimeout(flushDeferredRenderIfIdle, 0);
+});
+
 root.addEventListener('touchend', event => {
   const musicSlider = event.target.closest?.('#musicLevel');
   if (musicSlider) flushMusicLevelSave(musicSlider.value);
@@ -4143,7 +4253,9 @@ root.addEventListener('keydown', event => {
 
 root.addEventListener('input', event => {
   const form = event.target.closest?.('form[data-form]');
-  if (formIdentity(form)) form.dataset.dirty = 'true';
+  if (formIdentity(form) && !event.target.matches?.('[data-schedule-mode]')) {
+    form.dataset.dirty = 'true';
+  }
   const itemSlider = event.target.closest?.('.itemVolumeSlider');
   if (itemSlider) {
     const output = itemSlider.parentElement?.querySelector('output');
@@ -4184,7 +4296,11 @@ root.addEventListener('input', event => {
 
 root.addEventListener('change', event => {
   const form = event.target.closest?.('form[data-form]');
+  const formWasDirty = form?.dataset?.dirty === 'true';
   if (formIdentity(form)) form.dataset.dirty = 'true';
+  if (scheduleNativeControl(event.target)) {
+    clearScheduleControlInteraction({ delayMs: 250 });
+  }
   const schedulePicker = event.target.closest?.('#schedulePicker');
   if (schedulePicker) {
     if (busy) {
@@ -4198,6 +4314,52 @@ root.addEventListener('change', event => {
     }
     const scheduleId = String(schedulePicker.value || '');
     if (!selectSavedSchedule(scheduleId)) setFeedback('That saved schedule no longer exists.', false);
+    return;
+  }
+  const scheduleMode = event.target.closest?.('[data-schedule-mode]');
+  if (scheduleMode) {
+    const id = String(form?.dataset?.id || '');
+    const existingSchedule = (store.state.schedules || []).find(item => item.id === id);
+    const requestedMode = scheduleMode.value === 'order' ? 'order' : 'time';
+    const dirtyItemDraft = root.querySelector(
+      `form[data-form="schedule-item"][data-schedule-id="${CSS.escape(id)}"][data-dirty="true"]`
+    );
+    if (busy || dirtyItemDraft || formWasDirty) {
+      scheduleMode.value = existingSchedule?.mode === 'order' ? 'order' : 'time';
+      if (!formWasDirty && form) delete form.dataset.dirty;
+      setFeedback(
+        busy
+          ? 'Finish the current action before changing Run by.'
+          : dirtyItemDraft
+            ? 'Save or discard the open item edit before changing Run by.'
+            : 'Save the schedule name or enabled setting before changing Run by.',
+        false
+      );
+      return;
+    }
+    if (!existingSchedule || existingSchedule.mode === requestedMode) {
+      if (!formWasDirty && form) delete form.dataset.dirty;
+      return;
+    }
+    const formKey = formIdentity(form);
+    scheduleMode.blur();
+    clearScheduleControlInteraction();
+    runAction(`Switching schedule to ${requestedMode === 'time' ? 'Time' : 'Order'}`, () => store.mutate(draft => {
+      const schedule = (draft.schedules || []).find(item => item.id === id);
+      if (!schedule) throw new Error('Saved schedule no longer exists.');
+      schedule.mode = requestedMode;
+      resetScheduleSequence(draft, schedule.id);
+      draft.activityLog = [
+        makeLog('settings', 'Schedule run mode changed', `${schedule.name} · ${requestedMode === 'time' ? 'Time' : 'Order'} mode`),
+        ...(draft.activityLog || [])
+      ];
+      return draft;
+    }, 'Schedule run mode changed')).then(() => {
+      if (!formWasDirty) clearDirtyForm(formKey);
+      renderWhenIdle(true);
+    }).catch(error => {
+      setFeedback(error.message || String(error), false);
+    });
     return;
   }
   if (event.target.matches?.('[data-schedule-kind], [data-announcement-source], [data-volume-mode], [data-advance-mode]')) {
@@ -4363,7 +4525,8 @@ root.addEventListener('submit', event => {
     if (kind === 'schedule-item') {
       const id = String(form.dataset.id || '');
       const scheduleId = String(form.dataset.scheduleId || '');
-      const actionKind = ['announcement', 'controlled', 'apple', 'spotify'].includes(String(data.get('kind'))) ? String(data.get('kind')) : 'announcement';
+      const actionKind = ['announcement', 'controlled', 'apple', 'spotify', 'stop'].includes(String(data.get('kind'))) ? String(data.get('kind')) : 'announcement';
+      const stopItem = actionKind === 'stop';
       const iphoneAppleVolume = ['apple', 'spotify'].includes(actionKind) && activeReceiverIsIOS();
       const announcementSource = data.get('announcementSource') === 'inline' ? 'inline' : 'saved';
       const announcementSourceId = String(data.get('sourceId') || 'natural-voice');
@@ -4385,7 +4548,7 @@ root.addEventListener('submit', event => {
       ) {
         throw new Error(`Shorten this timed announcement to ${PUSHCUT_MAX_ANNOUNCEMENT_CHARACTERS} characters or fewer for reliable Pushcut playback.`);
       }
-      if (actionKind !== 'announcement' && !itemUrl) throw new Error('Add the Apple Music, Suno, or direct audio URL for this music item.');
+      if (actionKind !== 'announcement' && !stopItem && !itemUrl) throw new Error('Add the Apple Music, Spotify, Suno, or direct audio URL for this music item.');
       if (actionKind === 'apple' && itemUrl && !isAppleMusicUrl(itemUrl)) throw new Error('Use a valid Apple Music playlist, album, artist, or track URL for this item.');
       if (actionKind === 'spotify' && itemUrl && !isSpotifyUrl(itemUrl)) throw new Error('Use a valid Spotify playlist, album, artist, or track URL for this item.');
       const playAfterSave = submitIntent === 'play';
@@ -4397,6 +4560,7 @@ root.addEventListener('submit', event => {
         const existing = schedule.items[index];
         const targetOrder = clamp(data.get('order') || existing.position?.order || index + 1, 1, 100, index + 1);
         const volumeMode = actionKind !== 'announcement'
+          && !stopItem
           && !iphoneAppleVolume
           && data.get('volumeMode') === 'custom'
             ? 'custom'
@@ -4408,6 +4572,7 @@ root.addEventListener('submit', event => {
         schedule.items[index] = {
           ...existing,
           label: label.slice(0, 100),
+          type: actionKind,
           enabled: data.get('enabled') === 'on',
           days: schedule.mode === 'time' ? selectedDays : existing.days,
           position: {
@@ -4416,15 +4581,17 @@ root.addEventListener('submit', event => {
           },
           action: {
             kind: actionKind,
-            announcementSource,
-            announcementId: String(data.get('announcementId') || ''),
+            announcementSource: actionKind === 'announcement' ? announcementSource : '',
+            announcementId: actionKind === 'announcement' ? String(data.get('announcementId') || '') : '',
             sourceId: actionKind === 'announcement' ? announcementSourceId : '',
-            text: announcementSource === 'inline' ? inlineText.slice(0, 900) : '',
-            url: itemUrl.slice(0, 2000)
+            text: actionKind === 'announcement' && announcementSource === 'inline' ? inlineText.slice(0, 900) : '',
+            url: actionKind === 'announcement' || stopItem ? '' : itemUrl.slice(0, 2000)
           },
           volume: {
             mode: volumeMode,
-            percent: actionKind === 'announcement'
+            percent: stopItem
+              ? 0
+              : actionKind === 'announcement'
               ? VOICE_LEVEL_PERCENT
               : clamp(
                   iphoneAppleVolume ? existing.volume?.percent : data.get('volumePercent'),
@@ -4434,7 +4601,7 @@ root.addEventListener('submit', event => {
                 )
           },
           advance: {
-            mode: actionKind === 'announcement' ? 'complete' : advanceMode,
+            mode: actionKind === 'announcement' || stopItem ? 'complete' : advanceMode,
             durationSeconds: clamp(data.get('durationSeconds'), 1, 86_400, 300)
           }
         };

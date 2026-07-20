@@ -328,6 +328,89 @@ describe('Version X Automatic Receiver UI and routing contract', () => {
     assert.match(scheduleItem, /\$\{store\.state\.config\.musicLevel\}% shared/);
   });
 
+  test('makes Time scheduling discoverable and applies Run by changes immediately', () => {
+    const schedule = sourceBetween(
+      'function renderSchedule',
+      'function renderSettings'
+    );
+    const changeHandler = sourceBetween(
+      "root.addEventListener('change'",
+      "root.addEventListener('submit'"
+    );
+
+    assert.match(schedule, /data-schedule-mode/);
+    assert.match(schedule, /Time runs automatically in Central Time/);
+    assert.match(schedule, /expand each item to set its clock time and days/i);
+    assert.match(changeHandler, /const scheduleMode = event\.target\.closest\?\.\('\[data-schedule-mode\]'\)/);
+    assert.match(changeHandler, /schedule\.mode = requestedMode/);
+    assert.match(changeHandler, /resetScheduleSequence\(draft, schedule\.id\)/);
+    assert.match(changeHandler, /Switching schedule to/);
+  });
+
+  test('offers a first-class quiet-hours Stop item without music URL or volume fields', () => {
+    const scheduleItem = sourceBetween(
+      'function renderScheduleRow',
+      'function renderSchedule'
+    );
+    const visibility = sourceBetween(
+      'function updateScheduleFormVisibility',
+      'function clearScheduleDragState'
+    );
+    const submit = sourceBetween(
+      "if (kind === 'schedule-item')",
+      'window.addEventListener(\'pagehide\''
+    );
+
+    assert.match(scheduleItem, /option value="stop"/);
+    assert.match(scheduleItem, /Stop music · quiet hours/);
+    assert.match(scheduleItem, /data-show-schedule-kind="stop"/);
+    assert.match(scheduleItem, /leaves the Receiver quiet/);
+    assert.match(visibility, /const stopItem = kind === 'stop'/);
+    assert.match(visibility, /musicUrl\.required = kind !== 'announcement' && !stopItem/);
+    assert.match(submit, /'announcement', 'controlled', 'apple', 'spotify', 'stop'/);
+    assert.match(submit, /actionKind !== 'announcement' && !stopItem && !itemUrl/);
+    assert.match(submit, /percent: stopItem\s*\? 0/);
+    assert.match(submit, /actionKind === 'announcement' \|\| stopItem \? 'complete'/);
+  });
+
+  test('defers polling renders during native iPhone schedule controls and opens new items', () => {
+    const renderGuard = sourceBetween(
+      'function focusedEditor',
+      'function customPlaybackMusicTarget'
+    );
+    const render = sourceBetween(
+      'function render(',
+      'function selectTab'
+    );
+    const addItem = sourceBetween(
+      "if (action === 'add-schedule-item')",
+      "if (action === 'delete-schedule-item')"
+    );
+
+    assert.match(renderGuard, /SCHEDULE_NATIVE_CONTROL_LOCK_MS/);
+    assert.match(renderGuard, /details\[data-persist-open\^="schedule-"\] > summary/);
+    assert.match(renderGuard, /scheduleControlInteractionActive\(\)/);
+    assert.match(renderGuard, /deferredRenderPending = true/);
+    assert.match(renderGuard, /focusedEditor\(\) \|\| scheduleControlInteractionActive\(\)/);
+    assert.match(render, /pendingOpenScheduleItemId/);
+    assert.match(render, /detail\.open = true/);
+    assert.match(addItem, /const itemId = makeId\('schedule-item'\)/);
+    assert.match(addItem, /pendingOpenScheduleItemId = itemId/);
+    assert.match(addItem, /id: itemId/);
+  });
+
+  test('describes automatic quiet-hours Stop rows as background Receiver work', () => {
+    const schedule = sourceBetween(
+      'function renderSchedule',
+      'function renderSettings'
+    );
+
+    assert.match(schedule, /announcement and quiet-hours Stop rows use the background Automatic Receiver/);
+    assert.match(schedule, /quiet-hours Stop rows wake the background Receiver Shortcut/);
+    assert.match(schedule, /announcement and quiet-hours Stop rows run once through the background Shortcut/);
+    assert.match(schedule, /Background announcement and quiet-hours Stop rows remain automatic/);
+  });
+
   test('does not label a stale or unrenewed automatic schedule as ready', () => {
     const schedule = sourceBetween(
       'function renderSchedule',

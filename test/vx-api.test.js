@@ -533,6 +533,20 @@ describe('Version X API isolation', { concurrency: false }, () => {
                 advance: { mode: 'manual', durationSeconds: 300 }
               },
               {
+                id: 'quiet-hours',
+                label: 'Quiet hours',
+                type: 'quiet-hours',
+                position: { time: '22:00', order: 3 },
+                action: {
+                  kind: 'quiet-hours',
+                  url: 'https://must-not-survive.example/music',
+                  announcementId: 'must-not-survive',
+                  text: 'must not survive'
+                },
+                volume: { mode: 'custom', percent: 82 },
+                advance: { mode: 'manual', durationSeconds: 999 }
+              },
+              {
                 id: 'catalog-announcement',
                 label: 'Experimental catalog announcement',
                 type: 'announcement',
@@ -605,6 +619,13 @@ describe('Version X API isolation', { concurrency: false }, () => {
     const sunoBed = schedule.items.find(item => item.id === 'suno-bed');
     assert.equal(sunoBed.type, 'controlled');
     assert.equal(sunoBed.action.kind, 'controlled');
+    const quietHours = schedule.items.find(item => item.id === 'quiet-hours');
+    assert.equal(quietHours.type, 'stop');
+    assert.deepEqual(quietHours.action, { kind: 'stop' });
+    assert.deepEqual(quietHours.volume, { mode: 'global', percent: 0 });
+    assert.deepEqual(quietHours.advance, { mode: 'complete', durationSeconds: 300 });
+    assert.equal(quietHours.url, '');
+    assert.equal(quietHours.announcementId, '');
     const catalogAnnouncement = schedule.items.find(item => item.id === 'catalog-announcement');
     assert.equal(catalogAnnouncement.action.sourceId, 'spotify-catalog');
     assert.equal(state.schedule.find(item => item.id === 'spotify-bed').type, 'spotify');
