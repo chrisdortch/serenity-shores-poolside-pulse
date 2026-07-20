@@ -852,6 +852,91 @@ describe('Version X Resend transport', { concurrency: false }, () => {
     );
     assert.equal(calls, 0);
   });
+
+  test('classifies non-retryable provider failures and logs only redacted diagnostics', async () => {
+    const scenarios = [
+      {
+        name: 'invalid or revoked API key',
+        status: 401,
+        payload: {
+          message: 'Invalid API key re_live_super-secret for wake@example.com.'
+        },
+        errorCode: 'providerInvalidApiKey',
+        message: /Replace RESEND_API_KEY_X with a valid key/,
+        classification: 'invalid_api_key'
+      },
+      {
+        name: 'resend.dev test-sender recipient restriction',
+        status: 403,
+        payload: {
+          message: 'You can only send testing emails to your own email address, owner@example.com. To send to receiver@example.com, verify a domain and change wake@example.com.'
+        },
+        errorCode: 'providerTestSenderRestricted',
+        message: /Use that address for RECEIVER_WAKE_EMAIL_X.*verify a sending domain/i,
+        classification: 'test_sender_recipient_restricted'
+      },
+      {
+        name: 'other permission or rejection',
+        status: 422,
+        payload: {
+          message: 'The sender wake@example.com is not permitted to send to receiver@example.com.'
+        },
+        errorCode: 'providerRejected',
+        message: /Verify the sender domain, receiver address, and Resend account permissions/,
+        classification: 'permission_or_rejection'
+      }
+    ];
+
+    for (const [index, scenario] of scenarios.entries()) {
+      const diagnostics = [];
+      let providerCalls = 0;
+      await assert.rejects(
+        sendEmailWakeX({
+          eventId: `email-wake-x-provider-failure-${index + 1}-0001`
+        }, {
+          env: configuredEnv({
+            RESEND_API_KEY_X: 're_live_super-secret',
+            RECEIVER_WAKE_EMAIL_X: 'receiver@example.com',
+            RECEIVER_WAKE_FROM_X: 'Poolside Pulse <wake@example.com>'
+          }),
+          fetchImpl: async () => {
+            providerCalls += 1;
+            return {
+              ok: false,
+              status: scenario.status,
+              headers: { get: () => null },
+              async json() {
+                return scenario.payload;
+              }
+            };
+          },
+          consoleErrorImpl: entry => diagnostics.push(entry),
+          now: () => NOW
+        }),
+        error =>
+          error instanceof EmailWakeXError
+          && error.code === scenario.errorCode
+          && error.statusCode === 502
+          && scenario.message.test(error.message),
+        scenario.name
+      );
+      assert.equal(providerCalls, 1, `${scenario.name} must not be retried`);
+      assert.deepEqual(diagnostics, [{
+        route: '/emails',
+        provider: 'resend',
+        httpStatus: scenario.status,
+        classification: scenario.classification
+      }]);
+      assert.deepEqual(
+        Object.keys(diagnostics[0]).sort(),
+        ['classification', 'httpStatus', 'provider', 'route']
+      );
+      const serialized = JSON.stringify(diagnostics);
+      assert.doesNotMatch(serialized, /re_live_super-secret/);
+      assert.doesNotMatch(serialized, /wake@example\.com|receiver@example\.com|owner@example\.com/);
+      assert.doesNotMatch(serialized, /invalid api key|verify a domain|not permitted/i);
+    }
+  });
 });
 
 describe('Version X receiver claim and protected command route', { concurrency: false }, () => {

@@ -287,7 +287,15 @@ const SAFE_ERRORS = Object.freeze({
   }),
   providerRejected: Object.freeze({
     statusCode: 502,
-    message: 'The receiver wake email could not be accepted.'
+    message: 'Resend rejected the receiver wake email. Verify the sender domain, receiver address, and Resend account permissions.'
+  }),
+  providerInvalidApiKey: Object.freeze({
+    statusCode: 502,
+    message: 'The Resend API key is invalid or revoked. Replace RESEND_API_KEY_X with a valid key.'
+  }),
+  providerTestSenderRestricted: Object.freeze({
+    statusCode: 502,
+    message: 'Resend test mode can deliver only to the Resend account email. Use that address for RECEIVER_WAKE_EMAIL_X, or verify a sending domain and update RECEIVER_WAKE_FROM_X.'
   }),
   providerUnavailable: Object.freeze({
     statusCode: 503,
@@ -418,6 +426,9 @@ function dependencies(options = {}) {
     AbortControllerImpl: options.AbortControllerImpl || globalThis.AbortController,
     setTimeoutImpl: options.setTimeoutImpl || globalThis.setTimeout,
     clearTimeoutImpl: options.clearTimeoutImpl || globalThis.clearTimeout,
+    consoleErrorImpl: typeof options.consoleErrorImpl === 'function'
+      ? options.consoleErrorImpl
+      : entry => console.error(JSON.stringify(entry)),
     now: options.now || Date.now
   };
 }
@@ -1244,6 +1255,71 @@ function resendEmailId(value) {
   return /^[A-Za-z0-9-]{8,100}$/.test(id) ? id : '';
 }
 
+function resendFailureText(payload) {
+  if (!payload || typeof payload !== 'object') return '';
+  return [
+    payload.message,
+    payload.name,
+    payload.error?.message,
+    typeof payload.error === 'string' ? payload.error : ''
+  ]
+    .map(value => String(value || '').trim().toLowerCase())
+    .filter(Boolean)
+    .join(' ');
+}
+
+function classifyResendFailure(httpStatus, payload) {
+  const message = resendFailureText(payload);
+  if (
+    httpStatus === 401
+    || /invalid(?: or revoked)? api[-_ ]?key|api[-_ ]?key (?:is )?(?:invalid|revoked)|revoked api[-_ ]?key/.test(message)
+  ) {
+    return Object.freeze({
+      classification: 'invalid_api_key',
+      errorCode: 'providerInvalidApiKey'
+    });
+  }
+  if (
+    httpStatus === 403
+    && (
+      /only send (?:testing )?emails? to your own email/.test(message)
+      || /verify (?:a|your) (?:sending )?domain/.test(message)
+      || /resend\.dev/.test(message)
+      || /test sender/.test(message)
+    )
+  ) {
+    return Object.freeze({
+      classification: 'test_sender_recipient_restricted',
+      errorCode: 'providerTestSenderRestricted'
+    });
+  }
+  return Object.freeze({
+    classification: 'permission_or_rejection',
+    errorCode: 'providerRejected'
+  });
+}
+
+function resendDiagnosticRoute(url) {
+  const value = String(url || '');
+  if (value === EMAIL_WAKE_X_RESEND_URL) return '/emails';
+  if (
+    value.startsWith(`${EMAIL_WAKE_X_RESEND_URL}/`)
+    && value.endsWith('/cancel')
+  ) {
+    return '/emails/:emailId/cancel';
+  }
+  return '/unknown';
+}
+
+function reportResendFailure(deps, url, httpStatus, classification) {
+  deps.consoleErrorImpl({
+    route: resendDiagnosticRoute(url),
+    provider: 'resend',
+    httpStatus,
+    classification
+  });
+}
+
 async function resendRequest(url, {
   acceptedStatuses = [],
   body,
@@ -1275,9 +1351,17 @@ async function resendRequest(url, {
       const payload = await response.json().catch(() => ({}));
       if (response.ok || acceptedStatuses.includes(response.status)) return payload;
       const retryable = response.status === 429 || response.status >= 500;
-      if (!retryable || attempt >= 2) {
-        fail(retryable ? 'providerUnavailable' : 'providerRejected');
+      if (!retryable) {
+        const classified = classifyResendFailure(response.status, payload);
+        reportResendFailure(
+          deps,
+          url,
+          response.status,
+          classified.classification
+        );
+        fail(classified.errorCode);
       }
+      if (attempt >= 2) fail('providerUnavailable');
       const retryAfter = Number(response.headers?.get?.('retry-after'));
       const delayMs = Number.isFinite(retryAfter) && retryAfter > 0
         ? Math.min(2_000, Math.ceil(retryAfter * 1000))
