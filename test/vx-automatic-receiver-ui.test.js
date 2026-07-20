@@ -362,9 +362,9 @@ describe('Version X Automatic Receiver UI and routing contract', () => {
     );
 
     assert.match(scheduleItem, /option value="stop"/);
-    assert.match(scheduleItem, /Stop music · quiet hours/);
+    assert.match(scheduleItem, /Quiet hours · silence output/);
     assert.match(scheduleItem, /data-show-schedule-kind="stop"/);
-    assert.match(scheduleItem, /leaves the Receiver quiet/);
+    assert.match(scheduleItem, /leaves the connected speakers quiet/);
     assert.match(visibility, /const stopItem = kind === 'stop'/);
     assert.match(visibility, /musicUrl\.required = kind !== 'announcement' && !stopItem/);
     assert.match(submit, /'announcement', 'controlled', 'apple', 'spotify', 'stop'/);
@@ -399,16 +399,16 @@ describe('Version X Automatic Receiver UI and routing contract', () => {
     assert.match(addItem, /id: itemId/);
   });
 
-  test('describes automatic quiet-hours Stop rows as background Receiver work', () => {
+  test('describes automatic quiet-hours 0% output as background Receiver work', () => {
     const schedule = sourceBetween(
       'function renderSchedule',
       'function renderSettings'
     );
 
-    assert.match(schedule, /announcement and quiet-hours Stop rows use the background Automatic Receiver/);
-    assert.match(schedule, /quiet-hours Stop rows wake the background Receiver Shortcut/);
-    assert.match(schedule, /announcement and quiet-hours Stop rows run once through the background Shortcut/);
-    assert.match(schedule, /Background announcement and quiet-hours Stop rows remain automatic/);
+    assert.match(schedule, /quiet-hours 0% output rows use the background Automatic Receiver/);
+    assert.match(schedule, /quiet-hours rows set the iPhone media output to 0%/);
+    assert.match(schedule, /announcements and quiet-hours 0% output run once through the background Shortcut/);
+    assert.match(schedule, /Background announcements and quiet-hours 0% output remain automatic/);
   });
 
   test('does not label a stale or unrenewed automatic schedule as ready', () => {

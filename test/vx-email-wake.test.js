@@ -46,6 +46,7 @@ import {
   emailWakeXDrainEventId
 } from '../api/email-wake-receipt-x.js';
 import {
+  createPushcutXReceipt,
   PushcutXReceiptError
 } from '../api/_pushcut-receipts-x.js';
 import {
@@ -2431,7 +2432,12 @@ describe('Version X email schedule manifest', { concurrency: false }, () => {
           }]
         };
       },
-      createReceipt: async command => ({ receipt: { eventId: command.eventId }, durable: true }),
+      createReceipt: async (command, options) => createPushcutXReceipt(command, {
+        ...options,
+        env: {},
+        now: () => NOW,
+        requireDurable: false
+      }),
       updateReceipt: async () => ({}),
       enqueueCommand: async command => {
         queued.push(command);
@@ -2455,6 +2461,8 @@ describe('Version X email schedule manifest', { concurrency: false }, () => {
     assert.equal(queued[0].musicPercent, 0);
     assert.equal(queued[0].resumeMusic, false);
     assert.equal(queued[0].source, 'schedule');
+    assert.equal(queued[0].label, 'Stop Music / Quiet Hours');
+    assert.equal(queued[0].text, 'Version X scheduled quiet-hours volume update.');
   });
 
   test('drops an elapsed manifest entry without racing its queued receiver command', async () => {

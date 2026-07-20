@@ -90,6 +90,16 @@ export function emailWakeXMaintenanceEventId(
 function commandFor(occurrence, now, env = process.env) {
   const eventId = emailWakeXScheduleEventId(occurrence, env);
   if (occurrence.action === 'volume') {
+    /*
+     * Keep quiet hours on the established volume command contract. The
+     * installed Automatic Receiver already understands this action and will
+     * apply 0% without requiring another Shortcut import. `source: schedule`
+     * keeps it distinct from an ordinary live manager volume change.
+     *
+     * Volume receipts use the same canonical receipt store as announcements,
+     * whose input contract requires non-empty text and label metadata even
+     * though neither value is spoken for a volume-only command.
+     */
     return Object.freeze({
       schemaVersion: 1,
       version: 'x',
@@ -100,6 +110,8 @@ function commandFor(occurrence, now, env = process.env) {
       scheduledFor: occurrence.scheduledFor,
       source: 'schedule',
       receiverContract: EMAIL_WAKE_X_RECEIVER_CONTRACT,
+      text: 'Version X scheduled quiet-hours volume update.',
+      label: String(occurrence.label || 'Stop Music / Quiet Hours').slice(0, 80),
       musicPercent: 0,
       resumeMusic: false
     });
