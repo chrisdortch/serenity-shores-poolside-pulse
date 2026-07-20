@@ -484,6 +484,81 @@ function mergeById(limit, newestFirst, ...lists) {
   return newestFirst ? sorted.slice(0, limit) : sorted.slice(-limit);
 }
 
+function scheduleAnnouncementHasContent(value) {
+  if (!isRecord(value)) return false;
+  const action = isRecord(value.action) ? value.action : {};
+  return Boolean(
+    boundedString(action.announcementId ?? value.announcementId, 120)
+    || boundedString(action.text ?? action.inlineText ?? value.inlineText ?? value.customText ?? value.text, 900)
+    || boundedString(action.url ?? value.url, 2_000)
+  );
+}
+
+function preservePersistedStopItem(value, previous) {
+  if (!isRecord(value)
+    || !requestedScheduleStop(previous)
+    || requestedScheduleStop(value)
+    || requestedScheduleBedProvider(value)
+    || scheduleAnnouncementHasContent(value)) {
+    return value;
+  }
+
+  // Version X added a first-class stop/quiet-hours row after some Receiver
+  // pages were already open. Those older bundles normalize an unknown `stop`
+  // kind into an empty announcement on every heartbeat. Preserve the existing
+  // stop when the same row comes back as a contentless announcement, while
+  // still allowing an intentional change to a music bed or a real saved/inline
+  // announcement.
+  return {
+    ...value,
+    type: 'stop',
+    kind: 'stop',
+    action: { kind: 'stop' },
+    announcementId: '',
+    url: '',
+    volume: { mode: 'global', percent: 0 },
+    advance: { mode: 'complete', durationSeconds: 5 * 60 }
+  };
+}
+
+function preservePersistedStopItems(value, previous) {
+  if (!isRecord(value) || !isRecord(previous)) return value;
+  const previousSchedules = Array.isArray(previous.schedules) ? previous.schedules : [];
+  const previousSchedulesById = new Map(previousSchedules
+    .filter(isRecord)
+    .map(schedule => [boundedString(schedule.id, 120), schedule]));
+  const protectItems = (items, previousItems) => {
+    const previousList = Array.isArray(previousItems) ? previousItems : [];
+    const previousById = new Map(previousList
+      .filter(isRecord)
+      .map(item => [boundedString(item.id, 120), item]));
+    return (Array.isArray(items) ? items : []).map((item, index) => preservePersistedStopItem(
+      item,
+      previousById.get(boundedString(item?.id, 120)) || previousList[index]
+    ));
+  };
+
+  const schedules = Array.isArray(value.schedules)
+    ? value.schedules.map((schedule, index) => {
+        if (!isRecord(schedule)) return schedule;
+        const previousSchedule = previousSchedulesById.get(boundedString(schedule.id, 120))
+          || previousSchedules[index];
+        return {
+          ...schedule,
+          items: protectItems(schedule.items, previousSchedule?.items)
+        };
+      })
+    : value.schedules;
+
+  const activeScheduleId = boundedString(value.activeScheduleId ?? previous.activeScheduleId, 120);
+  const previousActive = previousSchedulesById.get(activeScheduleId) || previousSchedules[0];
+  const schedule = Array.isArray(value.schedule)
+    ? protectItems(value.schedule, previousActive?.items)
+    : value.schedule;
+
+  return { ...value, schedules, schedule };
+}
+
 async function sanitizeStoredState(value, now = Date.now()) {
   if (!isRecord(value)) return null;
   const safe = await sanitizeXState(value, now);
@@ -515,7 +590,7 @@ async function finalizeState(incoming, previous, now = Date.now()) {
     events: mergeById(120, false, previousSafe?.events, source.events),
     activityLog: mergeById(180, true, previousSafe?.activityLog, source.activityLog)
   };
-  const safe = await sanitizeXState(merged, now);
+  const safe = await sanitizeXState(preservePersistedStopItems(merged, previousSafe), now);
   return {
     ...safe,
     version: X_STATE_VERSION,

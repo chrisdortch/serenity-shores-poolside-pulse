@@ -647,6 +647,116 @@ describe('Version X API isolation', { concurrency: false }, () => {
     );
   });
 
+  test('keeps persisted quiet hours when a legacy Receiver heartbeat downgrades stop to an empty announcement', async () => {
+    const xCookie = cookieFor('x');
+    const initial = await invoke(stateXHandler, request('POST', '/api/state-x?v=x', {
+      cookie: xCookie,
+      body: {
+        version: 'x',
+        expectedRevision: 0,
+        state: {
+          version: 'x',
+          schedules: [{
+            id: 'daily',
+            name: 'Daily',
+            mode: 'time',
+            enabled: true,
+            items: [{
+              id: 'daily-quiet-hours-x',
+              label: 'Pool Closed / Quiet Hours',
+              type: 'stop',
+              position: { time: '22:00', order: 1 },
+              action: { kind: 'stop' },
+              volume: { mode: 'global', percent: 0 }
+            }]
+          }],
+          activeScheduleId: 'daily'
+        }
+      }
+    }));
+    assert.equal(initial.statusCode, 200);
+    assert.equal(initial.json().state.schedules[0].items[0].action.kind, 'stop');
+
+    const legacyHeartbeatState = structuredClone(initial.json().state);
+    const legacyItem = legacyHeartbeatState.schedules[0].items[0];
+    Object.assign(legacyItem, {
+      type: 'announcement',
+      kind: 'announcement',
+      announcementId: '',
+      url: '',
+      action: {
+        kind: 'announcement',
+        announcementSource: 'saved',
+        announcementId: '',
+        sourceId: 'natural-voice',
+        text: '',
+        url: ''
+      },
+      volume: { mode: 'global', percent: 100 }
+    });
+    legacyHeartbeatState.schedule = legacyHeartbeatState.schedules[0].items.map(item => ({
+      id: item.id,
+      label: item.label,
+      type: item.type,
+      time: item.position.time,
+      announcementId: item.announcementId,
+      url: item.url,
+      enabled: item.enabled,
+      days: item.days
+    }));
+    legacyHeartbeatState.scheduleProjectionSignature = 'legacy-heartbeat-signature';
+    legacyHeartbeatState.receiver = {
+      id: 'receiver-x',
+      sessionId: 'session-x',
+      status: 'online',
+      lastSeen: Date.now(),
+      leaseUntil: Date.now() + 60_000
+    };
+
+    const heartbeat = await invoke(stateXHandler, request('POST', '/api/state-x?v=x', {
+      cookie: xCookie,
+      body: {
+        version: 'x',
+        expectedRevision: 1,
+        state: legacyHeartbeatState
+      }
+    }));
+    assert.equal(heartbeat.statusCode, 200);
+    const protectedItem = heartbeat.json().state.schedules[0].items[0];
+    assert.equal(protectedItem.type, 'stop');
+    assert.deepEqual(protectedItem.action, { kind: 'stop' });
+    assert.equal(protectedItem.volume.percent, 0);
+    assert.equal(heartbeat.json().state.receiver.id, 'receiver-x');
+
+    const intentionalEditState = structuredClone(heartbeat.json().state);
+    const intentionalItem = intentionalEditState.schedules[0].items[0];
+    Object.assign(intentionalItem, {
+      type: 'announcement',
+      kind: 'announcement',
+      announcementId: 'welcome',
+      action: {
+        kind: 'announcement',
+        announcementSource: 'saved',
+        announcementId: 'welcome',
+        sourceId: 'natural-voice',
+        text: '',
+        url: ''
+      }
+    });
+
+    const intentional = await invoke(stateXHandler, request('POST', '/api/state-x?v=x', {
+      cookie: xCookie,
+      body: {
+        version: 'x',
+        expectedRevision: 2,
+        state: intentionalEditState
+      }
+    }));
+    assert.equal(intentional.statusCode, 200);
+    assert.equal(intentional.json().state.schedules[0].items[0].action.kind, 'announcement');
+    assert.equal(intentional.json().state.schedules[0].items[0].action.announcementId, 'welcome');
+  });
+
   test('uses the isolated Version X KV key for GET and compare-and-set only', async () => {
     process.env.KV_REST_API_URL = 'https://kv.test.invalid';
     process.env.KV_REST_API_TOKEN = 'test-kv-token';
