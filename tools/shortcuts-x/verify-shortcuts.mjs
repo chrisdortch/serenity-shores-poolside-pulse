@@ -211,9 +211,27 @@ for (const modes of conditionalGroups.values()) assert.deepEqual(modes, [0, 2]);
 
 assert.equal(recoveryActions[3].WFWorkflowActionParameters.WFCondition, 100);
 assert.equal(recoveryActions[8].WFWorkflowActionParameters.WFCondition, 5);
-assert.equal(recoveryActions[8].WFWorkflowActionParameters.WFNumberValue, 1);
+assert.equal(
+  recoveryActions[8].WFWorkflowActionParameters.WFConditionalActionString,
+  '1'
+);
+assert.equal(recoveryActions[8].WFWorkflowActionParameters.WFNumberValue, undefined);
+assert.equal(
+  recoveryActions[8].WFWorkflowActionParameters.WFInput.Variable.Value
+    .Aggrandizements[0].CoercionItemClass,
+  'WFStringContentItem'
+);
 assert.equal(recoveryActions[18].WFWorkflowActionParameters.WFCondition, 4);
-assert.equal(recoveryActions[18].WFWorkflowActionParameters.WFNumberValue, 1);
+assert.equal(
+  recoveryActions[18].WFWorkflowActionParameters.WFConditionalActionString,
+  '1'
+);
+assert.equal(recoveryActions[18].WFWorkflowActionParameters.WFNumberValue, undefined);
+assert.equal(
+  recoveryActions[18].WFWorkflowActionParameters.WFInput.Variable.Value
+    .Aggrandizements[0].CoercionItemClass,
+  'WFStringContentItem'
+);
 
 const recoveryMusicLevel = recoveryActions.find(
   (action) => action.WFWorkflowActionParameters?.CustomOutputName === 'musicLevel'
@@ -252,6 +270,11 @@ assert.equal(automaticActions[11].WFWorkflowActionParameters.WFNumberValue, 49);
 assert.match(
   automaticActions[12].WFWorkflowActionParameters.WFAskActionPrompt,
   /six-digit Receiver pairing code/
+);
+assert.equal(
+  automaticActions[12].WFWorkflowActionParameters.WFInputType,
+  'Text',
+  'Automatic Receiver pairing input must declare a Text type'
 );
 assert.equal(
   automaticActions[13].WFWorkflowActionParameters.WFURL,
@@ -294,7 +317,16 @@ assert.equal(
 );
 assert.equal(automaticActions[36].WFWorkflowActionParameters.WFDictionaryKey, 'pending');
 assert.equal(automaticActions[37].WFWorkflowActionParameters.WFCondition, 5);
-assert.equal(automaticActions[37].WFWorkflowActionParameters.WFNumberValue, 1);
+assert.equal(
+  automaticActions[37].WFWorkflowActionParameters.WFConditionalActionString,
+  '1'
+);
+assert.equal(automaticActions[37].WFWorkflowActionParameters.WFNumberValue, undefined);
+assert.equal(
+  automaticActions[37].WFWorkflowActionParameters.WFInput.Variable.Value
+    .Aggrandizements[0].CoercionItemClass,
+  'WFStringContentItem'
+);
 assert.ok(
   referencedOutputUuids(automaticActions[37].WFWorkflowActionParameters)
     .has(automaticActions[36].WFWorkflowActionParameters.UUID)
@@ -357,7 +389,16 @@ assert.equal(
   automaticActions[68].WFWorkflowActionParameters.UUID
 );
 assert.equal(automaticActions[70].WFWorkflowActionParameters.WFCondition, 4);
-assert.equal(automaticActions[70].WFWorkflowActionParameters.WFNumberValue, 1);
+assert.equal(
+  automaticActions[70].WFWorkflowActionParameters.WFConditionalActionString,
+  '1'
+);
+assert.equal(automaticActions[70].WFWorkflowActionParameters.WFNumberValue, undefined);
+assert.equal(
+  automaticActions[70].WFWorkflowActionParameters.WFInput.Variable.Value
+    .Aggrandizements[0].CoercionItemClass,
+  'WFStringContentItem'
+);
 assert.ok(
   referencedOutputUuids(automaticActions[70].WFWorkflowActionParameters)
     .has(automaticActions[69].WFWorkflowActionParameters.UUID)
@@ -392,7 +433,13 @@ const authorizationConditions =
     .WFActionParameterFilterTemplates;
 assert.equal(authorizationConditions.length, 3);
 assert.equal(authorizationConditions[0].WFCondition, 5);
-assert.equal(authorizationConditions[0].WFNumberValue, 1);
+assert.equal(authorizationConditions[0].WFConditionalActionString, '1');
+assert.equal(authorizationConditions[0].WFNumberValue, undefined);
+assert.equal(
+  authorizationConditions[0].WFInput.Variable.Value
+    .Aggrandizements[0].CoercionItemClass,
+  'WFStringContentItem'
+);
 assert.ok(
   referencedOutputUuids(authorizationConditions)
     .has(automaticActions[83].WFWorkflowActionParameters.UUID)

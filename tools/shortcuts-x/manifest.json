@@ -10,15 +10,15 @@
     "recovery": {
       "file": "public/shortcuts/poolside-pulse-x-recovery.shortcut",
       "name": "Poolside Pulse X Recovery",
-      "sha256": "f042cb2244d61d2d605c5e0456a5c75694afedd89c4bc1637ca01e8ff22ee9ec"
+      "sha256": "6380b45851b36bca8fa30f557c709dbf13cf8f5aac80e9b25f8aa81a385eca2c"
     },
     "automaticReceiver": {
       "file": "public/shortcuts/poolside-pulse-x-automatic-receiver.shortcut",
       "name": "Poolside Pulse X Automatic Receiver",
-      "sourceSha256": "38558515fb47e9b28dfdb59028460fdeb9c40776ddedf53d7dc2e118933105d9",
-      "unsignedSha256": "8d9fb056f6f6086aa31cd256fe8c4deaf53bc4678674ec5d54fdfa8fab0be1e7",
-      "signedFromUnsignedSha256": "8d9fb056f6f6086aa31cd256fe8c4deaf53bc4678674ec5d54fdfa8fab0be1e7",
-      "sha256": "9592156379be1de7719564e856cbf6b8ed0c8cd292b10e6b0034a80a7e6e65e1"
+      "sourceSha256": "2e5f8d0f463d796968b8ba8fcdb1127f2024e9378e7f3f01acbc7d269a7205de",
+      "unsignedSha256": "b571d4e85b5e6db7e0a7ddebf05f730f85bccb32cda68b1c29a755314fe2d924",
+      "signedFromUnsignedSha256": "b571d4e85b5e6db7e0a7ddebf05f730f85bccb32cda68b1c29a755314fe2d924",
+      "sha256": "b12f89066fdb3fffc9a9c54369bcb2b4cff8e8d4ffc30f990395f27a87a745c5"
     }
   }
 }

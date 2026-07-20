@@ -23,7 +23,9 @@ replaying the announcement until the server receives restoration proof.
 #define color blue
 #define mac false
 
-action 'ask' askForPairingCode(text prompt: 'WFAskActionPrompt'): text
+action 'ask' askForPairingCode(text prompt: 'WFAskActionPrompt'): text {
+    "WFInputType": "Text"
+}
 
 action 'getvalueforkey' getFloatValue(
     dictionary dictionary: 'WFInput',
@@ -90,9 +92,14 @@ const claimResponse = jsonRequest(
     }
 )
 const command = getDictionary(claimResponse)
-const pending = getFloatValue(command, "pending")
+const pending = getValue(command, "pending")
 
-if pending != 1 {
+/*
+Dictionary values are dynamically typed in iOS Shortcuts. Comparing one
+directly to a numeric literal can import as “is not [blank]”. Coerce the
+transport flag to text so the required comparison value survives import.
+*/
+if pending.text != "1" {
     stop()
 } else {
     const action = getValue(command, "action")
@@ -163,14 +170,14 @@ if pending != 1 {
                 stop()
             } else {
                     const commandMusicLevel = getFloatValue(command, "musicLevel")
-                    const reclaimed = getFloatValue(command, "reclaimed")
+                    const reclaimed = getValue(command, "reclaimed")
 
                     /*
                     A reclaimed attempt means an earlier automation stopped
                     without a valid receipt. Recover the music bed first; only
                     then prepare a fresh, attempt-bound announcement.
                     */
-                    if reclaimed == 1 {
+                    if reclaimed.text == "1" {
                         setVolume(0.0)
                         play()
                         wait(1)
@@ -188,7 +195,7 @@ if pending != 1 {
                     const executeUrl = getValue(command, "executeUrl")
                     const executeResponse = downloadURL("{executeUrl}")
                     const executeDictionary = getDictionary(executeResponse)
-                    const authorized = getFloatValue(
+                    const authorized = getValue(
                         executeDictionary,
                         "authorized"
                     )
@@ -210,7 +217,7 @@ if pending != 1 {
                     const authorizedExecutionAttempt = number(
                         authorizedExecutionAttemptValue
                     )
-                    if authorized != 1
+                    if authorized.text != "1"
                         || authorizedContract.text != "poolside-pulse-x-wake-v1"
                         || authorizedExecutionAttempt != claimedExecutionAttempt {
                         stop()
