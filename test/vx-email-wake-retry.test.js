@@ -443,7 +443,7 @@ describe('Version X post-download receipt retry preparation', {
         { executionAttempt: 1 }
       ),
       receipt: createSignedEmailWakeXUrl(
-        request('POST', '/'),
+        request('GET', '/'),
         '/api/email-wake-receipt-x',
         eventId,
         'receipt',
@@ -514,15 +514,8 @@ describe('Version X post-download receipt retry preparation', {
     });
     const staleReceipt = await invoke(
       receiptHandler,
-      request('POST', new URL(staleUrls.receipt.url).pathname
-        + new URL(staleUrls.receipt.url).search, {
-        body: {
-          eventId,
-          status: 'failed',
-          receiverContract: EMAIL_WAKE_X_RECEIVER_CONTRACT,
-          failureCode: 'stale_attempt'
-        }
-      })
+      request('GET', new URL(staleUrls.receipt.url).pathname
+        + new URL(staleUrls.receipt.url).search)
     );
     assert.equal(staleReceipt.statusCode, 409);
     assert.match(staleReceipt.json().error, /stale/i);
@@ -937,7 +930,7 @@ describe('Version X recovery-only restore and receipt', {
       }
     );
     const receiptUrl = createSignedEmailWakeXUrl(
-      request('POST', '/'),
+      request('GET', '/'),
       '/api/email-wake-receipt-x',
       eventId,
       'receipt',
@@ -976,18 +969,8 @@ describe('Version X recovery-only restore and receipt', {
     });
     const completedRecovery = await invoke(
       receiptHandler,
-      request('POST', new URL(receiptUrl.url).pathname
-        + new URL(receiptUrl.url).search, {
-        body: {
-          eventId,
-          status: 'failed',
-          receiverContract: EMAIL_WAKE_X_RECEIVER_CONTRACT,
-          failureCode: 'retry_exhausted_recovery_required',
-          volumeRestored: true,
-          restoredMusicPercent: 42,
-          musicResumed: true
-        }
-      })
+      request('GET', new URL(receiptUrl.url).pathname
+        + new URL(receiptUrl.url).search)
     );
     assert.equal(completedRecovery.statusCode, 200);
     assert.deepEqual(removed, [eventId]);

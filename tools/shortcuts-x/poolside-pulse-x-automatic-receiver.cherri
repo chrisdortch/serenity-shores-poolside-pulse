@@ -109,20 +109,7 @@ if pending.text != "1" {
         setVolume(volumeLevel)
 
         const volumeReceiptUrl = getValue(command, "receiptUrl")
-        const volumeMusicPercentValue = getValue(command, "musicPercent")
-        const volumeMusicPercent = number(volumeMusicPercentValue)
-        rawAction("is.workflow.actions.downloadurl", {
-            "WFURL": "${volumeReceiptUrl}",
-            "WFHTTPMethod": "POST",
-            "WFHTTPBodyType": "JSON",
-            "WFJSONValues": {
-                "status": "completed",
-                "receiverContract": "poolside-pulse-x-wake-v1",
-                "volumeRestored": true,
-                "restoredMusicPercent": "${volumeMusicPercent}",
-                "musicResumed": false
-            }
-        })
+        downloadURL("{volumeReceiptUrl}")
     } else {
         if action.text == "recover" {
                 /*
@@ -146,25 +133,11 @@ if pending.text != "1" {
                 )
                 setVolume(recoveryMusicLevel)
 
-                const recoveryReceiptUrl = getValue(command, "receiptUrl")
-                const recoveryMusicPercentValue = getValue(
-                    recoveryRestoreDictionary,
-                    "musicPercent"
+                const recoveryReceiptUrl = getValue(
+                    command,
+                    "receiptUrl"
                 )
-                const recoveryMusicPercent = number(recoveryMusicPercentValue)
-                rawAction("is.workflow.actions.downloadurl", {
-                    "WFURL": "${recoveryReceiptUrl}",
-                    "WFHTTPMethod": "POST",
-                    "WFHTTPBodyType": "JSON",
-                    "WFJSONValues": {
-                        "status": "failed",
-                        "receiverContract": "poolside-pulse-x-wake-v1",
-                        "failureCode": "retry_exhausted_recovered",
-                        "volumeRestored": true,
-                        "restoredMusicPercent": "${recoveryMusicPercent}",
-                        "musicResumed": true
-                    }
-                })
+                downloadURL("{recoveryReceiptUrl}")
         } else {
             if action.text != "announce" {
                 stop()
@@ -250,25 +223,7 @@ if pending.text != "1" {
                     setVolume(musicLevel)
 
                     const receiptUrl = getValue(command, "receiptUrl")
-                    const restoredMusicPercentValue = getValue(
-                        restoreDictionary,
-                        "musicPercent"
-                    )
-                    const restoredMusicPercent = number(
-                        restoredMusicPercentValue
-                    )
-                    rawAction("is.workflow.actions.downloadurl", {
-                        "WFURL": "${receiptUrl}",
-                        "WFHTTPMethod": "POST",
-                        "WFHTTPBodyType": "JSON",
-                        "WFJSONValues": {
-                            "status": "completed",
-                            "receiverContract": "poolside-pulse-x-wake-v1",
-                            "volumeRestored": true,
-                            "restoredMusicPercent": "${restoredMusicPercent}",
-                            "musicResumed": true
-                        }
-                    })
+                    downloadURL("{receiptUrl}")
             }
         }
     }

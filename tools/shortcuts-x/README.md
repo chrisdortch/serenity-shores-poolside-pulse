@@ -23,7 +23,9 @@ authorized command from Version X and performs this sequence:
 6. Resume the current source, wait one second, apply the command's safe
    fallback level, and then restore the latest
    manager-selected music level.
-7. POST the signed `poolside-pulse-x-wake-v1` completion receipt.
+7. GET the signed, attempt-bound completion URL. The server derives and
+   validates the expected restore target from the durable receipt, avoiding a
+   fragile iOS-generated JSON body after playback.
 
 If two Remotes send at nearly the same time, the server grants one playback
 lease and a busy automation stops immediately. The active Shortcut handles one

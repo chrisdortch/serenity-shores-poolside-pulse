@@ -73,6 +73,34 @@ function getValueAction(workflow, key) {
   );
 }
 
+function getValueActions(workflow, key) {
+  return workflow.WFWorkflowActions.filter(
+    (action) =>
+      action.WFWorkflowActionIdentifier === 'is.workflow.actions.getvalueforkey' &&
+      action.WFWorkflowActionParameters?.WFDictionaryKey === key
+  );
+}
+
+function actionIndex(actions, action, message) {
+  const index = actions.indexOf(action);
+  assert.notEqual(index, -1, message);
+  return index;
+}
+
+function actionIndexReferencingOutput(actions, identifier, outputAction, {
+  after = -1,
+  before = actions.length
+} = {}) {
+  const outputUuid = outputAction?.WFWorkflowActionParameters?.UUID;
+  assert.ok(outputUuid, 'Referenced output action is missing its UUID');
+  return actions.findIndex((action, index) =>
+    index > after &&
+    index < before &&
+    action.WFWorkflowActionIdentifier === identifier &&
+    referencedOutputUuids(action.WFWorkflowActionParameters).has(outputUuid)
+  );
+}
+
 function dictionaryValues(action) {
   const items =
     action.WFWorkflowActionParameters?.WFJSONValues?.Value?.WFDictionaryFieldValueItems || [];
@@ -253,7 +281,7 @@ assert.equal(
 );
 
 const automaticActions = automaticReceiver.WFWorkflowActions;
-assert.equal(automaticActions.length, 121);
+assert.equal(automaticActions.length, 115);
 
 assert.equal(
   automaticActions[0].WFWorkflowActionParameters.WFGetFilePath,
@@ -343,18 +371,18 @@ assert.ok(getValueAction(automaticReceiver, 'reclaimed'));
 // Recovery-only attempts never replay speech. They resume while muted,
 // applies the command fallback before networking, fetches the latest target,
 // and then records a truthful recovered failure.
-assert.equal(automaticActions[51].WFWorkflowActionParameters.WFVolume, 0);
-assert.equal(automaticActions[52].WFWorkflowActionParameters.WFPlayPauseBehavior, 'Play');
-assert.equal(automaticActions[53].WFWorkflowActionParameters.WFDelayTime, 1);
+assert.equal(automaticActions[49].WFWorkflowActionParameters.WFVolume, 0);
+assert.equal(automaticActions[50].WFWorkflowActionParameters.WFPlayPauseBehavior, 'Play');
+assert.equal(automaticActions[51].WFWorkflowActionParameters.WFDelayTime, 1);
 assert.equal(
-  actionOutputUuid(automaticActions[54].WFWorkflowActionParameters.WFVolume),
-  automaticActions[50].WFWorkflowActionParameters.UUID
+  actionOutputUuid(automaticActions[52].WFWorkflowActionParameters.WFVolume),
+  automaticActions[48].WFWorkflowActionParameters.UUID
 );
 assert.equal(
-  actionOutputUuid(automaticActions[59].WFWorkflowActionParameters.WFVolume),
-  automaticActions[58].WFWorkflowActionParameters.UUID
+  actionOutputUuid(automaticActions[57].WFWorkflowActionParameters.WFVolume),
+  automaticActions[56].WFWorkflowActionParameters.UUID
 );
-for (const action of automaticActions.slice(50, 64)) {
+for (const action of automaticActions.slice(48, 60)) {
   assert.notEqual(
     action.WFWorkflowActionParameters?.WFVolume,
     1,
@@ -373,63 +401,63 @@ for (const action of automaticActions.slice(50, 64)) {
 }
 
 // Unknown action types stop instead of falling into announcement playback.
-assert.equal(automaticActions[65].WFWorkflowActionParameters.WFCondition, 5);
+assert.equal(automaticActions[61].WFWorkflowActionParameters.WFCondition, 5);
 assert.equal(
-  automaticActions[65].WFWorkflowActionParameters.WFConditionalActionString,
+  automaticActions[61].WFWorkflowActionParameters.WFConditionalActionString,
   'announce'
 );
-assert.equal(automaticActions[66].WFWorkflowActionIdentifier, 'is.workflow.actions.exit');
+assert.equal(automaticActions[62].WFWorkflowActionIdentifier, 'is.workflow.actions.exit');
 
 // A reclaimed attempt first repairs the bed at the command fallback level.
-assert.equal(automaticActions[71].WFWorkflowActionParameters.WFVolume, 0);
-assert.equal(automaticActions[72].WFWorkflowActionParameters.WFPlayPauseBehavior, 'Play');
-assert.equal(automaticActions[73].WFWorkflowActionParameters.WFDelayTime, 1);
+assert.equal(automaticActions[67].WFWorkflowActionParameters.WFVolume, 0);
+assert.equal(automaticActions[68].WFWorkflowActionParameters.WFPlayPauseBehavior, 'Play');
+assert.equal(automaticActions[69].WFWorkflowActionParameters.WFDelayTime, 1);
 assert.equal(
-  actionOutputUuid(automaticActions[74].WFWorkflowActionParameters.WFVolume),
-  automaticActions[68].WFWorkflowActionParameters.UUID
+  actionOutputUuid(automaticActions[70].WFWorkflowActionParameters.WFVolume),
+  automaticActions[64].WFWorkflowActionParameters.UUID
 );
-assert.equal(automaticActions[70].WFWorkflowActionParameters.WFCondition, 4);
+assert.equal(automaticActions[66].WFWorkflowActionParameters.WFCondition, 4);
 assert.equal(
-  automaticActions[70].WFWorkflowActionParameters.WFConditionalActionString,
+  automaticActions[66].WFWorkflowActionParameters.WFConditionalActionString,
   '1'
 );
-assert.equal(automaticActions[70].WFWorkflowActionParameters.WFNumberValue, undefined);
+assert.equal(automaticActions[66].WFWorkflowActionParameters.WFNumberValue, undefined);
 assert.equal(
-  automaticActions[70].WFWorkflowActionParameters.WFInput.Variable.Value
+  automaticActions[66].WFWorkflowActionParameters.WFInput.Variable.Value
     .Aggrandizements[0].CoercionItemClass,
   'WFStringContentItem'
 );
 assert.ok(
-  referencedOutputUuids(automaticActions[70].WFWorkflowActionParameters)
-    .has(automaticActions[69].WFWorkflowActionParameters.UUID)
+  referencedOutputUuids(automaticActions[66].WFWorkflowActionParameters)
+    .has(automaticActions[65].WFWorkflowActionParameters.UUID)
 );
 
 // Normal attempts download all audio, then authorize this exact attempt,
 // before the first announcement-related volume or playback mutation.
-assert.equal(automaticActions[79].WFWorkflowActionParameters.CustomOutputName, 'announcementAudio');
-assert.equal(automaticActions[79].WFWorkflowActionParameters.WFHTTPMethod, 'GET');
+assert.equal(automaticActions[75].WFWorkflowActionParameters.CustomOutputName, 'announcementAudio');
+assert.equal(automaticActions[75].WFWorkflowActionParameters.WFHTTPMethod, 'GET');
 assert.ok(
-  referencedOutputUuids(automaticActions[79].WFWorkflowActionParameters)
-    .has(automaticActions[78].WFWorkflowActionParameters.UUID)
+  referencedOutputUuids(automaticActions[75].WFWorkflowActionParameters)
+    .has(automaticActions[74].WFWorkflowActionParameters.UUID)
 );
-assert.equal(automaticActions[81].WFWorkflowActionParameters.WFHTTPMethod, 'GET');
+assert.equal(automaticActions[77].WFWorkflowActionParameters.WFHTTPMethod, 'GET');
 assert.ok(
-  referencedOutputUuids(automaticActions[81].WFWorkflowActionParameters)
-    .has(automaticActions[80].WFWorkflowActionParameters.UUID)
+  referencedOutputUuids(automaticActions[77].WFWorkflowActionParameters)
+    .has(automaticActions[76].WFWorkflowActionParameters.UUID)
 );
-assert.equal(automaticActions[81].WFWorkflowActionParameters.CustomOutputName, 'executeResponse');
-assert.equal(automaticActions[82].WFWorkflowActionParameters.CustomOutputName, 'executeDictionary');
-assert.equal(automaticActions[83].WFWorkflowActionParameters.WFDictionaryKey, 'authorized');
-assert.equal(automaticActions[84].WFWorkflowActionParameters.WFDictionaryKey, 'receiverContract');
-assert.equal(automaticActions[85].WFWorkflowActionParameters.WFDictionaryKey, 'executionAttempt');
-assert.equal(automaticActions[87].WFWorkflowActionParameters.WFDictionaryKey, 'executionAttempt');
+assert.equal(automaticActions[77].WFWorkflowActionParameters.CustomOutputName, 'executeResponse');
+assert.equal(automaticActions[78].WFWorkflowActionParameters.CustomOutputName, 'executeDictionary');
+assert.equal(automaticActions[79].WFWorkflowActionParameters.WFDictionaryKey, 'authorized');
+assert.equal(automaticActions[80].WFWorkflowActionParameters.WFDictionaryKey, 'receiverContract');
+assert.equal(automaticActions[81].WFWorkflowActionParameters.WFDictionaryKey, 'executionAttempt');
+assert.equal(automaticActions[83].WFWorkflowActionParameters.WFDictionaryKey, 'executionAttempt');
 assert.equal(
-  automaticActions[89].WFWorkflowActionParameters.WFConditions.Value
+  automaticActions[85].WFWorkflowActionParameters.WFConditions.Value
     .WFActionParameterFilterPrefix,
   0
 );
 const authorizationConditions =
-  automaticActions[89].WFWorkflowActionParameters.WFConditions.Value
+  automaticActions[85].WFWorkflowActionParameters.WFConditions.Value
     .WFActionParameterFilterTemplates;
 assert.equal(authorizationConditions.length, 3);
 assert.equal(authorizationConditions[0].WFCondition, 5);
@@ -442,64 +470,171 @@ assert.equal(
 );
 assert.ok(
   referencedOutputUuids(authorizationConditions)
-    .has(automaticActions[83].WFWorkflowActionParameters.UUID)
+    .has(automaticActions[79].WFWorkflowActionParameters.UUID)
+);
+assert.ok(
+  referencedOutputUuids(authorizationConditions)
+    .has(automaticActions[80].WFWorkflowActionParameters.UUID)
+);
+assert.ok(
+  referencedOutputUuids(authorizationConditions)
+    .has(automaticActions[82].WFWorkflowActionParameters.UUID)
 );
 assert.ok(
   referencedOutputUuids(authorizationConditions)
     .has(automaticActions[84].WFWorkflowActionParameters.UUID)
 );
-assert.ok(
-  referencedOutputUuids(authorizationConditions)
-    .has(automaticActions[86].WFWorkflowActionParameters.UUID)
-);
-assert.ok(
-  referencedOutputUuids(authorizationConditions)
-    .has(automaticActions[88].WFWorkflowActionParameters.UUID)
-);
-assert.equal(automaticActions[90].WFWorkflowActionIdentifier, 'is.workflow.actions.exit');
+assert.equal(automaticActions[86].WFWorkflowActionIdentifier, 'is.workflow.actions.exit');
 
-assert.equal(automaticActions[94].WFWorkflowActionParameters.WFVolume, 0);
-assert.equal(automaticActions[95].WFWorkflowActionParameters.WFPlayPauseBehavior, 'Pause');
-assert.equal(automaticActions[96].WFWorkflowActionParameters.WFDelayTime, 1);
-assert.equal(automaticActions[97].WFWorkflowActionParameters.WFVolume, 1);
+assert.equal(automaticActions[90].WFWorkflowActionParameters.WFVolume, 0);
+assert.equal(automaticActions[91].WFWorkflowActionParameters.WFPlayPauseBehavior, 'Pause');
+assert.equal(automaticActions[92].WFWorkflowActionParameters.WFDelayTime, 1);
+assert.equal(automaticActions[93].WFWorkflowActionParameters.WFVolume, 1);
 assert.equal(
-  actionOutputUuid(automaticActions[98].WFWorkflowActionParameters.WFInput),
-  automaticActions[79].WFWorkflowActionParameters.UUID
+  actionOutputUuid(automaticActions[94].WFWorkflowActionParameters.WFInput),
+  automaticActions[75].WFWorkflowActionParameters.UUID
 );
-assert.equal(automaticActions[99].WFWorkflowActionParameters.WFVolume, 0);
-assert.equal(automaticActions[100].WFWorkflowActionParameters.WFPlayPauseBehavior, 'Play');
-assert.equal(automaticActions[101].WFWorkflowActionParameters.WFDelayTime, 1);
+assert.equal(automaticActions[95].WFWorkflowActionParameters.WFVolume, 0);
+assert.equal(automaticActions[96].WFWorkflowActionParameters.WFPlayPauseBehavior, 'Play');
+assert.equal(automaticActions[97].WFWorkflowActionParameters.WFDelayTime, 1);
 assert.equal(
-  actionOutputUuid(automaticActions[102].WFWorkflowActionParameters.WFVolume),
-  automaticActions[68].WFWorkflowActionParameters.UUID
+  actionOutputUuid(automaticActions[98].WFWorkflowActionParameters.WFVolume),
+  automaticActions[64].WFWorkflowActionParameters.UUID
 );
 assert.ok(
-  referencedOutputUuids(automaticActions[104].WFWorkflowActionParameters)
-    .has(automaticActions[103].WFWorkflowActionParameters.UUID)
+  referencedOutputUuids(automaticActions[100].WFWorkflowActionParameters)
+    .has(automaticActions[99].WFWorkflowActionParameters.UUID)
 );
 assert.equal(
-  actionOutputUuid(automaticActions[107].WFWorkflowActionParameters.WFVolume),
-  automaticActions[106].WFWorkflowActionParameters.UUID
+  actionOutputUuid(automaticActions[103].WFWorkflowActionParameters.WFVolume),
+  automaticActions[102].WFWorkflowActionParameters.UUID
 );
 
-for (const receiptIndex of [47, 63, 111]) {
-  const receipt = automaticActions[receiptIndex];
-  assert.equal(receipt.WFWorkflowActionParameters.WFHTTPMethod, 'POST');
-  assert.equal(receipt.WFWorkflowActionParameters.WFHTTPBodyType, 'JSON');
-  const values = dictionaryValues(receipt);
-  assert.equal(values.receiverContract, 'poolside-pulse-x-wake-v1');
-  assert.equal(values.volumeRestored, true);
+// Every terminal branch acknowledges its signed receipt with a plain GET.
+// The server derives the result from the attempt-bound capability and stored
+// receipt; the Shortcut must not construct a client-asserted JSON body.
+const receiptUrlActions = getValueActions(automaticReceiver, 'receiptUrl');
+assert.equal(receiptUrlActions.length, 3);
+const receiptUrlsByOutputName = new Map(
+  receiptUrlActions.map(action => [
+    action.WFWorkflowActionParameters.CustomOutputName,
+    action
+  ])
+);
+assert.deepEqual(
+  [...receiptUrlsByOutputName.keys()].sort(),
+  ['receiptUrl', 'recoveryReceiptUrl', 'volumeReceiptUrl']
+);
+
+const receiptGetsByOutputName = new Map();
+for (const [outputName, receiptUrlAction] of receiptUrlsByOutputName) {
+  const receiptUrlIndex = actionIndex(
+    automaticActions,
+    receiptUrlAction,
+    `${outputName} is missing from the Automatic Receiver`
+  );
+  const receiptGet = automaticActions[receiptUrlIndex + 1];
+  assert.equal(
+    receiptGet?.WFWorkflowActionIdentifier,
+    'is.workflow.actions.downloadurl',
+    `${outputName} must be consumed by the immediately following download action`
+  );
+  const parameters = receiptGet.WFWorkflowActionParameters;
+  assert.equal(parameters.WFHTTPMethod, 'GET', `${outputName} must use GET`);
+  assert.equal(parameters.WFHTTPBodyType, undefined, `${outputName} must not declare a body`);
+  assert.equal(parameters.WFJSONValues, undefined, `${outputName} must not contain JSON`);
+  assert.equal(parameters.WFFormValues, undefined, `${outputName} must not contain form data`);
+  assert.deepEqual(
+    [...referencedOutputUuids(parameters.WFURL)],
+    [receiptUrlAction.WFWorkflowActionParameters.UUID],
+    `${outputName} GET must use only its matching signed receiptUrl output`
+  );
+  receiptGetsByOutputName.set(outputName, {
+    receiptUrlIndex
+  });
 }
-assert.equal(dictionaryValues(automaticActions[47]).musicResumed, false);
-assert.equal(dictionaryValues(automaticActions[47]).status, 'completed');
-assert.equal(dictionaryValues(automaticActions[63]).status, 'failed');
-assert.equal(
-  dictionaryValues(automaticActions[63]).failureCode,
-  'retry_exhausted_recovered'
+
+const volumeLevelAction = automaticActions.find(
+  action => action.WFWorkflowActionParameters?.CustomOutputName === 'volumeLevel'
 );
-assert.equal(dictionaryValues(automaticActions[63]).musicResumed, true);
-assert.equal(dictionaryValues(automaticActions[111]).status, 'completed');
-assert.equal(dictionaryValues(automaticActions[111]).musicResumed, true);
+const volumeReceipt = receiptGetsByOutputName.get('volumeReceiptUrl');
+const volumeSetIndex = actionIndexReferencingOutput(
+  automaticActions,
+  'is.workflow.actions.setvolume',
+  volumeLevelAction,
+  { before: volumeReceipt.receiptUrlIndex }
+);
+assert.ok(
+  volumeSetIndex >= 0 && volumeSetIndex < volumeReceipt.receiptUrlIndex,
+  'Volume receipt GET must run after the requested volume is applied'
+);
+
+const recoveryMusicLevelAction = automaticActions.find(
+  action => action.WFWorkflowActionParameters?.CustomOutputName === 'recoveryMusicLevel'
+);
+const recoveryFallbackLevelAction = automaticActions.find(
+  action => action.WFWorkflowActionParameters?.CustomOutputName === 'recoveryFallbackLevel'
+);
+const recoveryFallbackLevelIndex = actionIndex(
+  automaticActions,
+  recoveryFallbackLevelAction,
+  'Recovery fallback level is missing from the Automatic Receiver'
+);
+const recoveryReceipt = receiptGetsByOutputName.get('recoveryReceiptUrl');
+const recoverySetIndex = actionIndexReferencingOutput(
+  automaticActions,
+  'is.workflow.actions.setvolume',
+  recoveryMusicLevelAction,
+  { before: recoveryReceipt.receiptUrlIndex }
+);
+const recoveryPlayIndex = automaticActions.findIndex((action, index) =>
+  index > recoveryFallbackLevelIndex &&
+  index < recoverySetIndex &&
+  action.WFWorkflowActionIdentifier === 'is.workflow.actions.pausemusic' &&
+  action.WFWorkflowActionParameters?.WFPlayPauseBehavior === 'Play'
+);
+assert.ok(
+  recoveryPlayIndex >= 0 &&
+    recoveryPlayIndex < recoverySetIndex &&
+    recoverySetIndex < recoveryReceipt.receiptUrlIndex,
+  'Recovery receipt GET must run after Play and the resolved recovery volume'
+);
+
+const announcementReceipt = receiptGetsByOutputName.get('receiptUrl');
+const announcementAudioAction = automaticActions.find(
+  action => action.WFWorkflowActionParameters?.CustomOutputName === 'announcementAudio'
+);
+const playSoundIndex = actionIndexReferencingOutput(
+  automaticActions,
+  'is.workflow.actions.playsound',
+  announcementAudioAction,
+  { before: announcementReceipt.receiptUrlIndex }
+);
+const resumedPlayIndex = automaticActions.findIndex((action, index) =>
+  index > playSoundIndex &&
+  index < announcementReceipt.receiptUrlIndex &&
+  action.WFWorkflowActionIdentifier === 'is.workflow.actions.pausemusic' &&
+  action.WFWorkflowActionParameters?.WFPlayPauseBehavior === 'Play'
+);
+const restoredMusicLevelAction = automaticActions.find(
+  action => action.WFWorkflowActionParameters?.CustomOutputName === 'musicLevel'
+);
+const restoredSetIndex = actionIndexReferencingOutput(
+  automaticActions,
+  'is.workflow.actions.setvolume',
+  restoredMusicLevelAction,
+  {
+    after: resumedPlayIndex,
+    before: announcementReceipt.receiptUrlIndex
+  }
+);
+assert.ok(
+  playSoundIndex >= 0 &&
+    resumedPlayIndex > playSoundIndex &&
+    restoredSetIndex > resumedPlayIndex &&
+    restoredSetIndex < announcementReceipt.receiptUrlIndex,
+  'Announcement receipt GET must run after speech, resumed playback, and final restored volume'
+);
 
 const automaticConditionalGroups = new Map();
 for (const action of automaticActions.filter(

@@ -1388,6 +1388,472 @@ describe('Version X receiver claim and protected command route', { concurrency: 
     );
   });
 
+  test('signed verified GET completes an announcement only after audio and restore proof exist', async () => {
+    const eventId = 'email-wake-x-verified-get-0001';
+    const signed = createSignedEmailWakeXUrl(
+      request('GET', '/'),
+      '/api/email-wake-receipt-x',
+      eventId,
+      'receipt',
+      {
+        env: configuredEnv(),
+        now: () => NOW,
+        ttlSeconds: 30 * 60,
+        executionAttempt: 1
+      }
+    );
+    assert.ok(signed);
+    const verifiedUrl = new URL(signed.url);
+    const removed = [];
+    let stored = {
+      ...naturalCommand(eventId),
+      receiverContract: 'poolside-pulse-x-wake-v1',
+      status: 'timed_out',
+      providerMode: 'email-wake-x',
+      executionMode: 'announcement',
+      executionAttempt: 1,
+      audioFetchedAt: NOW + 100,
+      restoreTargetMusicPercent: 30,
+      restoreTargetResolvedAt: NOW + 200,
+      volumeRestored: false,
+      restoredMusicPercent: null,
+      musicResumed: false
+    };
+    const handler = createEmailWakeReceiptXHandler({
+      receiptReader: async () => stored,
+      receiptUpdater: async (_eventId, patch) => {
+        stored = { ...stored, ...patch };
+        return stored;
+      },
+      latestRepairer: async () => stored,
+      commandRemover: async id => {
+        removed.push(id);
+        return true;
+      },
+      nextReadyReader: async () => '',
+      watchdogWakeCanceller: async () => true,
+      now: () => NOW + 300
+    });
+    const completed = await invoke(
+      handler,
+      request('GET', verifiedUrl.pathname + verifiedUrl.search)
+    );
+    assert.equal(completed.statusCode, 200);
+    assert.equal(completed.json().receipt.status, 'completed');
+    assert.equal(completed.json().receipt.volumeRestored, true);
+    assert.equal(completed.json().receipt.restoredMusicPercent, 30);
+    assert.equal(completed.json().receipt.musicResumed, true);
+    assert.deepEqual(removed, [eventId]);
+
+    const replay = await invoke(
+      handler,
+      request('GET', verifiedUrl.pathname + verifiedUrl.search)
+    );
+    assert.equal(replay.statusCode, 200);
+    assert.equal(replay.json().receipt.status, 'completed');
+    assert.equal(replay.json().receipt.restoredMusicPercent, 30);
+  });
+
+  test('signed verified GET cannot complete before the restore target is resolved', async () => {
+    const eventId = 'email-wake-x-verified-get-early-0001';
+    const signed = createSignedEmailWakeXUrl(
+      request('GET', '/'),
+      '/api/email-wake-receipt-x',
+      eventId,
+      'receipt',
+      {
+        env: configuredEnv(),
+        now: () => NOW,
+        ttlSeconds: 30 * 60,
+        executionAttempt: 1
+      }
+    );
+    assert.ok(signed);
+    const verifiedUrl = new URL(signed.url);
+    const removed = [];
+    const stored = {
+      ...naturalCommand(eventId),
+      receiverContract: 'poolside-pulse-x-wake-v1',
+      status: 'started',
+      providerMode: 'email-wake-x',
+      executionMode: 'announcement',
+      executionAttempt: 1,
+      audioFetchedAt: NOW + 100,
+      restoreTargetMusicPercent: 30,
+      restoreTargetResolvedAt: 0
+    };
+    const handler = createEmailWakeReceiptXHandler({
+      receiptReader: async () => stored,
+      commandRemover: async id => {
+        removed.push(id);
+      },
+      nextReadyReader: async () => '',
+      watchdogWakeCanceller: async () => true,
+      now: () => NOW + 300
+    });
+    const rejected = await invoke(
+      handler,
+      request('GET', verifiedUrl.pathname + verifiedUrl.search)
+    );
+    assert.equal(rejected.statusCode, 409);
+    assert.match(
+      rejected.json().error,
+      /did not prove the requested volume and playback result/i
+    );
+    assert.deepEqual(removed, []);
+  });
+
+  test('signed verified GET derives a volume completion without resuming music', async () => {
+    const eventId = 'email-wake-x-verified-volume-get-0001';
+    const signed = createSignedEmailWakeXUrl(
+      request('GET', '/'),
+      '/api/email-wake-receipt-x',
+      eventId,
+      'receipt',
+      {
+        env: configuredEnv(),
+        now: () => NOW,
+        ttlSeconds: 30 * 60,
+        executionAttempt: 1
+      }
+    );
+    assert.ok(signed);
+    let stored = {
+      ...naturalCommand(eventId, {
+        action: 'volume',
+        musicPercent: 47,
+        resumeMusic: false
+      }),
+      receiverContract: 'poolside-pulse-x-wake-v1',
+      status: 'accepted',
+      providerMode: 'email-wake-x',
+      executionMode: 'volume',
+      executionAttempt: 1,
+      volumeRestored: false,
+      restoredMusicPercent: null,
+      musicResumed: false
+    };
+    const removed = [];
+    const handler = createEmailWakeReceiptXHandler({
+      receiptReader: async () => stored,
+      receiptUpdater: async (_eventId, patch) => {
+        stored = { ...stored, ...patch };
+        return stored;
+      },
+      latestRepairer: async () => stored,
+      commandRemover: async id => {
+        removed.push(id);
+      },
+      nextReadyReader: async () => '',
+      watchdogWakeCanceller: async () => true,
+      now: () => NOW + 100
+    });
+    const verifiedUrl = new URL(signed.url);
+    const completed = await invoke(
+      handler,
+      request('GET', verifiedUrl.pathname + verifiedUrl.search)
+    );
+    assert.equal(completed.statusCode, 200);
+    assert.equal(completed.json().receipt.status, 'completed');
+    assert.equal(completed.json().receipt.volumeRestored, true);
+    assert.equal(completed.json().receipt.restoredMusicPercent, 47);
+    assert.equal(completed.json().receipt.musicResumed, false);
+    assert.deepEqual(removed, [eventId]);
+  });
+
+  test('signed verified GET cannot overwrite a conflicting terminal result', async () => {
+    const eventId = 'email-wake-x-verified-get-terminal-0001';
+    const signed = createSignedEmailWakeXUrl(
+      request('GET', '/'),
+      '/api/email-wake-receipt-x',
+      eventId,
+      'receipt',
+      {
+        env: configuredEnv(),
+        now: () => NOW,
+        ttlSeconds: 30 * 60,
+        executionAttempt: 1
+      }
+    );
+    assert.ok(signed);
+    let updates = 0;
+    let removed = 0;
+    const stored = {
+      ...naturalCommand(eventId),
+      receiverContract: 'poolside-pulse-x-wake-v1',
+      status: 'failed',
+      providerMode: 'email-wake-x',
+      executionMode: 'announcement',
+      executionAttempt: 1,
+      audioFetchedAt: NOW + 100,
+      restoreTargetMusicPercent: 30,
+      restoreTargetResolvedAt: NOW + 200,
+      volumeRestored: false,
+      restoredMusicPercent: null,
+      musicResumed: false
+    };
+    const handler = createEmailWakeReceiptXHandler({
+      receiptReader: async () => stored,
+      receiptUpdater: async () => {
+        updates += 1;
+        return stored;
+      },
+      commandRemover: async () => {
+        removed += 1;
+      },
+      now: () => NOW + 300
+    });
+    const signedUrl = new URL(signed.url);
+    const rejected = await invoke(
+      handler,
+      request('GET', signedUrl.pathname + signedUrl.search)
+    );
+    assert.equal(rejected.statusCode, 409);
+    assert.match(rejected.json().error, /different terminal result/i);
+    assert.equal(updates, 0);
+    assert.equal(removed, 0);
+  });
+
+  test('signed verified GET does not drain when a concurrent update wins', async () => {
+    const eventId = 'email-wake-x-verified-get-update-race-0001';
+    const signed = createSignedEmailWakeXUrl(
+      request('GET', '/'),
+      '/api/email-wake-receipt-x',
+      eventId,
+      'receipt',
+      {
+        env: configuredEnv(),
+        now: () => NOW,
+        ttlSeconds: 30 * 60,
+        executionAttempt: 1
+      }
+    );
+    assert.ok(signed);
+    let removed = 0;
+    const stored = {
+      ...naturalCommand(eventId),
+      receiverContract: 'poolside-pulse-x-wake-v1',
+      status: 'started',
+      providerMode: 'email-wake-x',
+      executionMode: 'announcement',
+      executionAttempt: 1,
+      audioFetchedAt: NOW + 100,
+      restoreTargetMusicPercent: 30,
+      restoreTargetResolvedAt: NOW + 200,
+      volumeRestored: false,
+      restoredMusicPercent: null,
+      musicResumed: false
+    };
+    const handler = createEmailWakeReceiptXHandler({
+      receiptReader: async () => stored,
+      receiptUpdater: async () => ({
+        ...stored,
+        status: 'failed',
+        providerStatus: 'concurrent_failure'
+      }),
+      commandRemover: async () => {
+        removed += 1;
+      },
+      now: () => NOW + 300
+    });
+    const signedUrl = new URL(signed.url);
+    const rejected = await invoke(
+      handler,
+      request('GET', signedUrl.pathname + signedUrl.search)
+    );
+    assert.equal(rejected.statusCode, 409);
+    assert.match(rejected.json().error, /could not be recorded/i);
+    assert.equal(removed, 0);
+  });
+
+  test('signed recovery GET records restoration proof on a prior failed receipt', async () => {
+    const eventId = 'email-wake-x-verified-recovery-proof-0001';
+    const signed = createSignedEmailWakeXUrl(
+      request('GET', '/'),
+      '/api/email-wake-receipt-x',
+      eventId,
+      'receipt',
+      {
+        env: configuredEnv(),
+        now: () => NOW,
+        ttlSeconds: 30 * 60,
+        executionAttempt: 1
+      }
+    );
+    assert.ok(signed);
+    let stored = {
+      ...naturalCommand(eventId),
+      receiverContract: 'poolside-pulse-x-wake-v1',
+      status: 'failed',
+      providerMode: 'email-wake-x',
+      providerStatus: 'email_wake_receiver_failed',
+      executionMode: 'recovery',
+      executionAttempt: 1,
+      restoreTargetMusicPercent: 30,
+      restoreTargetResolvedAt: NOW + 100,
+      volumeRestored: false,
+      restoredMusicPercent: null,
+      musicResumed: false
+    };
+    const removed = [];
+    const handler = createEmailWakeReceiptXHandler({
+      receiptReader: async () => stored,
+      receiptUpdater: async (_eventId, patch) => {
+        stored = { ...stored, ...patch };
+        return stored;
+      },
+      commandRemover: async id => {
+        removed.push(id);
+      },
+      nextReadyReader: async () => '',
+      watchdogWakeCanceller: async () => true,
+      now: () => NOW + 200
+    });
+    const signedUrl = new URL(signed.url);
+    const completed = await invoke(
+      handler,
+      request('GET', signedUrl.pathname + signedUrl.search)
+    );
+    assert.equal(completed.statusCode, 200);
+    assert.equal(completed.json().receipt.status, 'failed');
+    assert.equal(completed.json().receipt.providerStatus, 'email_wake_recovery_completed');
+    assert.equal(completed.json().receipt.volumeRestored, true);
+    assert.equal(completed.json().receipt.restoredMusicPercent, 30);
+    assert.equal(completed.json().receipt.musicResumed, true);
+    assert.deepEqual(removed, [eventId]);
+  });
+
+  test('signed verified GET rejects null and out-of-range server volume targets', async () => {
+    const cases = [
+      {
+        eventId: 'email-wake-x-verified-null-announcement-target-0001',
+        stored: {
+          ...naturalCommand('email-wake-x-verified-null-announcement-target-0001'),
+          action: 'announce',
+          executionMode: 'announcement',
+          audioFetchedAt: NOW + 100,
+          restoreTargetMusicPercent: null,
+          restoreTargetResolvedAt: NOW + 200
+        }
+      },
+      {
+        eventId: 'email-wake-x-verified-null-volume-target-0001',
+        stored: {
+          ...naturalCommand('email-wake-x-verified-null-volume-target-0001'),
+          action: 'volume',
+          executionMode: 'volume',
+          musicPercent: null
+        }
+      },
+      {
+        eventId: 'email-wake-x-verified-high-volume-target-0001',
+        stored: {
+          ...naturalCommand('email-wake-x-verified-high-volume-target-0001'),
+          action: 'volume',
+          executionMode: 'volume',
+          musicPercent: 101
+        }
+      }
+    ];
+    for (const item of cases) {
+      const signed = createSignedEmailWakeXUrl(
+        request('GET', '/'),
+        '/api/email-wake-receipt-x',
+        item.eventId,
+        'receipt',
+        {
+          env: configuredEnv(),
+          now: () => NOW,
+          ttlSeconds: 30 * 60,
+          executionAttempt: 1
+        }
+      );
+      assert.ok(signed);
+      let removed = 0;
+      const stored = {
+        ...item.stored,
+        receiverContract: 'poolside-pulse-x-wake-v1',
+        status: 'started',
+        providerMode: 'email-wake-x',
+        executionAttempt: 1
+      };
+      const handler = createEmailWakeReceiptXHandler({
+        receiptReader: async () => stored,
+        commandRemover: async () => {
+          removed += 1;
+        },
+        now: () => NOW + 300
+      });
+      const signedUrl = new URL(signed.url);
+      const rejected = await invoke(
+        handler,
+        request('GET', signedUrl.pathname + signedUrl.search)
+      );
+      assert.equal(rejected.statusCode, 409, item.eventId);
+      assert.match(rejected.json().error, /execution state/i, item.eventId);
+      assert.equal(removed, 0, item.eventId);
+    }
+  });
+
+  test('signed verified GET requires an attempt-bound capability and a known execution mode', async () => {
+    const eventId = 'email-wake-x-verified-get-contract-0001';
+    const legacy = createSignedEmailWakeXUrl(
+      request('GET', '/'),
+      '/api/email-wake-receipt-x',
+      eventId,
+      'receipt',
+      {
+        env: configuredEnv(),
+        now: () => NOW,
+        ttlSeconds: 30 * 60
+      }
+    );
+    assert.ok(legacy);
+    const stored = {
+      ...naturalCommand(eventId),
+      receiverContract: 'poolside-pulse-x-wake-v1',
+      status: 'started',
+      providerMode: 'email-wake-x',
+      executionMode: 'unknown',
+      executionAttempt: 1,
+      audioFetchedAt: NOW + 100,
+      restoreTargetMusicPercent: 30,
+      restoreTargetResolvedAt: NOW + 200
+    };
+    const handler = createEmailWakeReceiptXHandler({
+      receiptReader: async () => stored,
+      now: () => NOW + 300
+    });
+    const legacyUrl = new URL(legacy.url);
+    const unbound = await invoke(
+      handler,
+      request('GET', legacyUrl.pathname + legacyUrl.search)
+    );
+    assert.equal(unbound.statusCode, 403);
+    assert.match(unbound.json().error, /attempt-bound/i);
+
+    const attemptBound = createSignedEmailWakeXUrl(
+      request('GET', '/'),
+      '/api/email-wake-receipt-x',
+      eventId,
+      'receipt',
+      {
+        env: configuredEnv(),
+        now: () => NOW,
+        ttlSeconds: 30 * 60,
+        executionAttempt: 1
+      }
+    );
+    assert.ok(attemptBound);
+    const attemptUrl = new URL(attemptBound.url);
+    const invalidMode = await invoke(
+      handler,
+      request('GET', attemptUrl.pathname + attemptUrl.search)
+    );
+    assert.equal(invalidMode.statusCode, 409);
+    assert.match(invalidMode.json().error, /execution state/i);
+  });
+
   test('keeps the current watchdog when the next-command drain wake is rejected', async () => {
     const eventId = 'email-wake-x-drain-retry-safety-0001';
     const signed = createSignedEmailWakeXUrl(
