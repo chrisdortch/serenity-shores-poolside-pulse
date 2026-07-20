@@ -144,13 +144,20 @@ export function createEmailWakeScheduleXHandler({
         error: 'Save the Version X schedule once, then retry email schedule sync.'
       });
     }
-    if (Number(canonical.revision) !== expectedRevision) {
+    const canonicalRevision = Number(canonical.revision || 0);
+    if (expectedRevision > canonicalRevision) {
       return json(res, 409, {
         ok: false,
-        error: 'The schedule changed in another session. Refresh Poolside Pulse and retry.',
-        currentRevision: Number(canonical.revision || 0)
+        error: 'The schedule revision is ahead of the canonical Version X state. Refresh Poolside Pulse and retry.',
+        currentRevision: canonicalRevision
       });
     }
+    // Receiver heartbeats and playback status share the same state revision as
+    // schedules. They may advance between a Remote save and this request even
+    // though no schedule input changed. Synchronizing the newest canonical
+    // state is safe: this endpoint never writes state, and the manifest
+    // fingerprint still makes any later schedule edit visibly out of date.
+    const revisionAdvanced = canonicalRevision > expectedRevision;
     try {
       const result = await synchronizer({
         state: canonical.state,
@@ -162,6 +169,8 @@ export function createEmailWakeScheduleXHandler({
         ok: true,
         service: 'email-wake-schedule-x',
         synchronized: true,
+        stateRevision: canonicalRevision,
+        revisionAdvanced,
         ...result,
         note: 'Wake emails are synchronized for the rolling 29-day Central Time horizon.'
       });

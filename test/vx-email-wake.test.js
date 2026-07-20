@@ -53,6 +53,9 @@ import {
   createEmailWakeXHandler
 } from '../api/email-wake-x.js';
 import {
+  createEmailWakeScheduleXHandler
+} from '../api/email-wake-schedule-x.js';
+import {
   applyEmailWakeMusicVolume
 } from '../src/vx/email-wake-client.js';
 
@@ -940,6 +943,87 @@ describe('Version X Resend transport', { concurrency: false }, () => {
       assert.doesNotMatch(serialized, /wake@example\.com|receiver@example\.com|owner@example\.com/);
       assert.doesNotMatch(serialized, /invalid api key|verify a domain|not permitted/i);
     }
+  });
+});
+
+describe('Version X automatic schedule route revision safety', { concurrency: false }, () => {
+  const canonicalState = {
+    version: 'x',
+    config: { musicLevel: 30 },
+    announcements: [],
+    announcementSources: [],
+    schedules: [],
+    activeScheduleId: ''
+  };
+
+  test('syncs the newest canonical schedule after receiver-only revisions advance', async () => {
+    const synchronized = [];
+    const handler = createEmailWakeScheduleXHandler({
+      manifestStoreFactory: () => ({}),
+      stateReader: async () => ({
+        revision: 12,
+        state: canonicalState,
+        durable: true
+      }),
+      synchronizer: async input => {
+        synchronized.push(input);
+        return {
+          transport: 'email-wake-x',
+          enabled: true,
+          scheduledCount: 0,
+          announcementScheduledCount: 0,
+          volumeScheduledCount: 0,
+          musicBrowserCount: 0,
+          maintenanceScheduled: false,
+          warnings: []
+        };
+      }
+    });
+
+    const result = await invoke(
+      handler,
+      request('POST', '/api/email-wake-schedule-x?v=x', {
+        cookie: xCookie(),
+        body: { expectedRevision: 11, enabled: true }
+      })
+    );
+
+    assert.equal(result.statusCode, 200);
+    assert.equal(result.json().synchronized, true);
+    assert.equal(result.json().stateRevision, 12);
+    assert.equal(result.json().revisionAdvanced, true);
+    assert.equal(synchronized.length, 1);
+    assert.equal(synchronized[0].state, canonicalState);
+    assert.equal(synchronized[0].enabled, true);
+  });
+
+  test('rejects a browser revision that is ahead of canonical state', async () => {
+    let syncCalls = 0;
+    const handler = createEmailWakeScheduleXHandler({
+      manifestStoreFactory: () => ({}),
+      stateReader: async () => ({
+        revision: 12,
+        state: canonicalState,
+        durable: true
+      }),
+      synchronizer: async () => {
+        syncCalls += 1;
+        return {};
+      }
+    });
+
+    const result = await invoke(
+      handler,
+      request('POST', '/api/email-wake-schedule-x?v=x', {
+        cookie: xCookie(),
+        body: { expectedRevision: 13, enabled: true }
+      })
+    );
+
+    assert.equal(result.statusCode, 409);
+    assert.equal(result.json().currentRevision, 12);
+    assert.match(result.json().error, /ahead of the canonical/i);
+    assert.equal(syncCalls, 0);
   });
 });
 
