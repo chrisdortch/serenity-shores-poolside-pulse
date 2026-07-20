@@ -58,13 +58,15 @@ function volumeCommand(body, now = Date.now()) {
     !body
     || typeof body !== 'object'
     || Array.isArray(body)
+    || body.version !== 'x'
     || body.action !== 'volume'
     || body.source !== 'live'
     || Object.keys(body).some(key => ![
       'action',
       'eventId',
       'musicPercent',
-      'source'
+      'source',
+      'version'
     ].includes(key))
     || !validPushcutXEventId(body.eventId)
     || !Number.isInteger(body.musicPercent)

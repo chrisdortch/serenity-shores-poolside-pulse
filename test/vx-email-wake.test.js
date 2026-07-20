@@ -52,6 +52,9 @@ import {
 import {
   createEmailWakeXHandler
 } from '../api/email-wake-x.js';
+import {
+  applyEmailWakeMusicVolume
+} from '../src/vx/email-wake-client.js';
 
 const SESSION_SECRET = 'version-x-email-wake-test-session-secret-long-enough';
 const NOW = Date.parse('2026-07-19T15:00:00.000Z');
@@ -1210,6 +1213,134 @@ describe('Version X receiver claim and protected command route', { concurrency: 
     assert.equal(result.json().queued, false);
     assert.equal(result.json().wakeSent, false);
     assert.equal(resolved, 0);
+  });
+
+  test('accepts the exact browser volume envelope and activates its queued receiver command', async () => {
+    const eventId = 'email-volume-browser-contract-0001';
+    const calls = [];
+    let receipt = null;
+    const handler = createEmailWakeXHandler({
+      commandResolver: async () => {
+        throw new Error('A volume envelope must not use the announcement resolver.');
+      },
+      receiptCreator: async command => {
+        calls.push({ type: 'receipt', command: structuredClone(command) });
+        receipt = {
+          ...command,
+          status: 'queued',
+          providerStatus: 'created'
+        };
+        return {
+          created: true,
+          receipt,
+          durable: true
+        };
+      },
+      commandEnqueuer: async command => {
+        calls.push({ type: 'enqueue', command: structuredClone(command) });
+        return {
+          created: true,
+          item: { status: 'pending', command },
+          durable: true
+        };
+      },
+      wakeSender: async wake => {
+        calls.push({ type: 'wake', wake: structuredClone(wake) });
+        return {
+          emailId: 'volume-browser-email-id-12345678',
+          provider: 'resend'
+        };
+      },
+      commandActivator: async activatedEventId => {
+        calls.push({ type: 'activate', eventId: activatedEventId });
+        return { item: { status: 'queued' }, durable: true };
+      },
+      receiptUpdater: async (_eventId, patch) => {
+        receipt = { ...receipt, ...patch };
+        return receipt;
+      }
+    });
+    let browserBody;
+    const fetchImpl = async (url, options = {}) => {
+      browserBody = JSON.parse(options.body);
+      const req = request(options.method, url, {
+        cookie: xCookie(),
+        body: browserBody
+      });
+      req.headers['idempotency-key'] = options.headers['Idempotency-Key'];
+      const result = await invoke(handler, req);
+      return {
+        ok: result.statusCode >= 200 && result.statusCode < 300,
+        status: result.statusCode,
+        headers: {
+          get: name => result.getHeader(name)
+        },
+        async json() {
+          return result.json();
+        }
+      };
+    };
+
+    const dispatched = await applyEmailWakeMusicVolume({
+      eventId,
+      musicPercent: 37,
+      fetchImpl
+    });
+
+    assert.deepEqual(browserBody, {
+      version: 'x',
+      action: 'volume',
+      eventId,
+      source: 'live',
+      musicPercent: 37
+    });
+    assert.equal(dispatched.accepted, true);
+    assert.equal(dispatched.queued, true);
+    assert.equal(dispatched.wakeSent, true);
+    assert.equal(dispatched.eventId, eventId);
+    assert.deepEqual(calls.map(call => call.type), [
+      'receipt',
+      'enqueue',
+      'wake',
+      'activate'
+    ]);
+    assert.equal(calls[0].command.version, 'x');
+    assert.equal(calls[0].command.action, 'volume');
+    assert.equal(calls[0].command.eventId, eventId);
+    assert.equal(calls[0].command.source, 'live');
+    assert.equal(calls[0].command.musicPercent, 37);
+    assert.equal(calls[0].command.resumeMusic, false);
+    assert.equal(
+      calls[0].command.receiverContract,
+      'poolside-pulse-x-wake-v1'
+    );
+    assert.deepEqual(calls[2].wake, { eventId });
+    assert.equal(calls[3].eventId, eventId);
+
+    for (const invalidBody of [
+      {
+        ...browserBody,
+        eventId: 'email-volume-wrong-version-0001',
+        version: 'final'
+      },
+      {
+        ...browserBody,
+        eventId: 'email-volume-extra-field-0001',
+        unexpected: true
+      }
+    ]) {
+      const before = calls.length;
+      const rejected = await invoke(
+        handler,
+        request('POST', '/api/email-wake-x?v=x', {
+          cookie: xCookie(),
+          body: invalidBody
+        })
+      );
+      assert.equal(rejected.statusCode, 400);
+      assert.equal(rejected.json().ok, false);
+      assert.equal(calls.length, before);
+    }
   });
 
   test('returns an existing completed command without re-enqueueing or sending another wake', async () => {
