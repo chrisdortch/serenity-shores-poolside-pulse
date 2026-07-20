@@ -557,10 +557,12 @@ describe('Version X Pushcut schedule synchronization', { concurrency: false }, (
 
     const incomplete = await invoke(handler, request('GET', signed.url));
     assert.equal(incomplete.statusCode, 200);
-    assert.equal(incomplete.json().shouldRecover, true);
+    assert.equal(incomplete.json().shouldRecover, 1);
+    assert.equal(incomplete.json().shouldRecoverBoolean, true);
     assert.equal(incomplete.json().musicPercent, 67);
     assert.equal(incomplete.json().musicLevel, 0.67);
-    assert.equal(incomplete.json().resumeMusic, true);
+    assert.equal(incomplete.json().resumeMusic, 1);
+    assert.equal(incomplete.json().resumeMusicBoolean, true);
 
     receipt = {
       ...receipt,
@@ -574,8 +576,10 @@ describe('Version X Pushcut schedule synchronization', { concurrency: false }, (
     };
     const completed = await invoke(handler, request('GET', signed.url));
     assert.equal(completed.statusCode, 200);
-    assert.equal(completed.json().shouldRecover, false);
-    assert.equal(completed.json().resumeMusic, false);
+    assert.equal(completed.json().shouldRecover, 0);
+    assert.equal(completed.json().shouldRecoverBoolean, false);
+    assert.equal(completed.json().resumeMusic, 0);
+    assert.equal(completed.json().resumeMusicBoolean, false);
     assert.equal(Object.hasOwn(completed.json(), 'musicLevel'), false);
 
     receipt = {
@@ -588,9 +592,9 @@ describe('Version X Pushcut schedule synchronization', { concurrency: false }, (
     };
     const incompleteCompletedReceipt = await invoke(handler, request('GET', signed.url));
     assert.equal(incompleteCompletedReceipt.statusCode, 200);
-    assert.equal(incompleteCompletedReceipt.json().shouldRecover, true);
+    assert.equal(incompleteCompletedReceipt.json().shouldRecover, 1);
     assert.equal(incompleteCompletedReceipt.json().musicPercent, 67);
-    assert.equal(incompleteCompletedReceipt.json().resumeMusic, true);
+    assert.equal(incompleteCompletedReceipt.json().resumeMusic, 1);
 
     receipt = {
       ...receipt,
@@ -602,8 +606,8 @@ describe('Version X Pushcut schedule synchronization', { concurrency: false }, (
     manifestStatus = 'cancel-pending';
     const cancelledButProviderStale = await invoke(handler, request('GET', signed.url));
     assert.equal(cancelledButProviderStale.statusCode, 200);
-    assert.equal(cancelledButProviderStale.json().shouldRecover, false);
-    assert.equal(cancelledButProviderStale.json().resumeMusic, false);
+    assert.equal(cancelledButProviderStale.json().shouldRecover, 0);
+    assert.equal(cancelledButProviderStale.json().resumeMusic, 0);
     assert.equal(cancelledButProviderStale.json().reason, 'scheduled-occurrence-is-no-longer-active');
     assert.equal(Object.hasOwn(cancelledButProviderStale.json(), 'musicLevel'), false);
     manifestStatus = 'scheduled';
@@ -620,8 +624,8 @@ describe('Version X Pushcut schedule synchronization', { concurrency: false }, (
       };
       const stale = await invoke(handler, request('GET', signed.url));
       assert.equal(stale.statusCode, 200);
-      assert.equal(stale.json().shouldRecover, false);
-      assert.equal(stale.json().resumeMusic, false);
+      assert.equal(stale.json().shouldRecover, 0);
+      assert.equal(stale.json().resumeMusic, 0);
       assert.equal(stale.json().reason, 'announcement-was-not-left-incomplete');
       assert.equal(Object.hasOwn(stale.json(), 'musicLevel'), false);
     }

@@ -578,7 +578,8 @@ describe('Version X post-download receipt retry preparation', {
         + new URL(currentExecuteUrl.url).search)
     );
     assert.equal(currentExecute.statusCode, 200);
-    assert.equal(currentExecute.json().authorized, true);
+    assert.equal(currentExecute.json().authorized, 1);
+    assert.equal(currentExecute.json().authorizedBoolean, true);
     assert.equal(currentExecute.json().executionAttempt, 2);
   });
 

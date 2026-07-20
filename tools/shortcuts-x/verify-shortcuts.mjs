@@ -293,6 +293,12 @@ assert.equal(
   'Automatic Receiver must handle one command per background automation'
 );
 assert.equal(automaticActions[36].WFWorkflowActionParameters.WFDictionaryKey, 'pending');
+assert.equal(automaticActions[37].WFWorkflowActionParameters.WFCondition, 5);
+assert.equal(automaticActions[37].WFWorkflowActionParameters.WFNumberValue, 1);
+assert.ok(
+  referencedOutputUuids(automaticActions[37].WFWorkflowActionParameters)
+    .has(automaticActions[36].WFWorkflowActionParameters.UUID)
+);
 assert.equal(automaticActions[38].WFWorkflowActionIdentifier, 'is.workflow.actions.exit');
 assert.ok(getValueAction(automaticReceiver, 'pending'));
 assert.ok(getValueAction(automaticReceiver, 'action'));
@@ -350,6 +356,12 @@ assert.equal(
   actionOutputUuid(automaticActions[74].WFWorkflowActionParameters.WFVolume),
   automaticActions[68].WFWorkflowActionParameters.UUID
 );
+assert.equal(automaticActions[70].WFWorkflowActionParameters.WFCondition, 4);
+assert.equal(automaticActions[70].WFWorkflowActionParameters.WFNumberValue, 1);
+assert.ok(
+  referencedOutputUuids(automaticActions[70].WFWorkflowActionParameters)
+    .has(automaticActions[69].WFWorkflowActionParameters.UUID)
+);
 
 // Normal attempts download all audio, then authorize this exact attempt,
 // before the first announcement-related volume or playback mutation.
@@ -379,6 +391,8 @@ const authorizationConditions =
   automaticActions[89].WFWorkflowActionParameters.WFConditions.Value
     .WFActionParameterFilterTemplates;
 assert.equal(authorizationConditions.length, 3);
+assert.equal(authorizationConditions[0].WFCondition, 5);
+assert.equal(authorizationConditions[0].WFNumberValue, 1);
 assert.ok(
   referencedOutputUuids(authorizationConditions)
     .has(automaticActions[83].WFWorkflowActionParameters.UUID)

@@ -63,8 +63,10 @@ export function createPushcutRecoveryXHandler({
           version: 'x',
           receiverContract: PUSHCUT_X_RECEIVER_CONTRACT,
           eventId: capability.eventId,
-          shouldRecover: false,
-          resumeMusic: false,
+          shouldRecover: 0,
+          shouldRecoverBoolean: false,
+          resumeMusic: 0,
+          resumeMusicBoolean: false,
           reason: 'announcement-already-completed'
         });
       }
@@ -75,8 +77,10 @@ export function createPushcutRecoveryXHandler({
           version: 'x',
           receiverContract: PUSHCUT_X_RECEIVER_CONTRACT,
           eventId: capability.eventId,
-          shouldRecover: false,
-          resumeMusic: false,
+          shouldRecover: 0,
+          shouldRecoverBoolean: false,
+          resumeMusic: 0,
+          resumeMusicBoolean: false,
           reason: 'announcement-was-not-left-incomplete'
         });
       }
@@ -95,8 +99,10 @@ export function createPushcutRecoveryXHandler({
           version: 'x',
           receiverContract: PUSHCUT_X_RECEIVER_CONTRACT,
           eventId: capability.eventId,
-          shouldRecover: false,
-          resumeMusic: false,
+          shouldRecover: 0,
+          shouldRecoverBoolean: false,
+          resumeMusic: 0,
+          resumeMusicBoolean: false,
           reason: 'scheduled-occurrence-is-no-longer-active'
         });
       }
@@ -109,10 +115,12 @@ export function createPushcutRecoveryXHandler({
         version: 'x',
         receiverContract: PUSHCUT_X_RECEIVER_CONTRACT,
         eventId: capability.eventId,
-        shouldRecover: true,
+        shouldRecover: 1,
+        shouldRecoverBoolean: true,
         musicPercent: levels.musicPercent,
         musicLevel: levels.musicLevel,
-        resumeMusic: true,
+        resumeMusic: 1,
+        resumeMusicBoolean: true,
         reason: 'incomplete-scheduled-announcement'
       });
     } catch (error) {

@@ -950,12 +950,13 @@ describe('Version X receiver claim and protected command route', { concurrency: 
     });
     const updates = [];
     const watchdogs = [];
+    let claimAttempt = 1;
     const handler = createEmailWakeClaimXHandler({
       receiverAuthenticator: async token => token === 'valid-token',
       commandClaimer: async () => ({
         item: {
           eventId: command.eventId,
-          claimAttempt: 1,
+          claimAttempt,
           leaseUntil: NOW + 120_000,
           command
         },
@@ -989,7 +990,10 @@ describe('Version X receiver claim and protected command route', { concurrency: 
     );
     assert.equal(claimed.statusCode, 200);
     const body = claimed.json();
-    assert.equal(body.pending, true);
+    assert.equal(body.pending, 1);
+    assert.equal(body.pendingBoolean, true);
+    assert.equal(body.reclaimed, 0);
+    assert.equal(body.reclaimedBoolean, false);
     assert.equal(body.transport, 'email-wake-x');
     assert.equal(body.voicePercent, 100);
     assert.equal(body.musicPercent, 0);
@@ -1011,6 +1015,16 @@ describe('Version X receiver claim and protected command route', { concurrency: 
       updates[1].patch.watchdogScheduledFor,
       NOW + 120_000
     );
+
+    claimAttempt = 2;
+    const reclaimed = await invoke(
+      handler,
+      request('POST', '/api/email-wake-claim-x', { token: 'valid-token' })
+    );
+    assert.equal(reclaimed.statusCode, 200);
+    assert.equal(reclaimed.json().pending, 1);
+    assert.equal(reclaimed.json().reclaimed, 1);
+    assert.equal(reclaimed.json().reclaimedBoolean, true);
   });
 
   test('rolls back an unarmed claim and sends one deterministic retry wake', async () => {
@@ -1138,7 +1152,8 @@ describe('Version X receiver claim and protected command route', { concurrency: 
       request('POST', '/api/email-wake-claim-x', { token: 'valid-token' })
     );
     assert.equal(result.statusCode, 200);
-    assert.equal(result.json().pending, false);
+    assert.equal(result.json().pending, 0);
+    assert.equal(result.json().pendingBoolean, false);
     assert.equal(result.json().maintenanceDue, true);
     assert.equal(result.json().maintenanceRenewed, true);
     assert.equal(result.json().maintenanceRetryScheduled, false);
@@ -1164,7 +1179,8 @@ describe('Version X receiver claim and protected command route', { concurrency: 
       request('POST', '/api/email-wake-claim-x', { token: 'valid-token' })
     );
     assert.equal(result.statusCode, 200);
-    assert.equal(result.json().pending, false);
+    assert.equal(result.json().pending, 0);
+    assert.equal(result.json().pendingBoolean, false);
     assert.equal(result.json().maintenanceRetryScheduled, true);
     assert.equal(retries.length, 1);
     assert.match(retries[0].eventId, /^email-wake-x-maintenance-retry-/);

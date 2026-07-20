@@ -32,13 +32,6 @@ action 'getvalueforkey' getFloatValue(
     "WFGetDictionaryValueType": "Value"
 }
 
-action 'getvalueforkey' getBooleanValue(
-    dictionary dictionary: 'WFInput',
-    text key: 'WFDictionaryKey'
-): bool {
-    "WFGetDictionaryValueType": "Value"
-}
-
 const tokenFile = getFile(
     "Poolside Pulse X/receiver-token.txt",
     nil,
@@ -97,9 +90,9 @@ const claimResponse = jsonRequest(
     }
 )
 const command = getDictionary(claimResponse)
-const pending = getBooleanValue(command, "pending")
+const pending = getFloatValue(command, "pending")
 
-if pending != true {
+if pending != 1 {
     stop()
 } else {
     const action = getValue(command, "action")
@@ -170,14 +163,14 @@ if pending != true {
                 stop()
             } else {
                     const commandMusicLevel = getFloatValue(command, "musicLevel")
-                    const reclaimed = getBooleanValue(command, "reclaimed")
+                    const reclaimed = getFloatValue(command, "reclaimed")
 
                     /*
                     A reclaimed attempt means an earlier automation stopped
                     without a valid receipt. Recover the music bed first; only
                     then prepare a fresh, attempt-bound announcement.
                     */
-                    if reclaimed == true {
+                    if reclaimed == 1 {
                         setVolume(0.0)
                         play()
                         wait(1)
@@ -195,7 +188,7 @@ if pending != true {
                     const executeUrl = getValue(command, "executeUrl")
                     const executeResponse = downloadURL("{executeUrl}")
                     const executeDictionary = getDictionary(executeResponse)
-                    const authorized = getBooleanValue(
+                    const authorized = getFloatValue(
                         executeDictionary,
                         "authorized"
                     )
@@ -217,7 +210,7 @@ if pending != true {
                     const authorizedExecutionAttempt = number(
                         authorizedExecutionAttemptValue
                     )
-                    if authorized != true
+                    if authorized != 1
                         || authorizedContract.text != "poolside-pulse-x-wake-v1"
                         || authorizedExecutionAttempt != claimedExecutionAttempt {
                         stop()

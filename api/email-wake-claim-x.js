@@ -67,6 +67,33 @@ function json(res, status, body) {
   res.end(JSON.stringify({ serverTime: Date.now(), ...body }));
 }
 
+/*
+iOS Shortcuts compares values returned by Get Dictionary Value as numbers in
+the generated Receiver workflow. Keep these transport-only flags as 0/1 so
+the installed Shortcut does not stop after a successful JSON boolean claim.
+The descriptive *Boolean fields preserve an unambiguous API value for logs
+and future clients.
+*/
+function shortcutFlag(value) {
+  return value === true ? 1 : 0;
+}
+
+function claimCorrelation(eventId, env = process.env) {
+  return createHash('sha256')
+    .update(emailWakeXNamespacedHashInput(
+      `email-wake-x-claim-log\0${String(eventId || '')}`,
+      env
+    ))
+    .digest('hex')
+    .slice(0, 12);
+}
+
+function logClaim(details) {
+  try {
+    console.info('Poolside Pulse X receiver claim', details);
+  } catch {}
+}
+
 export function emailWakeXWatchdogEventId(
   eventId,
   claimAttempt,
@@ -313,12 +340,18 @@ export function createEmailWakeClaimXHandler({
       for (let index = 0; index < CLAIM_LOOP_LIMIT; index += 1) {
         const claimed = await commandClaimer({ requireDurable: true });
         if (!claimed?.item) {
+          const busy = claimed?.busy === true;
+          logClaim({
+            result: busy ? 'busy' : 'idle',
+            pending: 0
+          });
           return json(res, 200, {
             ok: true,
             version: 'x',
             service: 'email-wake-claim-x',
-            pending: false,
-            busy: claimed?.busy === true,
+            pending: 0,
+            pendingBoolean: false,
+            busy,
             maintenanceDue,
             maintenanceRenewed,
             maintenanceRetryScheduled
@@ -387,7 +420,8 @@ export function createEmailWakeClaimXHandler({
               error: requeued
                 ? 'The Receiver safety watchdog could not be armed. The command remains queued for a safe retry.'
                 : 'The Receiver safety watchdog could not be armed and the active claim could not be rolled back.',
-              pending: requeued,
+              pending: shortcutFlag(requeued),
+              pendingBoolean: requeued,
               retryPending: requeued,
               retryWakeScheduled,
               maintenanceDue,
@@ -417,7 +451,8 @@ export function createEmailWakeClaimXHandler({
             error: requeued
               ? 'The Receiver safety watchdog is unavailable. The command remains queued.'
               : 'The Receiver safety watchdog is unavailable and the active claim could not be rolled back.',
-            pending: requeued,
+            pending: shortcutFlag(requeued),
+            pendingBoolean: requeued,
             retryPending: requeued,
             retryWakeScheduled: false,
             maintenanceDue,
@@ -500,11 +535,21 @@ export function createEmailWakeClaimXHandler({
           requireDurable: true,
           now: () => claimNow
         });
+        const reclaimed = claimAttempt > 1;
+        logClaim({
+          result: 'claimed',
+          correlation: claimCorrelation(command.eventId, env),
+          action: recoveryOnly ? 'recover' : command.action,
+          claimAttempt,
+          reclaimed: shortcutFlag(reclaimed)
+        });
         return json(res, 200, {
           ok: true,
           service: 'email-wake-claim-x',
-          pending: true,
-          reclaimed: claimAttempt > 1,
+          pending: 1,
+          pendingBoolean: true,
+          reclaimed: shortcutFlag(reclaimed),
+          reclaimedBoolean: reclaimed,
           leaseUntil,
           watchdogScheduled,
           watchdogScheduledFor: watchdogScheduled ? leaseUntil : 0,
@@ -521,7 +566,8 @@ export function createEmailWakeClaimXHandler({
         ok: true,
         version: 'x',
         service: 'email-wake-claim-x',
-        pending: false,
+        pending: 0,
+        pendingBoolean: false,
         busy: false,
         maintenanceDue,
         maintenanceRenewed,

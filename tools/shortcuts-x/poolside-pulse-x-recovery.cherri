@@ -20,21 +20,14 @@ action 'getvalueforkey' getFloatValue(
     "WFGetDictionaryValueType": "Value"
 }
 
-action 'getvalueforkey' getBooleanValue(
-    dictionary dictionary: 'WFInput',
-    text key: 'WFDictionaryKey'
-): bool {
-    "WFGetDictionaryValueType": "Value"
-}
-
 @recoveryDictionary = getDictionary(ShortcutInput)
 const recoveryUrl = getValue(@recoveryDictionary, "recoveryUrl")
 
 if recoveryUrl {
     const recoveryResponse = downloadURL("{recoveryUrl}")
     @recoveryDictionary = getDictionary(recoveryResponse)
-    const shouldRecover = getBooleanValue(@recoveryDictionary, "shouldRecover")
-    if shouldRecover != true {
+    const shouldRecover = getFloatValue(@recoveryDictionary, "shouldRecover")
+    if shouldRecover != 1 {
         stop()
     }
 }
@@ -42,7 +35,7 @@ if recoveryUrl {
 const musicLevel = getFloatValue(@recoveryDictionary, "musicLevel")
 setVolume(musicLevel)
 
-const resumeMusic = getBooleanValue(@recoveryDictionary, "resumeMusic")
-if resumeMusic == true {
+const resumeMusic = getFloatValue(@recoveryDictionary, "resumeMusic")
+if resumeMusic == 1 {
     play()
 }

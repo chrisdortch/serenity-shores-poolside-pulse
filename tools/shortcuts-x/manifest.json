@@ -15,7 +15,7 @@
     "automaticReceiver": {
       "file": "public/shortcuts/poolside-pulse-x-automatic-receiver.shortcut",
       "name": "Poolside Pulse X Automatic Receiver",
-      "sourceSha256": "ef9bf1dba0cf2ce65675b085997babba02053daac60f365b3c8ef69256eb180f",
+      "sourceSha256": "38558515fb47e9b28dfdb59028460fdeb9c40776ddedf53d7dc2e118933105d9",
       "unsignedSha256": "8d9fb056f6f6086aa31cd256fe8c4deaf53bc4678674ec5d54fdfa8fab0be1e7",
       "signedFromUnsignedSha256": "8d9fb056f6f6086aa31cd256fe8c4deaf53bc4678674ec5d54fdfa8fab0be1e7",
       "sha256": "9592156379be1de7719564e856cbf6b8ed0c8cd292b10e6b0034a80a7e6e65e1"

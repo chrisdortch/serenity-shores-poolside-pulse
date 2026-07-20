@@ -118,7 +118,11 @@ export function createEmailWakeExecuteXHandler({
         receiverContract: EMAIL_WAKE_X_RECEIVER_CONTRACT,
         eventId: capability.eventId,
         executionAttempt: capability.executionAttempt,
-        authorized: true,
+        // The installed iOS Shortcut compares this dictionary value to the
+        // numeric value 1. Keep the transport flag numeric and expose the
+        // explicit Boolean alongside it for other clients.
+        authorized: 1,
+        authorizedBoolean: true,
         authorizedAt
       });
     } catch (error) {
