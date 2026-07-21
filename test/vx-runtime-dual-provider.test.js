@@ -422,6 +422,52 @@ describe('Version X Apple and Spotify runtime integration', { concurrency: false
     assert.equal(store.state.playback.intent, 'stopped');
   });
 
+  test('lets an Order announcement wait for Play Next or auto-chain after speech', async () => {
+    const { runtime } = harness();
+    const announcementOptions = [];
+    runtime.assertExternalAudioIntent = () => true;
+    runtime.announce = async (_text, options) => {
+      announcementOptions.push(options);
+      return { completed: true };
+    };
+    runtime.completeOrderGate = async (_scheduleId, _token, status) => status;
+    const claim = {
+      scheduleId: 'party-live-cues',
+      token: 'party-welcome-token',
+      item: {
+        id: 'party-welcome',
+        label: 'Welcome when food is ready',
+        type: 'announcement',
+        action: {
+          kind: 'announcement',
+          announcementSource: 'inline',
+          text: 'Welcome to the party.',
+          restoreMusicPercent: 30
+        },
+        advance: { mode: 'manual' }
+      }
+    };
+
+    assert.deepEqual(
+      await runtime.executeOrderItem(claim),
+      { continue: false, status: 'waiting-manual' }
+    );
+    assert.equal(announcementOptions[0].restoreMusicPercent, 30);
+    assert.deepEqual(
+      await runtime.executeOrderItem({
+        ...claim,
+        token: 'party-game-token',
+        item: {
+          ...claim.item,
+          action: { ...claim.item.action, restoreMusicPercent: 100 },
+          advance: { mode: 'complete' }
+        }
+      }),
+      { continue: true, status: 'auto-pending' }
+    );
+    assert.equal(announcementOptions[1].restoreMusicPercent, 100);
+  });
+
   test('passes the selected finite source through both Order and Time announcements', async () => {
     const { runtime, store } = harness();
     const source = {
@@ -457,7 +503,8 @@ describe('Version X Apple and Spotify runtime integration', { concurrency: false
           kind: 'announcement',
           announcementSource: 'saved',
           announcementId: 'welcome',
-          sourceId: source.id
+          sourceId: source.id,
+          restoreMusicPercent: 100
         },
         volume: { mode: 'custom', percent: 100 }
       }
@@ -487,7 +534,8 @@ describe('Version X Apple and Spotify runtime integration', { concurrency: false
           kind: 'announcement',
           announcementSource: 'saved',
           announcementId: 'welcome',
-          sourceId: source.id
+          sourceId: source.id,
+          restoreMusicPercent: 30
         },
         volume: { mode: 'custom', percent: 100 }
       }]
@@ -504,7 +552,9 @@ describe('Version X Apple and Spotify runtime integration', { concurrency: false
       assert.equal(delivery.options.announcementDurationSeconds, 11);
     }
     assert.equal(deliveries[0].options.scheduledRunToken, 'finite-order-token');
+    assert.equal(deliveries[0].options.restoreMusicPercent, 100);
     assert.match(deliveries[1].options.scheduledRunToken, /^time-run-/);
+    assert.equal(deliveries[1].options.restoreMusicPercent, 30);
     assert.equal(store.state.scheduleRuns['finite-time-item'].status, 'completed');
   });
 

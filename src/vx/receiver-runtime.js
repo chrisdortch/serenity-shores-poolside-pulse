@@ -3998,7 +3998,9 @@ export class ReceiverRuntime {
       }
       const token = String(trigger.id || makeId('order-step', now));
       const kind = item.action?.kind || item.type || 'announcement';
-      const advanceMode = kind === 'announcement' ? 'complete' : (item.advance?.mode || 'manual');
+      const advanceMode = kind === 'announcement'
+        ? item.advance?.mode === 'manual' ? 'manual' : 'complete'
+        : (item.advance?.mode || 'manual');
       const active = {
         token,
         triggerId: String(trigger.id || token),
@@ -4194,7 +4196,9 @@ export class ReceiverRuntime {
     const externalIntentGeneration = claim.externalIntentGeneration ?? this.orderIntentGenerations.get(token);
     this.assertExternalAudioIntent(externalIntentGeneration);
     const kind = item.action?.kind || item.type || 'announcement';
-    const advanceMode = kind === 'announcement' ? 'complete' : (item.advance?.mode || 'manual');
+    const advanceMode = kind === 'announcement'
+      ? item.advance?.mode === 'manual' ? 'manual' : 'complete'
+      : (item.advance?.mode || 'manual');
     if (kind === 'announcement') {
       const resolved = resolveScheduleAnnouncementText(item, this.state.announcements);
       const announcementId = item.action?.announcementId || item.announcementId || '';
@@ -4208,10 +4212,12 @@ export class ReceiverRuntime {
         scheduledItemId: item.id,
         scheduledRunToken: token,
         volumePercent: effectiveScheduleItemVolume(item, this.state.config),
+        restoreMusicPercent: item.action?.restoreMusicPercent,
         ...this.announcementDeliveryForScheduleItem(item)
       });
       this.assertExternalAudioIntent(externalIntentGeneration, 'A newer audio command cancelled this Order announcement before its position could advance.');
-      const status = await this.completeOrderGate(scheduleId, token, 'auto-pending', 'announcement completed', externalIntentGeneration);
+      const nextStatus = advanceMode === 'manual' ? 'waiting-manual' : 'auto-pending';
+      const status = await this.completeOrderGate(scheduleId, token, nextStatus, 'announcement completed', externalIntentGeneration);
       return { continue: status === 'auto-pending', status };
     }
 
@@ -4583,6 +4589,7 @@ export class ReceiverRuntime {
             scheduledItemId: item.id,
             scheduledRunToken: timeRunToken,
             volumePercent: effectiveScheduleItemVolume(item, this.state.config),
+            restoreMusicPercent: item.action?.restoreMusicPercent,
             ...this.announcementDeliveryForScheduleItem(item)
           });
         } else if (itemKind === 'stop') {

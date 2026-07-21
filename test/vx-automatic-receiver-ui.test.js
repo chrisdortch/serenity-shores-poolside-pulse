@@ -261,6 +261,7 @@ describe('Version X Automatic Receiver UI and routing contract', () => {
 
     assert.match(dispatch, /sendEmailWakeAnnouncement/);
     assert.match(dispatch, /waitForEmailWakeCompletion/);
+    assert.match(dispatch, /restoreMusicPercent === null[\s\S]*clamp\(restoreMusicPercent, 0, 100, fallbackMusicTarget\)/);
     assert.match(dispatch, /music \$\{requestedMusicTarget\}% → 0% → announcement 100% → restore/);
     assert.match(live, /if \(automaticAnnouncementsEnabled\(\)\)/);
     assert.match(live, /dispatchAutomaticAnnouncement/);
@@ -364,7 +365,35 @@ describe('Version X Automatic Receiver UI and routing contract', () => {
     assert.match(submit, /'announcement', 'controlled', 'apple', 'spotify', 'stop'/);
     assert.match(submit, /actionKind !== 'announcement' && !stopItem && !itemUrl/);
     assert.match(submit, /percent: stopItem\s*\? 0/);
-    assert.match(submit, /actionKind === 'announcement' \|\| stopItem \? 'complete'/);
+    assert.match(
+      submit,
+      /mode: stopItem[\s\S]*\? 'complete'[\s\S]*actionKind === 'announcement'[\s\S]*schedule\.mode === 'order' && advanceMode === 'manual' \? 'manual' : 'complete'/
+    );
+  });
+
+  test('keeps Order announcement and music advance controls independent', () => {
+    const scheduleItem = sourceBetween(
+      'function renderScheduleRow',
+      'function renderSchedule'
+    );
+    const labels = sourceBetween(
+      'function scheduleAdvanceLabel',
+      'function renderWeekdayControls'
+    );
+    const visibility = sourceBetween(
+      'function updateScheduleFormVisibility',
+      'function clearScheduleDragState'
+    );
+    const submit = sourceBetween(
+      "if (kind === 'schedule-item')",
+      'window.addEventListener(\'pagehide\''
+    );
+
+    assert.match(scheduleItem, /name="announcementAdvanceMode" data-announcement-advance-mode/);
+    assert.match(scheduleItem, /name="advanceMode" data-music-advance-mode/);
+    assert.match(labels, /schedule\?\.mode !== 'order'\) return 'Completes after speech'/);
+    assert.match(visibility, /kind === 'announcement'[\s\S]*data-announcement-advance-mode[\s\S]*data-music-advance-mode/);
+    assert.match(submit, /actionKind === 'announcement'[\s\S]*data\.get\('announcementAdvanceMode'\)[\s\S]*data\.get\('advanceMode'\)/);
   });
 
   test('defers polling renders during native iPhone schedule controls and opens new items', () => {

@@ -2087,8 +2087,13 @@ function scheduleVolumeLabel(item) {
     : `Music ${percent}%`;
 }
 
-function scheduleAdvanceLabel(item) {
-  if (scheduleItemKind(item) === 'announcement') return 'Completes after speech';
+function scheduleAdvanceLabel(item, schedule) {
+  if (scheduleItemKind(item) === 'announcement') {
+    if (schedule?.mode !== 'order') return 'Completes after speech';
+    return item.advance?.mode === 'manual'
+      ? 'Waits for Play Next after speech'
+      : 'Auto-advances after speech';
+  }
   if (scheduleItemKind(item) === 'stop') return 'Completes after silence';
   const mode = item.advance?.mode || 'manual';
   if (mode === 'duration') return `${Math.max(1, Math.round(Number(item.advance?.durationSeconds || 300) / 60))} min segment`;
@@ -2195,7 +2200,7 @@ function renderScheduleRow(item, schedule, index) {
       <details class="scheduleItemCard" data-persist-open="schedule-${escapeAttr(item.id)}">
         <summary data-focus-key="summary-${escapeAttr(item.id)}">
           <span class="schedulePosition ${schedule.mode}">${escapeHtml(collapsedPosition)}</span>
-          <span class="scheduleSummaryCopy"><strong>${escapeHtml(item.label)}</strong><small>${escapeHtml(scheduleKindLabel(item))} · ${escapeHtml(scheduleAdvanceLabel(item))}</small></span>
+          <span class="scheduleSummaryCopy"><strong>${escapeHtml(item.label)}</strong><small>${escapeHtml(scheduleKindLabel(item))} · ${escapeHtml(scheduleAdvanceLabel(item, schedule))}</small></span>
           <span class="scheduleVolumeBadge">${escapeHtml(scheduleVolumeLabel(item))}</span>
           <span class="scheduleEnabled ${item.enabled && !skippedToday ? 'on' : 'off'}">${skippedToday ? 'Skipped today' : item.enabled ? 'On' : 'Off'}</span>
         </summary>
@@ -2213,11 +2218,12 @@ function renderScheduleRow(item, schedule, index) {
               <label data-show-announcement-source="inline" ${announcementSource === 'inline' ? '' : 'hidden'}>Custom announcement<textarea name="text" maxlength="${announcementTextLimit}" placeholder="Type the announcement spoken only by this schedule item">${escapeHtml(item.action?.text || '')}</textarea><small>This text stays inside this schedule and is not added to Saved Messages.${announcementTextLimit < 900 ? ` Maximum ${announcementTextLimit} characters for reliable Receiver Shortcut playback.` : ''}</small></label>
               <label>Playback source<select name="sourceId">${announcementSourceOptions(announcementSourceId)}</select><small>Natural Voice or a saved finite clip. Apple Music and Spotify catalog items are disabled for announcement use on one iPhone.</small></label>
               <label>Resume music after announcement<input name="restoreMusicPercent" type="number" min="0" max="100" step="1" value="${escapeAttr(item.action?.restoreMusicPercent ?? store.state.config.musicLevel)}" /><small>Usually 30% for the Daily bed and 100% while the Wednesday Party bed is active.</small></label>
+              ${schedule.mode === 'order' ? `<label>After announcement<select name="announcementAdvanceMode" data-announcement-advance-mode><option value="complete" ${advanceMode === 'complete' ? 'selected' : ''}>Play the next cue immediately</option><option value="manual" ${advanceMode === 'manual' ? 'selected' : ''}>Wait for Play Next</option></select></label>` : ''}
               <div class="fixedVoiceNote"><strong>Announcement ${VOICE_LEVEL_PERCENT}%</strong><span>Music reaches ${DUCK_LEVEL_PERCENT}% before speech starts. Playback resumes at the music slider target only after the announcement finishes.</span></div>
             </div>
             <div class="conditionalFields musicFields" data-show-schedule-kind="music" ${kind === 'announcement' || stopItem ? 'hidden' : ''}>
               <label>Music URL<input name="url" type="url" value="${escapeAttr(item.action?.url || item.url || '')}" placeholder="Apple Music, Spotify, Suno, or direct HTTPS audio URL" ${kind === 'announcement' || stopItem ? '' : 'required'} /></label>
-              ${schedule.mode === 'order' ? `<label>Advance<select name="advanceMode" data-advance-mode><option value="manual" ${advanceMode === 'manual' ? 'selected' : ''}>Manually with Play Next</option><option value="track-end" ${advanceMode === 'track-end' ? 'selected' : ''} ${['apple', 'spotify'].includes(kind) ? 'disabled' : ''}>At direct track end (Suno/direct only)</option><option value="duration" ${advanceMode === 'duration' ? 'selected' : ''}>After a duration</option><option value="complete" ${advanceMode === 'complete' ? 'selected' : ''}>Immediately after playback starts</option></select></label><label data-show-advance-mode="duration" ${advanceMode === 'duration' ? '' : 'hidden'}>Duration seconds<input name="durationSeconds" type="number" min="1" max="86400" step="1" value="${escapeAttr(item.advance?.durationSeconds || 300)}" /></label>` : ''}
+              ${schedule.mode === 'order' ? `<label>Advance<select name="advanceMode" data-music-advance-mode><option value="manual" ${advanceMode === 'manual' ? 'selected' : ''}>Manually with Play Next</option><option value="track-end" ${advanceMode === 'track-end' ? 'selected' : ''} ${['apple', 'spotify'].includes(kind) ? 'disabled' : ''}>At direct track end (Suno/direct only)</option><option value="duration" ${advanceMode === 'duration' ? 'selected' : ''}>After a duration</option><option value="complete" ${advanceMode === 'complete' ? 'selected' : ''}>Immediately after playback starts</option></select></label><label data-show-advance-mode="duration" ${advanceMode === 'duration' ? '' : 'hidden'}>Duration seconds<input name="durationSeconds" type="number" min="1" max="86400" step="1" value="${escapeAttr(item.advance?.durationSeconds || 300)}" /></label>` : ''}
             </div>
             <div class="conditionalFields stopFields" data-show-schedule-kind="stop" ${stopItem ? '' : 'hidden'}>
               <div class="fixedVoiceNote"><strong>Quiet hours</strong><span>Browser Receiver stops playback. Automatic Receiver sets the iPhone media output to 0%. Either path leaves the connected speakers quiet until a later schedule item or Remote command starts audible playback.</span></div>
@@ -3000,6 +3006,7 @@ async function dispatchAutomaticAnnouncement({
   text,
   label = 'Speak Now',
   safety = false,
+  restoreMusicPercent = null,
   announcementMode = 'natural-voice',
   announcementProvider = '',
   announcementAudioUrl = '',
@@ -3013,7 +3020,12 @@ async function dispatchAutomaticAnnouncement({
           || 'Automatic Receiver is not configured yet.'
     );
   }
-  const requestedMusicTarget = audibleMusicTarget(store.state);
+  const fallbackMusicTarget = audibleMusicTarget(store.state);
+  const requestedMusicTarget = restoreMusicPercent === null
+    || restoreMusicPercent === undefined
+    || restoreMusicPercent === ''
+    ? fallbackMusicTarget
+    : clamp(restoreMusicPercent, 0, 100, fallbackMusicTarget);
   const result = await sendEmailWakeAnnouncement({
     text,
     label,
@@ -3571,7 +3583,9 @@ function updateScheduleFormVisibility(form) {
     && activeReceiverIsIOS()
     && !automaticAnnouncementsEnabled();
   const fixedVolume = kind === 'announcement' || stopItem || iphoneAppleVolume;
-  const advanceSelect = form.querySelector('[data-advance-mode]');
+  const advanceSelect = kind === 'announcement'
+    ? form.querySelector('[data-announcement-advance-mode]')
+    : form.querySelector('[data-music-advance-mode]');
   const trackEndOption = advanceSelect?.querySelector('option[value="track-end"]');
   if (trackEndOption) trackEndOption.disabled = ['apple', 'spotify'].includes(kind);
   if (['apple', 'spotify'].includes(kind) && advanceSelect?.value === 'track-end') advanceSelect.value = 'manual';
@@ -4534,7 +4548,7 @@ root.addEventListener('change', event => {
     });
     return;
   }
-  if (event.target.matches?.('[data-schedule-kind], [data-announcement-source], [data-volume-mode], [data-advance-mode]')) {
+  if (event.target.matches?.('[data-schedule-kind], [data-announcement-source], [data-volume-mode], [data-announcement-advance-mode], [data-music-advance-mode]')) {
     updateScheduleFormVisibility(form);
     return;
   }
@@ -4762,8 +4776,11 @@ root.addEventListener('submit', event => {
           && data.get('volumeMode') === 'custom'
             ? 'custom'
             : 'global';
-      const advanceMode = ['complete', 'track-end', 'duration', 'manual'].includes(String(data.get('advanceMode')))
-          ? String(data.get('advanceMode'))
+      const requestedAdvanceMode = actionKind === 'announcement'
+        ? data.get('announcementAdvanceMode')
+        : data.get('advanceMode');
+      const advanceMode = ['complete', 'track-end', 'duration', 'manual'].includes(String(requestedAdvanceMode))
+          ? String(requestedAdvanceMode)
           : (actionKind === 'announcement' ? 'complete' : 'manual');
         if (['apple', 'spotify'].includes(actionKind) && advanceMode === 'track-end') throw new Error(`${actionKind === 'spotify' ? 'Spotify' : 'Apple Music'} cannot provide a schedule-safe track-end event. Choose Manual, Duration, or Immediately after start.`);
         schedule.items[index] = {
@@ -4801,7 +4818,11 @@ root.addEventListener('submit', event => {
                 )
           },
           advance: {
-            mode: actionKind === 'announcement' || stopItem ? 'complete' : advanceMode,
+            mode: stopItem
+              ? 'complete'
+              : actionKind === 'announcement'
+                ? schedule.mode === 'order' && advanceMode === 'manual' ? 'manual' : 'complete'
+                : advanceMode,
             durationSeconds: clamp(data.get('durationSeconds'), 1, 86_400, 300)
           }
         };

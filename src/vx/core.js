@@ -403,11 +403,15 @@ export function normalizeScheduleItem(item, index = 0) {
     : 'saved';
   const requestedAdvanceMode = String(advanceSource.mode ?? source.advanceMode ?? '').toLowerCase();
   const defaultAdvanceMode = kind === 'announcement' || stop ? 'complete' : 'manual';
-  // Speech has one truthful completion gate: the announcement promise resolves
-  // after spoken audio finishes. Persisted legacy values must not turn speech
-  // into an unsupported timer, track-end, or manual gate.
-  const advanceMode = kind === 'announcement' || stop
+  // Speech always completes through its truthful playback promise. An Order
+  // cue may then either continue immediately or wait for the operator's next
+  // Play Next tap; timers and track-end gates remain music-only.
+  const advanceMode = stop
     ? 'complete'
+    : kind === 'announcement'
+      ? ['complete', 'manual'].includes(requestedAdvanceMode)
+        ? requestedAdvanceMode
+        : defaultAdvanceMode
     : ['complete', 'track-end', 'duration', 'manual'].includes(requestedAdvanceMode)
       ? requestedAdvanceMode
       : defaultAdvanceMode;
@@ -666,7 +670,9 @@ function normalizeSequenceActive(active) {
   const kind = scheduleActionKind({ type: source.kind });
   const requestedAdvanceMode = String(source.advanceMode || '').toLowerCase();
   const advanceMode = kind === 'announcement'
-    ? 'complete'
+    ? ['complete', 'manual'].includes(requestedAdvanceMode)
+      ? requestedAdvanceMode
+      : 'complete'
     : ['complete', 'track-end', 'duration', 'manual'].includes(requestedAdvanceMode)
       ? requestedAdvanceMode
       : 'manual';

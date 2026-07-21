@@ -110,6 +110,8 @@ test('resort hub migration preserves paired Automatic Receiver and weather state
   assert.equal(migrated.schedules[1].id, 'wednesday-party-schedule');
   assert.equal(migrated.schedules[2].id, 'wednesday-party-live-cues');
   assert.equal(migrated.activeScheduleId, 'wednesday-party-live-cues');
+  assert.equal(migrated.schedules[2].items[0].advance.mode, 'manual');
+  assert.equal(migrated.schedules[2].items[1].advance.mode, 'complete');
   assert.equal(migrated.schedules.find(schedule => schedule.id === 'old-extra-time').enabled, false);
   assert.equal(migrated.schedules.find(schedule => schedule.id === 'manual-order-cues').enabled, true);
   assert.equal(migrated.announcementSources.length, 14);
