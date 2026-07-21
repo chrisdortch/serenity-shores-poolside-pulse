@@ -7,6 +7,7 @@ import {
   dailyResortSchedule,
   prepareResortHubState,
   resortHubAnnouncementSources,
+  wednesdayPartyLiveCuesSchedule,
   wednesdayPartySchedule
 } from '../tools/version-x-resort-hub-state.mjs';
 
@@ -32,19 +33,40 @@ test('Daily Operations opens at 10, stays clear for Party, and protects closing'
   assert.deepEqual(routineInPartyWindow, []);
 });
 
-test('Wednesday Party is a cancellable concurrent overlay with verified 100 percent music', () => {
+test('Wednesday Party is a cancellable timed overlay without readiness-gated guesses', () => {
   const party = wednesdayPartySchedule();
   assert.equal(party.mode, 'time');
   assert.equal(party.enabled, true);
   assert.equal(party.cancellable, true);
-  assert.equal(party.items.length, 24);
+  assert.equal(party.items.length, 17);
   assert.ok(party.items.every(item => JSON.stringify(item.days) === '[3]'));
   const music = party.items.filter(item => item.action.kind === 'apple');
-  assert.equal(music.length, 11);
+  assert.equal(music.length, 8);
   assert.ok(music.slice(0, -1).every(item => item.volume.percent === 100));
   assert.equal(music.at(-1).action.url, DAILY_APPLE_PLAYLIST);
   assert.equal(music.at(-1).volume.percent, 30);
-  assert.equal(party.items.find(item => item.id === 'party-suno-07-x').action.restoreMusicPercent, 100);
+  assert.equal(party.items.some(item => ['party-suno-02-x', 'party-suno-07-x', 'party-suno-08-x', 'party-suno-09-x'].includes(item.id)), false);
+});
+
+test('Wednesday Party live queue gates staff-dependent cues and chains each game announcement to its song', () => {
+  const live = wednesdayPartyLiveCuesSchedule();
+  assert.equal(live.mode, 'order');
+  assert.equal(live.enabled, true);
+  assert.equal(live.items.length, 7);
+  assert.deepEqual(live.items.map(item => item.position.order), [1, 2, 3, 4, 5, 6, 7]);
+  assert.match(live.items[0].label, /HOLD until food line is ready/);
+  assert.equal(live.items[0].advance.mode, 'manual');
+  assert.equal(live.items[1].id, 'party-suno-07-x');
+  assert.equal(live.items[1].advance.mode, 'complete');
+  assert.equal(live.items[2].id, 'party-apple-limbo-x');
+  assert.equal(live.items[2].advance.mode, 'manual');
+  assert.equal(live.items[3].id, 'party-suno-08-x');
+  assert.equal(live.items[3].advance.mode, 'complete');
+  assert.equal(live.items[4].id, 'party-apple-wipeout-x');
+  assert.match(live.items[5].label, /HOLD until lifeguard shack is ready/);
+  assert.equal(live.items[5].advance.mode, 'complete');
+  assert.equal(live.items[6].id, 'party-apple-icecream-x');
+  assert.ok(live.items.every(item => item.volume.percent === 100 || item.id === 'party-suno-02-x'));
 });
 
 test('all thirteen Party Suno clips are finite, verified, and under 180 seconds', () => {
@@ -86,6 +108,8 @@ test('resort hub migration preserves paired Automatic Receiver and weather state
   assert.equal(migrated.config.musicLevel, 30);
   assert.equal(migrated.schedules[0].id, 'daily-schedule');
   assert.equal(migrated.schedules[1].id, 'wednesday-party-schedule');
+  assert.equal(migrated.schedules[2].id, 'wednesday-party-live-cues');
+  assert.equal(migrated.activeScheduleId, 'wednesday-party-live-cues');
   assert.equal(migrated.schedules.find(schedule => schedule.id === 'old-extra-time').enabled, false);
   assert.equal(migrated.schedules.find(schedule => schedule.id === 'manual-order-cues').enabled, true);
   assert.equal(migrated.announcementSources.length, 14);

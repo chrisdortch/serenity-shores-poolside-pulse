@@ -125,20 +125,21 @@ describe('Version X Spotify receiver isolation', { concurrency: false }, () => {
     assert.match(panelSource, /spotifySetupButton\(\{ disabled: spotify\.loggedIn\(\) && !owned \}\)/);
     assert.match(panelSource, /Spotify: Authorize → Prepare if shown → Activate on this Receiver/);
     assert.match(panelSource, /Mode 1 · remote music control/);
-    assert.match(panelSource, /Mode 2 · remote Pushcut announcements/);
+    assert.match(panelSource, /Automatic Receiver · no Pushcut foreground/);
   });
 
-  test('uses the shared receiver mode ahead of a stale lease and exposes the official mode switch', () => {
+  test('uses Automatic Receiver ahead of stale legacy mode and keeps Pushcut fallback isolated', () => {
     const modeStart = VX_APP_SOURCE.indexOf('function receiverOperatingMode');
     const modeEnd = VX_APP_SOURCE.indexOf('async function refreshPushcutStatus', modeStart);
     const modeSource = VX_APP_SOURCE.slice(modeStart, modeEnd);
 
     assert.ok(modeStart > 0 && modeEnd > modeStart);
+    assert.match(modeSource, /automaticAnnouncementsEnabled\(state\)\) return 'browser'/);
     assert.match(modeSource, /state\?\.config\?\.receiverMode/);
     assert.match(modeSource, /configuredMode === 'browser' \|\| configuredMode === 'pushcut'/);
     assert.match(VX_APP_SOURCE, /const PUSHCUT_RUN_SERVER_URL = 'pushcut:\/\/open\/runServer'/);
-    assert.match(VX_APP_SOURCE, /The Remote applies the music slider, pauses music for speech, plays the announcement at 100%, restores \$\{musicTarget\}%, and resumes/);
-    assert.match(VX_APP_SOURCE, /operatingMode === 'pushcut'[\s\S]*Version X intentionally hides browser Play controls in Pushcut mode/);
+    assert.match(VX_APP_SOURCE, /Automatic Receiver is active\. Pushcut is retired from normal Resort Media Hub operation/);
+    assert.match(VX_APP_SOURCE, /Browser music stopped\. Automatic announcements remain armed without Pushcut/);
   });
 
   test('routes live voice by shared mode and keeps Browser-mode sliders usable', () => {
@@ -164,15 +165,16 @@ describe('Version X Spotify receiver isolation', { concurrency: false }, () => {
     assert.doesNotMatch(VX_APP_SOURCE.slice(voiceStart, voiceEnd), /id="voiceLevel" type="range"/);
   });
 
-  test('keeps Pushcut timed copies separate from the live Browser schedule', () => {
-    assert.match(VX_APP_SOURCE, /pushcutEnabled: requestedPushcutEnabled/);
-    assert.match(VX_APP_SOURCE, /browserReceiverOnline: receiverMode === 'browser' && receiverOnline/);
-    assert.match(VX_APP_SOURCE, /Pending Pushcut timed copies were cancelled/);
-    assert.match(VX_APP_SOURCE, /Version X automatically cancels Pushcut timed copies/);
-    assert.match(VX_APP_SOURCE, /runtime\.start[\s\S]*pushcutEnabledOverride: false/);
-    assert.match(VX_APP_SOURCE, /runtime\.stop\(\)[\s\S]*pushcutEnabledOverride: true/);
-    assert.match(VX_APP_SOURCE, /Stop Receiver &amp; Prepare Pushcut/);
-    assert.match(VX_APP_SOURCE, /browserActive[\s\S]*data-action="stop-receiver"[\s\S]*PUSHCUT_RUN_SERVER_URL/);
+  test('does not enter Pushcut schedule mode while Automatic Receiver is active', () => {
+    const startAction = VX_APP_SOURCE.slice(
+      VX_APP_SOURCE.indexOf("if (action === 'start-receiver')"),
+      VX_APP_SOURCE.indexOf("if (action === 'enable-managed-volume')")
+    );
+    assert.match(startAction, /if \(!automaticAnnouncementsEnabled\(\) && pushcutAnnouncementReady\(\)\)/);
+    assert.match(startAction, /if \(automaticAnnouncementsEnabled\(\)\)[\s\S]*applyReceiverMusicTargetNow/);
+    assert.match(startAction, /Browser music stopped\. Automatic announcements remain armed without Pushcut/);
+    assert.match(startAction, /Automatic Receiver is active\. Pushcut is retired from normal Resort Media Hub operation/);
+    assert.match(VX_APP_SOURCE, /queuePushcutScheduleSync[\s\S]*automaticAnnouncementsEnabled\(\)/);
   });
 
   test('continues scheduled controlled playlists without bypassing track-end schedule gates', () => {

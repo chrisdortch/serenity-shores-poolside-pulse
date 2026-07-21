@@ -102,6 +102,14 @@ function musicItem(id, label, time, url, percent, days = WEDNESDAY, durationSeco
   };
 }
 
+function orderItem(item, order, advanceMode = item.advance?.mode || 'manual') {
+  return {
+    ...item,
+    position: { ...item.position, order },
+    advance: { ...item.advance, mode: advanceMode }
+  };
+}
+
 function stopItem() {
   return {
     id: 'daily-quiet-hours-x',
@@ -174,18 +182,11 @@ export function wednesdayPartySchedule() {
     cancelledDates: [],
     items: withOrders([
       finitePartyAnnouncement('01', '18:20', 30),
-      finitePartyAnnouncement('02', '18:25', 30, ' · confirm food line is ready'),
       finitePartyAnnouncement('03', '18:45', 30),
       finitePartyAnnouncement('04', '18:50', 30),
       finitePartyAnnouncement('05', '18:55', 30),
       finitePartyAnnouncement('06', '19:00', 30),
       musicItem('party-apple-hot-x', apple('hot')[0], '19:02', apple('hot')[1], 100, WEDNESDAY, apple('hot')[2]),
-      finitePartyAnnouncement('07', '19:15', 100),
-      musicItem('party-apple-limbo-x', apple('limbo')[0], '19:16', apple('limbo')[1], 100, WEDNESDAY, apple('limbo')[2]),
-      finitePartyAnnouncement('08', '19:25', 100),
-      musicItem('party-apple-wipeout-x', apple('wipeout')[0], '19:26', apple('wipeout')[1], 100, WEDNESDAY, apple('wipeout')[2]),
-      finitePartyAnnouncement('09', '19:35', 100, ' · confirm lifeguard shack is ready'),
-      musicItem('party-apple-icecream-x', apple('icecream')[0], '19:36', apple('icecream')[1], 100, WEDNESDAY, apple('icecream')[2]),
       finitePartyAnnouncement('10', '19:50', 100),
       finitePartyAnnouncement('11', '20:00', 100),
       musicItem('party-apple-macarena-x', apple('macarena')[0], '20:01', apple('macarena')[1], 100, WEDNESDAY, apple('macarena')[2]),
@@ -201,9 +202,37 @@ export function wednesdayPartySchedule() {
   };
 }
 
+export function wednesdayPartyLiveCuesSchedule() {
+  return {
+    id: 'wednesday-party-live-cues',
+    name: 'Wednesday Party Live Cues',
+    mode: 'order',
+    enabled: true,
+    cancellable: false,
+    cancelledDates: [],
+    items: [
+      orderItem(
+        finitePartyAnnouncement('02', '18:25', 30, ' · HOLD until food line is ready'),
+        1,
+        'manual'
+      ),
+      orderItem(finitePartyAnnouncement('07', '19:15', 100, ' · after balloon toss'), 2, 'complete'),
+      orderItem(musicItem('party-apple-limbo-x', PARTY_APPLE.limbo[0], '19:16', PARTY_APPLE.limbo[1], 100, WEDNESDAY, PARTY_APPLE.limbo[2]), 3, 'manual'),
+      orderItem(finitePartyAnnouncement('08', '19:25', 100, ' · after limbo'), 4, 'complete'),
+      orderItem(musicItem('party-apple-wipeout-x', PARTY_APPLE.wipeout[0], '19:26', PARTY_APPLE.wipeout[1], 100, WEDNESDAY, PARTY_APPLE.wipeout[2]), 5, 'manual'),
+      orderItem(finitePartyAnnouncement('09', '19:35', 100, ' · HOLD until lifeguard shack is ready'), 6, 'complete'),
+      orderItem(musicItem('party-apple-icecream-x', PARTY_APPLE.icecream[0], '19:36', PARTY_APPLE.icecream[1], 100, WEDNESDAY, PARTY_APPLE.icecream[2]), 7, 'manual')
+    ]
+  };
+}
+
 export function prepareResortHubState(inputState, now = Date.now()) {
   const current = normalizeState(inputState, now);
-  const replacementIds = new Set(['daily-schedule', 'wednesday-party-schedule']);
+  const replacementIds = new Set([
+    'daily-schedule',
+    'wednesday-party-schedule',
+    'wednesday-party-live-cues'
+  ]);
   const retainedSchedules = (current.schedules || []).filter(schedule => (
     !replacementIds.has(schedule.id)
     && !['daily', 'daily operations', 'party', 'wednesday party'].includes(String(schedule.name || '').trim().toLowerCase())
@@ -247,20 +276,25 @@ export function prepareResortHubState(inputState, now = Date.now()) {
     schedules: [
       dailyResortSchedule(),
       wednesdayPartySchedule(),
+      wednesdayPartyLiveCuesSchedule(),
       ...retainedSchedules
     ],
-    activeScheduleId: 'daily-schedule',
+    // Time schedules are concurrent overlays. Keep the readiness-gated and
+    // crowd-timed Party cues as the active manual queue so the Remote's Play
+    // Next button is immediately useful without weakening Daily automation.
+    activeScheduleId: 'wednesday-party-live-cues',
     sequenceRuns: {
       ...(current.sequenceRuns || {}),
       'daily-schedule': undefined,
-      'wednesday-party-schedule': undefined
+      'wednesday-party-schedule': undefined,
+      'wednesday-party-live-cues': undefined
     },
     activityLog: [
       {
         id: `log-resort-hub-${now}`,
         kind: 'settings',
         title: 'Resort media-hub schedules installed',
-        detail: 'Daily Operations and Wednesday Party now run together; Automatic Receiver is authoritative and Pushcut is retired from normal operation.',
+        detail: 'Daily Operations and Wednesday Party run together; readiness-gated game cues use the live Play Next queue; Automatic Receiver is authoritative and Pushcut is retired from normal operation.',
         createdAt: now
       },
       ...(current.activityLog || [])

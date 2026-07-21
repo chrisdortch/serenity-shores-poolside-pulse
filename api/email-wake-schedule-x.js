@@ -172,6 +172,15 @@ export function createEmailWakeScheduleXHandler({
         stateRevision: canonicalRevision,
         revisionAdvanced,
         ...result,
+        // The synchronizer exposes numeric mutation counters. On an
+        // idempotent sync, maintenanceScheduled is 0 and
+        // maintenanceUnchanged is 1 even though a durable renewal is still
+        // scheduled. Normalize the public route response back to the boolean
+        // status used by the browser UI so it never shows a false warning.
+        maintenanceScheduled:
+          result.maintenanceScheduled === true
+          || Number(result.maintenanceScheduled || 0) > 0
+          || Number(result.maintenanceUnchanged || 0) > 0,
         note: 'Wake emails are synchronized for the rolling 29-day Central Time horizon.'
       });
     } catch (error) {

@@ -1025,6 +1025,38 @@ describe('Version X automatic schedule route revision safety', { concurrency: fa
     assert.match(result.json().error, /ahead of the canonical/i);
     assert.equal(syncCalls, 0);
   });
+
+  test('reports an unchanged durable maintenance wake as scheduled to the browser', async () => {
+    const handler = createEmailWakeScheduleXHandler({
+      manifestStoreFactory: () => ({}),
+      stateReader: async () => ({
+        revision: 12,
+        state: canonicalState,
+        durable: true
+      }),
+      synchronizer: async () => ({
+        transport: 'email-wake-x',
+        enabled: true,
+        scheduledCount: 5,
+        maintenanceScheduled: 0,
+        maintenanceUnchanged: 1,
+        maintenanceScheduledFor: Date.now() + 60_000,
+        warnings: []
+      })
+    });
+
+    const result = await invoke(
+      handler,
+      request('POST', '/api/email-wake-schedule-x?v=x', {
+        cookie: xCookie(),
+        body: { expectedRevision: 12, enabled: true }
+      })
+    );
+
+    assert.equal(result.statusCode, 200);
+    assert.equal(result.json().maintenanceScheduled, true);
+    assert.equal(result.json().maintenanceUnchanged, 1);
+  });
 });
 
 describe('Version X receiver claim and protected command route', { concurrency: false }, () => {
