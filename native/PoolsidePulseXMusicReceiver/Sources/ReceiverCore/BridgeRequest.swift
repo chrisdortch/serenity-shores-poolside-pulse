@@ -31,7 +31,7 @@ public struct BridgeRequest {
     public static let version = 1
     public static let methods: Set<String> = [
         "capabilities", "activate", "play", "pause", "pauseImmediate",
-        "resume", "next", "stop", "state", "setVolume",
+        "resume", "previous", "next", "stop", "state", "setVolume",
         "pauseForAnnouncement", "resumeAfterAnnouncement", "failSafePause"
     ]
 

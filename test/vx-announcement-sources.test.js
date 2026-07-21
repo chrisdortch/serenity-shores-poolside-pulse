@@ -47,7 +47,7 @@ describe('Version X browser announcement source contract', () => {
     assert.equal(payload.announcementDurationSeconds, 21);
   });
 
-  test('rejects catalog providers, insecure URLs, and clips over 45 seconds before dispatch', async () => {
+  test('rejects catalog providers, insecure URLs, and clips over 180 seconds before dispatch', async () => {
     let calls = 0;
     const fetchImpl = async () => { calls += 1; };
     const base = {
@@ -60,7 +60,7 @@ describe('Version X browser announcement source contract', () => {
     };
     await assert.rejects(sendPushcutAnnouncement({ ...base, announcementProvider: 'spotify' }), /Direct or Suno/i);
     await assert.rejects(sendPushcutAnnouncement({ ...base, eventId: 'pushcut-invalid-source-0002', announcementProvider: 'direct', announcementAudioUrl: 'http://media.example/test.mp3' }), /HTTPS/i);
-    await assert.rejects(sendPushcutAnnouncement({ ...base, eventId: 'pushcut-invalid-source-0003', announcementProvider: 'direct', announcementDurationSeconds: 46 }), /1 to 45 seconds/i);
+    await assert.rejects(sendPushcutAnnouncement({ ...base, eventId: 'pushcut-invalid-source-0003', announcementProvider: 'direct', announcementDurationSeconds: 181 }), /1 to 180 seconds/i);
     assert.equal(calls, 0);
   });
 });

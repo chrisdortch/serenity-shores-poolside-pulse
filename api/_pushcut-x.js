@@ -1,5 +1,8 @@
 import { randomUUID } from 'node:crypto';
-import { normalizeFiniteAudioReference } from './_finite-audio-x.js';
+import {
+  FINITE_AUDIO_X_MAX_SECONDS,
+  normalizeFiniteAudioReference
+} from './_finite-audio-x.js';
 import {
   PUSHCUT_X_ANNOUNCEMENT_SHORTCUT_NAME,
   PUSHCUT_X_RECEIVER_CONTRACT,
@@ -426,7 +429,11 @@ function announcementSource(body) {
     });
   }
   if (mode !== 'finite-audio') invalid();
-  if (!Number.isInteger(rawDuration) || rawDuration < 1 || rawDuration > 45) invalid();
+  if (
+    !Number.isInteger(rawDuration)
+    || rawDuration < 1
+    || rawDuration > FINITE_AUDIO_X_MAX_SECONDS
+  ) invalid();
   let reference;
   try {
     reference = normalizeFiniteAudioReference(provider, sourceUrl);

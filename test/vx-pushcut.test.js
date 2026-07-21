@@ -33,6 +33,7 @@ import {
   verifiedPushcutXCompletion
 } from '../api/_pushcut-receipts-x.js';
 import {
+  FINITE_AUDIO_X_MAX_SECONDS,
   FiniteAudioXError,
   loadFiniteAnnouncementAudio,
   normalizeFiniteAudioReference,
@@ -306,7 +307,8 @@ describe('Version X Pushcut command validation', { concurrency: false }, () => {
     assert.equal(command.musicPercent, 100);
   });
 
-  test('accepts only finite direct files or exact Suno song/share references', () => {
+  test('accepts finite clips through 180 seconds and only direct files or exact Suno references', async () => {
+    assert.equal(FINITE_AUDIO_X_MAX_SECONDS, 180);
     const base = {
       version: 'x',
       eventId: 'pushcut-finite-validation-0001',
@@ -317,7 +319,7 @@ describe('Version X Pushcut command validation', { concurrency: false }, () => {
       voicePercent: 100,
       musicPercent: 30,
       announcementMode: 'finite-audio',
-      announcementDurationSeconds: 12
+      announcementDurationSeconds: 180
     };
     const direct = normalizePushcutXCommand({
       ...base,
@@ -326,8 +328,11 @@ describe('Version X Pushcut command validation', { concurrency: false }, () => {
     });
     assert.equal(direct.announcementMode, 'finite-audio');
     assert.equal(direct.announcementProvider, 'direct');
-    assert.equal(direct.announcementDurationSeconds, 12);
+    assert.equal(direct.announcementDurationSeconds, 180);
     assert.equal(direct.announcementAudioUrl, 'https://media.example/audio/pool-message.mp3?token=private');
+    const receipt = await createPushcutXReceipt(direct);
+    assert.equal(receipt.receipt.announcementDurationSeconds, 180);
+    assert.equal(receipt.receipt.deadlineAt - receipt.receipt.queuedAt, 240_000);
 
     const suno = normalizePushcutXCommand({
       ...base,
@@ -355,7 +360,7 @@ describe('Version X Pushcut command validation', { concurrency: false }, () => {
       ...base,
       announcementProvider: 'direct',
       announcementAudioUrl: 'https://media.example/message.mp3',
-      announcementDurationSeconds: 46
+      announcementDurationSeconds: 181
     }), PushcutXError);
     const { announcementDurationSeconds: _missingDuration, ...missingDuration } = base;
     assert.throws(() => normalizePushcutXCommand({

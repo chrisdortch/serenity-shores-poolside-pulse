@@ -2622,7 +2622,30 @@ describe('Version X email schedule manifest', { concurrency: false }, () => {
             id: 'quiet-hours',
             enabled: true,
             action: { kind: 'stop' }
+          }, {
+            id: 'daily-apple',
+            enabled: true,
+            action: { kind: 'apple' }
           }]
+        }, {
+          id: 'wednesday-party',
+          mode: 'time',
+          enabled: true,
+          items: [{
+            id: 'party-suno',
+            enabled: true,
+            action: { kind: 'controlled' }
+          }]
+        }, {
+          id: 'manual-order',
+          mode: 'order',
+          enabled: true,
+          items: [{ id: 'ignored-order', enabled: true, action: { kind: 'spotify' } }]
+        }, {
+          id: 'disabled-time',
+          mode: 'time',
+          enabled: false,
+          items: [{ id: 'ignored-disabled', enabled: true, action: { kind: 'spotify' } }]
         }]
       }
     }, {
@@ -2668,7 +2691,7 @@ describe('Version X email schedule manifest', { concurrency: false }, () => {
     });
 
     assert.equal(result.scheduled, 1);
-    assert.equal(result.musicBrowserCount, 0);
+    assert.equal(result.musicBrowserCount, 2);
     assert.equal(result.announcementScheduledCount, 0);
     assert.equal(result.volumeScheduledCount, 1);
     assert.equal(queued.length, 1);

@@ -84,6 +84,10 @@ function fakeMusicKit() {
     async skipToNextItem() {
       calls.push(['skipToNextItem']);
       this.playbackState = 'playing';
+    },
+    async skipToPreviousItem() {
+      calls.push(['skipToPreviousItem']);
+      this.playbackState = 'playing';
     }
   };
   const kit = {
@@ -299,6 +303,23 @@ describe('Version X MusicKit adapter', { concurrency: false }, () => {
     music.pause = async () => { throw new Error('pause transport failed'); };
 
     await assert.rejects(receiver.pauseForAnnouncement(), /pause transport failed/i);
+    assert.equal(music.playbackState, 'playing');
+  });
+
+  test('skips to the previous MusicKit item and preserves playing state', async () => {
+    installBrowser();
+    const { kit, music, calls } = fakeMusicKit();
+    const receiver = new AppleMusicReceiver({ musicKit: kit, fetchImpl: tokenFetch(calls) });
+    await receiver.prepareAuthorization();
+    await receiver.authorizeFromUserGesture();
+    await receiver.activateFromUserGesture();
+    await receiver.connectFromUserGesture();
+    music.playbackState = 'playing';
+
+    const state = await receiver.previous();
+
+    assert.equal(calls.some(call => call[0] === 'skipToPreviousItem'), true);
+    assert.equal(state.isPlaying, true);
     assert.equal(music.playbackState, 'playing');
   });
 

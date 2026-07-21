@@ -124,6 +124,20 @@ public final class MusicAutomation {
         return try decodeState(descriptor, sourceURL: currentSourceURL)
     }
 
+    public func previous(volume: Int) throws -> MusicState {
+        guard (0...100).contains(volume) else { throw ReceiverBridgeError.invalidVolume }
+        let descriptor = try execute("""
+        tell application "Music"
+            set sound volume to \(volume)
+            previous track
+            play
+        end tell
+        delay 0.35
+        \(Self.stateScript)
+        """)
+        return try decodeState(descriptor, sourceURL: currentSourceURL)
+    }
+
     public func stop() throws -> MusicState {
         let descriptor = try execute("""
         tell application "Music" to stop

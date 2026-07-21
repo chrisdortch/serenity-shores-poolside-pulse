@@ -1,4 +1,7 @@
-import { normalizeFiniteAudioReference } from './_finite-audio-x.js';
+import {
+  FINITE_AUDIO_X_MAX_SECONDS,
+  normalizeFiniteAudioReference
+} from './_finite-audio-x.js';
 import { EMAIL_WAKE_X_RECEIVER_CONTRACT } from './_email-wake-x.js';
 import { PUSHCUT_X_MAX_EXECUTION_ATTEMPT } from './_pushcut-security-x.js';
 import { PUSHCUT_X_RECEIVER_CONTRACT } from './_pushcut-x.js';
@@ -13,7 +16,11 @@ const RECEIVER_BUSY_KEY = `${RECEIPT_NAMESPACE}meta:receiver-busy`;
 const RECEIPT_TTL_SECONDS = 24 * 60 * 60;
 const RECEIPT_MAX_TTL_SECONDS = 31 * 24 * 60 * 60;
 const RECEIPT_DEADLINE_MS = 90_000;
-export const PUSHCUT_X_RECEIVER_BUSY_LEASE_MS = RECEIPT_DEADLINE_MS + 30_000;
+const FINITE_AUDIO_RECEIPT_OVERHEAD_MS = 60_000;
+const MAX_RECEIPT_DEADLINE_MS =
+  FINITE_AUDIO_X_MAX_SECONDS * 1000 + FINITE_AUDIO_RECEIPT_OVERHEAD_MS;
+export const PUSHCUT_X_RECEIVER_BUSY_LEASE_MS =
+  RECEIPT_DEADLINE_MS + 30_000;
 const KV_REQUEST_TIMEOUT_MS = 8_000;
 export const PUSHCUT_X_DISPATCH_LEASE_MS = 30_000;
 export const PUSHCUT_X_AUDIO_LEASE_MS = 30_000;
@@ -307,6 +314,10 @@ local currentMode = tostring(current.executionMode or "")
 local reason = ""
 local prepared = false
 local changed = false
+local finiteDurationSeconds = tonumber(current.announcementDurationSeconds or 0) or 0
+if finiteDurationSeconds > 0 then
+  deadlineAt = math.max(deadlineAt, now + finiteDurationSeconds * 1000 + 60000)
+end
 if tostring(current.receiverContract or "") ~= receiverContract then
   reason = "contract"
 elseif currentStatus == "completed" or currentStatus == "failed" then
@@ -777,7 +788,11 @@ function baseReceipt(command, now, ttlSeconds) {
     announcementProvider = reference.provider;
     announcementAudioUrl = reference.sourceUrl;
     const duration = Number(command.announcementDurationSeconds || 0);
-    if (!Number.isInteger(duration) || duration < 1 || duration > 45) {
+    if (
+      !Number.isInteger(duration)
+      || duration < 1
+      || duration > FINITE_AUDIO_X_MAX_SECONDS
+    ) {
       throw new PushcutXReceiptError('invalid');
     }
     announcementDurationSeconds = duration;
@@ -814,7 +829,7 @@ function baseReceipt(command, now, ttlSeconds) {
     providerMode: '',
     queuedAt: now,
     updatedAt: now,
-    deadlineAt: (scheduledFor || now) + RECEIPT_DEADLINE_MS,
+    deadlineAt: (scheduledFor || now) + receiptDeadlineMs(command),
     expiresAt: now + ttlSeconds * 1000,
     acceptedAt: 0,
     dispatchClaimedAt: 0,
@@ -840,6 +855,24 @@ function baseReceipt(command, now, ttlSeconds) {
     watchdogEmailId: '',
     watchdogScheduledFor: 0
   };
+}
+
+function receiptDeadlineMs(command) {
+  const finiteDurationSeconds = Number(
+    command?.announcementMode === 'finite-audio'
+      ? command?.announcementDurationSeconds
+      : 0
+  );
+  if (!Number.isFinite(finiteDurationSeconds) || finiteDurationSeconds <= 0) {
+    return RECEIPT_DEADLINE_MS;
+  }
+  return Math.min(
+    MAX_RECEIPT_DEADLINE_MS,
+    Math.max(
+      RECEIPT_DEADLINE_MS,
+      finiteDurationSeconds * 1000 + FINITE_AUDIO_RECEIPT_OVERHEAD_MS
+    )
+  );
 }
 
 function ensureCompatible(existing, candidate) {
@@ -1060,7 +1093,7 @@ export async function prepareEmailWakeXReceiptAttempt(
         executionMode: mode,
         providerMode: 'email-wake-x',
         updatedAt: now,
-        deadlineAt: now + RECEIPT_DEADLINE_MS,
+        deadlineAt: now + receiptDeadlineMs(current),
         watchdogEmailId: '',
         watchdogScheduledFor: 0,
         restoreTargetMusicPercent: null,

@@ -1,6 +1,10 @@
 import { createHash } from 'node:crypto';
 
 import {
+  enabledTimeSchedules
+} from '../src/vx/core.js';
+
+import {
   createPushcutXReceipt,
   updatePushcutXReceipt
 } from './_pushcut-receipts-x.js';
@@ -246,17 +250,14 @@ export async function renewEmailWakeXScheduleIfDue({
 }
 
 function browserMusicItemCount(state) {
-  const activeId = String(state?.activeScheduleId || '');
-  const active = Array.isArray(state?.schedules)
-    ? state.schedules.find(schedule => String(schedule?.id || '') === activeId)
-    : null;
-  if (!active || active.enabled === false || active.mode !== 'time') return 0;
-  return (Array.isArray(active.items) ? active.items : [])
-    .filter(item => (
-      item?.enabled !== false
-      && ['controlled', 'apple', 'spotify'].includes(String(item?.action?.kind || ''))
-    ))
-    .length;
+  return enabledTimeSchedules(state).reduce((count, schedule) => (
+    count + (Array.isArray(schedule.items) ? schedule.items : [])
+      .filter(item => (
+        item?.enabled !== false
+        && ['controlled', 'apple', 'spotify'].includes(String(item?.action?.kind || ''))
+      ))
+      .length
+  ), 0);
 }
 
 export async function readEmailWakeXScheduleStatus({

@@ -1,9 +1,9 @@
 const PUSHCUT_X_ENDPOINT = '/api/pushcut-x?v=x';
 const PUSHCUT_VOLUME_X_ENDPOINT = '/api/pushcut-volume-x?v=x';
 const REQUEST_TIMEOUT_MS = 20_000;
-const COMPLETION_TIMEOUT_MS = 90_000;
+const COMPLETION_TIMEOUT_MS = 240_000;
 export const PUSHCUT_MAX_ANNOUNCEMENT_CHARACTERS = 500;
-export const PUSHCUT_MAX_FINITE_AUDIO_SECONDS = 45;
+export const PUSHCUT_MAX_FINITE_AUDIO_SECONDS = 180;
 
 function cleanText(value, maximum, field) {
   const text = String(value || '').trim();

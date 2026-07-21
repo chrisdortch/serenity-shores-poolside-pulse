@@ -3,12 +3,12 @@ const EMAIL_WAKE_PAIR_X_ENDPOINT = '/api/email-wake-pair-x?v=x';
 const EMAIL_WAKE_BROWSER_LEASE_X_ENDPOINT =
   '/api/email-wake-browser-lease-x?v=x';
 const REQUEST_TIMEOUT_MS = 20_000;
-const COMPLETION_TIMEOUT_MS = 120_000;
+const COMPLETION_TIMEOUT_MS = 240_000;
 const BROWSER_AUDIO_LEASE_WAIT_MS = 150_000;
 const BROWSER_AUDIO_LEASE_RENEW_MS = 30_000;
 
 export const EMAIL_WAKE_MAX_ANNOUNCEMENT_CHARACTERS = 500;
-export const EMAIL_WAKE_MAX_FINITE_AUDIO_SECONDS = 45;
+export const EMAIL_WAKE_MAX_FINITE_AUDIO_SECONDS = 180;
 
 function cleanText(value, maximum, field) {
   const text = String(value || '').trim();

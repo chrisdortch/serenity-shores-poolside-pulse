@@ -4,19 +4,25 @@ import { describe, test } from 'node:test';
 import { AudioEngine } from '../src/vx/audio-engine.js';
 import {
   ANNOUNCEMENT_FINITE_AUDIO_MAX_SECONDS,
+  DEFAULT_APPLE_MUSIC_PLAYLIST,
   DUCK_LEVEL_PERCENT,
   STATE_VERSION,
   VERSION,
   announcementDeliveryForSource,
   audioPolicy,
   createDefaultState,
+  dueTimeScheduleItems,
+  enabledTimeSchedules,
   effectiveScheduleItemVolume,
+  findScheduleItem,
   isAppleMusicUrl,
   isSpotifyUrl,
   managerVolumePlan,
   normalizeAnnouncementSource,
+  normalizeNamedSchedule,
   normalizeScheduleItem,
   normalizeState,
+  scheduleDateKey,
   weatherRequestUrl
 } from '../src/vx/core.js';
 
@@ -101,21 +107,36 @@ describe('Poolside Pulse Version X state isolation and volume model', () => {
     }
   });
 
-  test('uses a safe Time-mode default of a 10 AM welcome and 10 PM stop', () => {
+  test('uses the complete Daily Operations default from 10 AM through quiet hours', () => {
     const state = createDefaultState(1);
     const schedule = state.schedules[0];
 
     assert.equal(schedule.mode, 'time');
-    assert.equal(schedule.items.length, 2);
+    assert.equal(schedule.items.length, 9);
     assert.deepEqual(schedule.items.map(item => [item.time, item.type]), [
       ['10:00', 'announcement'],
+      ['10:02', 'apple'],
+      ['11:30', 'announcement'],
+      ['12:30', 'announcement'],
+      ['13:30', 'announcement'],
+      ['14:30', 'announcement'],
+      ['21:45', 'announcement'],
+      ['21:55', 'announcement'],
       ['22:00', 'stop']
     ]);
     assert.equal(schedule.items[0].announcementId, 'welcome');
-    assert.equal(schedule.items[1].volume.percent, 0);
-    assert.equal(schedule.items[1].advance.mode, 'complete');
+    assert.equal(schedule.items[1].action.url, DEFAULT_APPLE_MUSIC_PLAYLIST);
+    assert.equal(schedule.items.at(-1).volume.percent, 0);
+    assert.equal(schedule.items.at(-1).advance.mode, 'complete');
     assert.deepEqual(state.schedule.map(item => [item.time, item.type, item.url, item.announcementId]), [
       ['10:00', 'announcement', '', 'welcome'],
+      ['10:02', 'apple', DEFAULT_APPLE_MUSIC_PLAYLIST, ''],
+      ['11:30', 'announcement', '', 'no-glass'],
+      ['12:30', 'announcement', '', 'owner'],
+      ['13:30', 'announcement', '', 'hydrate'],
+      ['14:30', 'announcement', '', 'manager'],
+      ['21:45', 'announcement', '', 'closing-15'],
+      ['21:55', 'announcement', '', 'closing-5'],
       ['22:00', 'stop', '', '']
     ]);
   });
@@ -153,6 +174,65 @@ describe('Poolside Pulse Version X state isolation and volume model', () => {
     assert.equal(normalized.schedules[0].items[0].action.sourceId, 'natural-voice');
   });
 
+  test('preserves concurrent Time schedule controls and honors local cancel and skip dates', () => {
+    const wednesdayAtTenChicago = Date.parse('2026-07-15T15:00:30.000Z');
+    const daily = normalizeNamedSchedule({
+      id: 'daily',
+      name: 'Daily',
+      mode: 'time',
+      enabled: true,
+      cancellable: false,
+      cancelledDates: ['bad', '2026-07-14', '2026-02-30', '2026-07-14'],
+      items: [{
+        id: 'morning',
+        time: '10:00',
+        days: [3],
+        protected: true,
+        skippedDates: ['2026-07-13', 'nope', '2026-07-13'],
+        action: {
+          kind: 'announcement',
+          announcementId: 'welcome',
+          restoreMusicPercent: 37
+        }
+      }]
+    });
+    const party = normalizeNamedSchedule({
+      id: 'party',
+      name: 'Wednesday Party',
+      mode: 'time',
+      enabled: true,
+      cancellable: true,
+      cancelledDates: ['2026-07-15'],
+      items: [{
+        id: 'party-welcome',
+        time: '10:00',
+        days: [3],
+        skippedDates: ['2026-07-15'],
+        action: { kind: 'announcement', restoreMusicPercent: 125 }
+      }]
+    });
+    const order = normalizeNamedSchedule({ id: 'manual', mode: 'order', enabled: true, items: [] });
+    const disabled = normalizeNamedSchedule({ id: 'disabled', mode: 'time', enabled: false, items: [] });
+    const state = { schedules: [daily, party, order, disabled] };
+
+    assert.equal(scheduleDateKey(wednesdayAtTenChicago), '2026-07-15');
+    assert.deepEqual(daily.cancelledDates, ['2026-07-14']);
+    assert.equal(daily.cancellable, false);
+    assert.equal(daily.items[0].protected, true);
+    assert.deepEqual(daily.items[0].skippedDates, ['2026-07-13']);
+    assert.equal(daily.items[0].action.restoreMusicPercent, 37);
+    assert.equal(party.cancellable, true);
+    assert.equal(party.items[0].action.restoreMusicPercent, 100);
+    assert.deepEqual(enabledTimeSchedules(state).map(schedule => schedule.id), ['daily', 'party']);
+    assert.equal(findScheduleItem(state, 'party-welcome')?.schedule.id, 'party');
+    assert.equal(findScheduleItem(state, 'missing'), null);
+    assert.deepEqual(
+      dueTimeScheduleItems(daily, {}, wednesdayAtTenChicago).map(item => item.id),
+      ['morning']
+    );
+    assert.deepEqual(dueTimeScheduleItems(party, {}, wednesdayAtTenChicago), []);
+  });
+
   test('preserves a supported finite announcement clip and its source references', () => {
     const source = normalizeAnnouncementSource({
       id: 'pool-chime',
@@ -185,10 +265,10 @@ describe('Poolside Pulse Version X state isolation and volume model', () => {
   });
 
   test('rejects unsafe or overlong finite clips and keeps catalog announcement sources experimental', () => {
-    assert.equal(ANNOUNCEMENT_FINITE_AUDIO_MAX_SECONDS, 45);
+    assert.equal(ANNOUNCEMENT_FINITE_AUDIO_MAX_SECONDS, 180);
     const tooLong = normalizeAnnouncementSource({
       id: 'too-long', provider: 'direct', kind: 'finite-audio', finite: true,
-      url: 'https://media.example/long.mp3', durationSeconds: 46
+      url: 'https://media.example/long.mp3', durationSeconds: 181
     });
     const insecure = normalizeAnnouncementSource({
       id: 'insecure', provider: 'direct', kind: 'finite-audio', finite: true,

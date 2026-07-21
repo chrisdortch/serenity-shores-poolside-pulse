@@ -25,7 +25,7 @@ const MAX_SUNO_HTML_BYTES = 2_000_000;
 // Vercel Functions cap request and response bodies at 4.5 MB. Leave headroom
 // for platform framing instead of accepting a file that cannot be returned.
 export const FINITE_AUDIO_X_MAX_BYTES = 4 * 1024 * 1024;
-export const FINITE_AUDIO_X_MAX_SECONDS = 45;
+export const FINITE_AUDIO_X_MAX_SECONDS = 180;
 export const FINITE_AUDIO_X_TIMEOUT_MS = 18_000;
 
 const SAFE_ERRORS = Object.freeze({

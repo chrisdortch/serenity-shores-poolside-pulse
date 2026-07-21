@@ -6,7 +6,7 @@ export const NATIVE_MUSIC_BRIDGE_NAME = 'poolsideMusic';
 const REQUEST_TIMEOUT_MS = 15_000;
 const FAIL_SAFE_TIMEOUT_MS = 20_000;
 const MUTATING_METHODS = new Set([
-  'play', 'pause', 'pauseImmediate', 'resume', 'next', 'stop', 'setVolume',
+  'play', 'pause', 'pauseImmediate', 'resume', 'previous', 'next', 'stop', 'setVolume',
   'pauseForAnnouncement', 'resumeAfterAnnouncement'
 ]);
 let requestSequence = 0;

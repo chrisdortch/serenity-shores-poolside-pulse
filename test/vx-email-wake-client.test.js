@@ -4,6 +4,7 @@ import { describe, test } from 'node:test';
 import {
   applyEmailWakeMusicVolume,
   createEmailWakePairingCode,
+  EMAIL_WAKE_MAX_FINITE_AUDIO_SECONDS,
   getEmailWakeStatus,
   sendEmailWakeAnnouncement,
   waitForEmailWakeCompletion
@@ -116,7 +117,7 @@ describe('Version X Automatic Receiver browser clients', () => {
     assert.equal(canonical.musicPercent, 30);
   });
 
-  test('validates and queues finite Suno announcement audio', async () => {
+  test('validates and queues finite Suno announcement audio through 180 seconds', async () => {
     let body;
     const fetchImpl = async (_url, options) => {
       body = JSON.parse(options.body);
@@ -135,14 +136,27 @@ describe('Version X Automatic Receiver browser clients', () => {
       announcementMode: 'finite-audio',
       announcementProvider: 'suno',
       announcementAudioUrl: 'https://cdn.example.test/pool.mp3',
-      announcementDurationSeconds: 15,
+      announcementDurationSeconds: 180,
       fetchImpl
     });
 
     assert.equal(body.announcementMode, 'finite-audio');
     assert.equal(body.announcementProvider, 'suno');
-    assert.equal(body.announcementDurationSeconds, 15);
+    assert.equal(EMAIL_WAKE_MAX_FINITE_AUDIO_SECONDS, 180);
+    assert.equal(body.announcementDurationSeconds, 180);
     assert.equal(body.musicPercent, 42);
+
+    await assert.rejects(sendEmailWakeAnnouncement({
+      eventId: 'email-wake-suno-too-long-123456',
+      text: 'Recorded pool announcement',
+      label: 'Suno Clip',
+      musicPercent: 42,
+      announcementMode: 'finite-audio',
+      announcementProvider: 'suno',
+      announcementAudioUrl: 'https://cdn.example.test/pool.mp3',
+      announcementDurationSeconds: 181,
+      fetchImpl
+    }), /1 to 180 seconds/i);
   });
 
   test('queues a receiver-volume action without announcement fields', async () => {

@@ -10,8 +10,10 @@ import {
   completeEvent,
   createTargetedEvent,
   dueTimeScheduleItems,
+  enabledTimeSchedules,
   effectiveScheduleItemVolume,
   evaluateWeather,
+  findScheduleItem,
   getActiveSchedule,
   isDirectAudioUrl,
   makeId,
@@ -24,6 +26,7 @@ import {
   resolveScheduleAnnouncementText,
   renewReceiverLease,
   safetyAnnouncementText,
+  scheduleDateKey,
   weatherRequestUrl
 } from './core.js';
 import { isIOSLike } from './audio-engine.js';
@@ -42,6 +45,7 @@ const EXTERNAL_AUDIO_INTENT_TYPES = new Map([
   ['pause-music', 'terminal'],
   ['resume-music', 'play'],
   ['stop-music', 'terminal'],
+  ['previous-music', 'play'],
   ['next-music', 'play'],
   ['calibration', 'play'],
   ['order-next', 'schedule'],
@@ -436,14 +440,15 @@ export class ReceiverRuntime {
       error.code = 'SCHEDULE_RUN_CANCELLED';
       throw error;
     }
-    const schedule = getActiveSchedule(state);
     const itemId = String(scheduledItemId || '');
-    if (schedule?.enabled !== false && schedule?.mode === 'time') {
-      const claim = state.scheduleRuns?.[itemId];
-      const item = (schedule.items || []).find(candidate => String(candidate.id || '') === itemId);
+    const claim = state.scheduleRuns?.[itemId];
+    const timeEntry = findScheduleItem(state, itemId, String(claim?.scheduleId || ''));
+    const schedule = timeEntry?.schedule || getActiveSchedule(state);
+    if (timeEntry?.schedule?.enabled !== false && timeEntry?.schedule?.mode === 'time') {
+      const item = timeEntry.item;
       const successfulStatus = claim?.status === 'in-progress' ||
         (claim?.status === 'completed' && !String(claim?.outcome || '').startsWith('cancelled-'));
-      if (item?.enabled !== false && claim?.scheduleId === schedule.id && claim?.token === token &&
+      if (item?.enabled !== false && claim?.scheduleId === timeEntry.schedule.id && claim?.token === token &&
           claim?.sessionId === this.sessionId && successfulStatus &&
           claim?.fingerprint === scheduleItemFingerprint(item)) return true;
     }
@@ -1461,11 +1466,12 @@ export class ReceiverRuntime {
     }
   }
 
-  async releaseToPushcut({ beacon = false } = {}) {
+  async releaseReceiverMode(mode = 'pushcut', { beacon = false } = {}) {
+    const requestedMode = mode === 'browser' ? 'browser' : 'pushcut';
     const receiver = this.state.receiver;
     if (!receiver?.id || !receiver?.sessionId) return false;
     if (typeof this.store.releaseReceiverSession === 'function') {
-      await this.store.releaseReceiverSession(receiver, { beacon });
+      await this.store.releaseReceiverSession(receiver, { beacon, mode: requestedMode });
       return true;
     }
     // Test/local-store compatibility. Production uses the atomic endpoint so
@@ -1473,22 +1479,28 @@ export class ReceiverRuntime {
     await this.store.mutate(draft => {
       if (draft.receiver?.id !== receiver.id || draft.receiver?.sessionId !== receiver.sessionId) return draft;
       const now = this.now();
-      draft.config = { ...(draft.config || {}), receiverMode: 'pushcut' };
+      draft.config = { ...(draft.config || {}), receiverMode: requestedMode };
       draft.receiver = {
         ...draft.receiver,
         status: 'offline',
         lastSeen: now,
         leaseUntil: 0,
-        detail: 'Browser Receiver handed control to Pushcut.'
+        detail: requestedMode === 'browser'
+          ? 'Browser Receiver stopped. Automatic Receiver remains armed.'
+          : 'Browser Receiver handed control to Pushcut.'
       };
       return draft;
-    }, 'Receiver handed to Pushcut', { requireDurable: true });
+    }, requestedMode === 'browser' ? 'Browser Receiver released' : 'Receiver handed to Pushcut', { requireDurable: true });
     return true;
   }
 
-  async failSafeStop(message, { releaseToPushcut = false, beacon = false } = {}) {
+  async releaseToPushcut({ beacon = false } = {}) {
+    return await this.releaseReceiverMode('pushcut', { beacon });
+  }
+
+  async failSafeStop(message, { releaseToPushcut = false, releaseMode = '', beacon = false } = {}) {
     if (this.failSafeStopInFlight) return await this.failSafeStopInFlight;
-    const stopping = this.performFailSafeStop(message, { releaseToPushcut, beacon });
+    const stopping = this.performFailSafeStop(message, { releaseToPushcut, releaseMode, beacon });
     this.failSafeStopInFlight = stopping;
     try {
       return await stopping;
@@ -1497,7 +1509,7 @@ export class ReceiverRuntime {
     }
   }
 
-  async performFailSafeStop(message, { releaseToPushcut = false, beacon = false } = {}) {
+  async performFailSafeStop(message, { releaseToPushcut = false, releaseMode = '', beacon = false } = {}) {
     this.beginExternalAudioIntent('terminal');
     this.nextAudioRequest();
     this.invalidateAudioRestores();
@@ -1506,9 +1518,14 @@ export class ReceiverRuntime {
     // while iOS is suspending Safari.
     this.active = false;
     this.stopLoops();
-    const handoff = releaseToPushcut
-      ? this.releaseToPushcut({ beacon }).catch(error => {
-          this.status(`Pushcut handoff could not be confirmed: ${error.message || String(error)}`, false);
+    const requestedReleaseMode = releaseMode === 'browser'
+      ? 'browser'
+      : releaseToPushcut || releaseMode === 'pushcut'
+        ? 'pushcut'
+        : '';
+    const handoff = requestedReleaseMode
+      ? this.releaseReceiverMode(requestedReleaseMode, { beacon }).catch(error => {
+          this.status(`Receiver release could not be confirmed: ${error.message || String(error)}`, false);
           return false;
         })
       : Promise.resolve(false);
@@ -1788,6 +1805,8 @@ export class ReceiverRuntime {
         return await this.resumeMusic();
       case 'stop-music':
         return await this.stopMusic();
+      case 'previous-music':
+        return await this.previousMusic();
       case 'next-music':
         return await this.nextMusic();
       case 'set-music-level':
@@ -2034,7 +2053,7 @@ export class ReceiverRuntime {
           scheduledItemId: String(scheduledItemId || ''),
           scheduledRunToken: String(scheduledRunToken || ''),
           scheduledFingerprint: scheduledRunToken
-            ? scheduleItemFingerprint((getActiveSchedule(draft)?.items || []).find(item => String(item.id || '') === String(scheduledItemId || '')))
+            ? scheduleItemFingerprint(findScheduleItem(draft, scheduledItemId)?.item)
             : '',
           updatedAt: this.now()
         };
@@ -2329,7 +2348,7 @@ export class ReceiverRuntime {
           scheduledItemId: String(scheduledItemId || ''),
           scheduledRunToken: String(scheduledRunToken || ''),
           scheduledFingerprint: scheduledRunToken
-            ? scheduleItemFingerprint((getActiveSchedule(draft)?.items || []).find(item => String(item.id || '') === String(scheduledItemId || '')))
+            ? scheduleItemFingerprint(findScheduleItem(draft, scheduledItemId)?.item)
             : '',
           updatedAt: this.now(),
           volumeVerified: !!physical.result.volume?.verified,
@@ -2600,7 +2619,7 @@ export class ReceiverRuntime {
           scheduledItemId: String(scheduledItemId || ''),
           scheduledRunToken: String(scheduledRunToken || ''),
           scheduledFingerprint: scheduledRunToken
-            ? scheduleItemFingerprint((getActiveSchedule(draft)?.items || []).find(item => String(item.id || '') === String(scheduledItemId || '')))
+            ? scheduleItemFingerprint(findScheduleItem(draft, scheduledItemId)?.item)
             : '',
           updatedAt: this.now(),
           volumeVerified: !!physical.result.volume?.verified,
@@ -3016,7 +3035,16 @@ export class ReceiverRuntime {
     }
   }
 
-  async nextMusic({ automatic = false, expectedUrl = '', postSafety = false, externalIntentGeneration = null } = {}) {
+  async nextMusic(options = {}) {
+    return await this.skipMusic('next', options);
+  }
+
+  async previousMusic(options = {}) {
+    return await this.skipMusic('previous', options);
+  }
+
+  async skipMusic(direction = 'next', { automatic = false, expectedUrl = '', postSafety = false, externalIntentGeneration = null } = {}) {
+    const goingPrevious = direction === 'previous';
     this.assertExternalAudioIntent(externalIntentGeneration, 'A newer audio command replaced this deferred next-track action.');
     if (automatic && (this.safetyPendingCount > 0 || this.currentAnnouncement?.safety || this.announcementQueue.some(job => job.safety))) {
       this.deferredAutomaticNext = {
@@ -3050,7 +3078,7 @@ export class ReceiverRuntime {
       this.audio.pauseMusic();
       let state;
       try {
-        state = await this.apple.next({ assertCurrent: () => this.assertAudioRequest(requestId, epoch) });
+        state = await this.apple[goingPrevious ? 'previous' : 'next']({ assertCurrent: () => this.assertAudioRequest(requestId, epoch) });
       } catch (error) {
         if (requestId !== this.audioRequestId || epoch !== this.audioEpoch || !this.isOwner()) {
           try {
@@ -3071,10 +3099,10 @@ export class ReceiverRuntime {
       }
       const label = state?.name
         ? `${state.name}${state.artists ? ` - ${state.artists}` : ''}`
-        : (this.apple.current?.name || 'Apple Music next track');
+        : (this.apple.current?.name || `Apple Music ${goingPrevious ? 'previous' : 'next'} track`);
       this.physicalProvider = 'apple';
       this.physicalRequestId = requestId;
-        return { provider, patch: { provider: 'apple', intent: 'playing', label, positionMs: Number(state?.position || 0), unavailableReason: '' }, title: 'Apple Music skipped' };
+        return { provider, patch: { provider: 'apple', intent: 'playing', label, positionMs: Number(state?.position || 0), unavailableReason: '' }, title: `Apple Music ${goingPrevious ? 'previous' : 'next'}` };
       }
       if (provider === 'spotify') {
       if (this.apple.ready || this.apple.current?.paused === false) {
@@ -3084,7 +3112,7 @@ export class ReceiverRuntime {
       this.audio.pauseMusic();
       let state;
       try {
-        state = await this.spotify.next({ assertCurrent: () => this.assertAudioRequest(requestId, epoch) });
+        state = await this.spotify[goingPrevious ? 'previous' : 'next']({ assertCurrent: () => this.assertAudioRequest(requestId, epoch) });
       } catch (error) {
         if (requestId !== this.audioRequestId || epoch !== this.audioEpoch || !this.isOwner()) {
           try {
@@ -3105,10 +3133,10 @@ export class ReceiverRuntime {
       }
       const label = state?.name
         ? `${state.name}${state.artists ? ` - ${state.artists}` : ''}`
-        : (this.spotify.current?.name || 'Spotify next track');
+        : (this.spotify.current?.name || `Spotify ${goingPrevious ? 'previous' : 'next'} track`);
       this.physicalProvider = 'spotify';
       this.physicalRequestId = requestId;
-        return { provider, patch: { provider: 'spotify', intent: 'playing', label, positionMs: Number(state?.position || 0), unavailableReason: '' }, title: 'Spotify skipped' };
+        return { provider, patch: { provider: 'spotify', intent: 'playing', label, positionMs: Number(state?.position || 0), unavailableReason: '' }, title: `Spotify ${goingPrevious ? 'previous' : 'next'}` };
       }
       const tracks = Array.isArray(playback.tracks) ? playback.tracks : [];
       if (!tracks.length) throw new Error('No controlled playlist is loaded.');
@@ -3121,8 +3149,16 @@ export class ReceiverRuntime {
         this.assertAudioRequest(requestId, epoch, 'Controlled skip was superseded while Spotify was being silenced.');
       }
       this.applyConfiguredMusicTarget({ report: false });
-      const nextIndex = (Number(playback.trackIndex || 0) + 1) % tracks.length;
+      const nextIndex = goingPrevious
+        ? (Number(playback.trackIndex || 0) - 1 + tracks.length) % tracks.length
+        : (Number(playback.trackIndex || 0) + 1) % tracks.length;
       const track = tracks[nextIndex];
+      if (goingPrevious && tracks.length === 1 && this.audio.musicElement) {
+        try {
+          this.audio.musicElement.currentTime = 0;
+          this.audio.musicElement.pause();
+        } catch {}
+      }
       await this.audio.playMusicUrl(track.audioUrl, { label: track.title, loop: tracks.length === 1, scheduledRunToken: playback.scheduledRunToken });
       if (automatic && playback.scheduledRunToken) {
         this.assertScheduledRunAuthorization(
@@ -3137,7 +3173,7 @@ export class ReceiverRuntime {
       }
       this.physicalProvider = 'controlled';
       this.physicalRequestId = requestId;
-      return { provider, patch: { provider: 'controlled', intent: 'playing', label: `${track.title}${track.artist ? ` - ${track.artist}` : ''}`, audioUrl: track.audioUrl, trackIndex: nextIndex, positionMs: 0 }, title: 'Controlled track skipped' };
+      return { provider, patch: { provider: 'controlled', intent: 'playing', label: `${track.title}${track.artist ? ` - ${track.artist}` : ''}`, audioUrl: track.audioUrl, trackIndex: nextIndex, positionMs: 0 }, title: `Controlled track ${goingPrevious ? 'previous' : 'next'}` };
     });
     if (!physical) return false;
     try {
@@ -4411,21 +4447,19 @@ export class ReceiverRuntime {
           && await this.externalAutomationBusy()
         ) return;
         await this.tickOrderSchedule();
-        return;
       }
       const now = this.now();
       const automaticAnnouncements =
         this.automaticReceiverEnabled();
-      const allDue = dueTimeScheduleItems(
-        getActiveSchedule(this.state),
-        this.state.scheduleRuns,
-        now
+      const allDue = enabledTimeSchedules(this.state).flatMap(schedule =>
+        dueTimeScheduleItems(schedule, this.state.scheduleRuns, now)
+          .map(item => ({ scheduleId: schedule.id, item }))
       );
       const delegatedDue = automaticAnnouncements
         ? allDue.filter(
-            item =>
+            entry =>
               ['announcement', 'stop'].includes(
-                String(item.action?.kind || item.type || 'announcement')
+                String(entry.item.action?.kind || entry.item.type || 'announcement')
               )
           )
         : [];
@@ -4434,7 +4468,7 @@ export class ReceiverRuntime {
         && this.shouldDelegateScheduledAnnouncements() !== true
       ) {
         const holdNotice = delegatedDue
-          .map(item => String(item.id || 'announcement'))
+          .map(entry => `${String(entry.scheduleId || 'schedule')}:${String(entry.item.id || 'announcement')}`)
           .sort()
           .join(',');
         if (holdNotice !== this.automaticScheduleHoldNotice) {
@@ -4452,18 +4486,17 @@ export class ReceiverRuntime {
       // copy even when its latest status is stale or unavailable; browser
       // fallback would therefore create deterministic duplicate announcements.
       const due = allDue.filter(
-        item =>
+        entry =>
           !automaticAnnouncements
           || !['announcement', 'stop'].includes(
-            String(item.action?.kind || item.type || 'announcement')
+            String(entry.item.action?.kind || entry.item.type || 'announcement')
           )
       );
       if (due.length && await this.externalAutomationBusy()) return;
-      for (const dueItem of due) {
-      const dateParts = new Intl.DateTimeFormat('en-US', { timeZone: 'America/Chicago', year: 'numeric', month: '2-digit', day: '2-digit' })
-        .formatToParts(new Date(now));
-      const dateValues = Object.fromEntries(dateParts.map(part => [part.type, part.value]));
-      const dateKey = `${dateValues.year}-${dateValues.month}-${dateValues.day}`;
+      for (const dueEntry of due) {
+      const dueItem = dueEntry.item;
+      const dueScheduleId = String(dueEntry.scheduleId || '');
+      const dateKey = scheduleDateKey(now);
       const localKey = `${dueItem.id}:${dateKey}`;
       if (this.scheduleCompletedLocal.has(localKey)) continue;
       const externalIntentGeneration = this.beginExternalAudioIntent('time-schedule');
@@ -4472,9 +4505,13 @@ export class ReceiverRuntime {
       await this.store.mutate(draft => {
         item = null;
         this.assertExternalAudioIntent(externalIntentGeneration, 'A newer audio command cancelled this Time schedule claim.');
-        const latest = dueTimeScheduleItems(getActiveSchedule(draft), draft.scheduleRuns, now)
-          .find(candidate => candidate.id === dueItem.id);
-        if (!latest) return draft;
+        const latestSchedule = enabledTimeSchedules(draft)
+          .find(candidate => String(candidate.id || '') === dueScheduleId);
+        const latest = latestSchedule
+          ? dueTimeScheduleItems(latestSchedule, draft.scheduleRuns, now)
+              .find(candidate => candidate.id === dueItem.id)
+          : null;
+        if (!latest || !latestSchedule) return draft;
         const existing = draft.scheduleRuns?.[latest.id];
         const activeClaim = existing && typeof existing === 'object' &&
           existing.dateKey === dateKey && existing.status === 'in-progress' &&
@@ -4487,7 +4524,7 @@ export class ReceiverRuntime {
             dateKey,
             status: 'in-progress',
             token: timeRunToken,
-            scheduleId: getActiveSchedule(draft)?.id || '',
+            scheduleId: latestSchedule.id,
             fingerprint: scheduleItemFingerprint(latest),
             claimedAt: this.now(),
             receiverId: this.deviceId,
@@ -4520,7 +4557,7 @@ export class ReceiverRuntime {
               }
             };
           }
-          draft.activityLog = [makeLog('schedule', 'Scheduled item cancelled by newer audio command', `${item.label}: ${error.message}`, this.now(), { scheduleId: item.id }), ...(draft.activityLog || [])];
+          draft.activityLog = [makeLog('schedule', 'Scheduled item cancelled by newer audio command', `${item.label}: ${error.message}`, this.now(), { scheduleId: claim.scheduleId, scheduleItemId: item.id }), ...(draft.activityLog || [])];
           return draft;
         }, 'Schedule cancellation recorded', { requireDurable: true });
         this.scheduleCompletedLocal.add(localKey);
@@ -4590,7 +4627,7 @@ export class ReceiverRuntime {
               sessionId: this.sessionId
             }
           };
-          draft.activityLog = [makeLog('schedule', 'Scheduled item completed', `${item.time} - ${item.label}`, this.now(), { scheduleId: item.id }), ...(draft.activityLog || [])];
+          draft.activityLog = [makeLog('schedule', 'Scheduled item completed', `${item.time} - ${item.label}`, this.now(), { scheduleId: claim.scheduleId, scheduleItemId: item.id }), ...(draft.activityLog || [])];
           return draft;
         }, 'Schedule run recorded', { requireDurable: true });
       } catch (error) {
@@ -4634,7 +4671,7 @@ export class ReceiverRuntime {
                 : 'Scheduled item failed; retry remains eligible',
             `${item.label}: ${error.message}`,
             this.now(),
-            { scheduleId: item.id }
+            { scheduleId: claim.scheduleId, scheduleItemId: item.id }
           ), ...(draft.activityLog || [])];
           return draft;
         }, 'Schedule failure recorded', { requireDurable: true });

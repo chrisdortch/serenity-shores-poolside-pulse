@@ -1396,6 +1396,36 @@ export class AppleMusicReceiver {
     return state;
   }
 
+  async previous({ assertCurrent = null } = {}) {
+    if (this.nativeEnabled()) {
+      if (!this.ready || !this.deviceId) throw new Error('Apple Music receiver is not connected.');
+      assertOperation(assertCurrent);
+      const raw = await this.nativeCall('previous', { volumePercent: this.targetVolumePercent });
+      this.applyNativePlayback(raw);
+      assertOperation(assertCurrent);
+      const state = await this.waitForPlayback(true, 6_000);
+      assertOperation(assertCurrent);
+      await this.enforceVolume(this.targetVolumePercent);
+      assertOperation(assertCurrent);
+      return state;
+    }
+    if (!this.music || !this.ready || !this.deviceId) throw new Error('Apple Music receiver is not connected.');
+    assertOperation(assertCurrent);
+    await this.callPlayer('skipToPreviousItem');
+    assertOperation(assertCurrent);
+    await wait(200);
+    let state = await this.playbackState();
+    if (!state.isPlaying) {
+      const resumed = await this.resume({ assertCurrent });
+      if (!resumed) throw new Error('Apple Music did not resume after skipping to the previous track.');
+      state = await this.playbackState();
+    } else if (this.supportsVolume) {
+      await this.enforceVolume().catch(() => {});
+    }
+    this.syncCurrent(false);
+    return state;
+  }
+
   async fadeRawVolume(toPercent, durationMs = 240) {
     if (this.nativeEnabled()) {
       if (!this.supportsVolume) return false;

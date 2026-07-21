@@ -1255,6 +1255,48 @@ export class SpotifyReceiver {
     return state || { isPlaying: true };
   }
 
+  async previous({ assertCurrent = null } = {}) {
+    if (!this.deviceId) throw new Error('Spotify receiver is not connected.');
+    assertOperation(assertCurrent);
+    const before = await this.playbackState().catch(() => null);
+    assertOperation(assertCurrent);
+    if (this.supportsVolume) await this.enforceVolume();
+    assertOperation(assertCurrent);
+    await this.api('POST', '/me/player/previous', null, { device_id: this.deviceId });
+    assertOperation(assertCurrent);
+    const startedAt = Date.now();
+    let state = null;
+    while (Date.now() - startedAt < 4_000) {
+      state = await this.playbackState().catch(() => null);
+      assertOperation(assertCurrent);
+      const uriChanged = !!state?.uri && (!before?.uri || state.uri !== before.uri);
+      const sameTrackReset = !!state?.uri && !!before?.uri && state.uri === before.uri
+        && Number(state.position || 0) + 500 < Number(before.position || 0);
+      if (uriChanged || sameTrackReset) break;
+      await wait(200);
+    }
+    if (!state?.isPlaying) {
+      const playing = await this.resume({ assertCurrent });
+      if (!playing) throw new Error('Spotify did not confirm playback after skipping to the previous track.');
+      state = await this.playbackState();
+      assertOperation(assertCurrent);
+    } else {
+      await this.enforceVolume().catch(() => {});
+    }
+    if (state?.name) {
+      this.current = {
+        ...(this.current || {}),
+        paused: !state.isPlaying,
+        position: state.position,
+        uri: state.uri,
+        name: state.name,
+        artists: state.artists
+      };
+      this.onState(this.current);
+    }
+    return state || { isPlaying: true };
+  }
+
   async pauseForAnnouncement() {
     let stateKnown = false;
     let snapshot = { wasPlaying: false, position: 0, uri: '', deviceId: this.deviceId };

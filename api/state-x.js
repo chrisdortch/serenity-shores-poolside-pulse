@@ -9,7 +9,7 @@ const KV_REQUEST_TIMEOUT_MS = 8_000;
 const MAX_REQUEST_BYTES = 1_100_000;
 const MAX_STATE_BYTES = 1_000_000;
 const MAX_ANNOUNCEMENT_SOURCES = 200;
-const MAX_FINITE_ANNOUNCEMENT_SECONDS = 45;
+const MAX_FINITE_ANNOUNCEMENT_SECONDS = 180;
 const X_BED_PROVIDER_ALIASES = new Map([
   ['apple', 'apple'],
   ['audio', 'controlled'],
@@ -755,16 +755,19 @@ export async function readCanonicalVersionXState({
 }
 
 /**
- * Releases only the exact Browser Receiver session named by the caller and
- * hands canonical receiver ownership to Pushcut mode. The durable path uses
- * the same compare-and-set revision gate as ordinary state saves. If another
- * writer replaces the receiver between GET and CAS, the replacement is read
- * and matched again before any retry, so a stale session cannot release a
- * newer receiver.
+ * Releases only the exact Browser Receiver session named by the caller. The
+ * requested canonical mode is preserved atomically with the offline lease:
+ * `pushcut` performs the legacy handoff, while `browser` keeps Automatic
+ * Receiver selected after Safari closes. The durable path uses the same
+ * compare-and-set revision gate as ordinary state saves. If another writer
+ * replaces the receiver between GET and CAS, the replacement is read and
+ * matched again before any retry, so a stale session cannot release a newer
+ * receiver.
  */
 export async function releaseVersionXReceiverSession({
   receiverId,
   sessionId,
+  mode = 'pushcut',
   env = process.env,
   fetchImpl = globalThis.fetch,
   now = Date.now,
@@ -773,8 +776,14 @@ export async function releaseVersionXReceiverSession({
 } = {}) {
   const expectedReceiverId = boundedString(receiverId, 160);
   const expectedSessionId = boundedString(sessionId, 160);
+  const receiverMode = String(mode || '').trim().toLowerCase();
   if (!expectedReceiverId || !expectedSessionId) {
     const error = new Error('receiverId and sessionId are required.');
+    error.statusCode = 400;
+    throw error;
+  }
+  if (!['browser', 'pushcut'].includes(receiverMode)) {
+    const error = new Error('Receiver release mode must be "browser" or "pushcut".');
     error.statusCode = 400;
     throw error;
   }
@@ -806,7 +815,7 @@ export async function releaseVersionXReceiverSession({
 
     const alreadyReleased = receiver.status === 'offline'
       && Number(receiver.leaseUntil || 0) <= releaseAt
-      && current.config?.receiverMode === 'pushcut';
+      && current.config?.receiverMode === receiverMode;
     if (alreadyReleased) {
       return {
         matched: true,
@@ -823,14 +832,16 @@ export async function releaseVersionXReceiverSession({
       ...current,
       config: {
         ...(current?.config || {}),
-        receiverMode: 'pushcut'
+        receiverMode
       },
       receiver: {
         ...receiver,
         status: 'offline',
         lastSeen: releaseAt,
         leaseUntil: releaseAt,
-        detail: 'Browser Receiver released for Pushcut handoff.'
+        detail: receiverMode === 'pushcut'
+          ? 'Browser Receiver released for Pushcut handoff.'
+          : 'Browser Receiver page closed; Browser Receiver remains selected.'
       }
     }, stored, releaseAt);
     const raw = JSON.stringify(next);

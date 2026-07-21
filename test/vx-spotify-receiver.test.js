@@ -553,7 +553,7 @@ describe('Version X receiver-mode and setup UI hardening', () => {
     assert.match(VX_APP_SOURCE, /Account authorization persists separately from playback activation/);
   });
 
-  test('shows verified Pushcut status without gating idle one-click commands and records mode transitions', () => {
+  test('keeps Pushcut as a legacy fallback while Automatic Receiver owns normal announcements', () => {
     assert.match(VX_APP_SOURCE, /function pushcutAnnouncementOperational\(\)/);
     assert.match(VX_APP_SOURCE, /pushcutStatus\.operational === true/);
     assert.match(VX_APP_SOURCE, /pushcutStatus\.connectedReady === true/);
@@ -561,7 +561,9 @@ describe('Version X receiver-mode and setup UI hardening', () => {
     assert.match(VX_APP_SOURCE, /Every command waits for its own signed completion receipt/);
     assert.match(VX_APP_SOURCE, /await selectSharedReceiverMode\('browser'\)/);
     assert.match(VX_APP_SOURCE, /await selectSharedReceiverMode\('pushcut'\)/);
-    assert.match(VX_APP_SOURCE, /releaseToPushcut: true,[\s\S]*beacon: true/);
+    assert.match(VX_APP_SOURCE, /if \(automaticAnnouncementsEnabled\(state\)\) return 'browser'/);
+    assert.match(VX_APP_SOURCE, /if \(!automaticAnnouncementsEnabled\(\)\) queuePushcutScheduleSync\(0\)/);
+    assert.match(VX_APP_SOURCE, /releaseMode: automaticAnnouncementsEnabled\(\) \? 'browser' : 'pushcut',[\s\S]*beacon: true/);
     assert.doesNotMatch(VX_APP_SOURCE, /pagehide[\s\S]{0,800}store\.releaseReceiverSession/);
   });
 
@@ -574,7 +576,7 @@ describe('Version X receiver-mode and setup UI hardening', () => {
     assert.match(VX_APP_SOURCE, /addEventListener\('touchend'[\s\S]*flushMusicLevelSave\(musicSlider\.value\)/);
   });
 
-  test('keeps Browser-mode announcement and schedule controls disabled while its lease is offline', () => {
+  test('keeps Browser music controls offline without disabling Automatic Receiver announcements', () => {
     const announceStart = VX_APP_SOURCE.indexOf('function renderAnnounce');
     const announceEnd = VX_APP_SOURCE.indexOf('function scheduleItemSource', announceStart);
     const announceSource = VX_APP_SOURCE.slice(announceStart, announceEnd);
@@ -591,6 +593,56 @@ describe('Version X receiver-mode and setup UI hardening', () => {
     assert.match(scheduleSource, /const browserReady = operatingMode === 'browser' && receiverOnline/);
     assert.match(scheduleSource, /Mixed and automatic Browser schedules are stopped/);
     assert.match(scheduleSource, /sequenceRun\.status !== 'complete' && browserReady/);
-    assert.match(scheduleSource, /The selected receiver is offline; no scheduled item can run/);
+    assert.match(scheduleSource, /Background announcements and quiet-hours 0% output remain automatic/);
+    assert.match(scheduleSource, /Start Browser Receiver for music/);
+  });
+});
+
+describe('Version X Spotify previous-track transport', { concurrency: false }, () => {
+  test('accepts either a changed URI or a same-track position reset', async () => {
+    const env = browserEnvironment();
+    try {
+      const scenarios = [
+        {
+          name: 'changed URI',
+          before: { isPlaying: true, uri: 'spotify:track:one', position: 90_000 },
+          after: { isPlaying: true, uri: 'spotify:track:zero', position: 800, name: 'Previous Song', artists: 'Poolside' }
+        },
+        {
+          name: 'same-track reset',
+          before: { isPlaying: true, uri: 'spotify:track:one', position: 90_000 },
+          after: { isPlaying: true, uri: 'spotify:track:one', position: 300, name: 'Restarted Song', artists: 'Poolside' }
+        }
+      ];
+
+      for (const scenario of scenarios) {
+        const requests = [];
+        const states = [scenario.before, scenario.after];
+        const receiver = new SpotifyReceiver({ clientId: 'client-id' });
+        receiver.deviceId = 'spotify-device-x';
+        receiver.ready = true;
+        receiver.player = {};
+        receiver.playbackState = async () => states.shift() || scenario.after;
+        receiver.enforceVolume = async () => ({ verified: false });
+        receiver.api = async (method, path, body, query) => {
+          requests.push({ method, path, body, query });
+          return {};
+        };
+
+        const state = await receiver.previous();
+
+        assert.deepEqual(requests, [{
+          method: 'POST',
+          path: '/me/player/previous',
+          body: null,
+          query: { device_id: 'spotify-device-x' }
+        }], scenario.name);
+        assert.equal(state.uri, scenario.after.uri, scenario.name);
+        assert.equal(state.position, scenario.after.position, scenario.name);
+        assert.equal(state.isPlaying, true, scenario.name);
+      }
+    } finally {
+      env.restore();
+    }
   });
 });

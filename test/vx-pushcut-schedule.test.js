@@ -205,7 +205,7 @@ beforeEach(() => {
 });
 
 describe('Version X Central Time occurrence planner', { concurrency: false }, () => {
-  test('plans a bounded rolling horizon for active Time-mode announcements only', () => {
+  test('plans a bounded rolling horizon for enabled Time-mode announcements only', () => {
     const plan = planPushcutXSchedule(scheduleState(), {
       now: NOW,
       horizonDays: 7
@@ -232,6 +232,73 @@ describe('Version X Central Time occurrence planner', { concurrency: false }, ()
     const orderState = scheduleState();
     orderState.schedules[0].mode = 'order';
     assert.equal(planPushcutXSchedule(orderState, { now: NOW }).occurrences.length, 0);
+  });
+
+  test('plans every enabled Time schedule together and honors cancel, skip, and restore targets', () => {
+    const state = scheduleState();
+    const sharedItem = {
+      label: 'Party message',
+      enabled: true,
+      days: [5],
+      action: {
+        kind: 'announcement',
+        announcementSource: 'saved',
+        announcementId: 'scheduled-message',
+        sourceId: 'natural-voice',
+        restoreMusicPercent: 100
+      },
+      volume: { mode: 'global', percent: 100 },
+      advance: { mode: 'complete', durationSeconds: 300 }
+    };
+    state.schedules.push({
+      id: 'wednesday-party',
+      name: 'Wednesday Party',
+      mode: 'time',
+      enabled: true,
+      cancellable: true,
+      items: [{
+        ...sharedItem,
+        id: 'party-message',
+        position: { time: '10:35', order: 1 }
+      }, {
+        ...sharedItem,
+        id: 'skipped-message',
+        skippedDates: ['2026-07-17'],
+        position: { time: '10:36', order: 2 }
+      }]
+    }, {
+      id: 'cancelled-party',
+      name: 'Cancelled Party',
+      mode: 'time',
+      enabled: true,
+      cancellable: true,
+      cancelledDates: ['2026-07-17'],
+      items: [{
+        ...sharedItem,
+        id: 'cancelled-message',
+        position: { time: '10:37', order: 1 }
+      }]
+    }, {
+      id: 'selected-order-cue',
+      name: 'Selected Order Cue',
+      mode: 'order',
+      enabled: true,
+      items: []
+    });
+    state.activeScheduleId = 'selected-order-cue';
+
+    const plan = planPushcutXSchedule(state, { now: NOW, horizonDays: 7 });
+    assert.deepEqual(
+      plan.occurrences.map(item => [item.scheduleId, item.itemId]),
+      [
+        ['active-time', 'scheduled-item'],
+        ['wednesday-party', 'party-message']
+      ]
+    );
+    const party = plan.occurrences[1];
+    assert.equal(party.musicPercent, 100);
+    assert.equal(party.musicLevel, 1);
+    assert.equal(party.recoveryFor, party.scheduledFor + 65_000);
   });
 
   test('adds quiet-hours volume occurrences only for the Automatic Receiver planner', () => {
@@ -330,12 +397,12 @@ describe('Version X Central Time occurrence planner', { concurrency: false }, ()
         kind: 'finite-audio',
         url: 'https://media.example/message.mp3',
         finite: true,
-        durationSeconds: 12
+        durationSeconds: 137
       }
     }), { now: NOW });
     assert.equal(finite.occurrences[0].announcementMode, 'finite-audio');
-    assert.equal(finite.occurrences[0].announcementDurationSeconds, 12);
-    assert.equal(finite.occurrences[0].recoveryFor, finite.occurrences[0].scheduledFor + 20_000);
+    assert.equal(finite.occurrences[0].announcementDurationSeconds, 137);
+    assert.equal(finite.occurrences[0].recoveryFor, finite.occurrences[0].scheduledFor + 145_000);
 
     const catalog = planPushcutXSchedule(scheduleState({
       source: {

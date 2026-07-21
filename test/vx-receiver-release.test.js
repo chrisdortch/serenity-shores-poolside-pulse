@@ -112,7 +112,7 @@ after(() => {
 });
 
 describe('Version X receiver release handoff', () => {
-  test('requires a same-origin authenticated Version X pushcut release request', async () => {
+  test('requires a same-origin authenticated Version X receiver release request', async () => {
     const handler = memoryReleaseHandler();
     const unauthenticated = await invoke(handler, request('POST', '/api/receiver-release-x?v=x', {
       body: { version: 'x', receiverId: 'receiver-a', sessionId: 'session-a', mode: 'pushcut' }
@@ -121,10 +121,10 @@ describe('Version X receiver release handoff', () => {
 
     const wrongMode = await invoke(handler, request('POST', '/api/receiver-release-x?v=x', {
       cookie: xCookie(),
-      body: { version: 'x', receiverId: 'receiver-a', sessionId: 'session-a', mode: 'browser' }
+      body: { version: 'x', receiverId: 'receiver-a', sessionId: 'session-a', mode: 'automatic' }
     }));
     assert.equal(wrongMode.statusCode, 400);
-    assert.match(wrongMode.json().error, /pushcut/i);
+    assert.match(wrongMode.json().error, /browser.*pushcut/i);
 
     const wrongVersion = await invoke(handler, request('POST', '/api/receiver-release-x?v=x', {
       cookie: xCookie(),
@@ -168,6 +168,58 @@ describe('Version X receiver release handoff', () => {
     const read = await invoke(stateXHandler, request('GET', '/api/state-x?v=x', { cookie: xCookie() }));
     assert.equal(read.statusCode, 200);
     assert.deepEqual(read.json().state, body.state);
+  });
+
+  test('atomically expires the matching lease while preserving browser mode', async () => {
+    const initial = await saveReceiver({ receiverId: 'receiver-browser', sessionId: 'session-browser' });
+    assert.equal(initial.config.receiverMode, 'browser');
+
+    const released = await invoke(memoryReleaseHandler(50_000), request('POST', '/api/receiver-release-x?v=x', {
+      cookie: xCookie(),
+      body: {
+        version: 'x',
+        receiverId: 'receiver-browser',
+        sessionId: 'session-browser',
+        mode: 'browser'
+      }
+    }));
+    assert.equal(released.statusCode, 200);
+    const body = released.json();
+    assert.equal(body.ok, true);
+    assert.equal(body.released, true);
+    assert.equal(body.changed, true);
+    assert.equal(body.receiverMode, 'browser');
+    assert.equal(body.state.config.receiverMode, 'browser');
+    assert.equal(body.state.receiver.status, 'offline');
+    assert.equal(body.state.receiver.lastSeen, 50_000);
+    assert.equal(body.state.receiver.leaseUntil, 50_000);
+    assert.match(body.state.receiver.detail, /remains selected/i);
+
+    const second = await releaseVersionXReceiverSession({
+      receiverId: 'receiver-browser',
+      sessionId: 'session-browser',
+      mode: 'browser',
+      requireDurable: false,
+      now: () => 50_000
+    });
+    assert.equal(second.changed, false);
+    assert.equal(second.reason, 'already-released');
+    assert.equal(second.revision, body.revision);
+  });
+
+  test('defaults omitted mode to the legacy pushcut handoff', async () => {
+    await saveReceiver({ receiverId: 'receiver-default', sessionId: 'session-default' });
+    const released = await invoke(memoryReleaseHandler(50_000), request('POST', '/api/receiver-release-x?v=x', {
+      cookie: xCookie(),
+      body: {
+        version: 'x',
+        receiverId: 'receiver-default',
+        sessionId: 'session-default'
+      }
+    }));
+    assert.equal(released.statusCode, 200);
+    assert.equal(released.json().receiverMode, 'pushcut');
+    assert.equal(released.json().state.config.receiverMode, 'pushcut');
   });
 
   test('is idempotent for the same released session without consuming another revision', async () => {

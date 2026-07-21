@@ -5,7 +5,7 @@ import {
 
 import {
   announcementDeliveryForSource,
-  getActiveSchedule,
+  enabledTimeSchedules,
   inlineAnnouncementText,
   normalizeState,
   safetyAnnouncementText
@@ -546,7 +546,6 @@ export function planPushcutXSchedule(stateInput, {
   if (
     !isRecord(stateInput)
     || !Array.isArray(stateInput.schedules)
-    || !bounded(stateInput.activeScheduleId, 120)
   ) fail('invalid');
   const safeNow = Number(now);
   if (!Number.isSafeInteger(safeNow) || safeNow < 0) fail('invalid');
@@ -556,9 +555,9 @@ export function planPushcutXSchedule(stateInput, {
   let horizonEnd = safeNow + effectiveHorizonDays * 24 * 60 * 60 * 1000;
   const state = normalizeState(stateInput, safeNow);
   const levels = pushcutXVolumeLevels(canonicalPushcutXMusicPercent(state));
-  const active = getActiveSchedule(state);
+  const timeSchedules = enabledTimeSchedules(state);
   const warnings = [];
-  if (!active || active.enabled === false || active.mode !== 'time') {
+  if (!timeSchedules.length) {
     return Object.freeze({
       timeZone,
       horizonEnd,
@@ -567,12 +566,14 @@ export function planPushcutXSchedule(stateInput, {
       warnings: Object.freeze(warnings)
     });
   }
-  const enabledAnnouncementCount = (active.items || [])
-    .filter(item => item.enabled !== false && (
-      item.action?.kind === 'announcement'
-      || (includeStops === true && item.action?.kind === 'stop')
-    ))
-    .length;
+  const enabledAnnouncementCount = timeSchedules.reduce((count, schedule) => (
+    count + (schedule.items || [])
+      .filter(item => item.enabled !== false && (
+        item.action?.kind === 'announcement'
+        || (includeStops === true && item.action?.kind === 'stop')
+      ))
+      .length
+  ), 0);
   if (enabledAnnouncementCount > 0) {
     const capacityHorizonDays = Math.max(
       7,
@@ -581,93 +582,102 @@ export function planPushcutXSchedule(stateInput, {
     effectiveHorizonDays = Math.min(effectiveHorizonDays, capacityHorizonDays);
     horizonEnd = safeNow + effectiveHorizonDays * 24 * 60 * 60 * 1000;
     if (effectiveHorizonDays < boundedHorizonDays) {
-      warnings.push(`The rolling schedule window was limited to ${effectiveHorizonDays} days because this schedule contains ${enabledAnnouncementCount} active announcements.`);
+      warnings.push(`The rolling schedule window was limited to ${effectiveHorizonDays} days because the enabled Time schedules contain ${enabledAnnouncementCount} active announcements.`);
     }
   }
   const dates = localDates(safeNow, effectiveHorizonDays, timeZone);
   const occurrences = [];
-  for (const item of active.items || []) {
-    const actionKind = String(item.action?.kind || item.type || 'announcement');
-    const isStop = includeStops === true && actionKind === 'stop';
-    if (item.enabled === false || (actionKind !== 'announcement' && !isStop)) continue;
-    const announcement = isStop
-      ? null
-      : announcementForItem(item, state);
-    if (announcement?.warning) {
-      warnings.push(announcement.warning);
-      continue;
-    }
-    const time = bounded(item.position?.time || item.time, 5);
-    const match = /^(\d{2}):(\d{2})$/.exec(time);
-    if (!match) {
-      warnings.push(`${item.label}: invalid time.`);
-      continue;
-    }
-    const days = new Set(Array.isArray(item.days) ? item.days : [0, 1, 2, 3, 4, 5, 6]);
-    for (const date of dates) {
-      if (!days.has(date.weekday)) continue;
-      const scheduledFor = zonedOccurrenceTimestamp({
-        ...date,
-        hour: Number(match[1]),
-        minute: Number(match[2])
-      }, timeZone);
-      if (!scheduledFor) {
-        warnings.push(`${item.label}: ${date.key} ${time} does not exist in ${timeZone} because of a clock change.`);
+  for (const schedule of timeSchedules) {
+    const cancelledDates = new Set(Array.isArray(schedule.cancelledDates) ? schedule.cancelledDates : []);
+    for (const item of schedule.items || []) {
+      const actionKind = String(item.action?.kind || item.type || 'announcement');
+      const isStop = includeStops === true && actionKind === 'stop';
+      if (item.enabled === false || (actionKind !== 'announcement' && !isStop)) continue;
+      const announcement = isStop
+        ? null
+        : announcementForItem(item, state);
+      if (announcement?.warning) {
+        warnings.push(announcement.warning);
         continue;
       }
-      const delaySeconds = Math.ceil((scheduledFor - safeNow) / 1000);
-      if (
-        delaySeconds < PUSHCUT_X_SCHEDULE_MIN_DELAY_SECONDS
-        || delaySeconds > PUSHCUT_X_SCHEDULE_MAX_DELAY_SECONDS
-        || scheduledFor > horizonEnd
-      ) continue;
-      const logicalId = logicalOccurrenceId(
-        active.id,
-        item.id,
-        date.key,
-        time,
-        storageNamespace
-      );
-      const fingerprint = sha(JSON.stringify({
-        logicalId,
-        scheduledFor,
-        action: isStop ? 'volume' : 'announce',
-        text: announcement?.text || '',
-        label: announcement?.label || item.label,
-        delivery: announcement?.delivery || null,
-        voice: announcement?.source?.voice || '',
-        instructions: announcement?.source?.instructions || '',
-        receiverContract: PUSHCUT_X_RECEIVER_CONTRACT,
-        musicPercent: isStop ? 0 : levels.musicPercent
-      }), 48);
-      const ids = occurrenceIdentifiers(logicalId);
-      const finiteSeconds = Number(announcement?.delivery?.announcementDurationSeconds || 0);
-      const recoverySeconds = announcement?.delivery?.announcementMode === 'finite-audio'
-        ? Math.max(12, Math.min(60, finiteSeconds + 8))
-        : NATURAL_RECOVERY_SECONDS;
-      occurrences.push(Object.freeze({
-        logicalId,
-        ...ids,
-        eventId: eventIdFor(logicalId, fingerprint),
-        fingerprint,
-        scheduleId: active.id,
-        itemId: item.id,
-        scheduledFor,
-        recoveryFor: scheduledFor + recoverySeconds * 1000,
-        delaySeconds,
-        recoveryDelaySeconds: delaySeconds + recoverySeconds,
-        action: isStop ? 'volume' : 'announce',
-        text: announcement?.text || '',
-        label: announcement?.label || bounded(item.label, 80) || 'Quiet hours',
-        voice: bounded(announcement?.source?.voice, 40) || 'marin',
-        instructions: bounded(announcement?.source?.instructions, 700),
-        voicePercent: levels.voicePercent,
-        musicPercent: isStop ? 0 : levels.musicPercent,
-        announcementLevel: levels.announcementLevel,
-        musicLevel: isStop ? 0 : levels.musicLevel,
-        ...(announcement?.delivery || {})
-      }));
-      if (occurrences.length > MAX_PLAN_OCCURRENCES) fail('invalid');
+      const time = bounded(item.position?.time || item.time, 5);
+      const match = /^(\d{2}):(\d{2})$/.exec(time);
+      if (!match) {
+        warnings.push(`${item.label}: invalid time.`);
+        continue;
+      }
+      const days = new Set(Array.isArray(item.days) ? item.days : [0, 1, 2, 3, 4, 5, 6]);
+      const skippedDates = new Set(Array.isArray(item.skippedDates) ? item.skippedDates : []);
+      for (const date of dates) {
+        if (!days.has(date.weekday) || cancelledDates.has(date.key) || skippedDates.has(date.key)) continue;
+        const scheduledFor = zonedOccurrenceTimestamp({
+          ...date,
+          hour: Number(match[1]),
+          minute: Number(match[2])
+        }, timeZone);
+        if (!scheduledFor) {
+          warnings.push(`${item.label}: ${date.key} ${time} does not exist in ${timeZone} because of a clock change.`);
+          continue;
+        }
+        const delaySeconds = Math.ceil((scheduledFor - safeNow) / 1000);
+        if (
+          delaySeconds < PUSHCUT_X_SCHEDULE_MIN_DELAY_SECONDS
+          || delaySeconds > PUSHCUT_X_SCHEDULE_MAX_DELAY_SECONDS
+          || scheduledFor > horizonEnd
+        ) continue;
+        const logicalId = logicalOccurrenceId(
+          schedule.id,
+          item.id,
+          date.key,
+          time,
+          storageNamespace
+        );
+        const occurrenceLevels = isStop
+          ? pushcutXVolumeLevels(0)
+          : pushcutXVolumeLevels(
+              item.action?.restoreMusicPercent ?? levels.musicPercent
+            );
+        const fingerprint = sha(JSON.stringify({
+          logicalId,
+          scheduledFor,
+          action: isStop ? 'volume' : 'announce',
+          text: announcement?.text || '',
+          label: announcement?.label || item.label,
+          delivery: announcement?.delivery || null,
+          voice: announcement?.source?.voice || '',
+          instructions: announcement?.source?.instructions || '',
+          receiverContract: PUSHCUT_X_RECEIVER_CONTRACT,
+          musicPercent: occurrenceLevels.musicPercent
+        }), 48);
+        const ids = occurrenceIdentifiers(logicalId);
+        const finiteSeconds = Number(announcement?.delivery?.announcementDurationSeconds || 0);
+        const recoverySeconds = announcement?.delivery?.announcementMode === 'finite-audio'
+          ? Math.max(12, finiteSeconds + 8)
+          : NATURAL_RECOVERY_SECONDS;
+        occurrences.push(Object.freeze({
+          logicalId,
+          ...ids,
+          eventId: eventIdFor(logicalId, fingerprint),
+          fingerprint,
+          scheduleId: schedule.id,
+          itemId: item.id,
+          scheduledFor,
+          recoveryFor: scheduledFor + recoverySeconds * 1000,
+          delaySeconds,
+          recoveryDelaySeconds: delaySeconds + recoverySeconds,
+          action: isStop ? 'volume' : 'announce',
+          text: announcement?.text || '',
+          label: announcement?.label || bounded(item.label, 80) || 'Quiet hours',
+          voice: bounded(announcement?.source?.voice, 40) || 'marin',
+          instructions: bounded(announcement?.source?.instructions, 700),
+          voicePercent: occurrenceLevels.voicePercent,
+          musicPercent: occurrenceLevels.musicPercent,
+          announcementLevel: occurrenceLevels.announcementLevel,
+          musicLevel: occurrenceLevels.musicLevel,
+          ...(announcement?.delivery || {})
+        }));
+        if (occurrences.length > MAX_PLAN_OCCURRENCES) fail('invalid');
+      }
     }
   }
   occurrences.sort((left, right) => left.scheduledFor - right.scheduledFor || left.logicalId.localeCompare(right.logicalId));

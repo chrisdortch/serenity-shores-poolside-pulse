@@ -58,19 +58,19 @@ export function createReceiverReleaseXHandler({
     const receiverId = String(body?.receiverId || '').trim();
     const sessionId = String(body?.sessionId || '').trim();
     const version = String(body?.version || '').trim().toLowerCase();
-    const mode = String(body?.mode || '').trim().toLowerCase();
+    const mode = String(body?.mode || 'pushcut').trim().toLowerCase();
     if (version !== 'x') {
       return json(res, 400, { ok: false, error: 'Version X receiver release requires version "x".' });
     }
-    if (mode !== 'pushcut') {
-      return json(res, 400, { ok: false, error: 'Receiver release mode must be "pushcut".' });
+    if (!['browser', 'pushcut'].includes(mode)) {
+      return json(res, 400, { ok: false, error: 'Receiver release mode must be "browser" or "pushcut".' });
     }
     if (!receiverId || !sessionId || receiverId.length > 160 || sessionId.length > 160) {
       return json(res, 400, { ok: false, error: 'receiverId and sessionId are required.' });
     }
 
     try {
-      const result = await releaseReceiver({ receiverId, sessionId, requireDurable: true });
+      const result = await releaseReceiver({ receiverId, sessionId, mode, requireDurable: true });
       if (!result.matched) {
         return json(res, 409, {
           ok: false,
@@ -84,7 +84,7 @@ export function createReceiverReleaseXHandler({
         version: 'x',
         released: true,
         changed: result.changed === true,
-        receiverMode: 'pushcut',
+        receiverMode: mode,
         revision: result.revision,
         receiver: result.state?.receiver || null,
         state: result.state || null

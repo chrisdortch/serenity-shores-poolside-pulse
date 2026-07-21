@@ -5,7 +5,7 @@ export const STATE_VERSION = 'x';
 export const MUSIC_LEVEL_PERCENT = 30;
 export const VOICE_LEVEL_PERCENT = 100;
 export const DUCK_LEVEL_PERCENT = 0;
-export const ANNOUNCEMENT_FINITE_AUDIO_MAX_SECONDS = 45;
+export const ANNOUNCEMENT_FINITE_AUDIO_MAX_SECONDS = 180;
 export const MAX_SCHEDULE_ITEMS = 100;
 export const SCHEDULE_DURATION_MIN_SECONDS = 1;
 export const SCHEDULE_DURATION_MAX_SECONDS = 24 * 60 * 60;
@@ -21,7 +21,8 @@ export const WEATHER_TIME_ZONE = 'America/Chicago';
 
 // Apple Music sources are intentionally user supplied. MusicKit configuration
 // and its short-lived developer token come from the Version X server route.
-export const DEFAULT_APPLE_MUSIC_PLAYLIST = '';
+export const DEFAULT_APPLE_MUSIC_PLAYLIST =
+  'https://music.apple.com/us/playlist/pool-music-openai/pl.u-WabZvbaFRrzK3z1';
 export const DEFAULT_SPOTIFY_CLIENT_ID = '7e086716aaea4ce98051287b552a676c';
 export const DEFAULT_SPOTIFY_PLAYLIST = 'https://open.spotify.com/track/11dFghVXANMlKmJXsNCbNl';
 export const DEFAULT_SUNO_SOURCE = 'https://suno.com/s/mmRHZLjTTkACvgBW';
@@ -119,8 +120,15 @@ export const DEFAULT_ANNOUNCEMENT_SOURCES = [
 ];
 
 export const DEFAULT_SCHEDULE = [
-  { id: 'open-welcome', label: 'Pool Open Welcome', type: 'announcement', time: '10:00', announcementId: 'welcome', enabled: true, days: [0, 1, 2, 3, 4, 5, 6] },
-  { id: 'quiet-hours-stop', label: 'Quiet Hours', type: 'stop', time: '22:00', enabled: true, days: [0, 1, 2, 3, 4, 5, 6] }
+  { id: 'open-welcome', label: 'Morning Announcement', type: 'announcement', time: '10:00', announcementId: 'welcome', protected: true, restoreMusicPercent: 30, enabled: true, days: [0, 1, 2, 3, 4, 5, 6] },
+  { id: 'daily-pool-apple', label: 'Pool Music · Apple Playlist', type: 'apple', time: '10:02', url: DEFAULT_APPLE_MUSIC_PLAYLIST, volumeMode: 'custom', volumePercent: 30, enabled: true, days: [0, 1, 2, 3, 4, 5, 6] },
+  { id: 'daily-no-glass', label: 'No Glass Reminder', type: 'announcement', time: '11:30', announcementId: 'no-glass', restoreMusicPercent: 30, enabled: true, days: [0, 1, 2, 3, 4, 5, 6] },
+  { id: 'daily-owner', label: 'Owner Message', type: 'announcement', time: '12:30', announcementId: 'owner', restoreMusicPercent: 30, enabled: true, days: [0, 1, 2, 3, 4, 5, 6] },
+  { id: 'daily-hydrate', label: 'Hydration Reminder', type: 'announcement', time: '13:30', announcementId: 'hydrate', restoreMusicPercent: 30, enabled: true, days: [0, 1, 2, 3, 4, 5, 6] },
+  { id: 'daily-manager', label: 'Manager Message', type: 'announcement', time: '14:30', announcementId: 'manager', restoreMusicPercent: 30, enabled: true, days: [0, 1, 2, 3, 4, 5, 6] },
+  { id: 'daily-closing-15', label: 'Closing in 15 Minutes', type: 'announcement', time: '21:45', announcementId: 'closing-15', protected: true, restoreMusicPercent: 30, enabled: true, days: [0, 1, 2, 3, 4, 5, 6] },
+  { id: 'daily-closing-5', label: 'Closing in 5 Minutes', type: 'announcement', time: '21:55', announcementId: 'closing-5', protected: true, restoreMusicPercent: 30, enabled: true, days: [0, 1, 2, 3, 4, 5, 6] },
+  { id: 'quiet-hours-stop', label: 'Pool Closed / Quiet Hours', type: 'stop', time: '22:00', protected: true, enabled: true, days: [0, 1, 2, 3, 4, 5, 6] }
 ];
 
 export const DEFAULT_SCHEDULE_ID = 'daily-schedule';
@@ -156,7 +164,7 @@ export function createDefaultState(now = Date.now()) {
   const defaultItems = normalizeScheduleItems(clone(DEFAULT_SCHEDULE));
   const defaultNamedSchedule = normalizeNamedSchedule({
     id: DEFAULT_SCHEDULE_ID,
-    name: 'Daily Schedule',
+    name: 'Daily Operations',
     mode: 'time',
     enabled: true,
     items: defaultItems
@@ -353,6 +361,34 @@ function scheduleItemOrder(item, index = 0) {
   return clamp(item?.position?.order ?? item?.order, 1, MAX_SCHEDULE_ITEMS, index + 1);
 }
 
+function normalizedDateKey(value) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(value || '').trim());
+  if (!match) return '';
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const date = new Date(Date.UTC(year, month - 1, day));
+  if (
+    date.getUTCFullYear() !== year
+    || date.getUTCMonth() + 1 !== month
+    || date.getUTCDate() !== day
+  ) return '';
+  return `${match[1]}-${match[2]}-${match[3]}`;
+}
+
+function normalizedDateKeys(values) {
+  return [...new Set((Array.isArray(values) ? values : [])
+    .map(normalizedDateKey)
+    .filter(Boolean))]
+    .sort();
+}
+
+function optionalPercent(value) {
+  if (value === '' || value === null || value === undefined) return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? clamp(number, 0, 100, MUSIC_LEVEL_PERCENT) : null;
+}
+
 export function normalizeScheduleItem(item, index = 0) {
   const source = item && typeof item === 'object' ? item : {};
   const kind = scheduleActionKind(source);
@@ -392,10 +428,15 @@ export function normalizeScheduleItem(item, index = 0) {
   const announcementId = boundedString(actionSource.announcementId ?? source.announcementId, 120);
   const sourceId = boundedString(actionSource.sourceId ?? source.sourceId, 120);
   const url = boundedString(actionSource.url ?? source.url, 2000);
+  const restoreMusicPercent = optionalPercent(
+    actionSource.restoreMusicPercent ?? source.restoreMusicPercent
+  );
   const normalized = {
     id: boundedString(source.id, 120) || makeId('schedule-item'),
     label: boundedString(source.label, 100, 'Scheduled item') || 'Scheduled item',
     enabled: source.enabled !== false,
+    protected: source.protected === true,
+    skippedDates: normalizedDateKeys(source.skippedDates),
     days: Array.isArray(source.days)
       ? [...new Set(source.days.map(Number).filter(day => Number.isInteger(day) && day >= 0 && day <= 6))].sort((a, b) => a - b)
       : [0, 1, 2, 3, 4, 5, 6],
@@ -406,7 +447,8 @@ export function normalizeScheduleItem(item, index = 0) {
       announcementId: stop ? '' : announcementId,
       sourceId: stop ? '' : sourceId,
       text: stop ? '' : boundedString(inferredInlineText, 900),
-      url: stop ? '' : url
+      url: stop ? '' : url,
+      ...(kind === 'announcement' ? { restoreMusicPercent } : {})
     },
     volume: {
       mode: volumeMode,
@@ -520,6 +562,8 @@ export function normalizeNamedSchedule(schedule, index = 0) {
     name: boundedString(source.name ?? source.label, 80, `Schedule ${index + 1}`) || `Schedule ${index + 1}`,
     mode: String(source.mode || '').toLowerCase() === 'order' ? 'order' : 'time',
     enabled: source.enabled !== false,
+    cancellable: source.cancellable === true,
+    cancelledDates: normalizedDateKeys(source.cancelledDates),
     items: normalizeScheduleItems(Array.isArray(source.items) ? source.items : source.schedule)
   };
 }
@@ -531,6 +575,29 @@ export function getActiveSchedule(state) {
   }
   if (Array.isArray(state?.schedule)) {
     return normalizeNamedSchedule({ id: 'legacy-schedule', name: 'Daily Schedule', mode: 'time', items: state.schedule });
+  }
+  return null;
+}
+
+export function enabledTimeSchedules(state) {
+  return (Array.isArray(state?.schedules) ? state.schedules : [])
+    .filter(schedule => (
+      schedule
+      && schedule.enabled !== false
+      && String(schedule.mode || '').toLowerCase() === 'time'
+    ));
+}
+
+export function findScheduleItem(state, itemId, scheduleId = '') {
+  const requestedItemId = boundedString(itemId, 120);
+  const requestedScheduleId = boundedString(scheduleId, 120);
+  if (!requestedItemId) return null;
+  const schedules = Array.isArray(state?.schedules) ? state.schedules : [];
+  for (const schedule of schedules) {
+    if (requestedScheduleId && String(schedule?.id || '') !== requestedScheduleId) continue;
+    const item = (Array.isArray(schedule?.items) ? schedule.items : [])
+      .find(candidate => String(candidate?.id || '') === requestedItemId);
+    if (item) return { schedule, item };
   }
   return null;
 }
@@ -1042,7 +1109,7 @@ export function audioPolicy({
     action: 'pause',
     label: `${externalName} pause-for-voice compatibility`,
     detail: isIOS
-      ? `iPhone/iPad browsers cannot set ${externalName} playback volume directly. Use the receiver iPhone or connected speaker controls; when Pushcut is configured, the Poolside Pulse Shortcut sets the shared device output to ${target}% for music and ${voiceTarget}% for announcements. ${externalName} pauses during speech and resumes afterward.`
+      ? `iPhone/iPad browsers cannot set ${externalName} playback volume directly. Use the receiver iPhone or connected speaker controls; the Poolside Pulse Receiver Shortcut sets the shared device output to ${target}% for music and ${voiceTarget}% for announcements. ${externalName} pauses during speech and resumes afterward.`
       : `${externalName} volume has not been verified at ${target}% on this receiver. ${externalName} will pause for announcements and resume afterward.`
   };
 }
@@ -1109,7 +1176,7 @@ export function isDirectAudioUrl(value) {
   return /^https?:\/\/.+\.(?:mp3|m4a|aac|wav|ogg|oga|webm)(?:[?#].*)?$/i.test(String(value || '').trim());
 }
 
-function zonedParts(now, timeZone = WEATHER_TIME_ZONE) {
+export function zonedScheduleParts(now = Date.now(), timeZone = WEATHER_TIME_ZONE) {
   const parts = new Intl.DateTimeFormat('en-US', {
     timeZone,
     weekday: 'short',
@@ -1132,15 +1199,21 @@ function zonedParts(now, timeZone = WEATHER_TIME_ZONE) {
   };
 }
 
+export function scheduleDateKey(now = Date.now(), timeZone = WEATHER_TIME_ZONE) {
+  return zonedScheduleParts(now, timeZone).dateKey;
+}
+
 export function dueTimeScheduleItems(scheduleOrItems, scheduleRuns, now = Date.now(), timeZone = WEATHER_TIME_ZONE, catchupMs = SCHEDULE_CATCHUP_MS) {
   if (!Array.isArray(scheduleOrItems) && (String(scheduleOrItems?.mode || 'time') !== 'time' || scheduleOrItems?.enabled === false)) return [];
   const items = Array.isArray(scheduleOrItems) ? scheduleOrItems : scheduleOrItems?.items;
-  const parts = zonedParts(now, timeZone);
+  const parts = zonedScheduleParts(now, timeZone);
+  if (!Array.isArray(scheduleOrItems) && normalizedDateKeys(scheduleOrItems?.cancelledDates).includes(parts.dateKey)) return [];
   const currentSeconds = parts.hour * 3600 + parts.minute * 60 + parts.second;
   return (Array.isArray(items) ? items : []).filter(item => {
     const time = String(item?.position?.time ?? item?.time ?? '');
     const timeMatch = /^(\d{2}):(\d{2})$/.exec(time);
     if (!item?.enabled || !timeMatch) return false;
+    if (normalizedDateKeys(item.skippedDates).includes(parts.dateKey)) return false;
     if (Array.isArray(item.days) && item.days.length && !item.days.map(Number).includes(parts.weekday)) return false;
     const hour = Number(timeMatch[1]);
     const minute = Number(timeMatch[2]);

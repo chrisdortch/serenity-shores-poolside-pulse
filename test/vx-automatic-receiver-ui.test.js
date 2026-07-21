@@ -46,13 +46,13 @@ describe('Version X Automatic Receiver UI and routing contract', () => {
     assert.match(panel, /Run Immediately/);
     assert.match(panel, /Add Action → Run Shortcut/);
     assert.match(panel, /automaticSetupIssues/);
-    assert.match(panel, /Remote iPhones need no Shortcut or Pushcut setup/);
+    assert.match(panel, /Remote iPhones need no setup/);
     assert.match(panel, /Use this Version X address on every phone/);
     assert.match(panel, /RECEIVER_TEST_RECEIVER_URL/);
     assert.match(panel, /RECEIVER_TEST_REMOTE_URL/);
     assert.match(panel, /separate saved version and cannot control this Receiver/);
-    assert.match(panel, /Paired · run the required Receiver Test/);
-    assert.match(panel, /Test & Turn On Automatic Receiver/);
+    assert.match(panel, /Paired · complete the activation test/);
+    assert.match(panel, /Verify &amp; Turn On Automatic Receiver/);
     assert.match(panel, /a Remote cannot perform those account-security taps/);
     assert.match(panel, /Apple Music: Prepare → Authorize → Activate/);
     assert.match(panel, /Spotify: Authorize → Prepare if shown → Activate/);
@@ -62,7 +62,7 @@ describe('Version X Automatic Receiver UI and routing contract', () => {
     );
   });
 
-  test('puts a four-action setup wizard first and keeps legacy Pushcut collapsed', () => {
+  test('puts the four-action Automatic Receiver wizard first and removes legacy Pushcut controls', () => {
     const panel = sourceBetween(
       'function iphoneReceiverModePanel',
       'function updateLiveStatus'
@@ -72,8 +72,7 @@ describe('Version X Automatic Receiver UI and routing contract', () => {
       '<strong>Install Shortcut</strong>',
       '<strong>Pair Receiver</strong>',
       '<strong>Create Email Automation</strong>',
-      '<strong>Test &amp; Turn On</strong>',
-      '<details class="legacyFallback" data-persist-open="receiver-pushcut-fallback">'
+      '<strong>Verify &amp; Turn On</strong>'
     ];
     let previous = -1;
     for (const marker of expectedOrder) {
@@ -82,13 +81,13 @@ describe('Version X Automatic Receiver UI and routing contract', () => {
       previous = next;
     }
 
-    assert.match(panel, /Receiver Test · Version X candidate/);
+    assert.match(panel, /Resort Media Hub · Version X/);
     assert.match(panel, /Finish the four one-time steps/);
     assert.match(panel, /class="shortcutLink setupAction"/);
     assert.match(panel, /class="setupInstructions" data-persist-open="automatic-email-automation"/);
     assert.match(panel, /class="receiverDetailDisclosure" data-persist-open="receiver-browser-accounts"/);
-    assert.match(panel, /<details class="legacyFallback" data-persist-open="receiver-pushcut-fallback">\s*<summary>Legacy fallback · Pushcut<\/summary>/);
-    assert.doesNotMatch(panel, /<details class="legacyFallback"[^>]*\sopen/);
+    assert.doesNotMatch(panel, /Legacy fallback · Pushcut/);
+    assert.doesNotMatch(panel, /prepare-pushcut-mode/);
   });
 
   test('keeps every Receiver disclosure open or closed through live polling renders', () => {
@@ -114,10 +113,6 @@ describe('Version X Automatic Receiver UI and routing contract', () => {
       /<details class="receiverDetailDisclosure" data-persist-open="receiver-browser-accounts">/
     );
     assert.match(
-      panel,
-      /<details class="legacyFallback" data-persist-open="receiver-pushcut-fallback">/
-    );
-    assert.match(
       receiver,
       /<details class="readinessPanel receiverDiagnostics" data-persist-open="receiver-diagnostics">/
     );
@@ -131,7 +126,7 @@ describe('Version X Automatic Receiver UI and routing contract', () => {
     );
   });
 
-  test('labels the candidate host as the Automatic Receiver Test Build on every Speaker Receiver', () => {
+  test('labels every Speaker Receiver as the final Resort Media Hub build', () => {
     const buildLabel = sourceBetween(
       'function receiverTestBuildLabel',
       'function renderHeader'
@@ -140,15 +135,14 @@ describe('Version X Automatic Receiver UI and routing contract', () => {
     const receiver = sourceBetween('function renderReceiver', 'function providerSelector');
 
     assert.match(APP_SOURCE, /const RECEIVER_TEST_HOST = 'poolside-pulse-x-receiver\.vercel\.app'/);
-    assert.match(APP_SOURCE, /Poolside Pulse - Receiver Test - Version X/);
-    assert.match(buildLabel, /location\.hostname === RECEIVER_TEST_HOST/);
-    assert.match(buildLabel, /Automatic Receiver Test Build/);
-    assert.match(buildLabel, /Receiver Test · Version X/);
-    assert.match(header, /data-build-label="receiver-test"/);
+    assert.match(APP_SOURCE, /Poolside Pulse - Resort Media Hub - Version X/);
+    assert.match(buildLabel, /return 'Resort Media Hub · Version X'/);
+    assert.doesNotMatch(buildLabel, /location\.hostname/);
+    assert.match(header, /data-build-label="resort-media-hub"/);
     assert.match(header, /receiverTestBuildLabel\(\)/);
     assert.match(
       HTML_SOURCE,
-      /<title>Lake123 - Poolside Pulse - Automatic Receiver Test Build - Version X<\/title>/
+      /<title>Lake123 - Poolside Pulse - Resort Media Hub - Version X<\/title>/
     );
     assert.match(receiver, /\$\{iphoneReceiverModePanel\(\{ owned \}\)\}/);
     assert.doesNotMatch(
@@ -397,6 +391,33 @@ describe('Version X Automatic Receiver UI and routing contract', () => {
     assert.match(addItem, /const itemId = makeId\('schedule-item'\)/);
     assert.match(addItem, /pendingOpenScheduleItemId = itemId/);
     assert.match(addItem, /id: itemId/);
+  });
+
+  test('cancels or skips the next scheduled Party date and syncs before changing live music', () => {
+    const target = sourceBetween(
+      'function scheduleCancellationTarget',
+      'function scheduleItemSkippedToday'
+    );
+    const row = sourceBetween(
+      'function renderScheduleRow',
+      'function renderSchedule'
+    );
+    const cancelAction = sourceBetween(
+      "if (action === 'cancel-schedule-today' || action === 'restore-schedule-today')",
+      "if (action === 'skip-schedule-item-today' || action === 'restore-schedule-item-today')"
+    );
+
+    assert.match(target, /offset <= 7/);
+    assert.match(target, /hasRemainingItem/);
+    assert.match(row, /data-date-key="\$\{escapeAttr\(skipTarget\.dateKey\)\}"/);
+    assert.match(row, /\$\{skipTargetIsSkipped \? 'Restore' : 'Skip'\} \$\{escapeHtml\(skipTarget\.label\)\}/);
+    assert.match(cancelAction, /dataKey|dateKey/);
+    assert.match(cancelAction, /await syncCurrentEmailWakeSchedule/);
+    assert.ok(
+      cancelAction.indexOf('await syncCurrentEmailWakeSchedule') <
+        cancelAction.indexOf("await runtime.sendCommand('play-apple'"),
+      'durable cancellation must sync before any live music reset'
+    );
   });
 
   test('describes automatic quiet-hours 0% output as background Receiver work', () => {

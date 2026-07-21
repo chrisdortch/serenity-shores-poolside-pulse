@@ -80,6 +80,7 @@ function installNativeBridge() {
       }
       case 'resume':
       case 'resumeAfterAnnouncement':
+      case 'previous':
       case 'next':
         state.volume = payload.params.volumePercent;
         state.verifiedPercent = payload.params.volumePercent;
@@ -163,6 +164,19 @@ describe('Version X native macOS Music.app bridge', { concurrency: false }, () =
     assert.equal(fake.state.isPlaying, true);
     assert.equal(fake.state.volume, 42);
     assert.equal(receiver.volumeVerified, true);
+  });
+
+  test('dispatches previous through the native bridge at the current manager target', async () => {
+    const fake = installNativeBridge();
+    const receiver = await connectedReceiver();
+    receiver.setTargetVolumePercent(37);
+
+    const state = await receiver.previous();
+
+    const request = fake.calls.find(call => call.method === 'previous');
+    assert.deepEqual(request?.params, { volumePercent: 37 });
+    assert.equal(state.isPlaying, true);
+    assert.equal(fake.state.volume, 37);
   });
 
   test('does not mute Music.app when an announcement checks an already-paused player', async () => {

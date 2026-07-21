@@ -442,6 +442,15 @@ describe('Version X API isolation', { concurrency: false }, () => {
               durationSeconds: 30
             },
             {
+              id: 'suno-party-long',
+              label: 'Long-form party clip',
+              kind: 'media',
+              provider: 'suno',
+              url: 'https://suno.com/s/long-form-party-example',
+              finite: true,
+              durationSeconds: 137
+            },
+            {
               id: 'finite-kind-direct',
               label: 'Finite-kind direct clip',
               kind: 'finite-audio',
@@ -486,7 +495,7 @@ describe('Version X API isolation', { concurrency: false }, () => {
               provider: 'direct',
               url: 'https://media.example/long.mp3',
               finite: true,
-              durationSeconds: 46
+              durationSeconds: 181
             },
             {
               id: 'unknown-source',
@@ -582,11 +591,12 @@ describe('Version X API isolation', { concurrency: false }, () => {
     const sources = Object.fromEntries(state.announcementSources.map(source => [source.id, source]));
     assert.equal(Object.hasOwn(sources, 'unknown-source'), false);
     assert.deepEqual(
-      ['natural', 'direct-finite', 'suno-finite', 'finite-kind-direct'].map(id => [
+      ['natural', 'direct-finite', 'suno-finite', 'suno-party-long', 'finite-kind-direct'].map(id => [
         sources[id].playbackSupport,
         sources[id].verification
       ]),
       [
+        ['supported', 'unverified'],
         ['supported', 'unverified'],
         ['supported', 'unverified'],
         ['supported', 'unverified'],
@@ -596,6 +606,7 @@ describe('Version X API isolation', { concurrency: false }, () => {
     assert.equal(sources.natural.privateKey, undefined);
     assert.equal(sources['direct-finite'].durationSeconds, 12);
     assert.equal(sources['suno-finite'].durationSeconds, 30);
+    assert.equal(sources['suno-party-long'].durationSeconds, 137);
     assert.equal(sources['finite-kind-direct'].durationSeconds, 14);
     assert.equal(sources['apple-catalog'].playbackSupport, 'experimental');
     assert.equal(sources['apple-catalog'].verification, 'unverified');

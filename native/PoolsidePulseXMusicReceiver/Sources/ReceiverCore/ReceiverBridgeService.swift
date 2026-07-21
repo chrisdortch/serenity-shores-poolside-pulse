@@ -36,6 +36,8 @@ public final class ReceiverBridgeService {
             return try music.silenceAndPause().dictionary
         case "resume":
             return try music.resume(volume: request.volume("volumePercent", default: 30)).dictionary
+        case "previous":
+            return try music.previous(volume: request.volume("volumePercent", default: 30)).dictionary
         case "next":
             return try music.next(volume: request.volume("volumePercent", default: 30)).dictionary
         case "stop":

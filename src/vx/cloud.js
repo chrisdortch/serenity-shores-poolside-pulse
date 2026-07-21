@@ -187,43 +187,54 @@ export class CloudStore {
   }
 
   /**
-   * Atomically hands the speaker from Safari to Pushcut. The dedicated route
+   * Atomically releases the exact Safari receiver lease. `pushcut` preserves
+   * the legacy handoff behavior; `browser` leaves Browser Receiver selected
+   * while marking this specific page session offline. The dedicated route
    * validates the exact receiver session, so a suspended/stale page can never
    * release a newer speaker session. `beacon` is used during pagehide where
    * iOS may suspend JavaScript before a normal fetch settles.
    */
-  async releaseReceiverSession(receiver = this.state.receiver, { beacon = false } = {}) {
+  async releaseReceiverSession(receiver = this.state.receiver, {
+    beacon = false,
+    mode = 'pushcut'
+  } = {}) {
     const receiverId = String(receiver?.id || '');
     const sessionId = String(receiver?.sessionId || '');
     if (!receiverId || !sessionId) {
-      throw new Error('The Browser Receiver session is missing and could not be handed to Pushcut.');
+      throw new Error('The Browser Receiver session is missing and could not be released.');
+    }
+    const receiverMode = String(mode || '').trim().toLowerCase();
+    if (!['browser', 'pushcut'].includes(receiverMode)) {
+      throw new Error('Receiver release mode must be "browser" or "pushcut".');
     }
     const payload = {
       version: 'x',
       receiverId,
       sessionId,
-      mode: 'pushcut'
+      mode: receiverMode
     };
     const applyOptimisticRelease = () => {
       if (this.state.receiver?.id !== receiverId || this.state.receiver?.sessionId !== sessionId) return;
       this.state = normalizeState({
         ...this.state,
-        config: { ...this.state.config, receiverMode: 'pushcut' },
+        config: { ...this.state.config, receiverMode },
         receiver: {
           ...this.state.receiver,
           status: 'offline',
           leaseUntil: 0,
-          detail: 'Browser Receiver handed control to Pushcut.'
+          detail: receiverMode === 'pushcut'
+            ? 'Browser Receiver handed control to Pushcut.'
+            : 'Browser Receiver page closed; Browser Receiver remains selected.'
         }
       }, this.now());
-      this.emit('receiver handoff');
+      this.emit('receiver release');
     };
 
     if (beacon && typeof globalThis.navigator?.sendBeacon === 'function') {
       const body = new Blob([JSON.stringify(payload)], { type: 'application/json' });
       if (globalThis.navigator.sendBeacon(RECEIVER_RELEASE_URL, body)) {
         applyOptimisticRelease();
-        return { ok: true, released: true, queued: true, receiverMode: 'pushcut' };
+        return { ok: true, released: true, queued: true, receiverMode };
       }
     }
 
@@ -239,16 +250,16 @@ export class CloudStore {
         body: JSON.stringify(payload)
       });
       if (response.status === 404 || !isJsonResponse(response)) {
-        assertLocalFallbackAllowed('The receiver handoff service');
+        assertLocalFallbackAllowed('The receiver release service');
         applyOptimisticRelease();
-        return { ok: true, released: true, development: true, receiverMode: 'pushcut' };
+        return { ok: true, released: true, development: true, receiverMode };
       }
       const data = await responseData(response);
       this.observeServerTime(data, startedAt);
       if (data.state) {
         this.state = normalizeState(data.state, this.now());
         this.appliedFetchSequence = ++this.fetchSequence;
-        this.emit('receiver handoff');
+        this.emit('receiver release');
       } else {
         applyOptimisticRelease();
       }

@@ -50,6 +50,9 @@ struct BridgeRequestSelfTests {
         let appleURL = try request(method: "play", params: ["url": "https://music.apple.com/us/album/example/123?i=456"]).appleMusicURL()
         expect(appleURL.host == "music.apple.com", "accept exact Apple Music host")
 
+        let previous = try request(method: "previous", params: ["volumePercent": 30])
+        expect(try previous.volume("volumePercent") == 30, "accept previous-track request")
+
         do {
             _ = try request(method: "play", params: ["url": "https://evil.example/?next=https://music.apple.com/us/album/1"]).appleMusicURL()
             expect(false, "reject lookalike host")
