@@ -1209,7 +1209,7 @@ function iphoneReceiverModePanel({ owned = false } = {}) {
       </div>
       <div class="setupStatus ${automaticEnabled && automaticReady && browserActive ? 'verified' : 'limited'}" aria-live="polite">
         <strong>${automaticEnabled && automaticReady ? browserActive ? 'Automatic Receiver is verified and ready' : 'Automation verified · start Browser Receiver' : automaticReady ? 'Paired · complete the activation test' : automaticSetupIssues ? 'Automatic Receiver server setup needs attention' : emailWakeStatus.ready ? 'Finish the four one-time steps' : 'Checking Automatic Receiver service'}</strong>
-        <span>Automatic Receiver · no Pushcut foreground</span>
+        <span>Automatic Receiver · background Shortcut ready</span>
       </div>
       <p class="setupLead">Do these four steps once on the iPhone connected to the speakers. Keep this Resort Media Hub page visible for Suno, Apple Music, Spotify, and scheduled music; the background automation handles music ${musicTarget}% → 0% → announcement 100% → restore ${musicTarget}%.</p>
       <div class="roleAddressGuide">
@@ -1532,7 +1532,7 @@ function receiverSummary() {
     return `<strong>Pushcut announcement path ${pushcutAnnouncementOperational() ? 'connected and recently verified' : pushcutStatus.connectedReady ? 'connected' : 'configured; live connection not yet confirmed'}</strong><span>Open Pushcut on the Receiver iPhone and keep Ready For Requests visible. Every command waits for its own signed completion receipt; native music is controlled on that iPhone, not from the Remote.</span>`;
   }
   return mode === 'browser'
-    ? '<strong>Browser Receiver is selected but offline</strong><span>Open Version X on the speaker device and tap Start Receiver. Commands are not rerouted through a stale Pushcut configuration.</span>'
+    ? '<strong>Browser Receiver is selected but offline</strong><span>Open Version X on the speaker device and tap Start Receiver. Automatic announcements remain armed in the background.</span>'
     : '<strong>No receiver online</strong><span>Open Version X on the speaker device and tap Start Receiver.</span>';
 }
 
@@ -2457,7 +2457,7 @@ function renderSettings() {
         ${role === 'receiver'
           ? `<div class="stackedActions">${spotifySetupButton({ disabled: spotify.loggedIn() && !runtime.isOwner() })}${spotify.loggedIn() ? '<button data-action="spotify-logout" class="secondary">Remove Spotify Login</button>' : ''}</div>${spotify.loggedIn() && !runtime.isOwner() ? '<div class="callout"><strong>Start Receiver before connecting Spotify.</strong><p>Only the device holding the live receiver lease may become the Spotify player.</p></div>' : ''}`
           : '<div class="callout"><strong>Spotify account authorization stays on the speaker phone.</strong><p>On that iPhone, open Receiver → Browser Receiver, then tap Authorize Spotify Account once. Remote devices never hold the Spotify login.</p></div>'}
-        <div class="policyNote"><strong>Browser Receiver mode:</strong> Spotify Premium, <code>${SPOTIFY_REDIRECT_URI}</code> registered exactly, and the receiver account authorized for the Spotify app. Account authorization persists separately from playback activation. <strong>Pushcut mode:</strong> start music in the native Spotify app; Version X OAuth is not used because the Remote cannot control the native bed while Pushcut is foreground.</div>
+        <div class="policyNote"><strong>Automatic Receiver mode:</strong> Spotify Premium, <code>${SPOTIFY_REDIRECT_URI}</code> registered exactly, and the receiver account authorized in this visible Browser Receiver. Account authorization persists separately from playback activation; the background Shortcut handles announcement ducking and restoration.</div>
       </section>
       <section class="workspacePanel">
         <div class="sectionHeading"><div><p class="kicker">Sound verification</p><h2>Suno / voice sound check</h2></div></div>
@@ -3856,7 +3856,7 @@ root.addEventListener('click', event => {
         if (automaticAnnouncementsEnabled()) {
           await selectSharedReceiverMode('browser');
           setFeedback(
-            'Browser music stopped. Automatic announcements remain armed without Pushcut.',
+            'Browser music stopped. Automatic announcements remain armed in the background.',
             true
           );
           return true;
@@ -4143,7 +4143,7 @@ root.addEventListener('click', event => {
           ), ...(draft.activityLog || [])];
           return draft;
         }, restore ? 'Selected schedule date restored' : 'Selected schedule date cancelled');
-        if (automaticAnnouncementsEnabled() && emailWakeOperational()) {
+        if (automaticAnnouncementsEnabled()) {
           await syncCurrentEmailWakeSchedule({ retryStale: true });
         }
         if (

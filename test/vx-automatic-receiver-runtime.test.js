@@ -623,6 +623,36 @@ describe('Version X Automatic Receiver runtime routing', { concurrency: false },
     assert.deepEqual(processed, ['pending-browser-playback']);
   });
 
+  test('restores the shared 30% target after a live scheduled Party item is skipped', async () => {
+    const appliedTargets = [];
+    const { runtime, store } = harness({
+      owner: true,
+      externalMusicTarget: async percent => {
+        appliedTargets.push(percent);
+        return { completed: true, musicPercent: percent };
+      }
+    });
+    store.state.config.musicLevel = 30;
+    store.state.playback = {
+      ...store.state.playback,
+      provider: 'apple',
+      intent: 'playing',
+      musicLevelPercent: 100,
+      volumeMode: 'custom',
+      scheduledItemId: 'cancelled-party-track',
+      scheduledRunToken: 'cancelled-party-token'
+    };
+    const stops = [];
+    runtime.stopMusic = async options => {
+      stops.push(options);
+      return true;
+    };
+
+    assert.equal(await runtime.reconcileScheduledPlaybackAuthorization(), true);
+    assert.deepEqual(stops, [{ skipOrderFailure: true }]);
+    assert.deepEqual(appliedTargets, [30]);
+  });
+
   test('fails closed when backend execution status cannot be confirmed', async () => {
     const { runtime, store } = harness({
       owner: true,

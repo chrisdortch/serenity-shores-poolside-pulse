@@ -125,7 +125,7 @@ describe('Version X Spotify receiver isolation', { concurrency: false }, () => {
     assert.match(panelSource, /spotifySetupButton\(\{ disabled: spotify\.loggedIn\(\) && !owned \}\)/);
     assert.match(panelSource, /Spotify: Authorize → Prepare if shown → Activate on this Receiver/);
     assert.match(panelSource, /Mode 1 · remote music control/);
-    assert.match(panelSource, /Automatic Receiver · no Pushcut foreground/);
+    assert.match(panelSource, /Automatic Receiver · background Shortcut ready/);
   });
 
   test('uses Automatic Receiver ahead of stale legacy mode and keeps Pushcut fallback isolated', () => {
@@ -139,7 +139,7 @@ describe('Version X Spotify receiver isolation', { concurrency: false }, () => {
     assert.match(modeSource, /configuredMode === 'browser' \|\| configuredMode === 'pushcut'/);
     assert.match(VX_APP_SOURCE, /const PUSHCUT_RUN_SERVER_URL = 'pushcut:\/\/open\/runServer'/);
     assert.match(VX_APP_SOURCE, /Automatic Receiver is active\. Pushcut is retired from normal Resort Media Hub operation/);
-    assert.match(VX_APP_SOURCE, /Browser music stopped\. Automatic announcements remain armed without Pushcut/);
+    assert.match(VX_APP_SOURCE, /Browser music stopped\. Automatic announcements remain armed in the background/);
   });
 
   test('routes live voice by shared mode and keeps Browser-mode sliders usable', () => {
@@ -172,7 +172,7 @@ describe('Version X Spotify receiver isolation', { concurrency: false }, () => {
     );
     assert.match(startAction, /if \(!automaticAnnouncementsEnabled\(\) && pushcutAnnouncementReady\(\)\)/);
     assert.match(startAction, /if \(automaticAnnouncementsEnabled\(\)\)[\s\S]*applyReceiverMusicTargetNow/);
-    assert.match(startAction, /Browser music stopped\. Automatic announcements remain armed without Pushcut/);
+    assert.match(startAction, /Browser music stopped\. Automatic announcements remain armed in the background/);
     assert.match(startAction, /Automatic Receiver is active\. Pushcut is retired from normal Resort Media Hub operation/);
     assert.match(VX_APP_SOURCE, /queuePushcutScheduleSync[\s\S]*automaticAnnouncementsEnabled\(\)/);
   });

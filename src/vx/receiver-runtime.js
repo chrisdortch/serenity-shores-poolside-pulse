@@ -3028,6 +3028,11 @@ export class ReceiverRuntime {
     this.beginExternalAudioIntent('terminal');
     try {
       await this.stopMusic({ skipOrderFailure: true });
+      if (this.automaticReceiverEnabled() && this.onExternalMusicTarget) {
+        await this.onExternalMusicTarget(
+          clamp(this.state.config.musicLevel, 0, 100, 30)
+        );
+      }
       this.status('Scheduled playback stopped because its live schedule changed.', true);
       return true;
     } finally {

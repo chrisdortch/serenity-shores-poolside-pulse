@@ -34,7 +34,7 @@ describe('Version X Automatic Receiver UI and routing contract', () => {
       'function updateLiveStatus'
     );
 
-    assert.match(panel, /Automatic Receiver · no Pushcut foreground/);
+    assert.match(panel, /Automatic Receiver · background Shortcut ready/);
     assert.match(panel, /Install \$\{EMAIL_WAKE_X_SHORTCUT_NAME\}/);
     assert.match(panel, /Safari, tap the <strong>Downloads<\/strong> arrow/);
     assert.match(panel, /Create Pairing Code/);
@@ -413,6 +413,11 @@ describe('Version X Automatic Receiver UI and routing contract', () => {
     assert.match(row, /\$\{skipTargetIsSkipped \? 'Restore' : 'Skip'\} \$\{escapeHtml\(skipTarget\.label\)\}/);
     assert.match(cancelAction, /dataKey|dateKey/);
     assert.match(cancelAction, /await syncCurrentEmailWakeSchedule/);
+    assert.doesNotMatch(
+      cancelAction,
+      /automaticAnnouncementsEnabled\(\) && emailWakeOperational\(\)/,
+      'an Automatic cancellation must fail closed if the durable schedule service is temporarily unhealthy'
+    );
     assert.ok(
       cancelAction.indexOf('await syncCurrentEmailWakeSchedule') <
         cancelAction.indexOf("await runtime.sendCommand('play-apple'"),
