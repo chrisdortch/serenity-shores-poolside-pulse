@@ -20,23 +20,7 @@ COMMON=(
   -module-cache-path "$MODULE_CACHE"
 )
 
-"$SWIFTC" "${COMMON[@]}" -O -parse-as-library \
-  -emit-module -emit-library -static \
-  -module-name ReceiverCore \
-  -emit-module-path "$BUILD/ReceiverCore.swiftmodule" \
-  -o "$BUILD/libReceiverCore.a" \
-  "$ROOT/Sources/ReceiverCore/BridgeRequest.swift" \
-  "$ROOT/Sources/ReceiverCore/MusicAutomation.swift" \
-  "$ROOT/Sources/ReceiverCore/ReceiverBridgeService.swift"
-
-"$SWIFTC" "${COMMON[@]}" -O -parse-as-library \
-  -I "$BUILD" -L "$BUILD" -lReceiverCore \
-  -o "$BUILD/ReceiverCoreSelfTests" \
-  "$ROOT/Tests/ReceiverCoreTests/BridgeRequestSelfTests.swift"
-"$BUILD/ReceiverCoreSelfTests"
-
 "$SWIFTC" "${COMMON[@]}" -O \
-  -I "$BUILD" -L "$BUILD" -lReceiverCore \
   -o "$BUILD/PoolsidePulseXMusicReceiver" \
   "$ROOT/Sources/PoolsidePulseXMusicReceiver/ReceiverWebView.swift" \
   "$ROOT/Sources/PoolsidePulseXMusicReceiver/PoolsidePulseXMusicReceiverApp.swift"
@@ -51,11 +35,15 @@ codesign \
   --deep \
   --options runtime \
   --sign "$SIGN_IDENTITY" \
-  --entitlements "$ROOT/AppResources/PoolsidePulseXMusicReceiver.entitlements" \
   "$APP"
 
 codesign --verify --deep --strict --verbose=2 "$APP"
 if [[ "$SIGN_IDENTITY" == '-' ]]; then
+  SIGNING_DETAILS="$(codesign -d --verbose=4 "$APP" 2>&1)"
+  if [[ "$SIGNING_DETAILS" != *'Signature=adhoc'* ]]; then
+    echo 'ERROR: expected an ad hoc app signature.' >&2
+    exit 1
+  fi
   echo 'NOTE: ad hoc signed for this personal Mac. Use POOLSIDE_CODE_SIGN_IDENTITY for a stable Developer ID signature.' >&2
 fi
 echo "$APP"

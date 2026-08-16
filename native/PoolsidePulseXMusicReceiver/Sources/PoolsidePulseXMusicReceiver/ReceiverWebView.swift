@@ -1,142 +1,226 @@
 import AppKit
-import ReceiverCore
 import SwiftUI
 import WebKit
 
-private let receiverURL = URL(string: "https://poolside-pulse-x.vercel.app/#receiver")!
-private let allowedHost = "poolside-pulse-x.vercel.app"
+private let receiverURL = URL(string: "https://serenity-shores-poolside.chrisdortch.chatgpt.site/receiver")!
+private let allowedHost = "serenity-shores-poolside.chrisdortch.chatgpt.site"
+private let allowedMainPaths: Set<String> = ["/receiver", "/control"]
 
 struct ReceiverWebView: NSViewRepresentable {
-    @MainActor
-    final class Coordinator: NSObject, WKNavigationDelegate, WKScriptMessageHandlerWithReply {
-        private let bridge = ReceiverBridgeService()
-        private var acceptedMainFrameLoad = false
+    final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, NSWindowDelegate {
+        private weak var mainWebView: WKWebView?
+        private weak var authWebView: WKWebView?
+        private var authWindowController: NSWindowController?
 
-        nonisolated func userContentController(
-            _ userContentController: WKUserContentController,
-            didReceive message: WKScriptMessage,
-            replyHandler: @escaping (Any?, String?) -> Void
-        ) {
-            let origin = message.frameInfo.securityOrigin
-            let frameURL = message.frameInfo.request.url
-            let allowed = message.frameInfo.isMainFrame
-                && origin.protocol.lowercased() == "https"
-                && origin.host.lowercased() == allowedHost
-                && (origin.port == 0 || origin.port == 443)
-                && frameURL?.path == "/"
-                && frameURL?.fragment == "receiver"
-            let body = message.body
-            Task { @MainActor [weak self] in
-                guard allowed, let self else {
-                    let response: [String: Any] = ["ok": false, "error": "Native music control is restricted to the Poolside Pulse X receiver page."]
-                    replyHandler(response, nil)
-                    return
-                }
-                replyHandler(self.bridge.handle(body), nil)
-            }
+        func attach(mainWebView: WKWebView) {
+            self.mainWebView = mainWebView
         }
 
-        nonisolated func webView(
+        func webView(
             _ webView: WKWebView,
             decidePolicyFor navigationAction: WKNavigationAction,
             decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
         ) {
-            guard navigationAction.targetFrame?.isMainFrame != false else {
+            guard let url = navigationAction.request.url else {
                 decisionHandler(.cancel)
                 return
             }
-            guard let url = navigationAction.request.url,
-                  let scheme = url.scheme?.lowercased() else {
+
+            if webView === authWebView {
+                decideAuthNavigation(url, action: navigationAction, decisionHandler: decisionHandler)
+            } else if webView === mainWebView {
+                decideMainNavigation(webView, url: url, action: navigationAction, decisionHandler: decisionHandler)
+            } else {
+                decisionHandler(.cancel)
+            }
+        }
+
+        func webView(
+            _ webView: WKWebView,
+            createWebViewWith configuration: WKWebViewConfiguration,
+            for navigationAction: WKNavigationAction,
+            windowFeatures: WKWindowFeatures
+        ) -> WKWebView? {
+            guard webView === mainWebView,
+                  navigationAction.targetFrame == nil,
+                  isTrustedMainFrame(navigationAction.sourceFrame),
+                  let url = navigationAction.request.url
+            else { return nil }
+
+            guard isBlankURL(url) || isAppleAuthenticationURL(url) else {
+                if navigationAction.navigationType == .linkActivated, isOrdinaryExternalURL(url) {
+                    NSWorkspace.shared.open(url)
+                }
+                return nil
+            }
+
+            closeAuthWindow()
+
+            configuration.preferences.javaScriptCanOpenWindowsAutomatically = true
+            let popup = WKWebView(frame: .zero, configuration: configuration)
+            popup.navigationDelegate = self
+            popup.uiDelegate = self
+            popup.allowsMagnification = true
+
+            let window = NSWindow(
+                contentRect: NSRect(x: 0, y: 0, width: 720, height: 760),
+                styleMask: [.titled, .closable, .miniaturizable, .resizable],
+                backing: .buffered,
+                defer: false
+            )
+            window.title = "Sign in to Apple Music"
+            window.contentView = popup
+            window.delegate = self
+            window.isReleasedWhenClosed = false
+            window.center()
+
+            let controller = NSWindowController(window: window)
+            authWebView = popup
+            authWindowController = controller
+            controller.showWindow(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return popup
+        }
+
+        func webViewDidClose(_ webView: WKWebView) {
+            guard webView === authWebView else { return }
+            closeAuthWindow()
+        }
+
+        func windowWillClose(_ notification: Notification) {
+            guard let window = notification.object as? NSWindow,
+                  window === authWindowController?.window
+            else { return }
+            releaseAuthWindow()
+        }
+
+        func tearDown() {
+            closeAuthWindow()
+            mainWebView = nil
+        }
+
+        private func decideMainNavigation(
+            _ webView: WKWebView,
+            url: URL,
+            action: WKNavigationAction,
+            decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
+        ) {
+            if action.targetFrame?.isMainFrame == false {
+                let embeddedPageAllowed = isBlankURL(url)
+                    || isAllowedOriginURL(url)
+                    || isAppleAuthenticationURL(url)
+                decisionHandler(embeddedPageAllowed ? .allow : .cancel)
+                return
+            }
+
+            if action.targetFrame == nil {
+                if isAllowedMainURL(url) {
+                    webView.load(action.request)
+                    decisionHandler(.cancel)
+                    return
+                }
+                if isBlankURL(url) || isAppleAuthenticationURL(url) {
+                    decisionHandler(.allow)
+                    return
+                }
+                if action.navigationType == .linkActivated, isOrdinaryExternalURL(url) {
+                    NSWorkspace.shared.open(url)
+                }
                 decisionHandler(.cancel)
                 return
             }
-            let exactReceiverPage = scheme == "https"
-                && url.host?.lowercased() == allowedHost
-                && (url.port == nil || url.port == 443)
-                && (url.path.isEmpty || url.path == "/")
-                && url.fragment == "receiver"
-            if scheme == "about" {
+
+            guard action.targetFrame?.isMainFrame == true else {
+                decisionHandler(.cancel)
+                return
+            }
+
+            if isAllowedMainURL(url) || isBlankURL(url) {
                 decisionHandler(.allow)
                 return
             }
-            if exactReceiverPage {
-                Task { @MainActor [weak self] in
-                    guard let self else {
-                        decisionHandler(.cancel)
-                        return
-                    }
-                    if self.acceptedMainFrameLoad {
-                        MusicAutomation.shared.failSafePause()
-                    }
-                    self.acceptedMainFrameLoad = true
-                    decisionHandler(.allow)
-                }
-                return
-            }
-            if scheme == "https" && navigationAction.navigationType == .linkActivated {
-                Task { @MainActor in NSWorkspace.shared.open(url) }
+
+            if action.navigationType == .linkActivated, isOrdinaryExternalURL(url) {
+                NSWorkspace.shared.open(url)
             }
             decisionHandler(.cancel)
         }
 
-        nonisolated func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
-            Task { @MainActor in MusicAutomation.shared.failSafePause() }
+        private func decideAuthNavigation(
+            _ url: URL,
+            action: WKNavigationAction,
+            decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
+        ) {
+            if isBlankURL(url) || isAppleAuthenticationURL(url) || isAllowedMainURL(url) {
+                decisionHandler(.allow)
+                return
+            }
+            if action.navigationType == .linkActivated, isOrdinaryExternalURL(url) {
+                NSWorkspace.shared.open(url)
+            }
+            decisionHandler(.cancel)
         }
 
-        nonisolated func webView(
-            _ webView: WKWebView,
-            didFail navigation: WKNavigation!,
-            withError error: Error
-        ) {
-            Task { @MainActor in MusicAutomation.shared.failSafePause() }
+        private func isTrustedMainFrame(_ frame: WKFrameInfo) -> Bool {
+            frame.isMainFrame && frame.request.url.map(isAllowedMainURL) == true
         }
 
-        nonisolated func webView(
-            _ webView: WKWebView,
-            didFailProvisionalNavigation navigation: WKNavigation!,
-            withError error: Error
-        ) {
-            Task { @MainActor in MusicAutomation.shared.failSafePause() }
+        private func isAllowedMainURL(_ url: URL) -> Bool {
+            isAllowedOriginURL(url) && allowedMainPaths.contains(url.path)
+        }
+
+        private func isAllowedOriginURL(_ url: URL) -> Bool {
+            url.scheme?.lowercased() == "https"
+                && url.host?.lowercased() == allowedHost
+                && (url.port == nil || url.port == 443)
+        }
+
+        private func isAppleAuthenticationURL(_ url: URL) -> Bool {
+            guard url.scheme?.lowercased() == "https",
+                  let host = url.host?.lowercased()
+            else { return false }
+            return host == "apple.com" || host.hasSuffix(".apple.com")
+        }
+
+        private func isBlankURL(_ url: URL) -> Bool {
+            url.scheme?.lowercased() == "about" && url.absoluteString.lowercased() == "about:blank"
+        }
+
+        private func isOrdinaryExternalURL(_ url: URL) -> Bool {
+            guard let scheme = url.scheme?.lowercased() else { return false }
+            return scheme == "https" || scheme == "http" || scheme == "mailto"
+        }
+
+        private func closeAuthWindow() {
+            guard let controller = authWindowController else { return }
+            controller.window?.delegate = nil
+            releaseAuthWindow()
+            controller.close()
+        }
+
+        private func releaseAuthWindow() {
+            authWebView?.stopLoading()
+            authWebView?.navigationDelegate = nil
+            authWebView?.uiDelegate = nil
+            authWebView = nil
+            authWindowController = nil
         }
     }
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
     func makeNSView(context: Context) -> WKWebView {
-        let content = WKUserContentController()
-        let marker = """
-        Object.defineProperty(window, '__POOL_SIDE_NATIVE_MUSIC__', {
-          configurable: false,
-          enumerable: false,
-          writable: false,
-          value: Object.freeze({
-            version: 1,
-            platform: 'macos-music-app',
-            deviceName: 'Poolside Pulse X Music Receiver'
-          })
-        });
-        """
-        content.addUserScript(WKUserScript(
-            source: marker,
-            injectionTime: .atDocumentStart,
-            forMainFrameOnly: true
-        ))
-        content.addScriptMessageHandler(
-            context.coordinator,
-            contentWorld: .page,
-            name: "poolsideMusic"
-        )
-
         let configuration = WKWebViewConfiguration()
-        configuration.userContentController = content
         configuration.websiteDataStore = .default()
-        configuration.applicationNameForUserAgent = "PoolsidePulseNativeMusicReceiver/1.0"
-        configuration.preferences.javaScriptCanOpenWindowsAutomatically = false
+        configuration.applicationNameForUserAgent = "PoolsidePulseReceiver/2.0"
+        configuration.preferences.javaScriptCanOpenWindowsAutomatically = true
         configuration.mediaTypesRequiringUserActionForPlayback = []
 
         let webView = WKWebView(frame: .zero, configuration: configuration)
         webView.navigationDelegate = context.coordinator
+        webView.uiDelegate = context.coordinator
         webView.allowsMagnification = true
+        context.coordinator.attach(mainWebView: webView)
         webView.load(URLRequest(
             url: receiverURL,
             cachePolicy: .reloadIgnoringLocalAndRemoteCacheData,
@@ -148,9 +232,9 @@ struct ReceiverWebView: NSViewRepresentable {
     func updateNSView(_ webView: WKWebView, context: Context) {}
 
     static func dismantleNSView(_ webView: WKWebView, coordinator: Coordinator) {
-        MusicAutomation.shared.failSafePause()
+        coordinator.tearDown()
         webView.stopLoading()
-        webView.configuration.userContentController.removeScriptMessageHandler(forName: "poolsideMusic")
         webView.navigationDelegate = nil
+        webView.uiDelegate = nil
     }
 }

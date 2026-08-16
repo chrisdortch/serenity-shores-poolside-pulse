@@ -22,8 +22,6 @@
     <string>1</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
-    <key>NSAppleEventsUsageDescription</key>
-    <string>Poolside Pulse controls Music playback and volume on this Mac for pool announcements.</string>
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSHumanReadableCopyright</key>
