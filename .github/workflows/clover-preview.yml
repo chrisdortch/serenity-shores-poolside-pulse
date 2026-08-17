@@ -1,0 +1,17 @@
+name: Clover v1.1 preview validation
+
+on:
+  push:
+    branches:
+      - 'chatpro/clover-v1.1-poolside-pilot-20260816'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  clover:
+    uses: chrisdortch/first/.github/workflows/clover-preview-v1.1.yml@b04d3c5147a0e900e692b5a03ef5b09a602386c8
+    with:
+      protocol_ref: b04d3c5147a0e900e692b5a03ef5b09a602386c8
+      policy_path: .clover/project-policy.json
