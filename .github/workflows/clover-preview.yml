@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   clover:
-    uses: chrisdortch/first/.github/workflows/clover-preview-v1.1.yml@b04d3c5147a0e900e692b5a03ef5b09a602386c8
+    uses: chrisdortch/first/.github/workflows/clover-preview-v1.1.yml@ec7b7b42aead7ce9178b6be2bec3fa1293b4e9cb
     with:
-      protocol_ref: b04d3c5147a0e900e692b5a03ef5b09a602386c8
+      protocol_ref: ec7b7b42aead7ce9178b6be2bec3fa1293b4e9cb
       policy_path: .clover/project-policy.json
