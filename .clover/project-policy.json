@@ -1,0 +1,131 @@
+{
+  "schemaVersion": "1.1",
+  "protocol": {
+    "version": "1.1.0",
+    "repository": "chrisdortch/first",
+    "commit": "ec7b7b42aead7ce9178b6be2bec3fa1293b4e9cb"
+  },
+  "project": {
+    "id": "serenity-shores-poolside-pulse",
+    "title": "Serenity Shores Poolside Pulse",
+    "repository": "chrisdortch/serenity-shores-poolside-pulse",
+    "class": "authenticated-read-mostly",
+    "productionBranch": "main",
+    "productionUrl": "https://serenity-shores-poolside-pulse.vercel.app",
+    "vercelProjectId": "prj_dyXOTzR6X1Q7JIvf1CoyvLr59LxV"
+  },
+  "source": {
+    "baselineCommit": "d04e8d767903b0fdb084042bd65301407eb0359c",
+    "productionCommitAtEnrollment": "d04e8d767903b0fdb084042bd65301407eb0359c"
+  },
+  "execution": {
+    "mode": "preview-only",
+    "allowedBranchPrefixes": [
+      "chatpro/"
+    ],
+    "allowedChangePaths": [
+      ".clover/project-policy.json",
+      ".github/workflows/clover-preview.yml"
+    ],
+    "sensitivePaths": [
+      ".env*",
+      "api/**",
+      "src/**",
+      "public/**",
+      "test/**",
+      "index.html",
+      "package.json",
+      "package-lock.json",
+      "vite.config.js",
+      "vercel.json"
+    ],
+    "forbiddenCapabilities": [
+      "merge",
+      "production-deploy-or-promotion",
+      "production-state-write",
+      "kv-or-database-write",
+      "audio-control-command",
+      "tts-generation",
+      "spotify-control",
+      "domain-or-dns-change",
+      "secret-change",
+      "external-message",
+      "purchase"
+    ]
+  },
+  "commands": {
+    "install": "npm ci",
+    "verify": "npm run verify",
+    "preview": "npm run preview -- --host 127.0.0.1 --port 4173"
+  },
+  "browserAudit": {
+    "baseUrl": "http://127.0.0.1:4173",
+    "profiles": [
+      {
+        "id": "desktop-chromium",
+        "browser": "chromium",
+        "width": 1440,
+        "height": 1000,
+        "deviceScaleFactor": 1,
+        "isMobile": false,
+        "hasTouch": false
+      },
+      {
+        "id": "mobile-webkit",
+        "browser": "webkit",
+        "width": 390,
+        "height": 844,
+        "deviceScaleFactor": 2,
+        "isMobile": true,
+        "hasTouch": true
+      }
+    ],
+    "routes": [
+      {
+        "id": "role-picker",
+        "path": "/",
+        "waitForText": "What is this device?",
+        "requiredSelectors": [
+          "#app"
+        ],
+        "requiredText": [
+          "Poolside Pulse",
+          "What is this device?"
+        ]
+      },
+      {
+        "id": "command-role-local-preview",
+        "path": "/#command",
+        "waitForSelector": "#app",
+        "requiredSelectors": [
+          "#app"
+        ],
+        "requiredText": [
+          "Poolside Pulse"
+        ]
+      }
+    ],
+    "budgets": {
+      "maxConsoleErrors": 0,
+      "maxPageErrors": 0,
+      "maxFirstPartyRequestFailures": 0,
+      "maxHttpErrors": 0,
+      "maxBrokenImages": 0,
+      "maxHorizontalOverflowPx": 1,
+      "maxDuplicateIds": 0,
+      "maxUnlabeledControls": 0
+    },
+    "ignoreConsolePatterns": [],
+    "ignoreRequestPatterns": [],
+    "stabilizationMs": 1200
+  },
+  "authority": {
+    "mergeApproved": false,
+    "productionDeploymentApproved": false,
+    "productionDataMutationApproved": false,
+    "domainOrDnsChangeApproved": false,
+    "secretChangeApproved": false,
+    "externalMessageApproved": false,
+    "purchaseApproved": false
+  }
+}
