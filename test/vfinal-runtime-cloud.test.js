@@ -898,6 +898,134 @@ describe('receiver weather failure state', { concurrency: false }, () => {
 });
 
 describe('CloudStore optimistic concurrency and durability', { concurrency: false }, () => {
+  test('a local-development save rejects unavailable storage instead of claiming it was saved', async () => {
+    const previousFetch = globalThis.fetch;
+    const statuses = [];
+    globalThis.fetch = async () => new Response(null, { status: 404 });
+    const previousState = createDefaultState();
+    previousState.config.musicLabel = 'Previously saved practice title';
+    globalThis.localStorage.setItem('poolside-pulse-vfinal-local-state', JSON.stringify(previousState));
+    const workingSetItem = globalThis.localStorage.setItem.bind(globalThis.localStorage);
+    globalThis.localStorage.setItem = () => { throw new Error('Storage quota exceeded'); };
+    try {
+      const store = new CloudStore({ onStatus: status => statuses.push(status) });
+      await assert.rejects(store.mutate(draft => {
+        draft.config.musicLabel = 'Unsaved practice title';
+      }, 'Practice settings'), /could not be saved.*browser storage/i);
+      assert.equal(store.state.config.musicLabel, 'Unsaved practice title');
+      assert.equal(statuses.at(-1).ok, false);
+      assert.doesNotMatch(statuses.at(-1).message, /saved locally|settings saved\./i);
+      await store.fetchRemote();
+      await store.load();
+      assert.equal(store.state.config.musicLabel, 'Unsaved practice title', 'poll/load must retain the rejected draft');
+      assert.equal(store.durableReady(), false);
+      const reloaded = new CloudStore();
+      assert.equal(reloaded.state.config.musicLabel, 'Previously saved practice title');
+      globalThis.localStorage.setItem = workingSetItem;
+      await store.mutate(() => {}, 'Retry practice settings');
+      assert.equal(store.localSavePending, false);
+      assert.equal(store.durableReady(), true);
+      assert.equal(new CloudStore().state.config.musicLabel, 'Unsaved practice title');
+    } finally {
+      globalThis.fetch = previousFetch;
+    }
+  });
+
+  test('a successful local-development save is retained by a fresh store read', async () => {
+    const previousFetch = globalThis.fetch;
+    globalThis.fetch = async () => new Response(null, { status: 404 });
+    try {
+      const store = new CloudStore();
+      const saved = await store.mutate(draft => {
+        draft.config.musicLabel = 'Persisted practice title';
+      }, 'Practice settings');
+      const reloaded = new CloudStore();
+      await reloaded.fetchRemote();
+      assert.equal(saved.revision, 1);
+      assert.equal(reloaded.state.revision, 1);
+      assert.equal(reloaded.state.config.musicLabel, 'Persisted practice title');
+    } finally {
+      globalThis.fetch = previousFetch;
+    }
+  });
+
+  test('an offline edit rejects unavailable storage instead of claiming local persistence', async () => {
+    const previousFetch = globalThis.fetch;
+    globalThis.fetch = async () => { throw new Error('Fictional network unavailable'); };
+    globalThis.localStorage.setItem = () => { throw new Error('Storage unavailable'); };
+    try {
+      const store = new CloudStore();
+      await assert.rejects(store.mutate(draft => {
+        draft.config.musicLabel = 'Unsaved offline title';
+      }, 'Offline settings'), /could not be saved.*browser storage/i);
+      assert.equal(store.state.config.musicLabel, 'Unsaved offline title');
+      await store.load();
+      assert.equal(store.state.config.musicLabel, 'Unsaved offline title');
+      assert.equal(store.durableReady(), false);
+    } finally {
+      globalThis.fetch = previousFetch;
+    }
+  });
+
+  test('remote polling preserves a rejected draft until an explicit durable save succeeds', async () => {
+    const previousFetch = globalThis.fetch;
+    const now = Date.now();
+    globalThis.fetch = async () => { throw new Error('Fictional network unavailable'); };
+    globalThis.localStorage.setItem = () => { throw new Error('Storage unavailable'); };
+    try {
+      const store = new CloudStore();
+      await assert.rejects(store.mutate(draft => {
+        draft.config.musicLabel = 'Pending owner edit';
+      }), /could not be saved.*browser storage/i);
+      globalThis.fetch = async (_url, options = {}) => jsonResponse({
+        state: options.method === 'POST'
+          ? { ...JSON.parse(options.body).state, revision: 3 }
+          : { ...createDefaultState(now), revision: 2 },
+        syncMode: 'kv', cloudSync: true
+      });
+      const authoritative = await store.fetchRemote();
+      assert.equal(authoritative.revision, 2);
+      assert.equal(store.state.config.musicLabel, 'Pending owner edit');
+      assert.equal(store.localSavePending, true);
+      assert.equal(store.durableReady(), false);
+      const saved = await store.mutate(draft => {
+        draft.config.musicLabel = 'Pending owner edit';
+      }, 'Explicit retry');
+      assert.equal(saved.revision, 3);
+      assert.equal(saved.config.musicLabel, 'Pending owner edit');
+      assert.equal(store.localSavePending, false);
+      assert.equal(store.durableReady(), true);
+    } finally {
+      globalThis.fetch = previousFetch;
+    }
+  });
+
+  test('a confirmed durable KV save remains successful when only the optional local cache fails', async () => {
+    const previousFetch = globalThis.fetch;
+    const now = Date.now();
+    let requests = 0;
+    globalThis.fetch = async (_url, options = {}) => {
+      requests += 1;
+      const state = options.method === 'POST'
+        ? { ...JSON.parse(options.body).state, revision: 1 }
+        : createDefaultState(now);
+      return jsonResponse({ state, syncMode: 'kv', cloudSync: true });
+    };
+    globalThis.localStorage.setItem = () => { throw new Error('Optional cache unavailable'); };
+    try {
+      const store = new CloudStore();
+      const saved = await store.mutate(draft => {
+        draft.config.musicLabel = 'Durably acknowledged';
+      }, 'Durable settings', { requireDurable: true });
+      assert.equal(saved.config.musicLabel, 'Durably acknowledged');
+      assert.equal(saved.revision, 1);
+      assert.equal(store.durableReady(), true);
+      assert.equal(requests, 2);
+    } finally {
+      globalThis.fetch = previousFetch;
+    }
+  });
+
   test('an unchanged authoritative poll updates sync metadata without emitting or rewriting local state', async () => {
     const now = Date.now();
     const authoritativeState = { ...createDefaultState(now), revision: 4, marker: 'unchanged' };
