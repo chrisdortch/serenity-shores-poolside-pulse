@@ -33,7 +33,12 @@ function localRead() {
 }
 
 function localWrite(state) {
-  try { localStorage.setItem(LOCAL_STATE_KEY, JSON.stringify(state)); } catch {}
+  try {
+    localStorage.setItem(LOCAL_STATE_KEY, JSON.stringify(state));
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function responseData(response) {
@@ -99,6 +104,7 @@ export class CloudStore {
     this.serverOffsetMs = 0;
     this.fetchSequence = 0;
     this.appliedFetchSequence = 0;
+    this.localSavePending = false;
   }
 
   now() {
@@ -106,7 +112,7 @@ export class CloudStore {
   }
 
   durableReady() {
-    return this.syncMode === 'kv' || (this.syncMode === 'local' && localDevelopmentHost());
+    return !this.localSavePending && (this.syncMode === 'kv' || (this.syncMode === 'local' && localDevelopmentHost()));
   }
 
   observeServerTime(data, startedAt, finishedAt = Date.now()) {
@@ -115,9 +121,19 @@ export class CloudStore {
     this.serverOffsetMs = Math.round(serverTime - ((startedAt + finishedAt) / 2));
   }
 
-  emit(reason = '') {
-    localWrite(this.state);
+  emit(reason = '', { localMutation = false } = {}) {
+    const persisted = localWrite(this.state);
+    if (localMutation) this.localSavePending = !persisted;
     this.onState(clone(this.state), { reason, syncMode: this.syncMode, cloudSync: this.cloudSync });
+    return persisted;
+  }
+
+  persistLocally(reason) {
+    if (this.emit(reason, { localMutation: true })) return;
+    const error = new Error('Changes could not be saved to browser storage. Keep this page open and free storage before retrying.');
+    error.code = 'LOCAL_PERSISTENCE_FAILED';
+    this.status(error.message, false);
+    throw error;
   }
 
   status(message, ok = true) {
@@ -135,7 +151,7 @@ export class CloudStore {
       this.appliedFetchSequence = requestSequence;
       this.syncMode = 'local';
       this.cloudSync = false;
-      this.state = normalizeState(localRead() || createDefaultState(this.now()), this.now());
+      if (!this.localSavePending) this.state = normalizeState(localRead() || createDefaultState(this.now()), this.now());
       return this.state;
     }
     const data = await responseData(response);
@@ -145,6 +161,9 @@ export class CloudStore {
     this.syncMode = data.syncMode || 'cloud';
     this.cloudSync = !!data.cloudSync;
     const incoming = normalizeState(data.state == null ? createDefaultState(this.now()) : data.state, this.now());
+    // Polls may observe new authoritative data, but only an explicit save may
+    // replace a visible draft whose browser persistence was rejected.
+    if (this.localSavePending) return incoming;
     const unchanged = JSON.stringify(incoming) === JSON.stringify(this.state);
     this.state = incoming;
     if (!unchanged) this.emit('cloud refresh');
@@ -166,7 +185,7 @@ export class CloudStore {
       this.cloudSync = false;
       this.state = normalizeState({ ...safe, revision: expectedRevision + 1, savedAt: this.now() }, this.now());
       this.appliedFetchSequence = ++this.fetchSequence;
-      this.emit('local save');
+      this.persistLocally('local save');
       return this.state;
     }
     let data;
@@ -180,6 +199,7 @@ export class CloudStore {
     this.syncMode = data.syncMode || 'cloud';
     this.cloudSync = !!data.cloudSync;
     this.state = normalizeState(data.state || safe, this.now());
+    this.localSavePending = false;
     this.appliedFetchSequence = ++this.fetchSequence;
     this.emit('cloud save');
     return this.state;
@@ -188,15 +208,23 @@ export class CloudStore {
   async load() {
     try {
       const state = await this.fetchRemote();
+      if (this.localSavePending) {
+        this.status('Changes remain unsaved in browser storage. Keep this page open and retry the save.', false);
+        return this.state;
+      }
       this.status(this.syncMode === 'kv' ? 'Cloud sync connected.' : this.syncMode === 'memory' ? 'Temporary server sync connected; durable KV is not active.' : 'Local development mode.', this.syncMode === 'kv' || this.syncMode === 'local');
       return state;
     } catch (error) {
       if (error.status === 401) throw error;
       this.syncMode = 'offline';
       this.cloudSync = false;
-      this.state = normalizeState(localRead() || this.state);
-      this.emit('offline fallback');
-      this.status(`Cloud sync unavailable: ${error.message}. This device is using its local copy.`, false);
+      if (!this.localSavePending) {
+        this.state = normalizeState(localRead() || this.state);
+        this.emit('offline fallback');
+      }
+      this.status(this.localSavePending
+        ? `Cloud sync unavailable: ${error.message}. Changes remain unsaved; keep this page open and retry the save.`
+        : `Cloud sync unavailable: ${error.message}. This device is using its local copy.`, false);
       return this.state;
     }
   }
@@ -232,6 +260,9 @@ export class CloudStore {
           if (!/^Receiver heartbeat/i.test(reason)) this.status(`${reason} saved.`, true);
           return saved;
         } catch (error) {
+          // A rejected browser save must not be converted into another successful
+          // offline fallback. The current draft remains visible for recovery.
+          if (error.code === 'LOCAL_PERSISTENCE_FAILED') throw error;
           if (error.status === 409) {
             if (Object.prototype.hasOwnProperty.call(error.data || {}, 'state')) {
               const conflictState = error.data.state == null ? createDefaultState(this.now()) : error.data.state;
@@ -243,7 +274,7 @@ export class CloudStore {
           }
           if (error.status === 401 || requireDurable) throw error;
           this.state = next;
-          this.emit('offline mutation');
+          this.persistLocally('offline mutation');
           if (!/^Receiver heartbeat/i.test(reason)) this.status(`${reason} saved locally; cloud sync failed: ${error.message}`, false);
           return next;
         }
